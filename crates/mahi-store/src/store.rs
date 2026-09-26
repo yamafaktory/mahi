@@ -54,7 +54,7 @@ const REF_LOCK_TIMEOUT: &str = "core.filesRefLockTimeout=5000";
 /// The project's git repository, seen through the objects and refs mahi writes.
 #[derive(Debug)]
 pub struct Store {
-    repo: Repository,
+    pub(crate) repo: Repository,
 }
 
 /// A store operation failed.
@@ -99,6 +99,24 @@ pub enum StoreError {
         /// The kind it was expected to be.
         expected: Kind,
     },
+    /// A worktree name is not a safe directory name.
+    #[error("invalid worktree name {0:?}")]
+    InvalidWorktreeName(String),
+    /// A worktree path or name is already taken.
+    #[error("{} already exists", .0.display())]
+    WorktreeExists(std::path::PathBuf),
+    /// Reading or writing the file system failed.
+    #[error("file system operation failed")]
+    Io(#[from] std::io::Error),
+    /// A worktree path contains a newline, which git's worktree files cannot hold.
+    #[error("worktree path {} contains a newline", .0.display())]
+    InvalidWorktreePath(std::path::PathBuf),
+    /// Checking files out into a worktree failed.
+    #[error("cannot check out worktree")]
+    Checkout(#[source] gix::Error),
+    /// A file in the tree could not be written, or collides with another.
+    #[error("cannot check out {0:?}")]
+    CheckoutPath(String),
     /// Two tree entries have the same name.
     #[error("duplicate tree entry name {0:?}")]
     DuplicateEntryName(String),
@@ -337,7 +355,7 @@ impl Store {
         Ok(())
     }
 
-    fn require_kind(&self, id: ObjectId, expected: Kind) -> Result<(), StoreError> {
+    pub(crate) fn require_kind(&self, id: ObjectId, expected: Kind) -> Result<(), StoreError> {
         let header = self.repo.try_find_header(id)?;
         if header.is_some_and(|header| header.kind() == expected) {
             Ok(())
