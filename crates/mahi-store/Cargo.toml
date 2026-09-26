@@ -15,6 +15,7 @@ gix-validate = { workspace = true }
 mahi-core = { workspace = true }
 mahi-crypto = { workspace = true }
 rustix = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

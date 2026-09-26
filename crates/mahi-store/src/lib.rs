@@ -17,6 +17,7 @@ pub use snapshot::{
     MAX_SNAPSHOT_FILE_BYTES,
     Skipped,
     Snapshot,
+    SnapshotCache,
 };
 pub use store::{
     COMMITTER_EMAIL,

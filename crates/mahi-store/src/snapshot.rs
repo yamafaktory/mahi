@@ -1,6 +1,9 @@
 use std::{
     cell::Cell,
-    collections::HashSet,
+    collections::{
+        HashMap,
+        HashSet,
+    },
     ffi::OsStr,
     fs::{
         self,
@@ -71,6 +74,10 @@ use rustix::{
     },
     io::Errno,
 };
+use sha2::{
+    Digest,
+    Sha256,
+};
 
 use crate::{
     Store,
@@ -86,6 +93,8 @@ pub const MAX_SNAPSHOT_DEPTH: usize = 256;
 
 const MAX_PATTERN_FILE_BYTES: u64 = 1024 * 1024;
 const WORKTREES: &str = "worktrees";
+const STAMP_PREFIX: &str = ".mahi-stamp-";
+const NO_CACHE: ((i64, i64), u64) = ((i64::MIN, 0), u64::MAX);
 const IGNORE_FILE: &[u8] = b".gitignore";
 const ATTRIBUTES_FILE: &[u8] = b".gitattributes";
 
@@ -125,16 +134,76 @@ pub struct Snapshot {
     pub tree: ObjectId,
     /// Paths left out, and why.
     pub skipped: Vec<(BString, Skipped)>,
+    /// How many files were read, rather than taken from the [`SnapshotCache`].
+    pub read: usize,
+}
+
+/// What is remembered between snapshots of one worktree, so unchanged files are not read again.
+///
+/// A file's blob is reused when its device, inode, size, modification and change times, mode
+/// and owner, the `.gitattributes` rules and index entry that apply to it are all unchanged,
+/// and both its modification and change times are earlier than the start of the snapshot that
+/// recorded it, measured on the worktree's own file system. A write within the same instant,
+/// or one whose modification time was set back, is never missed. Files on another file system
+/// than the worktree root are always read, and so is every file when that file system is not
+/// one whose change times can be trusted (ext4, xfs, btrfs, tmpfs, f2fs, zfs, bcachefs or
+/// overlayfs on Linux, APFS on macOS) or when the worktree root is not writable.
+#[derive(Debug, Default)]
+pub struct SnapshotCache {
+    key: Option<CacheKey>,
+    files: HashMap<BString, Cached>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheKey {
+    common_dir: (u64, u64),
+    name: String,
+    root: (u64, u64),
+}
+
+#[derive(Debug, Clone)]
+struct Cached {
+    stat: FileStat,
+    attributes: [u8; 32],
+    index_id: Option<ObjectId>,
+    recorded_at: (i64, i64),
+    id: ObjectId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStat {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    mode: u32,
+    uid: u32,
+}
+
+impl SnapshotCache {
+    /// Returns how many files are remembered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Returns whether nothing is remembered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
 }
 
 enum Leaf {
-    File(File, u64, bool),
+    File(File, FileStat),
     Link(Vec<u8>),
     Directory,
     Other,
 }
 
 struct Frame {
+    attributes: [u8; 32],
     dir: OwnedFd,
     rela: BString,
     ignored: bool,
@@ -178,7 +247,12 @@ impl Store {
     /// directory is where it should be, [`StoreError::ChangedDuringSnapshot`] if a path changed
     /// while it was read (the caller should snapshot again), or another [`StoreError`] if the
     /// repository cannot be read or written.
-    pub fn snapshot(&self, name: &str, globals: &GlobalPatterns) -> Result<Snapshot, StoreError> {
+    pub fn snapshot(
+        &self,
+        name: &str,
+        globals: &GlobalPatterns,
+        cache: &mut SnapshotCache,
+    ) -> Result<Snapshot, StoreError> {
         let (repo, workdir) = self.open_worktree(name)?;
         let index = repo.index_or_empty()?;
         let case = if repo.config_snapshot().boolean("core.ignoreCase") == Some(true) {
@@ -196,11 +270,33 @@ impl Store {
             FsMode::empty(),
         )
         .map_err(io::Error::from)?;
+        let key = CacheKey {
+            common_dir: dev_ino(&rustix::fs::stat(repo.common_dir()).map_err(io::Error::from)?)?,
+            name: name.to_owned(),
+            root: dev_ino(&fstat(&root).map_err(io::Error::from)?)?,
+        };
+        if cache.key.as_ref() != Some(&key) {
+            *cache = SnapshotCache {
+                key: Some(key),
+                files: HashMap::new(),
+            };
+        }
+        let (started, stamp_dev) = if trusted_times(&root) {
+            stamp(&root).unwrap_or(NO_CACHE)
+        } else {
+            NO_CACHE
+        };
 
         let mut collection = MetadataCollection::default();
         let attributes = global_attributes(&repo, globals, &mut collection)?;
         let lookup = (case == Case::Fold).then(|| index.prepare_icase_backing());
+        let root_attributes = root_fingerprint(&repo, globals, case)?;
         let mut walk = Walk {
+            cache_out: HashMap::with_capacity(cache.files.len()),
+            cache_in: std::mem::take(&mut cache.files),
+            started,
+            stamp_dev,
+            read: 0,
             ignore: global_ignore(&repo, globals)?,
             attributes,
             collection,
@@ -212,13 +308,22 @@ impl Store {
             lookup,
             repo: &repo,
         };
-        let tree = match walk.walk(root)? {
+        let walked = walk.walk(root, root_attributes);
+        let mut files = std::mem::take(&mut walk.cache_out);
+        if walked.is_err() {
+            for (path, cached) in walk.cache_in.drain() {
+                files.entry(path).or_insert(cached);
+            }
+        }
+        cache.files = files;
+        let tree = match walked? {
             Some(tree) => tree,
             None => repo.write_object(Tree::empty())?.detach(),
         };
         Ok(Snapshot {
             tree,
             skipped: walk.skipped,
+            read: walk.read,
         })
     }
 
@@ -285,6 +390,11 @@ fn global_attributes(
 }
 
 struct Walk<'a> {
+    cache_in: HashMap<BString, Cached>,
+    cache_out: HashMap<BString, Cached>,
+    started: (i64, i64),
+    stamp_dev: u64,
+    read: usize,
     ignore: gix::ignore::Search,
     attributes: gix::attrs::Search,
     collection: MetadataCollection,
@@ -298,20 +408,32 @@ struct Walk<'a> {
 }
 
 impl<'a> Walk<'a> {
-    fn walk(&mut self, root: OwnedFd) -> Result<Option<ObjectId>, StoreError> {
-        let mut stack = vec![self.enter(root, BString::default(), false, 0, Vec::new())?];
+    fn walk(
+        &mut self,
+        root: OwnedFd,
+        root_attributes: [u8; 32],
+    ) -> Result<Option<ObjectId>, StoreError> {
+        let mut stack = vec![self.enter(
+            root,
+            BString::default(),
+            false,
+            0,
+            Vec::new(),
+            root_attributes,
+        )?];
         loop {
             let Some(frame) = stack.last_mut() else {
                 return Ok(None);
             };
             if let Some(name) = frame.names.next() {
                 let rela = join(&frame.rela, &name);
-                let (ignored, depth) = (frame.ignored, frame.depth);
-                match self.step(&frame.dir, &name, rela, ignored, depth)? {
+                let (ignored, depth, attributes) = (frame.ignored, frame.depth, frame.attributes);
+                match self.step(&frame.dir, &name, rela, ignored, depth, attributes)? {
                     Step::Entry(entry) => frame.entries.push(entry),
                     Step::Nothing => {}
                     Step::Descend(child, prefix, child_ignored) => {
-                        let child = self.enter(child, prefix, child_ignored, depth + 1, name)?;
+                        let child =
+                            self.enter(child, prefix, child_ignored, depth + 1, name, attributes)?;
                         stack.push(child);
                     }
                 }
@@ -350,6 +472,7 @@ impl<'a> Walk<'a> {
         ignored: bool,
         depth: usize,
         name: Vec<u8>,
+        parent_attributes: [u8; 32],
     ) -> Result<Frame, StoreError> {
         let ignore_source = join(&rela, IGNORE_FILE);
         let ignore_file = if ignored {
@@ -367,6 +490,12 @@ impl<'a> Walk<'a> {
         let attributes_source = join(&rela, ATTRIBUTES_FILE);
         let attributes_file = read_pattern_file(&dir, ATTRIBUTES_FILE)?;
         let attributes_bytes = self.found_or_record(attributes_file, &attributes_source);
+        let attributes: [u8; 32] = Sha256::new()
+            .chain_update(parent_attributes)
+            .chain_update((attributes_bytes.len() as u64).to_le_bytes())
+            .chain_update(&attributes_bytes)
+            .finalize()
+            .into();
         self.attributes.add_patterns_buffer(
             &attributes_bytes,
             gix::path::from_bstr(attributes_source.as_bstr()).into_owned(),
@@ -379,11 +508,16 @@ impl<'a> Walk<'a> {
         for entry in Dir::read_from(&dir).map_err(io::Error::from)? {
             let entry = entry.map_err(io::Error::from)?;
             let entry_name = entry.file_name().to_bytes();
-            if entry_name != b"." && entry_name != b".." && entry_name != b".git" {
+            if entry_name != b"."
+                && entry_name != b".."
+                && entry_name != b".git"
+                && !entry_name.starts_with(STAMP_PREFIX.as_bytes())
+            {
                 names.push(entry_name.to_vec());
             }
         }
         Ok(Frame {
+            attributes,
             dir,
             rela,
             ignored,
@@ -401,6 +535,7 @@ impl<'a> Walk<'a> {
         rela: BString,
         dir_ignored: bool,
         depth: usize,
+        attributes: [u8; 32],
     ) -> Result<Step, StoreError> {
         if !safe_name(name) {
             self.skipped.push((rela, Skipped::UnsafeName));
@@ -481,27 +616,66 @@ impl<'a> Walk<'a> {
                 let id = self.repo.write_blob(&target)?.detach();
                 Ok(entry(EntryKind::Link, id))
             }
-            Leaf::File(file, size, executable) => {
+            Leaf::File(file, stat) => {
                 if tracked.is_none() && (dir_ignored || self.is_ignored(rela.as_bstr(), false)) {
                     return Ok(Step::Nothing);
                 }
-                if size > MAX_SNAPSHOT_FILE_BYTES {
-                    self.skipped.push((rela, Skipped::TooLarge));
-                    return Ok(Step::Nothing);
-                }
-                let Some(id) = self.hash_file(&rela, file, size)? else {
-                    self.skipped.push((rela, Skipped::Unconvertible));
-                    return Ok(Step::Nothing);
-                };
-                let kind = if executable {
+                let kind = if stat.mode & 0o100 != 0 {
                     EntryKind::BlobExecutable
                 } else {
                     EntryKind::Blob
                 };
-                Ok(entry(kind, id))
+                let index_id = tracked.map(|entry| entry.id);
+                Ok(self
+                    .file_id(rela, file, stat, attributes, index_id)?
+                    .map_or(Step::Nothing, |id| entry(kind, id)))
             }
             Leaf::Other => Ok(Step::Nothing),
         }
+    }
+
+    fn file_id(
+        &mut self,
+        rela: BString,
+        file: File,
+        stat: FileStat,
+        attributes: [u8; 32],
+        index_id: Option<ObjectId>,
+    ) -> Result<Option<ObjectId>, StoreError> {
+        if stat.size > MAX_SNAPSHOT_FILE_BYTES {
+            self.skipped.push((rela, Skipped::TooLarge));
+            return Ok(None);
+        }
+        let stamp_dev = self.stamp_dev;
+        let cached = self.cache_in.remove(&rela).filter(|cached| {
+            cached.stat == stat
+                && cached.attributes == attributes
+                && cached.index_id == index_id
+                && stat.dev == stamp_dev
+                && stat.mtime < cached.recorded_at
+                && stat.ctime < cached.recorded_at
+        });
+        let id = if let Some(cached) = cached {
+            cached.id
+        } else {
+            self.read += 1;
+            let Some(id) = self.hash_file(&rela, file, stat.size)? else {
+                self.skipped.push((rela, Skipped::Unconvertible));
+                return Ok(None);
+            };
+            id
+        };
+        self.cache_out.insert(
+            rela,
+            Cached {
+                stat,
+                attributes,
+                index_id,
+                recorded_at: self.started,
+                id,
+            },
+        );
+        Ok(Some(id))
     }
 
     fn tracked(&self, rela: &BStr) -> Option<&'a index::Entry> {
@@ -651,20 +825,151 @@ fn open_entry(dir: &OwnedFd, name: &[u8]) -> Result<Leaf, Errno> {
             if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
                 return Err(Errno::MLINK);
             }
-            let size = u64::try_from(stat.st_size).map_err(|_| Errno::INVAL)?;
-            Ok(Leaf::File(File::from(fd), size, stat.st_mode & 0o100 != 0))
+            Ok(Leaf::File(File::from(fd), file_stat(&stat)?))
         }
         _ => Ok(Leaf::Other),
     }
 }
 
+fn convert<T: TryInto<U>, U>(value: T) -> Result<U, Errno> {
+    value.try_into().map_err(|_| Errno::INVAL)
+}
+
+fn file_stat(stat: &rustix::fs::Stat) -> Result<FileStat, Errno> {
+    Ok(FileStat {
+        dev: convert(stat.st_dev)?,
+        ino: convert(stat.st_ino)?,
+        size: convert(stat.st_size)?,
+        mtime: (convert(stat.st_mtime)?, convert(stat.st_mtime_nsec)?),
+        ctime: (convert(stat.st_ctime)?, convert(stat.st_ctime_nsec)?),
+        mode: convert(stat.st_mode)?,
+        uid: convert(stat.st_uid)?,
+    })
+}
+
+fn stamp(root: &OwnedFd) -> Result<((i64, i64), u64), StoreError> {
+    let random = mahi_core::ThreadId::random().map_err(io::Error::other)?;
+    let name = format!("{STAMP_PREFIX}{random}");
+    let fd = openat(
+        root,
+        name.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        FsMode::from_raw_mode(0o600),
+    )
+    .map_err(io::Error::from)?;
+    let stat = fstat(&fd).map_err(io::Error::from);
+    let removed = rustix::fs::unlinkat(root, name.as_str(), AtFlags::empty());
+    let stat = file_stat(&stat?).map_err(io::Error::from)?;
+    removed.map_err(io::Error::from)?;
+    Ok((stat.mtime, stat.dev))
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_times(root: &OwnedFd) -> bool {
+    const TRUSTED: [i64; 8] = [
+        0xEF53,
+        0x5846_5342,
+        0x9123_683E,
+        0x0102_1994,
+        0xF2F5_2010,
+        0x2FC1_2FC1,
+        0xCA45_1A4E,
+        0x794C_7630,
+    ];
+    rustix::fs::fstatfs(root)
+        .ok()
+        .and_then(|stat| convert::<_, i64>(stat.f_type).ok())
+        .is_some_and(|kind| TRUSTED.contains(&kind))
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_times(root: &OwnedFd) -> bool {
+    rustix::fs::fstatfs(root).is_ok_and(|stat| {
+        let name: Vec<u8> = stat
+            .f_fstypename
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .filter_map(|byte| u8::try_from(*byte).ok())
+            .collect();
+        name == b"apfs"
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn trusted_times(_root: &OwnedFd) -> bool {
+    false
+}
+
+fn dev_ino(stat: &rustix::fs::Stat) -> Result<(u64, u64), StoreError> {
+    Ok((
+        convert(stat.st_dev).map_err(io::Error::from)?,
+        convert(stat.st_ino).map_err(io::Error::from)?,
+    ))
+}
+
+fn root_fingerprint(
+    repo: &Repository,
+    globals: &GlobalPatterns,
+    case: Case,
+) -> Result<[u8; 32], StoreError> {
+    let config = repo.config_snapshot();
+    let mut hasher = Sha256::new();
+    hasher.update([u8::from(case == Case::Fold)]);
+    for key in [
+        "core.autocrlf",
+        "core.eol",
+        "core.safecrlf",
+        "core.checkRoundtripEncoding",
+        "core.attributesFile",
+    ] {
+        let value = config.string(key);
+        hasher.update(value.as_ref().map_or(&b""[..], |value| value.as_slice()));
+        hasher.update([0]);
+    }
+    let files = [
+        config
+            .trusted_path("core.attributesFile")?
+            .or_else(|| globals.attributes.clone()),
+        Some(repo.common_dir().join("info").join("attributes")),
+    ];
+    for file in files.into_iter().flatten() {
+        let mut bytes = Vec::new();
+        let read = open_regular(&file).and_then(|opened| {
+            opened
+                .take(MAX_PATTERN_FILE_BYTES + 1)
+                .read_to_end(&mut bytes)
+        });
+        match read {
+            Ok(_) => {
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hasher.update(&bytes);
+            }
+            Err(error) => hasher.update(format!("unreadable {:?}", error.kind())),
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn open_regular(path: &Path) -> io::Result<File> {
+    let fd = openat(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        FsMode::empty(),
+    )?;
+    if FileType::from_raw_mode(fstat(&fd)?.st_mode) != FileType::RegularFile {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    Ok(File::from(fd))
+}
+
 fn read_pattern_file(dir: &OwnedFd, name: &[u8]) -> Result<PatternFile, StoreError> {
     match open_entry(dir, name) {
-        Ok(Leaf::File(_, size, _)) if size > MAX_PATTERN_FILE_BYTES => {
+        Ok(Leaf::File(_, stat)) if stat.size > MAX_PATTERN_FILE_BYTES => {
             Ok(PatternFile::Skip(Skipped::TooLarge))
         }
-        Ok(Leaf::File(file, size, _)) => {
-            let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+        Ok(Leaf::File(file, stat)) => {
+            let mut bytes = Vec::with_capacity(usize::try_from(stat.size).unwrap_or(0));
             file.take(MAX_PATTERN_FILE_BYTES).read_to_end(&mut bytes)?;
             Ok(PatternFile::Found(bytes))
         }
@@ -759,7 +1064,11 @@ mod tests {
     fn snapshot(setup: &Setup) -> Snapshot {
         setup
             .store
-            .snapshot("agent", &GlobalPatterns::default())
+            .snapshot(
+                "agent",
+                &GlobalPatterns::default(),
+                &mut SnapshotCache::default(),
+            )
             .unwrap()
     }
 
@@ -1015,7 +1324,11 @@ mod tests {
         for name in ["nope", "", "../agent", ".agent"] {
             assert!(
                 matches!(
-                    setup.store.snapshot(name, &GlobalPatterns::default()),
+                    setup.store.snapshot(
+                        name,
+                        &GlobalPatterns::default(),
+                        &mut SnapshotCache::default()
+                    ),
                     Err(StoreError::NotAWorktree(_))
                 ),
                 "{name:?}"
@@ -1023,7 +1336,11 @@ mod tests {
         }
         fs::rename(&path, setup.dir.path().join("moved")).unwrap();
         assert!(matches!(
-            setup.store.snapshot("agent", &GlobalPatterns::default()),
+            setup.store.snapshot(
+                "agent",
+                &GlobalPatterns::default(),
+                &mut SnapshotCache::default()
+            ),
             Err(StoreError::NotAWorktree(_))
         ));
     }
@@ -1087,7 +1404,11 @@ mod tests {
         fs::create_dir(path.join("closed")).unwrap();
         fs::write(path.join("closed/inner"), b"y").unwrap();
         fs::set_permissions(path.join("closed"), fs::Permissions::from_mode(0o000)).unwrap();
-        let result = setup.store.snapshot("agent", &GlobalPatterns::default());
+        let result = setup.store.snapshot(
+            "agent",
+            &GlobalPatterns::default(),
+            &mut SnapshotCache::default(),
+        );
         fs::set_permissions(path.join("closed"), fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             sorted(result.unwrap().skipped),
@@ -1233,6 +1554,242 @@ mod tests {
         }
         let skipped = snapshot(&setup).skipped;
         assert_eq!(skipped.len(), 2000);
+    }
+
+    fn cached_snapshot(setup: &Setup, cache: &mut SnapshotCache) -> Snapshot {
+        setup
+            .store
+            .snapshot("agent", &GlobalPatterns::default(), cache)
+            .unwrap()
+    }
+
+    #[test]
+    fn an_unchanged_worktree_is_not_read_again() {
+        let setup = setup();
+        let commit = default_base(&setup.store);
+        checkout(&setup, commit);
+        let mut cache = SnapshotCache::default();
+        let first = cached_snapshot(&setup, &mut cache);
+        assert_eq!(first.read, 4);
+        assert_eq!(cache.len(), 4);
+        let second = cached_snapshot(&setup, &mut cache);
+        assert_eq!(second.read, 0);
+        assert_eq!(second.tree, first.tree);
+    }
+
+    #[test]
+    fn only_edited_files_are_read_again() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        fs::write(path.join("README.md"), b"edited\n").unwrap();
+        let snapshot = cached_snapshot(&setup, &mut cache);
+        assert_eq!(snapshot.read, 1);
+        assert_eq!(blob(&setup.store, snapshot.tree, "README.md"), b"edited\n");
+    }
+
+    #[test]
+    fn a_same_size_rewrite_is_seen() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        fs::write(path.join("README.md"), b"HELLO\n").unwrap();
+        let snapshot = cached_snapshot(&setup, &mut cache);
+        assert_eq!(blob(&setup.store, snapshot.tree, "README.md"), b"HELLO\n");
+    }
+
+    #[test]
+    fn entries_recorded_too_recently_are_read_again() {
+        let setup = setup();
+        checkout(&setup, default_base(&setup.store));
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        for cached in cache.files.values_mut() {
+            cached.recorded_at = cached.stat.mtime;
+        }
+        assert_eq!(cached_snapshot(&setup, &mut cache).read, 4);
+    }
+
+    #[test]
+    fn changed_attributes_invalidate_the_files_below_them() {
+        let setup = setup();
+        let commit = base(
+            &setup.store,
+            &[
+                ("top.txt", EntryKind::Blob, b"a\n"),
+                ("sub/low.txt", EntryKind::Blob, b"b\n"),
+            ],
+        );
+        let path = checkout(&setup, commit);
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        fs::write(path.join("sub/.gitattributes"), b"*.txt ident\n").unwrap();
+        assert_eq!(cached_snapshot(&setup, &mut cache).read, 2);
+        assert_eq!(cached_snapshot(&setup, &mut cache).read, 0);
+    }
+
+    #[test]
+    fn a_backdated_same_size_edit_is_seen() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        let file = path.join("README.md");
+        let before = rustix::fs::stat(&file).unwrap();
+        fs::write(&file, b"HELLO\n").unwrap();
+        let old = rustix::fs::Timespec {
+            tv_sec: before.st_mtime,
+            tv_nsec: convert(before.st_mtime_nsec).unwrap(),
+        };
+        rustix::fs::utimensat(
+            CWD,
+            &file,
+            &rustix::fs::Timestamps {
+                last_access: old,
+                last_modification: old,
+            },
+            AtFlags::empty(),
+        )
+        .unwrap();
+        let snapshot = cached_snapshot(&setup, &mut cache);
+        assert_eq!(blob(&setup.store, snapshot.tree, "README.md"), b"HELLO\n");
+    }
+
+    #[test]
+    fn a_change_time_in_the_same_instant_as_the_stamp_forces_a_read() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let long_ago = rustix::fs::Timespec {
+            tv_sec: 1_000_000_000,
+            tv_nsec: 0,
+        };
+        for name in ["README.md", ".gitignore", "sub/.gitignore", "tracked.log"] {
+            rustix::fs::utimensat(
+                CWD,
+                path.join(name),
+                &rustix::fs::Timestamps {
+                    last_access: long_ago,
+                    last_modification: long_ago,
+                },
+                AtFlags::empty(),
+            )
+            .unwrap();
+        }
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        for cached in cache.files.values_mut() {
+            assert!(cached.stat.mtime < cached.stat.ctime);
+            cached.recorded_at = cached.stat.ctime;
+        }
+        assert_eq!(cached_snapshot(&setup, &mut cache).read, 4);
+    }
+
+    #[test]
+    fn an_unwritable_root_snapshots_without_the_cache() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = setup
+            .store
+            .snapshot("agent", &GlobalPatterns::default(), &mut cache);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(result.unwrap().read, 4);
+    }
+
+    #[test]
+    fn a_leftover_stamp_is_never_recorded() {
+        let setup = setup();
+        let commit = default_base(&setup.store);
+        let path = checkout(&setup, commit);
+        fs::write(path.join(".mahi-stamp-0123456789abcdef"), b"").unwrap();
+        assert_eq!(snapshot(&setup).tree, tree_of(&setup.store, commit));
+    }
+
+    #[test]
+    fn the_test_file_system_allows_the_cache() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let root = openat(
+            CWD,
+            &path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            FsMode::empty(),
+        )
+        .unwrap();
+        assert!(
+            trusted_times(&root),
+            "tests must run on a file system the cache trusts"
+        );
+    }
+
+    #[test]
+    fn a_changed_index_entry_forces_a_read() {
+        let setup = setup();
+        checkout(&setup, default_base(&setup.store));
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        for cached in cache.files.values_mut() {
+            cached.index_id = None;
+        }
+        assert_eq!(cached_snapshot(&setup, &mut cache).read, 4);
+    }
+
+    #[test]
+    fn the_stamp_leaves_nothing_behind() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let snapshot = cached_snapshot(&setup, &mut SnapshotCache::default());
+        assert!(
+            !only_names(&setup.store, snapshot.tree)
+                .iter()
+                .any(|name| name.contains("mahi-stamp"))
+        );
+        assert!(!fs::read_dir(&path).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("mahi-stamp")
+        }));
+    }
+
+    #[test]
+    fn toggling_ignore_case_invalidates_the_cache() {
+        let setup = setup();
+        checkout(&setup, default_base(&setup.store));
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        let config = setup.dir.path().join("repo/.git/config");
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str("[core]\n\tignoreCase = true\n");
+        fs::write(&config, text).unwrap();
+        let store = Store::open(&setup.dir.path().join("repo")).unwrap();
+        let again = store
+            .snapshot("agent", &GlobalPatterns::default(), &mut cache)
+            .unwrap();
+        assert_eq!(again.read, 4);
+    }
+
+    #[test]
+    fn a_cache_from_another_worktree_is_not_used() {
+        let setup = setup();
+        let commit = default_base(&setup.store);
+        checkout(&setup, commit);
+        setup
+            .store
+            .add_worktree("other", &setup.dir.path().join("other"), commit)
+            .unwrap();
+        let mut cache = SnapshotCache::default();
+        cached_snapshot(&setup, &mut cache);
+        let other = setup
+            .store
+            .snapshot("other", &GlobalPatterns::default(), &mut cache)
+            .unwrap();
+        assert_eq!(other.read, 4);
     }
 
     #[test]
