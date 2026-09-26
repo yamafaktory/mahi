@@ -1763,10 +1763,19 @@ mod tests {
         checkout(&setup, default_base(&setup.store));
         let mut cache = SnapshotCache::default();
         cached_snapshot(&setup, &mut cache);
+        let current = setup
+            .store
+            .repo
+            .config_snapshot()
+            .boolean("core.ignoreCase")
+            == Some(true);
         let config = setup.dir.path().join("repo/.git/config");
-        let mut text = fs::read_to_string(&config).unwrap();
-        text.push_str("[core]\n\tignoreCase = true\n");
-        fs::write(&config, text).unwrap();
+        let text = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            format!("{text}[core]\n\tignoreCase = {}\n", !current),
+        )
+        .unwrap();
         let store = Store::open(&setup.dir.path().join("repo")).unwrap();
         let again = store
             .snapshot("agent", &GlobalPatterns::default(), &mut cache)
