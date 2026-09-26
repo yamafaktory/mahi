@@ -1,0 +1,16 @@
+[package]
+authors.workspace = true
+description = "When to snapshot an agent's worktree: on a poke from its hooks, or on an adaptive timer."
+edition.workspace = true
+license.workspace = true
+name = "mahi-schedule"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

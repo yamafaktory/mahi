@@ -30,7 +30,7 @@ Review shouldn't be a gate at the end. When teammates watch, steer and prompt ea
 - **PTY wrapper**: launches the agent in a pseudo-terminal (`portable-pty`), passes it through to the user's terminal, and maintains a virtual screen (`vt100`) for late joiners and crude text snapshots.
 - **Sandbox**: the whole agent process runs inside an OS sandbox: namespaces, Landlock and seccomp on Linux (and WSL2), Seatbelt through `sandbox_init` on macOS. Same pattern as Anthropic's sandbox-runtime (`srt`), implemented natively in Rust with no helper program such as `bwrap`. All `unsafe` code in mahi lives in this one crate.
 - **Proxies**: a network allowlist proxy, and an LLM API proxy that injects the API key (the key never enters the sandbox) and meters tokens per participant.
-- **Worktree watcher** (`notify`): debounced snapshots of the agent's worktree into hidden refs.
+- **Snapshot scheduler**: snapshots of the agent's worktree into hidden refs, taken when the agent's hooks report that a tool ran or a turn ended, and otherwise on a timer that runs every second while the worktree keeps changing and backs off to 30 s while it does not. There is no file-system watcher: a worktree belongs to an agent, and a watcher can be made to follow a swapped-in symbolic link out of the tree, exhaust the user's watch limit, or queue events without bound, all of which were demonstrated against `notify`. The timer is the safety net for changes no hook reports (a background process, a person editing the worktree, an agent without hooks): they show up at the next tick, within a second while the worktree is busy and within 30 s after a long idle spell. Pokes never bring snapshots closer together than one second. With the snapshot cache a tick costs about 10 ms on 5,000 files and 170 ms on 100,000, in a release build.
 - **Git storage**: `gix` for objects, refs and worktrees, and for fetch. mahi never runs the `git` program. Push is not in `gix` yet, so mahi implements send-pack itself, over a pure-Rust SSH client (`russh`) and HTTPS.
 - **Live layer**: iroh (QUIC, hole punching, relay fallback) + iroh-gossip, one topic per thread.
 - **Shared state**: a CRDT (Automerge or Loro) for multi-writer data: human chat, claims, comments.
@@ -130,7 +130,7 @@ refs/threads/<id>/agents/<participant>.<agent>/session     # native agent sessio
 
 1. Create the thread: ID, thread key, `meta` ref (base commit, creator key, participants, landing branch). Optionally snapshot uncommitted changes as the real starting point.
 2. Add a linked worktree at the base with a detached `HEAD`, so no branch appears in the user's branch list; the agent's work is recorded in its `snapshots` ref. mahi writes git's linked-worktree layout itself and checks files out with gix. `.gitattributes` conversions (`text`, `eol`, `ident`, `working-tree-encoding`) apply as in git, so `git status` stays clean, but no filter driver is configured, so no filter program (such as git-lfs) runs: filtered files are checked out as stored. The worktree's git dir and the common git dir are read-only inside the sandbox (git config and hooks can execute code).
-3. Start the proxies and watcher (snapshot zero = base).
+3. Start the proxies and the snapshot scheduler (snapshot zero = base).
 4. Create the per-thread agent config dir and install capture hooks.
 5. Launch the agent in the sandbox → PTY → the user's terminal.
 6. Join the gossip topic; print an invite ticket (node address, topic, key), bound to participant public keys.

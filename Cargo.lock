@@ -2030,6 +2030,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mahi-schedule"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "mahi-store"
 version = "0.1.0"
 dependencies = [
