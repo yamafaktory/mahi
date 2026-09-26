@@ -111,6 +111,13 @@ pub enum StoreError {
     /// A worktree path contains a newline, which git's worktree files cannot hold.
     #[error("worktree path {} contains a newline", .0.display())]
     InvalidWorktreePath(std::path::PathBuf),
+    /// The name is not a linked worktree of this repository, or its recorded directory is not
+    /// where the worktree now is.
+    #[error("{0:?} is not a worktree of this repository")]
+    NotAWorktree(String),
+    /// A path changed while it was being read; snapshot again.
+    #[error("{0} changed while it was read")]
+    ChangedDuringSnapshot(gix::bstr::BString),
     /// Checking files out into a worktree failed.
     #[error("cannot check out worktree")]
     Checkout(#[source] gix::Error),
@@ -133,10 +140,8 @@ impl Store {
     ///
     /// Returns [`StoreError::Git`] if `path` is not a git repository.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let options =
-            gix::open::Options::default().config_overrides([DISABLE_REFLOG, REF_LOCK_TIMEOUT]);
         Ok(Self {
-            repo: gix::open_opts(path, options)?,
+            repo: gix::open_opts(path, open_options())?,
         })
     }
 
@@ -363,6 +368,10 @@ impl Store {
             Err(StoreError::WrongObject { id, expected })
         }
     }
+}
+
+pub(crate) fn open_options() -> gix::open::Options {
+    gix::open::Options::default().config_overrides([DISABLE_REFLOG, REF_LOCK_TIMEOUT])
 }
 
 fn generic_signature() -> Signature {

@@ -3,12 +3,20 @@
 #[cfg(not(unix))]
 compile_error!("mahi supports Linux and macOS only");
 
+mod snapshot;
 mod store;
 mod worktree;
 
 pub use gix::{
     ObjectId,
     objs::tree::EntryKind,
+};
+pub use snapshot::{
+    GlobalPatterns,
+    MAX_SNAPSHOT_DEPTH,
+    MAX_SNAPSHOT_FILE_BYTES,
+    Skipped,
+    Snapshot,
 };
 pub use store::{
     COMMITTER_EMAIL,

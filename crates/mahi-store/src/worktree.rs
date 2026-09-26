@@ -111,12 +111,19 @@ impl Store {
         let mut index = gix::index::State::from_tree(
             &tree,
             objects.clone(),
-            gix_validate::path::component::Options::default(),
+            gix_validate::path::component::Options {
+                protect_windows: false,
+                ..gix_validate::path::component::Options::default()
+            },
         )
         .map_err(|error| StoreError::Checkout(error.into()))?;
         let options = checkout::Options {
             fs: gix::fs::Capabilities::probe_dir(path),
             destination_is_initially_empty: true,
+            validate: gix_validate::path::component::Options {
+                protect_windows: false,
+                ..gix_validate::path::component::Options::default()
+            },
             ..checkout::Options::default()
         };
         let outcome = checkout(

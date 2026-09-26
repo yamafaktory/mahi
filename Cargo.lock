@@ -2037,6 +2037,7 @@ dependencies = [
  "gix-validate",
  "mahi-core",
  "mahi-crypto",
+ "rustix",
  "tempfile",
  "thiserror 2.0.21",
 ]
