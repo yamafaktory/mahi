@@ -11,7 +11,7 @@ use thiserror::Error;
 /// A participant's public key: an SSH ed25519 key, the only kind mahi accepts.
 ///
 /// Every other SSH key type is refused, `ssh-rsa` included, and so are ed25519 points of small
-/// order, which would let anyone decrypt what is encrypted to them. The key's comment is dropped,
+/// order, for which anyone can forge signatures. The key's comment is dropped,
 /// so two keys are equal exactly when their key material is.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ParticipantKey {
@@ -62,25 +62,13 @@ impl ParticipantKey {
         }
         let key = PublicKey::new(key.key_data().clone(), "");
         let line = key.to_openssh().map_err(|_| KeyError::Malformed)?;
-        let participant = Self { key, line };
-        participant.recipient()?;
-        Ok(participant)
+        Ok(Self { key, line })
     }
 
     /// Returns the key as an OpenSSH public key line, without a comment.
     #[must_use]
     pub fn to_openssh(&self) -> &str {
         &self.line
-    }
-
-    /// Returns the age recipient that encrypts to this key.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KeyError::Malformed`] if age does not accept the key, which construction
-    /// already rules out.
-    pub fn recipient(&self) -> Result<age::ssh::Recipient, KeyError> {
-        self.line.parse().map_err(|_| KeyError::Malformed)
     }
 
     pub(crate) fn public_key(&self) -> &PublicKey {
@@ -174,13 +162,6 @@ mod tests {
                 "{line:?}"
             );
         }
-    }
-
-    #[test]
-    fn age_recipient_matches_the_key() {
-        let private = ed25519();
-        let key = ParticipantKey::from_public_key(private.public_key()).unwrap();
-        assert_eq!(key.recipient().unwrap().to_string(), key.to_openssh());
     }
 
     #[test]

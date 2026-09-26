@@ -50,12 +50,15 @@ const MAX_TITLE_BYTES: usize = 256;
 const MAX_BRANCH_BYTES: usize = 256;
 const MAX_SIGNATURE_BYTES: usize = 4096;
 const MAX_PRIVATE_BYTES: usize = 4096;
+const LOW_ORDER_PROBE: [u8; 32] = [0x5a; 32];
 
-/// A person in a thread: their name and public key.
+/// A person in a thread: their name, the SSH key they sign with, and the mahi key that the
+/// thread key is wrapped to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Participant {
     name: ParticipantName,
     key: ParticipantKey,
+    recipient: x25519::Recipient,
 }
 
 /// The encrypted part of a thread's meta document.
@@ -106,6 +109,15 @@ pub enum InvalidMeta {
     /// Two participants share a key.
     #[error("two participants share a key")]
     DuplicateKey,
+    /// Two participants share a mahi key.
+    #[error("two participants share a mahi key")]
+    DuplicateRecipient,
+    /// A participant's mahi key is not an age X25519 recipient.
+    #[error("a participant's mahi key is not an age X25519 recipient")]
+    ParticipantRecipient,
+    /// A participant's mahi key is a point of small order, which no one can safely encrypt to.
+    #[error("a participant's mahi key is a weak X25519 point")]
+    WeakRecipient,
     /// The owner is not a participant.
     #[error("the owner is not a participant")]
     OwnerNotListed,
@@ -213,6 +225,7 @@ struct WireBody<'a> {
 struct WireParticipant<'a> {
     name: &'a str,
     key: &'a str,
+    recipient: &'a str,
     wrapped: &'a [u8],
 }
 
@@ -223,10 +236,25 @@ struct WirePrivate<'a> {
 }
 
 impl Participant {
-    /// Creates a participant.
-    #[must_use]
-    pub fn new(name: ParticipantName, key: ParticipantKey) -> Self {
-        Self { name, key }
+    /// Creates a participant who signs with `key` and receives the thread key at `recipient`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidMeta::WeakRecipient`] if `recipient` is an X25519 point of small order:
+    /// wrapping to one would give a shared secret of zero.
+    pub fn new(
+        name: ParticipantName,
+        key: ParticipantKey,
+        recipient: x25519::Recipient,
+    ) -> Result<Self, InvalidMeta> {
+        if is_low_order(&recipient) {
+            return Err(InvalidMeta::WeakRecipient);
+        }
+        Ok(Self {
+            name,
+            key,
+            recipient,
+        })
     }
 
     /// Returns the participant's name.
@@ -235,10 +263,16 @@ impl Participant {
         &self.name
     }
 
-    /// Returns the participant's public key.
+    /// Returns the participant's SSH signing key.
     #[must_use]
     pub fn key(&self) -> &ParticipantKey {
         &self.key
+    }
+
+    /// Returns the participant's mahi key, which the thread key is wrapped to.
+    #[must_use]
+    pub fn recipient(&self) -> &x25519::Recipient {
+        &self.recipient
     }
 }
 
@@ -350,12 +384,17 @@ impl MetaDraft {
 
         let mut wrapped = Vec::with_capacity(self.participants.len());
         for participant in &self.participants {
-            wrapped.push(thread_key.wrap(&[&participant.key.recipient()?])?);
+            wrapped.push(thread_key.wrap(&[&participant.recipient])?);
         }
         let names: Vec<String> = self
             .participants
             .iter()
             .map(|p| p.name.to_string())
+            .collect();
+        let recipients: Vec<String> = self
+            .participants
+            .iter()
+            .map(|p| p.recipient.to_string())
             .collect();
         let owner_name = self.owner.to_string();
         let recipient = thread_key.recipient().to_string();
@@ -370,12 +409,16 @@ impl MetaDraft {
                 .participants
                 .iter()
                 .zip(&names)
+                .zip(&recipients)
                 .zip(&wrapped)
-                .map(|((participant, name), wrapped)| WireParticipant {
-                    name,
-                    key: participant.key.to_openssh(),
-                    wrapped,
-                })
+                .map(
+                    |(((participant, name), recipient), wrapped)| WireParticipant {
+                        name,
+                        key: participant.key.to_openssh(),
+                        recipient,
+                        wrapped,
+                    },
+                )
                 .collect(),
             private: &private,
         })
@@ -464,7 +507,10 @@ impl VerifiedMeta {
             let participant = Participant::new(
                 ParticipantName::new(wire.name)?,
                 ParticipantKey::from_openssh(wire.key)?,
-            );
+                wire.recipient
+                    .parse()
+                    .map_err(|_| InvalidMeta::ParticipantRecipient)?,
+            )?;
             participants.push((participant, wire.wrapped.to_vec()));
         }
         validate_participants(&owner, participants.iter().map(|(p, _)| p))?;
@@ -577,6 +623,16 @@ impl fmt::Debug for VerifiedMeta {
     }
 }
 
+fn is_low_order(recipient: &x25519::Recipient) -> bool {
+    let Ok((_, data)) = bech32::decode(&recipient.to_string()) else {
+        return true;
+    };
+    let Ok(point) = <[u8; 32]>::try_from(data.as_slice()) else {
+        return true;
+    };
+    x25519_dalek::x25519(LOW_ORDER_PROBE, point) == [0; 32]
+}
+
 fn decode_exact<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, MetaError> {
     match postcard::take_from_bytes(bytes) {
         Ok((value, [])) => Ok(value),
@@ -596,6 +652,7 @@ fn validate_participants<'a>(
     }
     let mut names = HashSet::new();
     let mut keys = HashSet::new();
+    let mut recipients = HashSet::new();
     let mut has_owner = false;
     for participant in participants {
         if !names.insert(&participant.name) {
@@ -603,6 +660,9 @@ fn validate_participants<'a>(
         }
         if !keys.insert(&participant.key) {
             return Err(InvalidMeta::DuplicateKey);
+        }
+        if !recipients.insert(&participant.recipient) {
+            return Err(InvalidMeta::DuplicateRecipient);
         }
         has_owner |= &participant.name == owner;
     }
@@ -671,6 +731,7 @@ mod tests {
     struct Person {
         name: ParticipantName,
         private: PrivateKey,
+        mahi: x25519::Identity,
     }
 
     impl Person {
@@ -678,6 +739,7 @@ mod tests {
             Self {
                 name: ParticipantName::new(name).unwrap(),
                 private: PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+                mahi: x25519::Identity::generate(),
             }
         }
 
@@ -686,12 +748,11 @@ mod tests {
         }
 
         fn participant(&self) -> Participant {
-            Participant::new(self.name.clone(), self.key())
+            Participant::new(self.name.clone(), self.key(), self.mahi.to_public()).unwrap()
         }
 
-        fn identity(&self) -> age::ssh::Identity {
-            let pem = self.private.to_openssh(LineEnding::LF).unwrap();
-            age::ssh::Identity::from_buffer(pem.as_bytes(), None).unwrap()
+        fn identity(&self) -> &x25519::Identity {
+            &self.mahi
         }
     }
 
@@ -759,7 +820,7 @@ mod tests {
             [alice.participant(), bob.participant()]
         );
 
-        let key = meta.thread_key(&bob.name, &bob.identity()).unwrap();
+        let key = meta.thread_key(&bob.name, bob.identity()).unwrap();
         let private = meta.private(&key).unwrap();
         assert_eq!(private.title(), "Fix the parser");
         assert_eq!(private.landing_branch(), "feature/parser");
@@ -838,6 +899,7 @@ mod tests {
         let forged_owner = Person {
             name: alice.name.clone(),
             private: mallory.private.clone(),
+            mahi: x25519::Identity::generate(),
         };
         let forged = draft(&forged_owner, &[&bob]);
         let encoded = forged
@@ -948,9 +1010,11 @@ mod tests {
         let recipient = ThreadKey::generate().recipient().to_string();
         let base = base();
         let big_private = vec![0; MAX_PRIVATE_BYTES + 1];
+        let mahi = alice.mahi.to_public().to_string();
         let good = WireParticipant {
             name: "alice",
             key: key.to_openssh(),
+            recipient: &mahi,
             wrapped: b"",
         };
         let fresh = || WireBody {
@@ -1008,6 +1072,12 @@ mod tests {
             Err(MetaError::Invalid(InvalidMeta::PrivateTooLarge))
         ));
         let mut body = fresh();
+        body.participants[0].recipient = "age1nope";
+        assert!(matches!(
+            decode(&body),
+            Err(MetaError::Invalid(InvalidMeta::ParticipantRecipient))
+        ));
+        let mut body = fresh();
         body.participants[0].key = "ssh-ed25519 AAAA";
         assert!(matches!(decode(&body), Err(MetaError::Key(_))));
     }
@@ -1049,11 +1119,11 @@ mod tests {
         let encoded = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
         let meta = VerifiedMeta::decode(&encoded, draft.thread, &alice.key()).unwrap();
         assert!(matches!(
-            meta.thread_key(&carol.name, &carol.identity()),
+            meta.thread_key(&carol.name, carol.identity()),
             Err(MetaError::NotAParticipant)
         ));
         assert!(matches!(
-            meta.thread_key(&bob.name, &carol.identity()),
+            meta.thread_key(&bob.name, carol.identity()),
             Err(MetaError::WrappedKey(_))
         ));
     }
@@ -1066,13 +1136,13 @@ mod tests {
         let envelope: WireEnvelope<'_> = postcard::from_bytes(&encoded).unwrap();
         let mut body: WireBody<'_> = postcard::from_bytes(envelope.body).unwrap();
         let other = ThreadKey::generate()
-            .wrap(&[&alice.key().recipient().unwrap()])
+            .wrap(&[&alice.mahi.to_public()])
             .unwrap();
         body.participants[0].wrapped = &other;
         let resigned = resign(&alice.private, &postcard::to_allocvec(&body).unwrap());
         let meta = VerifiedMeta::decode(&resigned, draft.thread, &alice.key()).unwrap();
         assert!(matches!(
-            meta.thread_key(&alice.name, &alice.identity()),
+            meta.thread_key(&alice.name, alice.identity()),
             Err(MetaError::KeyMismatch)
         ));
     }
@@ -1114,12 +1184,108 @@ mod tests {
             make(vec![alice.participant(), alice.participant()]),
             Err(InvalidMeta::DuplicateName)
         );
-        let same_key = Participant::new(bob.name.clone(), alice.key());
+        let same_key =
+            Participant::new(bob.name.clone(), alice.key(), bob.mahi.to_public()).unwrap();
+        let same_recipient =
+            Participant::new(bob.name.clone(), bob.key(), alice.mahi.to_public()).unwrap();
         assert_eq!(
             make(vec![alice.participant(), same_key]),
             Err(InvalidMeta::DuplicateKey)
         );
+        assert_eq!(
+            make(vec![alice.participant(), same_recipient]),
+            Err(InvalidMeta::DuplicateRecipient)
+        );
         assert_eq!(make(vec![alice.participant(), bob.participant()]), Ok(()));
+    }
+
+    fn recipient_from_bytes(bytes: [u8; 32]) -> x25519::Recipient {
+        let hrp = bech32::Hrp::parse("age").unwrap();
+        bech32::encode::<bech32::Bech32>(hrp, &bytes)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn low_order_points() -> Vec<[u8; 32]> {
+        let mut minus_one = [0xff; 32];
+        minus_one[0] = 0xec;
+        minus_one[31] = 0x7f;
+        let mut one = [0; 32];
+        one[0] = 1;
+        let mut high_bit_zero = [0; 32];
+        high_bit_zero[31] = 0x80;
+        let order_eight = [
+            0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
+            0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
+            0x5f, 0x49, 0xb8, 0x00,
+        ];
+        vec![[0; 32], one, minus_one, high_bit_zero, order_eight]
+    }
+
+    #[test]
+    fn low_order_mahi_keys_are_refused() {
+        let alice = Person::new("alice");
+        for point in low_order_points() {
+            assert_eq!(
+                Participant::new(alice.name.clone(), alice.key(), recipient_from_bytes(point)),
+                Err(InvalidMeta::WeakRecipient),
+                "{point:02x?}"
+            );
+        }
+        assert!(Participant::new(alice.name.clone(), alice.key(), alice.mahi.to_public()).is_ok());
+    }
+
+    #[test]
+    fn a_signed_body_with_a_low_order_mahi_key_is_refused() {
+        let alice = Person::new("alice");
+        let key = alice.key();
+        let weak = recipient_from_bytes([0; 32]).to_string();
+        let recipient = ThreadKey::generate().recipient().to_string();
+        let base = base();
+        let body = WireBody {
+            thread: [0; 16],
+            generation: 0,
+            base: base.as_bytes(),
+            owner: "alice",
+            recipient: &recipient,
+            participants: vec![WireParticipant {
+                name: "alice",
+                key: key.to_openssh(),
+                recipient: &weak,
+                wrapped: b"",
+            }],
+            private: b"",
+        };
+        let encoded = resign(&alice.private, &postcard::to_allocvec(&body).unwrap());
+        assert!(matches!(
+            VerifiedMeta::decode(&encoded, ThreadId::from_bytes([0; 16]), &key),
+            Err(MetaError::Invalid(InvalidMeta::WeakRecipient))
+        ));
+    }
+
+    #[test]
+    fn differently_encoded_copies_of_a_mahi_key_are_duplicates() {
+        let (alice, bob) = (Person::new("alice"), Person::new("bob"));
+        let upper: x25519::Recipient = alice
+            .mahi
+            .to_public()
+            .to_string()
+            .to_uppercase()
+            .parse()
+            .unwrap();
+        let copy = Participant::new(bob.name.clone(), bob.key(), upper).unwrap();
+        assert!(matches!(
+            MetaDraft::new(
+                ThreadId::random().unwrap(),
+                0,
+                base(),
+                alice.name.clone(),
+                vec![alice.participant(), copy],
+                PrivateMeta::new("t", "main").unwrap(),
+            ),
+            Err(MetaError::Invalid(InvalidMeta::DuplicateRecipient))
+        ));
     }
 
     #[test]

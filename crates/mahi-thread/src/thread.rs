@@ -148,7 +148,6 @@ mod tests {
     use mahi_core::ParticipantName;
     use ssh_key::{
         Algorithm,
-        LineEnding,
         rand_core::OsRng,
     };
     use tempfile::TempDir;
@@ -164,6 +163,7 @@ mod tests {
         store: Store,
         owner: PrivateKey,
         owner_key: ParticipantKey,
+        mahi: age::x25519::Identity,
         thread: ThreadId,
     }
 
@@ -178,6 +178,7 @@ mod tests {
             store,
             owner,
             owner_key,
+            mahi: age::x25519::Identity::generate(),
             thread: ThreadId::random().unwrap(),
         }
     }
@@ -189,7 +190,7 @@ mod tests {
             generation,
             ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
             alice.clone(),
-            vec![Participant::new(alice, setup.owner_key.clone())],
+            vec![Participant::new(alice, setup.owner_key.clone(), setup.mahi.to_public()).unwrap()],
             PrivateMeta::new(title, "main").unwrap(),
         )
         .unwrap()
@@ -220,13 +221,8 @@ mod tests {
 
         let meta = load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
         assert_eq!(meta.generation(), 0);
-        let identity = age::ssh::Identity::from_buffer(
-            setup.owner.to_openssh(LineEnding::LF).unwrap().as_bytes(),
-            None,
-        )
-        .unwrap();
         let key = meta
-            .thread_key(&ParticipantName::new("alice").unwrap(), &identity)
+            .thread_key(&ParticipantName::new("alice").unwrap(), &setup.mahi)
             .unwrap();
         assert_eq!(meta.private(&key).unwrap().title(), "t");
         assert_eq!(
@@ -352,7 +348,14 @@ mod tests {
             5,
             ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
             alice.clone(),
-            vec![Participant::new(alice, mallory_key)],
+            vec![
+                Participant::new(
+                    alice,
+                    mallory_key,
+                    age::x25519::Identity::generate().to_public(),
+                )
+                .unwrap(),
+            ],
             PrivateMeta::new("t", "main").unwrap(),
         )
         .unwrap()

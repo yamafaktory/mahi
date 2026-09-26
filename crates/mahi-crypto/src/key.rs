@@ -237,12 +237,6 @@ fn read_exact_or_malformed(reader: &mut impl Read, buf: &mut [u8]) -> Result<(),
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use ssh_key::{
-        Algorithm,
-        LineEnding,
-        PrivateKey,
-        rand_core::OsRng,
-    };
 
     use super::*;
 
@@ -494,23 +488,6 @@ mod tests {
             ThreadKey::from_wrapped(&wrapped, &mallory),
             Err(WrappedKeyError::Decrypt(_))
         ));
-    }
-
-    #[test]
-    fn wraps_for_an_ssh_ed25519_key() {
-        let ssh = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        let private = ssh.to_openssh(LineEnding::LF).unwrap();
-        let public = ssh.public_key().to_openssh().unwrap();
-        let recipient: age::ssh::Recipient = public.parse().unwrap();
-        let identity = age::ssh::Identity::from_buffer(private.as_bytes(), None).unwrap();
-
-        let key = ThreadKey::generate();
-        let wrapped = key.wrap(&[&recipient]).unwrap();
-        let recovered = ThreadKey::from_wrapped(&wrapped, &identity).unwrap();
-        assert_eq!(
-            recovered.recipient().to_string(),
-            key.recipient().to_string()
-        );
     }
 
     #[test]

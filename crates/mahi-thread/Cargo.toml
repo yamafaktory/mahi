@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 age = { workspace = true }
+bech32 = { workspace = true }
 ed25519-dalek = { workspace = true }
 gix-hash = { workspace = true }
 gix-lock = { workspace = true }
@@ -23,6 +24,7 @@ serde = { workspace = true }
 sha2 = { workspace = true }
 ssh-key = { workspace = true }
 thiserror = { workspace = true }
+x25519-dalek = { workspace = true }
 
 [dev-dependencies]
 gix = { workspace = true }
