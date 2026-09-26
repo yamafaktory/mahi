@@ -1,0 +1,21 @@
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa comes in through age's ssh feature; no mahi code loads an ssh-rsa key, and DESIGN.md requires key loading to refuse one, which this ignore depends on" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

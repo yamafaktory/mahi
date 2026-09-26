@@ -45,3 +45,13 @@ jobs:
         with:
           tool: just,cargo-nextest
       - run: just test --profile ci
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-deny
+      - run: just deny

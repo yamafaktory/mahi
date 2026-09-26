@@ -103,6 +103,7 @@ refs/threads/<id>/agents/<participant>.<agent>/session     # native agent sessio
 ## Encryption
 
 - Encrypt at write time, before content becomes a git object: serialize → LZ4 → encrypt → write blob. The encrypted payload is the plaintext length (`u32`, little-endian) followed by one LZ4 block, so a reader checks the length against its limit before allocating, and a hostile blob cannot expand without bound. (zstd was the first choice; the only pure-Rust decoder, `ruzstd`, does not bound how much one block expands to.)
+- Participant keys are age X25519 or SSH ed25519 keys. Key loading refuses `ssh-rsa` and every other SSH key type: the `rsa` crate that `age` pulls in has an unfixed timing advisory (RUSTSEC-2023-0071).
 - `age` (Rust `age` crate): each thread has its own age X25519 identity, the thread key. Content is encrypted to the thread key's recipient. The thread key's secret is itself encrypted to each participant's key (SSH ed25519 keys supported) and stored in `meta`. Adding a participant wraps the existing thread key once more; nothing else is re-encrypted.
 - Always encrypted: transcripts, native session files, CRDT state, screen captures.
 - Code snapshots: plaintext for private remotes (keeps dedup and diffs), encrypted bundles per checkpoint for public remotes. Ask when unsure.

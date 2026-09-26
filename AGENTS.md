@@ -30,11 +30,12 @@ just clippy     # clippy on all targets, warnings are errors
 just test       # cargo nextest run; extra args pass through, e.g. just test -p mahi
 just build
 just run -- …   # run the mahi binary
-just check      # fmt-check + clippy + test
+just deny       # cargo-deny: advisories, licenses, banned crates, unknown sources
+just check      # fmt-check + clippy + test + deny
 ```
 
-CI (`.github/workflows/checks.yml`) runs `just fmt-check`, `just clippy` and
-`just test --profile ci` as separate jobs. Change a check in the `justfile`, not in the
+CI (`.github/workflows/checks.yml`) runs `just fmt-check`, `just clippy`,
+`just test --profile ci` and `just deny` as separate jobs. Change a check in the `justfile`, not in the
 workflow, so that CI and local runs stay the same.
 
 After every change, run `just fmt && just check`. A change is not done until `just check`
@@ -48,6 +49,9 @@ passes. Do not silence a failure: fix the cause.
   features. A crate refers to it with `dep = { workspace = true }`.
 - Every crate has `[lints] workspace = true`. Change lints only in the workspace manifest.
 - `Cargo.lock` is committed. Commands use `--locked`.
+- `deny.toml` is the dependency policy. An ignored advisory needs a `reason` that says why
+  the vulnerable code cannot run in mahi. A new license needs a line in `allow`. `just deny`
+  fetches the advisory database, so it needs network access.
 - Split code into a new crate only when it has a clear boundary (for example, logic that is
   pure and needs no I/O). Do not make a crate for each module.
 
