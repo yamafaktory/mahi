@@ -1,0 +1,22 @@
+[package]
+authors.workspace = true
+description = "The local mahi identity: a passphrase-protected age key in the user's config directory."
+edition.workspace = true
+license.workspace = true
+name = "mahi-identity"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+age = { workspace = true }
+rustix = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

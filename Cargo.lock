@@ -1993,6 +1993,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mahi-identity"
+version = "0.1.0"
+dependencies = [
+ "age",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "mahi-store"
 version = "0.1.0"
 dependencies = [
