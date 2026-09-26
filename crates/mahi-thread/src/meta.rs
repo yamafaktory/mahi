@@ -28,7 +28,6 @@ use sha2::{
 use ssh_key::{
     HashAlg,
     LineEnding,
-    PrivateKey,
     SshSig,
 };
 use thiserror::Error;
@@ -36,6 +35,8 @@ use thiserror::Error;
 use crate::{
     KeyError,
     ParticipantKey,
+    SignError,
+    SshSigner,
 };
 
 /// The largest encoded meta document mahi reads, in bytes.
@@ -181,7 +182,10 @@ pub enum MetaError {
     Key(#[from] KeyError),
     /// Signing failed.
     #[error("cannot sign meta document")]
-    Sign(#[source] ssh_key::Error),
+    Sign(#[source] SignError),
+    /// The signer returned a signature that the owner's key does not verify.
+    #[error("the signer returned a signature the owner's key does not verify")]
+    InvalidSignature,
     /// Sealing the private part failed.
     #[error("cannot seal meta document")]
     Seal(#[from] SealError),
@@ -368,7 +372,7 @@ impl MetaDraft {
     pub fn sign(
         &self,
         thread_key: &ThreadKey,
-        owner_key: &PrivateKey,
+        owner_key: &dyn SshSigner,
     ) -> Result<Vec<u8>, MetaError> {
         let owner = self.owner().ok_or(InvalidMeta::OwnerNotListed)?;
         if owner.key.public_key().key_data() != owner_key.public_key().key_data() {
@@ -425,9 +429,19 @@ impl MetaDraft {
         .map_err(MetaError::Encode)?;
 
         let signature = owner_key
-            .sign(NAMESPACE, HASH, &body)
-            .and_then(|signature| signature.to_pem(LineEnding::LF))
+            .sign_sshsig(NAMESPACE, HASH, &body)
             .map_err(MetaError::Sign)?;
+        if owner
+            .key
+            .public_key()
+            .verify(NAMESPACE, &body, &signature)
+            .is_err()
+        {
+            return Err(MetaError::InvalidSignature);
+        }
+        let signature = signature
+            .to_pem(LineEnding::LF)
+            .map_err(|error| MetaError::Sign(error.into()))?;
         let encoded = postcard::to_allocvec(&WireEnvelope {
             version: VERSION,
             body: &body,
@@ -723,6 +737,7 @@ mod tests {
     use proptest::prelude::*;
     use ssh_key::{
         Algorithm,
+        PrivateKey,
         rand_core::OsRng,
     };
 
@@ -1144,6 +1159,39 @@ mod tests {
         assert!(matches!(
             meta.thread_key(&alice.name, alice.identity()),
             Err(MetaError::KeyMismatch)
+        ));
+    }
+
+    struct LyingSigner {
+        claims: PrivateKey,
+        signs_with: PrivateKey,
+    }
+
+    impl SshSigner for LyingSigner {
+        fn public_key(&self) -> &ssh_key::PublicKey {
+            self.claims.public_key()
+        }
+
+        fn sign_sshsig(
+            &self,
+            namespace: &str,
+            hash: HashAlg,
+            message: &[u8],
+        ) -> Result<SshSig, SignError> {
+            Ok(self.signs_with.sign(namespace, hash, message)?)
+        }
+    }
+
+    #[test]
+    fn a_signer_returning_another_key_signature_is_refused() {
+        let (alice, mallory) = (Person::new("alice"), Person::new("mallory"));
+        let lying = LyingSigner {
+            claims: alice.private.clone(),
+            signs_with: mallory.private.clone(),
+        };
+        assert!(matches!(
+            draft(&alice, &[]).sign(&ThreadKey::generate(), &lying),
+            Err(MetaError::InvalidSignature)
         ));
     }
 

@@ -1949,6 +1949,8 @@ version = "0.1.0"
 dependencies = [
  "age",
  "rustix",
+ "signature",
+ "ssh-key",
  "tempfile",
  "thiserror 2.0.21",
  "zeroize",
@@ -1979,6 +1981,7 @@ dependencies = [
  "gix-validate",
  "mahi-core",
  "mahi-crypto",
+ "mahi-identity",
  "mahi-store",
  "postcard",
  "proptest",

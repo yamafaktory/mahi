@@ -18,6 +18,7 @@ gix-lock = { workspace = true }
 gix-validate = { workspace = true }
 mahi-core = { workspace = true }
 mahi-crypto = { workspace = true }
+mahi-identity = { workspace = true }
 mahi-store = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }

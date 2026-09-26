@@ -12,10 +12,13 @@ version.workspace = true
 [dependencies]
 age = { workspace = true }
 rustix = { workspace = true }
+ssh-key = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+signature = { workspace = true }
+ssh-key = { workspace = true, features = ["getrandom"] }
 tempfile = { workspace = true }
 
 [lints]

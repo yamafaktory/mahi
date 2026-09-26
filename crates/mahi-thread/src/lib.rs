@@ -3,6 +3,7 @@
 mod key;
 mod meta;
 mod pins;
+mod signer;
 mod thread;
 
 pub use key::{
@@ -20,6 +21,10 @@ pub use meta::{
     VerifiedMeta,
 };
 pub use pins::PinError;
+pub use signer::{
+    SignError,
+    SshSigner,
+};
 pub use thread::{
     META_ENTRY,
     ThreadError,

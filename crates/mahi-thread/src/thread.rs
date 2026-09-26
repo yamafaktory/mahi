@@ -10,7 +10,6 @@ use mahi_store::{
     Store,
     StoreError,
 };
-use ssh_key::PrivateKey;
 use thiserror::Error;
 
 use crate::{
@@ -19,6 +18,7 @@ use crate::{
     MetaError,
     ParticipantKey,
     PinError,
+    SshSigner,
     VerifiedMeta,
     pins::Pins,
 };
@@ -79,7 +79,7 @@ pub fn create_thread(
     store: &Store,
     draft: &MetaDraft,
     thread_key: &ThreadKey,
-    owner_key: &PrivateKey,
+    owner_key: &dyn SshSigner,
 ) -> Result<ObjectId, ThreadError> {
     if draft.generation() != 0 {
         return Err(ThreadError::NotFirstGeneration);
@@ -148,6 +148,7 @@ mod tests {
     use mahi_core::ParticipantName;
     use ssh_key::{
         Algorithm,
+        PrivateKey,
         rand_core::OsRng,
     };
     use tempfile::TempDir;
