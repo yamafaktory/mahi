@@ -795,6 +795,19 @@ mod tests {
             .data
     }
 
+    #[cfg(target_os = "linux")]
+    fn special_file(path: &Path) {
+        rustix::fs::mkfifoat(CWD, path, FsMode::from_raw_mode(0o600)).unwrap();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn special_file(path: &Path) {
+        let short = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let socket = short.path().join("s");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        fs::rename(&socket, path).unwrap();
+    }
+
     fn sorted(mut skipped: Vec<(BString, Skipped)>) -> Vec<(BString, Skipped)> {
         skipped.sort();
         skipped
@@ -1041,18 +1054,8 @@ mod tests {
         symlink(&outside, path.join("linked/.gitignore")).unwrap();
         fs::write(path.join("linked/kept.txt"), b"x").unwrap();
         fs::create_dir(path.join("piped")).unwrap();
-        rustix::fs::mkfifoat(
-            CWD,
-            path.join("piped/.gitignore"),
-            FsMode::from_raw_mode(0o600),
-        )
-        .unwrap();
-        rustix::fs::mkfifoat(
-            CWD,
-            path.join("piped/.gitattributes"),
-            FsMode::from_raw_mode(0o600),
-        )
-        .unwrap();
+        special_file(&path.join("piped/.gitignore"));
+        special_file(&path.join("piped/.gitattributes"));
         fs::write(path.join("piped/kept.txt"), b"y").unwrap();
         fs::create_dir(path.join("zero")).unwrap();
         symlink("/dev/zero", path.join("zero/.gitattributes")).unwrap();
@@ -1100,7 +1103,7 @@ mod tests {
         let setup = setup();
         let path = checkout(&setup, default_base(&setup.store));
         fs::write(path.join("git~1"), b"x").unwrap();
-        rustix::fs::mkfifoat(CWD, path.join("pipe"), FsMode::from_raw_mode(0o600)).unwrap();
+        special_file(&path.join("pipe"));
         let snapshot = snapshot(&setup);
         assert_eq!(
             snapshot.skipped,
