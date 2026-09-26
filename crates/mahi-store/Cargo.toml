@@ -1,21 +1,23 @@
 [package]
 authors.workspace = true
-description = "Identifiers, names and ref layout of mahi threads."
+description = "Thread refs, commits and objects of mahi, stored in the project's git repository."
 edition.workspace = true
 license.workspace = true
-name = "mahi-core"
+name = "mahi-store"
 publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-getrandom = { workspace = true }
+gix = { workspace = true }
+gix-validate = { workspace = true }
+mahi-core = { workspace = true }
+mahi-crypto = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-gix-validate = { workspace = true }
-proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

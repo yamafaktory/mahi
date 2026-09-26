@@ -4,6 +4,7 @@ description = "Thread keys and the encrypted blob format of mahi."
 edition.workspace = true
 license.workspace = true
 name = "mahi-crypto"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

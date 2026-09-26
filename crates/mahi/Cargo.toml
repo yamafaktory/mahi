@@ -4,6 +4,7 @@ description = "Real-time, peer-to-peer collaboration around any terminal coding 
 edition.workspace = true
 license.workspace = true
 name = "mahi"
+publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true

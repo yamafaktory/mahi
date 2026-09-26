@@ -6,6 +6,7 @@ resolver = "3"
 authors = ["Davy Duperron <yamafaktory@gmail.com>"]
 edition = "2024"
 license = "MIT"
+publish = false
 repository = "https://github.com/yamafaktory/mahi"
 rust-version = "1.98"
 version = "0.1.0"
@@ -13,12 +14,15 @@ version = "0.1.0"
 [workspace.dependencies]
 age = { version = "0.12.1", features = ["ssh"] }
 getrandom = "0.4.3"
+gix = { version = "0.88.0", default-features = false, features = ["pack-cache-lru-dynamic", "parallel", "sha1"] }
 gix-validate = "0.12.0"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode", "std"] }
 mahi-core = { path = "crates/mahi-core" }
 mahi-crypto = { path = "crates/mahi-crypto" }
+mahi-store = { path = "crates/mahi-store" }
 proptest = "1.11.0"
 ssh-key = { version = "0.6.7", default-features = false, features = ["ed25519", "getrandom", "std"] }
+tempfile = "3.27.0"
 thiserror = "2.0.21"
 zeroize = "1.9.0"
 
