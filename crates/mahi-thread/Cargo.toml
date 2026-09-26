@@ -1,9 +1,9 @@
 [package]
 authors.workspace = true
-description = "Thread keys and the encrypted blob format of mahi."
+description = "Threads of mahi: their signed meta document and participants."
 edition.workspace = true
 license.workspace = true
-name = "mahi-crypto"
+name = "mahi-thread"
 publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,15 @@ version.workspace = true
 
 [dependencies]
 age = { workspace = true }
-lz4_flex = { workspace = true }
+ed25519-dalek = { workspace = true }
+gix-hash = { workspace = true }
+gix-validate = { workspace = true }
+mahi-core = { workspace = true }
+mahi-crypto = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+ssh-key = { workspace = true }
 thiserror = { workspace = true }
-zeroize = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

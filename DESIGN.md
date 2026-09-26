@@ -110,6 +110,18 @@ refs/threads/<id>/agents/<participant>.<agent>/session     # native agent sessio
 - Removing a participant rotates the thread key for future content: a new thread identity, wrapped for the remaining participants. Content written before the removal stays readable to the removed participant.
 - Optional team recovery recipient (an offline key).
 
+### The `meta` document
+
+- Encoded with `postcard`, in a versioned envelope: `{ version, body, signature }`.
+- The body holds, in plain text: the thread ID, the base commit, the owner's name, the thread recipient, and each participant's name, SSH ed25519 public key and wrapped thread key. The title and the landing branch are sealed to the thread key.
+- The owner signs the body with their SSH key (SSHSIG, namespace `mahi-meta`, SHA-512).
+- A reader verifies the signature against an owner key it already trusts: its own key when it created the thread, or the key in the invite ticket when it joins. Never against the key the document names. This is what stops someone who can push to the remote from replacing `meta` with a thread key they control.
+- After unwrapping, a participant checks that their thread key matches the recipient in the body, so the owner cannot give different participants different keys.
+- The body names its thread and carries a generation: 0 for a new thread, one higher for each later version. A reader refuses a document whose thread is not the ref's. It also keeps, per thread and outside git, the highest generation it has accepted and that document's body hash. It refuses a lower generation (a rolled-back `meta` that still lists a removed participant or an old key), and a different body with the same generation. Checking that the ref only fast-forwards is not enough, since a force-push can rewrite it. An invite ticket carries the generation the joiner must accept at least.
+- A `meta` document is identified by the hash of its body, not by its git blob id: the envelope around a signed body can be re-encoded without breaking the signature.
+- Participant keys that are ed25519 points of small order are refused: anything wrapped to them is readable by anyone.
+- Reading is bounded: 256 KiB per document, 256 participants, and a 256-byte title.
+
 ## Session lifecycle
 
 `mahi run -- claude` (or any agent):
@@ -187,7 +199,6 @@ Branch deletion triggers cleanup:
 ## Open questions
 
 - Authorship: anyone who has a thread's public recipient can seal content to it, so encryption alone does not say who wrote a blob. Turn commits (or their content) should be signed with the author's key if mahi needs to know who wrote what.
-- Authenticating `meta`: whoever can push to the remote could replace `meta` with a thread key they control, wrapped for the real participants, and read everything sealed afterwards. `meta` must be signed by the thread owner (or checked against a key pinned at join time) before its thread key is trusted.
 - Automerge vs Loro for shared state.
 - Windows support (WSL2 only?).
 - Subscription-login agents: credentials must live inside the sandbox, which loses the key-injection property.
