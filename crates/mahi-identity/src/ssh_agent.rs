@@ -15,6 +15,15 @@ use std::{
     },
 };
 
+use rustix::{
+    event::{
+        PollFd,
+        PollFlags,
+        Timespec,
+        poll,
+    },
+    io::Errno,
+};
 use ssh_key::{
     Algorithm,
     HashAlg,
@@ -104,6 +113,7 @@ impl SshAgent {
         let len = u32::try_from(body.len()).map_err(|_| AgentError::Malformed)?;
         stream.write_all(&len.to_be_bytes())?;
         stream.write_all(&body)?;
+        stream.set_nonblocking(true)?;
 
         let response = read_frame(&mut stream, deadline)?;
         match response.split_first() {
@@ -191,22 +201,31 @@ fn read_frame(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>, Age
 
 fn read_exact_by(stream: &mut UnixStream, mut buf: &mut [u8], deadline: Instant) -> io::Result<()> {
     while !buf.is_empty() {
-        let left = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-            .ok_or(io::ErrorKind::TimedOut)?;
-        stream.set_read_timeout(Some(left))?;
         match stream.read(buf) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => buf = &mut buf[n..],
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                return Err(io::ErrorKind::TimedOut.into());
+                wait_readable(stream, deadline)?;
             }
             Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+fn wait_readable(stream: &UnixStream, deadline: Instant) -> io::Result<()> {
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or(io::ErrorKind::TimedOut)?;
+    let timeout = Timespec::try_from(left).map_err(|_| io::ErrorKind::InvalidInput)?;
+    let mut fds = [PollFd::new(stream, PollFlags::IN)];
+    match poll(&mut fds, Some(&timeout)) {
+        Ok(0) => Err(io::ErrorKind::TimedOut.into()),
+        Ok(_) | Err(Errno::INTR) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]
