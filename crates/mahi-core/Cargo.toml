@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+description = "Identifiers, names and ref layout of mahi threads."
+edition.workspace = true
+license.workspace = true
+name = "mahi-core"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+getrandom = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+gix-validate = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

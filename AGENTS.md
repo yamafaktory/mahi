@@ -57,9 +57,9 @@ The workspace lint table is the rule. A summary:
 
 - `clippy::pedantic` is `deny`, and so are `unwrap_used`, `panic`, `todo`, `unimplemented`,
   `dbg_macro` and `allow_attributes`. `clippy.toml` allows `unwrap`, `panic` and `dbg!` in tests.
-- `unsafe_code` is `deny`. If unsafe code is really necessary, ask first. Put it in the
-  smallest possible module with `#[expect(unsafe_code, reason = "…")]` and a `// SAFETY:`
-  comment.
+- `unsafe_code` is `deny`. The only exception is the `mahi-sandbox` crate, which needs it
+  between fork and exec. There, each unsafe block has `#[expect(unsafe_code, reason = "…")]`
+  and a `// SAFETY:` comment. Anywhere else, ask first.
 - `missing_docs`, `missing_debug_implementations` and `unreachable_pub` are errors through
   `just clippy`.
 - To allow a lint, use `#[expect(lint, reason = "…")]` on the smallest item possible. Do not
@@ -99,6 +99,28 @@ Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) an
   `portable-pty`, `vt100`, `notify`, `iroh`, `age`, …). Ask before you add a large dependency
   that the design does not name.
 
+## Performance and security
+
+Performance and security are both critical. Neither is traded away for convenience.
+
+- **Untrusted input.** Everything that comes from a peer, a remote ref, an agent, a transcript
+  or a file in a worktree is untrusted. Validate it at the boundary, bound its size, and never
+  let it choose a path, a command or a ref name without checking it.
+- **Secrets.** Keys and plaintext never reach logs, error messages, `Debug` output or
+  unencrypted git objects. Use `zeroize` for key material, and constant-time comparison for
+  anything secret.
+- **Crates.** Use modern, well-maintained, high-quality crates: `tokio` for async, `gix` for
+  git, `age` for encryption, `iroh` for the network, `fearless_simd` for SIMD. Prefer one
+  strong crate to several small ones.
+- **Pure Rust.** No crate that binds a C library (for example `zstd-sys` or `libgit2`), and
+  pick the pure-Rust backend when a crate offers one. Calling the operating system directly
+  (through `rustix`, `libc` or macOS system calls) is allowed.
+- **No external programs.** mahi never runs another program, such as `git`, `ssh` or `bwrap`.
+  The only program it starts is the agent that it wraps.
+- **Hot paths.** Stream data instead of buffering it whole, avoid allocations and copies in
+  loops, and prefer borrowed data. Use SIMD (`fearless_simd`) only where a benchmark shows the
+  code is hot. A performance change comes with a benchmark or a measurement in the commit.
+
 ## Comments and docs
 
 - Every public item has a `///` doc comment, because `missing_docs` requires it. Each crate
@@ -119,6 +141,11 @@ Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) an
 
 ## Commits
 
+- Build the project piece by piece. Each commit is small and adds one piece.
+- Every commit has tests for the behaviour it adds or changes. A commit without tests is not
+  done.
+- Before each commit, run a separate review agent on the staged diff. It checks correctness
+  and security. Fix every valid finding, run `just fmt && just check` again, then commit.
 - One logical change per commit. The subject line says what changed and why, in the
   imperative, with no type prefix.
 - Do not commit generated files, `target/` or local paths.

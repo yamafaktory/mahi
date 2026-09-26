@@ -28,10 +28,10 @@ Review shouldn't be a gate at the end. When teammates watch, steer and prompt ea
 ### Core (agent-independent)
 
 - **PTY wrapper**: launches the agent in a pseudo-terminal (`portable-pty`), passes it through to the user's terminal, and maintains a virtual screen (`vt100`) for late joiners and crude text snapshots.
-- **Sandbox**: the whole agent process runs inside bubblewrap (Linux, WSL2) or Seatbelt (macOS). Same pattern as Anthropic's sandbox-runtime (`srt`), implemented natively in Rust.
+- **Sandbox**: the whole agent process runs inside an OS sandbox: namespaces, Landlock and seccomp on Linux (and WSL2), Seatbelt through `sandbox_init` on macOS. Same pattern as Anthropic's sandbox-runtime (`srt`), implemented natively in Rust with no helper program such as `bwrap`. All `unsafe` code in mahi lives in this one crate.
 - **Proxies**: a network allowlist proxy, and an LLM API proxy that injects the API key (the key never enters the sandbox) and meters tokens per participant.
 - **Worktree watcher** (`notify`): debounced snapshots of the agent's worktree into hidden refs.
-- **Git storage**: `gix` for local object/ref writes; the `git` CLI for network operations.
+- **Git storage**: `gix` for objects, refs and worktrees, and for fetch. mahi never runs the `git` program. Push is not in `gix` yet, so mahi implements send-pack itself, over a pure-Rust SSH client (`russh`) and HTTPS.
 - **Live layer**: iroh (QUIC, hole punching, relay fallback) + iroh-gossip, one topic per thread.
 - **Shared state**: a CRDT (Automerge or Loro) for multi-writer data: human chat, claims, comments.
 - **Prompt queue**: remote prompts are held and injected into the agent's PTY only when it's idle.
@@ -88,32 +88,33 @@ Notes for Claude Code: a per-thread `CLAUDE_CONFIG_DIR` lets mahi inject hooks w
 ## Storage layout
 
 ```
-refs/threads/<id>/meta                     # title, base, participants, wrapped keys, landing branch
-refs/threads/<id>/<agent>/snapshots        # one commit per edit (worktree trees)
-refs/threads/<id>/<agent>/transcript       # one commit per agent turn (encrypted)
-refs/threads/<id>/<agent>/session          # native agent session files (encrypted)
-refs/threads/<id>/state                    # CRDT blob (encrypted)
+refs/threads/<id>/meta                              # title, base, participants, wrapped keys, landing branch
+refs/threads/<id>/state                             # CRDT blob (encrypted)
+refs/threads/<id>/agents/<participant>.<agent>/snapshots   # one commit per edit (worktree trees)
+refs/threads/<id>/agents/<participant>.<agent>/transcript  # one commit per agent turn (encrypted)
+refs/threads/<id>/agents/<participant>.<agent>/session     # native agent session files (encrypted)
 ```
 
 - Each author only writes their own refs, so the layout is append-only and conflict-free.
+- Agents live under `agents/`, named `<participant>.<agent>`, so an agent can never be called `meta` or `state`, and two people can run the same agent in one thread.
 - Thread refs are pushed to the project's remote (the durable backing store) after every turn. They are not in the default refspec, so normal clones never see them.
 - Thread IDs are random, and thread commits use a generic committer identity, to limit metadata leakage.
 
 ## Encryption
 
 - Encrypt at write time, before content becomes a git object: serialize → zstd → encrypt → write blob.
-- `age` (Rust `age` crate): a random per-thread data key, wrapped for each participant as an age recipient (SSH ed25519 keys supported).
+- `age` (Rust `age` crate): each thread has its own age X25519 identity, the thread key. Content is encrypted to the thread key's recipient. The thread key's secret is itself encrypted to each participant's key (SSH ed25519 keys supported) and stored in `meta`. Adding a participant wraps the existing thread key once more; nothing else is re-encrypted.
 - Always encrypted: transcripts, native session files, CRDT state, screen captures.
 - Code snapshots: plaintext for private remotes (keeps dedup and diffs), encrypted bundles per checkpoint for public remotes. Ask when unsure.
-- Removing a participant rotates the data key for future content.
+- Removing a participant rotates the thread key for future content: a new thread identity, wrapped for the remaining participants. Content written before the removal stays readable to the removed participant.
 - Optional team recovery recipient (an offline key).
 
 ## Session lifecycle
 
 `mahi run -- claude` (or any agent):
 
-1. Create the thread: ID, data key, `meta` ref (base commit, creator key, participants, landing branch). Optionally snapshot uncommitted changes as the real starting point.
-2. `git worktree add` on `threads/<id>/<agent>` from the base. The worktree's git dir and the common git dir are read-only inside the sandbox (git config and hooks can execute code).
+1. Create the thread: ID, thread key, `meta` ref (base commit, creator key, participants, landing branch). Optionally snapshot uncommitted changes as the real starting point.
+2. Add a linked worktree on `threads/<id>/<participant>.<agent>` from the base. The worktree's git dir and the common git dir are read-only inside the sandbox (git config and hooks can execute code).
 3. Start the proxies and watcher (snapshot zero = base).
 4. Create the per-thread agent config dir and install capture hooks.
 5. Launch the agent in the sandbox → PTY → the user's terminal.
@@ -164,7 +165,7 @@ Branch deletion triggers cleanup:
 - Detected via `git fetch --prune` on any `mahi` command, and optionally by a CI job on the forge's branch-delete event.
 - Merged (check with patch IDs or the forge API, since squash merges break ancestry): compact to the Landed tier or delete, per policy.
 - Deleted unmerged: tombstone in `meta`, grace period (~2 weeks); restoring the branch cancels it; then delete.
-- Purge: delete remote refs; locally remove worktrees, config dirs, sandbox state, refs **and reflogs**, prune objects, and destroy the data key (crypto-shredding covers forge caches). Peers clean up on their next fetch. Limit: purging can't be forced on a machine that never runs mahi again.
+- Purge: delete remote refs; locally remove worktrees, config dirs, sandbox state, refs **and reflogs**, prune objects, and destroy the thread keys (crypto-shredding covers forge caches). Peers clean up on their next fetch. Limit: purging can't be forced on a machine that never runs mahi again.
 
 ## Serverless caveats
 
