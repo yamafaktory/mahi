@@ -1,0 +1,14 @@
+[package]
+authors.workspace = true
+description = "Real-time, peer-to-peer collaboration around any terminal coding agent."
+edition.workspace = true
+license.workspace = true
+name = "mahi"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
