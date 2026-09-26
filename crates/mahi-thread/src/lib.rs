@@ -2,6 +2,8 @@
 
 mod key;
 mod meta;
+mod pins;
+mod thread;
 
 pub use key::{
     KeyError,
@@ -16,4 +18,11 @@ pub use meta::{
     Participant,
     PrivateMeta,
     VerifiedMeta,
+};
+pub use pins::PinError;
+pub use thread::{
+    META_ENTRY,
+    ThreadError,
+    create_thread,
+    load_meta,
 };

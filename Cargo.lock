@@ -2010,14 +2010,19 @@ version = "0.1.0"
 dependencies = [
  "age",
  "ed25519-dalek",
+ "gix",
  "gix-hash",
+ "gix-lock",
  "gix-validate",
  "mahi-core",
  "mahi-crypto",
+ "mahi-store",
  "postcard",
  "proptest",
  "serde",
+ "sha2 0.10.9",
  "ssh-key",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

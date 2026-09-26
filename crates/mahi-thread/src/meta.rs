@@ -21,6 +21,10 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use sha2::{
+    Digest,
+    Sha256,
+};
 use ssh_key::{
     HashAlg,
     LineEnding,
@@ -79,6 +83,7 @@ pub struct MetaDraft {
 pub struct VerifiedMeta {
     thread: ThreadId,
     generation: u64,
+    body_hash: [u8; 32],
     base: ObjectId,
     owner: ParticipantName,
     recipient: x25519::Recipient,
@@ -301,6 +306,24 @@ impl MetaDraft {
         })
     }
 
+    /// Returns the thread the draft describes.
+    #[must_use]
+    pub fn thread(&self) -> ThreadId {
+        self.thread
+    }
+
+    /// Returns the draft's generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the owner's participant entry.
+    #[must_use]
+    pub fn owner(&self) -> Option<&Participant> {
+        self.participants.iter().find(|p| p.name == self.owner)
+    }
+
     /// Seals the private part to `thread_key`, wraps `thread_key` for every participant, and
     /// signs the result with `owner_key`.
     ///
@@ -313,11 +336,7 @@ impl MetaDraft {
         thread_key: &ThreadKey,
         owner_key: &PrivateKey,
     ) -> Result<Vec<u8>, MetaError> {
-        let owner = self
-            .participants
-            .iter()
-            .find(|p| p.name == self.owner)
-            .ok_or(InvalidMeta::OwnerNotListed)?;
+        let owner = self.owner().ok_or(InvalidMeta::OwnerNotListed)?;
         if owner.key.public_key().key_data() != owner_key.public_key().key_data() {
             return Err(InvalidMeta::SigningKeyNotOwner.into());
         }
@@ -459,6 +478,7 @@ impl VerifiedMeta {
         Ok(Self {
             thread,
             generation: body.generation,
+            body_hash: Sha256::digest(envelope.body).into(),
             base,
             owner,
             recipient,
@@ -477,6 +497,12 @@ impl VerifiedMeta {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Returns the SHA-256 hash of the signed body, which identifies the document.
+    #[must_use]
+    pub fn body_hash(&self) -> [u8; 32] {
+        self.body_hash
     }
 
     /// Returns the commit the thread started from.
@@ -737,6 +763,23 @@ mod tests {
         let private = meta.private(&key).unwrap();
         assert_eq!(private.title(), "Fix the parser");
         assert_eq!(private.landing_branch(), "feature/parser");
+    }
+
+    #[test]
+    fn the_body_hash_ignores_the_envelope_but_not_the_body() {
+        let alice = Person::new("alice");
+        let draft = draft(&alice, &[]);
+        let encoded = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
+        let body = body_of(&encoded);
+        let a = VerifiedMeta::decode(&encoded, draft.thread, &alice.key()).unwrap();
+        let rewrapped = resign(&alice.private, &body);
+        let b = VerifiedMeta::decode(&rewrapped, draft.thread, &alice.key()).unwrap();
+        assert_eq!(a.body_hash(), b.body_hash());
+        assert_eq!(a.body_hash(), <[u8; 32]>::from(Sha256::digest(&body)));
+
+        let other = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
+        let c = VerifiedMeta::decode(&other, draft.thread, &alice.key()).unwrap();
+        assert_ne!(a.body_hash(), c.body_hash());
     }
 
     #[test]

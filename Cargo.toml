@@ -13,10 +13,11 @@ version = "0.1.0"
 
 [workspace.dependencies]
 age = { version = "0.12.1", features = ["ssh"] }
-getrandom = "0.4.3"
 ed25519-dalek = { version = "2.2.0", default-features = false }
+getrandom = "0.4.3"
 gix = { version = "0.88.0", default-features = false, features = ["pack-cache-lru-dynamic", "parallel", "sha1"] }
 gix-hash = "0.27.0"
+gix-lock = "25.0.0"
 gix-validate = "0.12.0"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode", "std"] }
 mahi-core = { path = "crates/mahi-core" }
@@ -26,6 +27,7 @@ mahi-thread = { path = "crates/mahi-thread" }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 proptest = "1.11.0"
 serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+sha2 = { version = "0.10.9", default-features = false }
 ssh-key = { version = "0.6.7", default-features = false, features = ["ed25519", "std"] }
 tempfile = "3.27.0"
 thiserror = "2.0.21"

@@ -46,6 +46,8 @@ pub const COMMITTER_NAME: &str = "mahi";
 pub const COMMITTER_EMAIL: &str = "mahi@mahi.invalid";
 
 const MAX_ENTRY_NAME_BYTES: usize = 255;
+const MAX_COMMIT_BYTES: u64 = 64 * 1024;
+const MAX_TREE_BYTES: u64 = 1024 * 1024;
 const DISABLE_REFLOG: &str = "core.logAllRefUpdates=false";
 const REF_LOCK_TIMEOUT: &str = "core.filesRefLockTimeout=5000";
 
@@ -77,6 +79,14 @@ pub enum StoreError {
     /// A thread ref is symbolic, which mahi never writes.
     #[error("{0} is a symbolic ref")]
     Symbolic(String),
+    /// An object is larger than the caller's limit.
+    #[error("object {id} is larger than {limit} bytes")]
+    TooLarge {
+        /// The object.
+        id: ObjectId,
+        /// The limit that was exceeded, in bytes.
+        limit: u64,
+    },
     /// A tree entry name is longer than 255 bytes, or is one git refuses to check out, such as
     /// `..`, `.git` or a name that some file system reads as `.git`.
     #[error("invalid tree entry name {0:?}")]
@@ -128,6 +138,56 @@ impl Store {
             .try_id()
             .map(|id| Some(id.to_owned()))
             .ok_or(StoreError::Symbolic(name))
+    }
+
+    /// Returns the repository's common git directory, shared by all its worktrees.
+    #[must_use]
+    pub fn common_dir(&self) -> &Path {
+        self.repo.common_dir()
+    }
+
+    /// Reads the blob named `name` at the top of `commit`'s tree, or `None` if there is none.
+    ///
+    /// Every object on the way is size-checked from its header before it is loaded: the commit
+    /// against 64 KiB, its tree against 1 MiB, and the blob against `max_len`. A packed object
+    /// stored as a delta may still inflate its bases while it is decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `commit` is not a commit or the entry is not a
+    /// blob, [`StoreError::TooLarge`] if an object is over its limit, or [`StoreError::Git`] if
+    /// reading fails.
+    pub fn read_entry(
+        &self,
+        commit: ObjectId,
+        name: &str,
+        max_len: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.require_bounded(commit, Kind::Commit, MAX_COMMIT_BYTES)?;
+        let tree_id = self
+            .repo
+            .find_commit(commit)?
+            .tree_id()
+            .map_err(gix::Error::from)?
+            .detach();
+        self.require_bounded(tree_id, Kind::Tree, MAX_TREE_BYTES)?;
+        let tree = self.repo.find_tree(tree_id)?;
+        let Some(entry) = tree.find_entry(name) else {
+            return Ok(None);
+        };
+        let id = entry.object_id();
+        if !entry.mode().is_blob() {
+            return Err(StoreError::WrongObject {
+                id,
+                expected: Kind::Blob,
+            });
+        }
+        self.require_bounded(id, Kind::Blob, max_len)?;
+        let data = self.repo.find_object(id)?.detach().data;
+        if data.len() as u64 > max_len {
+            return Err(StoreError::TooLarge { id, limit: max_len });
+        }
+        Ok(Some(data))
     }
 
     /// Writes `bytes` as a blob.
@@ -263,6 +323,18 @@ impl Store {
             expected,
             found,
         })
+    }
+
+    fn require_bounded(&self, id: ObjectId, expected: Kind, limit: u64) -> Result<(), StoreError> {
+        let header = self
+            .repo
+            .try_find_header(id)?
+            .filter(|header| header.kind() == expected)
+            .ok_or(StoreError::WrongObject { id, expected })?;
+        if header.size() > limit {
+            return Err(StoreError::TooLarge { id, limit });
+        }
+        Ok(())
     }
 
     fn require_kind(&self, id: ObjectId, expected: Kind) -> Result<(), StoreError> {
@@ -476,6 +548,94 @@ mod tests {
             store.write_tree(&[("a", EntryKind::Blob, blob), ("a", EntryKind::Tree, blob)]),
             Err(StoreError::DuplicateEntryName(_))
         ));
+    }
+
+    #[test]
+    fn read_entry_reads_a_named_blob_within_its_limit() {
+        let (_dir, store) = store();
+        let blob = store.write_blob(b"hello").unwrap();
+        let sub = empty_tree(&store);
+        let tree = store
+            .write_tree(&[
+                ("meta", EntryKind::Blob, blob),
+                ("dir", EntryKind::Tree, sub),
+            ])
+            .unwrap();
+        let r = transcript_ref();
+        let commit = store.append(&r, None, tree, "x").unwrap();
+
+        assert_eq!(
+            store.read_entry(commit, "meta", 5).unwrap().as_deref(),
+            Some(&b"hello"[..])
+        );
+        assert_eq!(store.read_entry(commit, "missing", 5).unwrap(), None);
+        assert!(matches!(
+            store.read_entry(commit, "meta", 4),
+            Err(StoreError::TooLarge { limit: 4, .. })
+        ));
+        assert!(matches!(
+            store.read_entry(commit, "dir", 5),
+            Err(StoreError::WrongObject {
+                expected: Kind::Blob,
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.read_entry(tree, "meta", 5),
+            Err(StoreError::WrongObject {
+                expected: Kind::Commit,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn read_entry_refuses_symlinks_and_oversized_trees_and_commits() {
+        let (_dir, store) = store();
+        let blob = store.write_blob(b"target").unwrap();
+        let tree = store
+            .write_tree(&[("meta", EntryKind::Link, blob)])
+            .unwrap();
+        let commit = store.append(&transcript_ref(), None, tree, "x").unwrap();
+        assert!(matches!(
+            store.read_entry(commit, "meta", 100),
+            Err(StoreError::WrongObject {
+                expected: Kind::Blob,
+                ..
+            })
+        ));
+
+        let names: Vec<String> = (0..40_000).map(|i| format!("entry-{i:05}")).collect();
+        let entries: Vec<_> = names
+            .iter()
+            .map(|name| (name.as_str(), EntryKind::Blob, blob))
+            .collect();
+        let big_tree = store.write_tree(&entries).unwrap();
+        let commit = store
+            .append(&transcript_ref(), None, big_tree, "x")
+            .unwrap();
+        assert!(matches!(
+            store.read_entry(commit, "entry-00000", 100),
+            Err(StoreError::TooLarge { id, .. }) if id == big_tree
+        ));
+
+        let huge_message = "m".repeat(usize::try_from(MAX_COMMIT_BYTES).unwrap());
+        let commit = store
+            .append(&transcript_ref(), None, empty_tree(&store), &huge_message)
+            .unwrap();
+        assert!(matches!(
+            store.read_entry(commit, "meta", 100),
+            Err(StoreError::TooLarge { id, .. }) if id == commit
+        ));
+    }
+
+    #[test]
+    fn common_dir_is_the_git_directory() {
+        let (dir, store) = store();
+        assert_eq!(
+            store.common_dir().canonicalize().unwrap(),
+            dir.path().join(".git").canonicalize().unwrap()
+        );
     }
 
     #[test]

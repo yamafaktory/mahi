@@ -13,16 +13,21 @@ version.workspace = true
 age = { workspace = true }
 ed25519-dalek = { workspace = true }
 gix-hash = { workspace = true }
+gix-lock = { workspace = true }
 gix-validate = { workspace = true }
 mahi-core = { workspace = true }
 mahi-crypto = { workspace = true }
+mahi-store = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 ssh-key = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+gix = { workspace = true }
 proptest = { workspace = true }
+tempfile = { workspace = true }
 ssh-key = { workspace = true, features = ["getrandom"] }
 
 [lints]
