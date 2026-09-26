@@ -102,7 +102,7 @@ refs/threads/<id>/agents/<participant>.<agent>/session     # native agent sessio
 
 ## Encryption
 
-- Encrypt at write time, before content becomes a git object: serialize → zstd → encrypt → write blob.
+- Encrypt at write time, before content becomes a git object: serialize → LZ4 → encrypt → write blob. The encrypted payload is the plaintext length (`u32`, little-endian) followed by one LZ4 block, so a reader checks the length against its limit before allocating, and a hostile blob cannot expand without bound. (zstd was the first choice; the only pure-Rust decoder, `ruzstd`, does not bound how much one block expands to.)
 - `age` (Rust `age` crate): each thread has its own age X25519 identity, the thread key. Content is encrypted to the thread key's recipient. The thread key's secret is itself encrypted to each participant's key (SSH ed25519 keys supported) and stored in `meta`. Adding a participant wraps the existing thread key once more; nothing else is re-encrypted.
 - Always encrypted: transcripts, native session files, CRDT state, screen captures.
 - Code snapshots: plaintext for private remotes (keeps dedup and diffs), encrypted bundles per checkpoint for public remotes. Ask when unsure.
@@ -185,6 +185,8 @@ Branch deletion triggers cleanup:
 
 ## Open questions
 
+- Authorship: anyone who has a thread's public recipient can seal content to it, so encryption alone does not say who wrote a blob. Turn commits (or their content) should be signed with the author's key if mahi needs to know who wrote what.
+- Authenticating `meta`: whoever can push to the remote could replace `meta` with a thread key they control, wrapped for the real participants, and read everything sealed afterwards. `meta` must be signed by the thread owner (or checked against a key pinned at join time) before its thread key is trusted.
 - Automerge vs Loro for shared state.
 - Windows support (WSL2 only?).
 - Subscription-login agents: credentials must live inside the sandbox, which loses the key-injection property.

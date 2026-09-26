@@ -1,0 +1,22 @@
+[package]
+authors.workspace = true
+description = "Thread keys and the encrypted blob format of mahi."
+edition.workspace = true
+license.workspace = true
+name = "mahi-crypto"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+age = { workspace = true }
+lz4_flex = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+ssh-key = { workspace = true }
+
+[lints]
+workspace = true
