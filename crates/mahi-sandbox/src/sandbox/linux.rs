@@ -1,5 +1,6 @@
 mod landlock;
 mod process;
+mod seccomp;
 
 use std::{
     ffi::{
@@ -53,6 +54,7 @@ use rustix::{
 use self::{
     landlock::Landlock,
     process::Forked,
+    seccomp::Filter,
 };
 use super::{
     Access,
@@ -106,6 +108,7 @@ pub(crate) struct Plan {
     mounts: Vec<PlannedMount>,
     links: Vec<PlannedLink>,
     landlock: Landlock,
+    filter: Filter,
     cwd: CString,
 }
 
@@ -172,6 +175,7 @@ impl Plan {
             mounts: devices.chain(binds).collect::<io::Result<_>>()?,
             links,
             landlock: Landlock::new(full_access),
+            filter: Filter::new()?,
             cwd: c_path(cwd)?,
         })
     }
@@ -201,7 +205,8 @@ impl Plan {
         rustix::process::chdir(self.cwd.as_c_str())?;
         drop_privileges()?;
         self.landlock.restrict_self()?;
-        mark_inherited_fds_close_on_exec()
+        mark_inherited_fds_close_on_exec()?;
+        self.filter.install()
     }
 
     fn build_root(&mut self) -> io::Result<()> {

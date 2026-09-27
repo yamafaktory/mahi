@@ -478,7 +478,7 @@ mod tests {
         assert!(output.contains("done"), "{output}");
         assert!(!output.contains("missing-unshare"), "{output}");
         assert!(!output.contains("nested-userns"), "{output}");
-        assert!(output.contains("No space left on device"), "{output}");
+        assert!(output.contains("Operation not permitted"), "{output}");
     }
 
     #[test]
@@ -530,6 +530,94 @@ mod tests {
         );
         assert_eq!(code, 0, "{output}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn the_filter_refuses_dangerous_system_calls() {
+        let exe = std::env::current_exe().unwrap();
+        let mut sandbox = Sandbox::system().unwrap();
+        sandbox.bind(&exe, Access::ReadOnly).unwrap();
+        let (code, output) = run_command(
+            PtyCommand::new(&exe, Path::new("/"), SIZE)
+                .arg("--exact")
+                .arg("tests::the_filter_refuses_dangerous_system_calls_inner")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .sandbox(sandbox),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("1 passed"), "{output}");
+    }
+
+    #[test]
+    #[ignore = "run inside the sandbox by the_filter_refuses_dangerous_system_calls"]
+    fn the_filter_refuses_dangerous_system_calls_inner() {
+        let flags = usize::try_from(libc::CLONE_NEWUSER).unwrap();
+        let high_flags = flags | (1 << 32);
+        let tiocsti = usize::try_from(libc::TIOCSTI).unwrap();
+        let high_tiocsti = tiocsti | (1 << 32);
+        let byte = *b"x";
+        let byte = byte.as_ptr() as usize;
+        let denied = [
+            ("unshare", raw_syscall(libc::SYS_unshare, [flags, 0, 0])),
+            ("keyctl", raw_syscall(libc::SYS_keyctl, [0, 0, 0])),
+            (
+                "perf_event_open",
+                raw_syscall(libc::SYS_perf_event_open, [0, 0, 0]),
+            ),
+            ("mount", raw_syscall(libc::SYS_mount, [0, 0, 0])),
+            (
+                "clone with a namespace",
+                raw_syscall(libc::SYS_clone, [flags, 0, 0]),
+            ),
+            ("TIOCSTI", raw_syscall(libc::SYS_ioctl, [0, tiocsti, byte])),
+            (
+                "clone with high bits",
+                raw_syscall(libc::SYS_clone, [high_flags, 0, 0]),
+            ),
+            (
+                "TIOCSTI with high bits",
+                raw_syscall(libc::SYS_ioctl, [0, high_tiocsti, byte]),
+            ),
+        ];
+        for (name, result) in denied {
+            assert_eq!(result, Err(libc::EPERM), "{name}");
+        }
+        let missing = [
+            (
+                "io_uring_setup",
+                raw_syscall(libc::SYS_io_uring_setup, [1, 0, 0]),
+            ),
+            ("clone3", raw_syscall(libc::SYS_clone3, [0, 0, 0])),
+        ];
+        for (name, result) in missing {
+            assert_eq!(result, Err(libc::ENOSYS), "{name}");
+        }
+        let clone_fs = usize::try_from(libc::CLONE_FS).unwrap();
+        assert_eq!(raw_syscall(libc::SYS_unshare, [clone_fs, 0, 0]), Ok(0));
+        assert_eq!(
+            fs::read_to_string("/proc/sys/user/max_user_namespaces").unwrap(),
+            "0\n"
+        );
+        assert!(rustix::termios::tcgetwinsize(std::io::stdin()).is_ok());
+        thread::spawn(|| 7).join().unwrap();
+        assert!(Command::new("/bin/true").status().unwrap().success());
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "the test makes raw system calls to check what the filter lets through"
+    )]
+    fn raw_syscall(nr: libc::c_long, args: [usize; 3]) -> Result<libc::c_long, i32> {
+        let [first, second, third] = args;
+        // SAFETY: every call is one the filter must refuse before the kernel reads its
+        // arguments, or one that fails on the null or zero arguments given; none writes memory.
+        let result = unsafe { libc::syscall(nr, first, second, third) };
+        if result == -1 {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        } else {
+            Ok(result)
+        }
     }
 
     fn spawn_errno(result: Result<PtyChild, PtyError>) -> Errno {
