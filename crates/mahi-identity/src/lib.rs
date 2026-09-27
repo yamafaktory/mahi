@@ -5,6 +5,8 @@ compile_error!("mahi supports Linux and macOS only");
 
 mod config;
 mod identity;
+mod private_file;
+mod public;
 mod ssh_agent;
 
 pub use config::{
@@ -14,6 +16,10 @@ pub use config::{
 pub use identity::{
     IdentityError,
     LocalIdentity,
+};
+pub use public::{
+    PublicIdentity,
+    SigningKey,
 };
 pub use ssh_agent::{
     AgentError,

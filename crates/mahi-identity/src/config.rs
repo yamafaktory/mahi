@@ -7,6 +7,8 @@ use thiserror::Error;
 
 const APP: &str = "mahi";
 const IDENTITY_FILE: &str = "identity.age";
+const RECIPIENT_FILE: &str = "identity.pub";
+const SIGNING_KEY_FILE: &str = "signing-key.pub";
 
 /// mahi's per-user configuration directory.
 ///
@@ -51,6 +53,18 @@ impl ConfigDir {
     #[must_use]
     pub fn identity_file(&self) -> PathBuf {
         self.0.join(IDENTITY_FILE)
+    }
+
+    /// Returns the path of the public half of the identity.
+    #[must_use]
+    pub fn recipient_file(&self) -> PathBuf {
+        self.0.join(RECIPIENT_FILE)
+    }
+
+    /// Returns the path of the SSH public key that signs thread `meta` documents.
+    #[must_use]
+    pub fn signing_key_file(&self) -> PathBuf {
+        self.0.join(SIGNING_KEY_FILE)
     }
 }
 

@@ -1,22 +1,11 @@
 use std::{
     fmt,
-    fs::{
-        self,
-        File,
-        Metadata,
-        OpenOptions,
-    },
     io::{
         self,
         Read,
         Write,
     },
     iter,
-    os::unix::fs::{
-        DirBuilderExt,
-        MetadataExt,
-        OpenOptionsExt,
-    },
     path::{
         Path,
         PathBuf,
@@ -39,12 +28,12 @@ use age::{
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::private_file;
+
 const WORK_FACTOR: u8 = 18;
 const MAX_WORK_FACTOR: u8 = 19;
 const MAX_FILE_BYTES: u64 = 4096;
 const MAX_SECRET_BYTES: usize = 128;
-const PRIVATE_FILE: u32 = 0o600;
-const PRIVATE_DIR: u32 = 0o700;
 
 /// The user's own mahi key: an age X25519 identity that thread keys are wrapped to.
 ///
@@ -71,6 +60,9 @@ pub enum IdentityError {
     /// The identity path is not a regular file.
     #[error("{} is not a regular file", .0.display())]
     NotAFile(PathBuf),
+    /// The SSH key is not ed25519, the only kind mahi signs with.
+    #[error("only ed25519 SSH keys are supported")]
+    UnsupportedKey,
     /// The passphrase is wrong.
     #[error("wrong passphrase")]
     WrongPassphrase,
@@ -133,34 +125,7 @@ impl LocalIdentity {
         let mut writer = encryptor.wrap_output(Vec::new())?;
         writer.write_all(self.0.to_string().expose_secret().as_bytes())?;
         let encrypted = writer.finish()?;
-
-        let parent = parent_of(path);
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(PRIVATE_DIR)
-            .create(parent)?;
-        check_private_dir(parent)?;
-        if fs::symlink_metadata(path).is_ok() {
-            return Err(IdentityError::Exists(path.to_path_buf()));
-        }
-
-        let temp = temp_path(path);
-        if let Err(error) = write_new(&temp, &encrypted) {
-            let _ = fs::remove_file(&temp);
-            return Err(error.into());
-        }
-        let linked = fs::hard_link(&temp, path);
-        let _ = fs::remove_file(&temp);
-        match linked {
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                Err(IdentityError::Exists(path.to_path_buf()))
-            }
-            Err(error) => Err(error.into()),
-            Ok(()) => {
-                let _ = File::open(parent).and_then(|dir| dir.sync_all());
-                Ok(())
-            }
-        }
+        private_file::write_new(path, &encrypted)
     }
 
     /// Reads the identity at `path` and decrypts it with `passphrase`.
@@ -172,30 +137,7 @@ impl LocalIdentity {
     /// private to the current user, [`IdentityError::WrongPassphrase`] if the passphrase is
     /// wrong, or another [`IdentityError`] if the file is malformed or unreadable.
     pub fn load(path: &Path, passphrase: &SecretString) -> Result<Self, IdentityError> {
-        match fs::symlink_metadata(path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(IdentityError::NotFound(path.to_path_buf()));
-            }
-            Err(error) => return Err(error.into()),
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(IdentityError::NotAFile(path.to_path_buf()));
-            }
-            Ok(_) => {}
-        }
-        check_private_dir(parent_of(path))?;
-        let file = File::open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(IdentityError::NotAFile(path.to_path_buf()));
-        }
-        if !is_private(&metadata, PRIVATE_FILE) {
-            return Err(IdentityError::NotPrivate(path.to_path_buf()));
-        }
-        let mut encrypted = Vec::new();
-        file.take(MAX_FILE_BYTES + 1).read_to_end(&mut encrypted)?;
-        if encrypted.len() as u64 > MAX_FILE_BYTES {
-            return Err(IdentityError::Malformed);
-        }
+        let encrypted = private_file::read(path, MAX_FILE_BYTES)?;
 
         let decryptor =
             Decryptor::new(encrypted.as_slice()).map_err(|_| IdentityError::Malformed)?;
@@ -235,45 +177,15 @@ impl fmt::Debug for LocalIdentity {
     }
 }
 
-fn parent_of(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp-{}", std::process::id()));
-    path.with_file_name(name)
-}
-
-fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let _ = fs::remove_file(path);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(PRIVATE_FILE)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
-
-fn is_private(metadata: &Metadata, allowed: u32) -> bool {
-    metadata.uid() == rustix::process::geteuid().as_raw() && metadata.mode() & 0o777 & !allowed == 0
-}
-
-fn check_private_dir(dir: &Path) -> Result<(), IdentityError> {
-    let metadata = fs::metadata(dir)?;
-    let owned = metadata.uid() == rustix::process::geteuid().as_raw();
-    if !metadata.is_dir() || !owned || metadata.mode() & 0o022 != 0 {
-        return Err(IdentityError::NotPrivate(dir.to_path_buf()));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        fs,
+        os::unix::fs::{
+            DirBuilderExt,
+            PermissionsExt,
+        },
+    };
 
     use tempfile::TempDir;
 
@@ -390,12 +302,12 @@ mod tests {
             .mode(0o700)
             .create(path.parent().unwrap())
             .unwrap();
-        fs::write(temp_path(&path), b"left by a crash").unwrap();
+        fs::write(crate::private_file::temp_path(&path), b"left by a crash").unwrap();
         LocalIdentity::generate()
             .save_with_work_factor(&path, &passphrase("p"), FAST)
             .unwrap();
         assert!(LocalIdentity::load(&path, &passphrase("p")).is_ok());
-        assert!(!temp_path(&path).exists());
+        assert!(!crate::private_file::temp_path(&path).exists());
     }
 
     #[test]
