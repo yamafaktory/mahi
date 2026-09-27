@@ -10,6 +10,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+mahi-sandbox = { workspace = true }
+rustix = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

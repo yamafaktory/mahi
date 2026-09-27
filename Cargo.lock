@@ -1994,6 +1994,12 @@ checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 [[package]]
 name = "mahi"
 version = "0.1.0"
+dependencies = [
+ "mahi-sandbox",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "mahi-core"
