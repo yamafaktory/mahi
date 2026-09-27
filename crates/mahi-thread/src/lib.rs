@@ -1,10 +1,11 @@
-//! Threads of mahi: their signed meta document and participants.
+//! Threads of mahi: their signed meta document, participants and transcripts.
 
 mod key;
 mod meta;
 mod pins;
 mod signer;
 mod thread;
+mod transcript;
 
 pub use key::{
     KeyError,
@@ -30,4 +31,18 @@ pub use thread::{
     ThreadError,
     create_thread,
     load_meta,
+};
+pub use transcript::{
+    Event,
+    MAX_EVENT_BYTES,
+    MAX_EVENTS_PER_TURN,
+    MAX_TURN_BYTES,
+    TURN_ENTRY,
+    TranscriptError,
+    TranscriptTip,
+    TurnRecord,
+    append_turn,
+    read_tip,
+    read_turns,
+    walk_turns,
 };

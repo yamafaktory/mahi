@@ -124,6 +124,14 @@ refs/threads/<id>/agents/<participant>.<agent>/session     # native agent sessio
 - Keys that are points of small order are refused: an SSH ed25519 key of small order lets anyone forge its signatures, and a mahi key of small order gives an all-zero shared secret (age panics on it).
 - Reading is bounded: 256 KiB per document, 256 participants, and a 256-byte title.
 
+### Transcripts
+
+- Each agent turn is one commit on `refs/threads/<id>/agents/<participant>.<agent>/transcript`, whose tree holds a single file, `turn`: the turn sealed to the thread key.
+- A turn is `postcard` in a versioned record: its number, counted from 0, and its events, each a host-assigned sequence number and an opaque payload (the ACP session update, as the adapter produced it).
+- Each sealed turn also stores the running last sequence number of the whole transcript, so an empty turn carries it forward.
+- Turn numbers go up by one from commit to commit, and sequence numbers strictly increase within and across turns. Appending checks the new turn against the transcript's tip (its newest commit, turn number and running last sequence number), which the host keeps in memory or recovers by opening only the newest commit; it never opens earlier turns. Reading walks newest first, holds one turn at a time, and checks every commit it walks, which also has to have at most one parent.
+- Reading is bounded: 1 MiB per event, 100,000 events and 64 MiB per encoded turn (plus the sealing overhead for the stored blob), and the caller chooses how many turns to read back.
+
 ## Session lifecycle
 
 `mahi run -- claude` (or any agent):

@@ -76,6 +76,9 @@ pub enum StoreError {
         /// Where the ref points now.
         found: Option<ObjectId>,
     },
+    /// A commit has several parents, which mahi's linear histories never have.
+    #[error("commit {0} has several parents")]
+    NotLinear(ObjectId),
     /// A thread ref is symbolic, which mahi never writes.
     #[error("{0} is a symbolic ref")]
     Symbolic(String),
@@ -211,6 +214,27 @@ impl Store {
             return Err(StoreError::TooLarge { id, limit: max_len });
         }
         Ok(Some(data))
+    }
+
+    /// Returns the parent of `commit`, or `None` for the first commit of a history.
+    ///
+    /// mahi's histories are linear, so a commit with more than one parent is refused. The
+    /// commit's size is checked before it is loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `commit` is not a commit,
+    /// [`StoreError::TooLarge`] if it is larger than 64 KiB, [`StoreError::NotLinear`] if it has
+    /// several parents, or [`StoreError::Git`] if reading fails.
+    pub fn parent(&self, commit: ObjectId) -> Result<Option<ObjectId>, StoreError> {
+        self.require_bounded(commit, Kind::Commit, MAX_COMMIT_BYTES)?;
+        let commit_object = self.repo.find_commit(commit)?;
+        let mut parents = commit_object.parent_ids();
+        let first = parents.next().map(gix::Id::detach);
+        if parents.next().is_some() {
+            return Err(StoreError::NotLinear(commit));
+        }
+        Ok(first)
     }
 
     /// Writes `bytes` as a blob.
@@ -653,6 +677,42 @@ mod tests {
         assert!(matches!(
             store.read_entry(commit, "meta", 100),
             Err(StoreError::TooLarge { id, .. }) if id == commit
+        ));
+    }
+
+    #[test]
+    fn parent_follows_a_linear_history_and_refuses_merges() {
+        let (_dir, store) = store();
+        let r = transcript_ref();
+        let tree = empty_tree(&store);
+        let first = store.append(&r, None, tree, "1").unwrap();
+        let second = store.append(&r, Some(first), tree, "2").unwrap();
+        assert_eq!(store.parent(second).unwrap(), Some(first));
+        assert_eq!(store.parent(first).unwrap(), None);
+
+        let merge = store
+            .repo
+            .write_object(&Commit {
+                tree,
+                parents: [first, second].into_iter().collect(),
+                author: generic_signature(),
+                committer: generic_signature(),
+                encoding: None,
+                message: "merge".into(),
+                extra_headers: Vec::new(),
+            })
+            .unwrap()
+            .detach();
+        assert!(matches!(
+            store.parent(merge),
+            Err(StoreError::NotLinear(id)) if id == merge
+        ));
+        assert!(matches!(
+            store.parent(tree),
+            Err(StoreError::WrongObject {
+                expected: Kind::Commit,
+                ..
+            })
         ));
     }
 

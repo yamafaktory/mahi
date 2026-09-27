@@ -57,3 +57,6 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
+
+[profile.dev.package."*"]
+opt-level = 2
