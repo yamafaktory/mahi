@@ -121,6 +121,12 @@ pub enum StoreError {
     /// A path changed while it was being read; snapshot again.
     #[error("{0} changed while it was read")]
     ChangedDuringSnapshot(gix::bstr::BString),
+    /// `HEAD` points to no commit yet.
+    #[error("the repository has no commit yet")]
+    NoCommit,
+    /// The branch `HEAD` is on has a name that is not UTF-8.
+    #[error("the branch name {0:?} is not UTF-8")]
+    NonUtf8Branch(gix::bstr::BString),
     /// Checking files out into a worktree failed.
     #[error("cannot check out worktree")]
     Checkout(#[source] gix::Error),
@@ -146,6 +152,63 @@ impl Store {
         Ok(Self {
             repo: gix::open_opts(path, open_options())?,
         })
+    }
+
+    /// Opens the git repository that holds `path`, looking in `path` and then in each parent
+    /// directory, as git does, without crossing into another file system. Git's environment
+    /// variables such as `GIT_DIR` and `GIT_CEILING_DIRECTORIES` are not read. A repository
+    /// owned by another user is refused, as git refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Git`] if no repository holds `path` or it is owned by another user.
+    pub fn discover(path: &Path) -> Result<Self, StoreError> {
+        let trust = gix::sec::trust::Mapping {
+            full: open_options(),
+            reduced: open_options(),
+        };
+        let options = gix::discover::upwards::Options {
+            trust: gix::discover::upwards::TrustPolicy::Required(gix::sec::Trust::Full),
+            ..gix::discover::upwards::Options::default()
+        };
+        let repo = gix::ThreadSafeRepository::discover_opts(path, options, trust)?;
+        Ok(Self {
+            repo: repo.to_thread_local(),
+        })
+    }
+
+    /// Returns the commit `HEAD` points to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NoCommit`] if `HEAD` has no commit yet, as in a new repository,
+    /// or [`StoreError::Git`] if it cannot be read.
+    pub fn head_commit(&self) -> Result<ObjectId, StoreError> {
+        let mut head = self.repo.head()?;
+        if head.is_unborn() {
+            return Err(StoreError::NoCommit);
+        }
+        Ok(head.peel_to_commit()?.id)
+    }
+
+    /// Returns the short name of the local branch `HEAD` is on, even before its first commit,
+    /// or `None` if `HEAD` is detached or points to something other than a local branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NonUtf8Branch`] if the branch name is not UTF-8, or
+    /// [`StoreError::Git`] if `HEAD` cannot be read.
+    pub fn head_branch(&self) -> Result<Option<String>, StoreError> {
+        let Some(name) = self.repo.head_name()? else {
+            return Ok(None);
+        };
+        if name.category() != Some(gix::refs::Category::LocalBranch) {
+            return Ok(None);
+        }
+        let short = name.shorten();
+        let text = std::str::from_utf8(short.as_ref())
+            .map_err(|_| StoreError::NonUtf8Branch(short.to_owned()))?;
+        Ok(Some(text.to_owned()))
     }
 
     /// Returns the commit `thread_ref` points to, or `None` if it does not exist.
@@ -454,6 +517,63 @@ mod tests {
 
     fn empty_tree(store: &Store) -> ObjectId {
         store.write_tree(&[]).unwrap()
+    }
+
+    fn commit_on_main(store: &Store) -> ObjectId {
+        std::fs::write(store.common_dir().join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let commit = Commit {
+            tree: empty_tree(store),
+            parents: std::iter::empty().collect(),
+            author: generic_signature(),
+            committer: generic_signature(),
+            encoding: None,
+            message: "base".into(),
+            extra_headers: Vec::new(),
+        };
+        let id = store.repo.write_object(&commit).unwrap().detach();
+        store
+            .repo
+            .reference("refs/heads/main", id, PreviousValue::Any, "test")
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn discovery_finds_the_repository_from_a_subdirectory() {
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        let nested = dir.path().join("src/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        let store = Store::discover(&nested).unwrap();
+        assert_eq!(
+            store.common_dir().canonicalize().unwrap(),
+            dir.path().join(".git").canonicalize().unwrap()
+        );
+        let outside = TempDir::new().unwrap();
+        assert!(matches!(
+            Store::discover(outside.path()),
+            Err(StoreError::Git(_))
+        ));
+    }
+
+    #[test]
+    fn head_is_read_as_a_commit_and_a_branch() {
+        let (_dir, store) = store();
+        assert!(matches!(store.head_commit(), Err(StoreError::NoCommit)));
+        let commit = commit_on_main(&store);
+        assert_eq!(store.head_commit().unwrap(), commit);
+        assert_eq!(store.head_branch().unwrap().as_deref(), Some("main"));
+
+        std::fs::write(store.common_dir().join("HEAD"), format!("{commit}\n")).unwrap();
+        assert_eq!(store.head_branch().unwrap(), None);
+        assert_eq!(store.head_commit().unwrap(), commit);
+
+        std::fs::write(store.common_dir().join("HEAD"), "ref: refs/tags/v1\n").unwrap();
+        assert_eq!(store.head_branch().unwrap(), None);
+
+        let missing = "0123456789012345678901234567890123456789";
+        std::fs::write(store.common_dir().join("HEAD"), format!("{missing}\n")).unwrap();
+        assert!(matches!(store.head_commit(), Err(StoreError::Git(_))));
     }
 
     #[test]

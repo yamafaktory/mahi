@@ -137,7 +137,7 @@ refs/threads/<id>/agents/<participant>.<agent>/session     # native agent sessio
 
 `mahi run -- claude` (or any agent):
 
-1. Create the thread: ID, thread key, `meta` ref (base commit, creator key, participants, landing branch). Optionally snapshot uncommitted changes as the real starting point.
+1. Find the repository that holds the current directory, as git does (a repository owned by another user is refused, as git refuses it), and create the thread: ID, thread key, `meta` ref (base commit, creator key, participants, landing branch). Optionally snapshot uncommitted changes as the real starting point.
 2. Add a linked worktree at the base with a detached `HEAD`, so no branch appears in the user's branch list; the agent's work is recorded in its `snapshots` ref. mahi writes git's linked-worktree layout itself and checks files out with gix. `.gitattributes` conversions (`text`, `eol`, `ident`, `working-tree-encoding`) apply as in git, so `git status` stays clean, but no filter driver is configured, so no filter program (such as git-lfs) runs: filtered files are checked out as stored. The worktree's git dir and the common git dir are read-only inside the sandbox (git config and hooks can execute code).
 3. Start the proxies and the snapshot scheduler (snapshot zero = base).
 4. Create the per-thread agent config dir and install capture hooks.
