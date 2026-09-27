@@ -481,6 +481,57 @@ mod tests {
         assert!(output.contains("No space left on device"), "{output}");
     }
 
+    #[test]
+    fn landlock_refuses_device_nodes_and_keeps_proc_and_the_terminal_usable() {
+        let (code, output) = run(
+            Sandbox::system().unwrap(),
+            Path::new("/"),
+            "mknod /tmp/device c 1 3 2>&1; echo 1000 > /proc/self/oom_score_adj && echo proc-ok; \
+             echo to-stdout > /dev/stdout; echo to-stderr > /dev/stderr; \
+             echo size=$(stty size)",
+        );
+        assert_eq!(code, 0, "{output}");
+        for expected in [
+            "/tmp/device: Permission denied",
+            "proc-ok",
+            "to-stdout",
+            "to-stderr",
+            "size=24 80",
+        ] {
+            assert!(output.contains(expected), "{expected} missing: {output}");
+        }
+    }
+
+    #[test]
+    fn everyday_file_work_still_succeeds_in_writable_paths() {
+        let work = tempfile::tempdir().unwrap();
+        let script = "mkdir a b c && echo data > a/f && mv a/f b/f && ln b/f c/hard && \
+                      mv c a/c && : > b/f && ln -s f b/link && mkfifo /tmp/fifo && rm -r a && \
+                      cp /usr/bin/true ./tool && ./tool && echo all-ok";
+        let (code, output) = run(
+            system_with(&[(work.path(), Access::ReadWrite)]),
+            work.path(),
+            script,
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("all-ok"), "{output}");
+        assert!(work.path().join("b/f").exists());
+    }
+
+    #[test]
+    fn a_read_write_file_can_be_bound_and_appended_to() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("settings.json");
+        fs::write(&file, "one\n").unwrap();
+        let (code, output) = run(
+            system_with(&[(&file, Access::ReadWrite)]),
+            Path::new("/"),
+            &format!("echo two >> {}", file.display()),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+    }
+
     fn spawn_errno(result: Result<PtyChild, PtyError>) -> Errno {
         match result {
             Err(PtyError::Spawn(_, error)) => Errno::from_io_error(&error).unwrap(),

@@ -1,3 +1,4 @@
+mod landlock;
 mod process;
 
 use std::{
@@ -49,7 +50,10 @@ use rustix::{
     },
 };
 
-use self::process::Forked;
+use self::{
+    landlock::Landlock,
+    process::Forked,
+};
 use super::{
     Access,
     Sandbox,
@@ -101,6 +105,7 @@ pub(crate) struct Plan {
     gid_map: Vec<u8>,
     mounts: Vec<PlannedMount>,
     links: Vec<PlannedLink>,
+    landlock: Landlock,
     cwd: CString,
 }
 
@@ -121,6 +126,7 @@ struct PlannedLink {
 
 impl Plan {
     pub(crate) fn new(sandbox: &Sandbox, cwd: &Path, terminal: &Path) -> io::Result<Self> {
+        Landlock::check_available()?;
         let uid = rustix::process::geteuid().as_raw();
         let gid = rustix::process::getegid().as_raw();
         let devices = DEVICES
@@ -131,6 +137,12 @@ impl Plan {
                 Path::new("/dev/console"),
                 DEVICE_ATTRIBUTES,
             )]);
+        let mut full_access = vec![c"/tmp".to_owned(), c"/dev/shm".to_owned()];
+        for bind in &sandbox.binds {
+            if bind.access == Access::ReadWrite {
+                full_access.push(c_path(&bind.path)?);
+            }
+        }
         let mut binds = sandbox.binds.iter().collect::<Vec<_>>();
         binds.sort_by_key(|bind| bind.path.components().count());
         let binds = binds.into_iter().map(|bind| {
@@ -159,6 +171,7 @@ impl Plan {
             gid_map: format!("{gid} {gid} 1").into_bytes(),
             mounts: devices.chain(binds).collect::<io::Result<_>>()?,
             links,
+            landlock: Landlock::new(full_access),
             cwd: c_path(cwd)?,
         })
     }
@@ -187,6 +200,7 @@ impl Plan {
         process::take_terminal()?;
         rustix::process::chdir(self.cwd.as_c_str())?;
         drop_privileges()?;
+        self.landlock.restrict_self()?;
         mark_inherited_fds_close_on_exec()
     }
 

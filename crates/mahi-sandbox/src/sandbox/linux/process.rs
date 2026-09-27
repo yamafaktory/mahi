@@ -75,14 +75,8 @@ pub(super) fn reap_all_until(agent: Pid) -> ! {
     reap(agent, true)
 }
 
-#[expect(
-    unsafe_code,
-    reason = "watching the terminal needs a borrowed descriptor for standard input"
-)]
 fn wait_for_hangup(init: &OwnedFd) -> Result<(), Errno> {
-    // SAFETY: fd 0 is the pseudo-terminal's slave that `Command` installed as standard input,
-    // and the watcher never closes it.
-    let terminal = unsafe { BorrowedFd::borrow_raw(0) };
+    let terminal = standard_input();
     let mut fds = [
         PollFd::new(init, PollFlags::IN),
         PollFd::new(&terminal, PollFlags::empty()),
@@ -149,17 +143,20 @@ pub(super) fn die_with(parent: &OwnedFd) -> io::Result<()> {
     }
 }
 
-#[expect(
-    unsafe_code,
-    reason = "taking the terminal needs a borrowed descriptor for standard input"
-)]
 pub(super) fn take_terminal() -> io::Result<()> {
     rustix::process::setsid()?;
-    // SAFETY: fd 0 is the pseudo-terminal's slave that `Command` installed as standard input
-    // and that stays open for the whole call.
-    let terminal = unsafe { BorrowedFd::borrow_raw(0) };
-    rustix::process::ioctl_tiocsctty(terminal)?;
+    rustix::process::ioctl_tiocsctty(standard_input())?;
     Ok(())
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the pseudo-terminal is reached through a borrowed descriptor for standard input"
+)]
+pub(super) fn standard_input() -> BorrowedFd<'static> {
+    // SAFETY: fd 0 is the pseudo-terminal's slave that `Command` installed as standard input.
+    // Nothing between fork and exec closes it, and the watchers never close it.
+    unsafe { BorrowedFd::borrow_raw(0) }
 }
 
 fn code_of(status: WaitStatus) -> i32 {
