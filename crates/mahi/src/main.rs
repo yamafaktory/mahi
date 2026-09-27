@@ -5,31 +5,25 @@ mod run;
 mod terminal;
 
 use std::{
-    env,
     error::Error,
     fmt::Write,
     process,
 };
 
+use clap::Parser;
+
 use crate::{
     cli::{
+        Cli,
         Command,
-        USAGE,
     },
     run::Outcome,
 };
 
 fn main() {
-    let code = match cli::parse(env::args_os()) {
-        Ok(Command::Help) => {
-            println!("{USAGE}");
-            0
-        }
-        Ok(Command::Version) => {
-            println!("mahi {}", env!("CARGO_PKG_VERSION"));
-            0
-        }
-        Ok(Command::Run(command)) => match run::run(&command) {
+    let cli = Cli::parse();
+    let code = match cli.command {
+        Command::Run(command) => match run::run(&command) {
             Ok(Outcome::Exited(code)) => code,
             Ok(Outcome::Stopped(signal)) => {
                 signal.reraise();
@@ -40,10 +34,6 @@ fn main() {
                 1
             }
         },
-        Err(error) => {
-            eprintln!("mahi: {error}\n{USAGE}");
-            2
-        }
     };
     process::exit(code);
 }

@@ -285,7 +285,12 @@ mod tests {
         let (_dir, cwd) = outside_tmp();
         let unknown = mahi(&["jump"], &cwd);
         assert_eq!(unknown.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&unknown.stderr).contains("usage: mahi run"));
+        let unknown_error = String::from_utf8_lossy(&unknown.stderr);
+        assert!(
+            unknown_error.contains("unrecognized subcommand 'jump'"),
+            "{unknown_error}"
+        );
+        assert!(unknown_error.contains("Usage: mahi"), "{unknown_error}");
         let missing = mahi(&["run", "no-such-agent-anywhere"], &cwd);
         assert_eq!(missing.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot find"));
@@ -296,7 +301,16 @@ mod tests {
         let (_dir, cwd) = outside_tmp();
         let help = mahi(&["--help"], &cwd);
         assert!(help.status.success());
-        assert!(String::from_utf8_lossy(&help.stdout).contains("usage: mahi run"));
+        let help_text = String::from_utf8_lossy(&help.stdout);
+        assert!(help_text.contains("Usage: mahi <COMMAND>"), "{help_text}");
+        assert!(help_text.contains("Exit codes"), "{help_text}");
+        let run_help = mahi(&["run", "--help"], &cwd);
+        assert!(run_help.status.success());
+        let run_help_text = String::from_utf8_lossy(&run_help.stdout);
+        assert!(
+            run_help_text.contains("Usage: mahi run <AGENT>"),
+            "{run_help_text}"
+        );
         let version = mahi(&["--version"], &cwd);
         assert!(String::from_utf8_lossy(&version.stdout).starts_with("mahi "));
     }

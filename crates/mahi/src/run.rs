@@ -154,7 +154,7 @@ pub(crate) fn run(command: &RunCommand) -> Result<Outcome, RunError> {
         .map_err(RunError::CurrentDirectory)?;
     let host = Host::from_environment()?;
     let search_path = env::var_os("PATH");
-    let agent = resolve(&command.agent, &cwd, search_path.as_deref())?;
+    let agent = resolve(command.agent(), &cwd, search_path.as_deref())?;
     let scratch = tempfile::Builder::new()
         .prefix("mahi-")
         .tempdir()
@@ -176,7 +176,7 @@ pub(crate) fn run(command: &RunCommand) -> Result<Outcome, RunError> {
         }
     }
     let mut pty = PtyCommand::new(&agent.program, &cwd, terminal::size());
-    for argument in &command.arguments {
+    for argument in command.arguments() {
         pty = pty.arg(argument);
     }
     for name in PASSED_ON {

@@ -100,8 +100,8 @@ Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) an
 - **Async and blocking.** Do not block inside async code. Use `spawn_blocking` or a dedicated
   thread for PTY, filesystem and git work that blocks.
 - **Dependencies.** Prefer well-maintained crates that DESIGN.md already names (`gix`,
-  `portable-pty`, `vt100`, `notify`, `iroh`, `age`, …). Ask before you add a large dependency
-  that the design does not name.
+  `rustix`, `vt100`, `iroh`, `age`, …), and `clap` (derive) for the command line. Ask
+  before you add a large dependency that the design does not name.
 
 ## Performance and security
 
