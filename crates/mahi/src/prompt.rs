@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs::{
         File,
         OpenOptions,
@@ -8,8 +9,17 @@ use std::{
         Read,
         Write,
     },
-    os::fd::AsFd,
+    os::{
+        fd::AsFd,
+        unix::{
+            ffi::OsStrExt,
+            fs::OpenOptionsExt,
+        },
+    },
+    path::Path,
     process,
+    thread,
+    time::Duration,
 };
 
 use age::secrecy::SecretString;
@@ -17,14 +27,18 @@ use mahi_sandbox::{
     Termination,
     TerminationSignals,
 };
-use rustix::termios::{
-    LocalModes,
-    OptionalActions,
-    Termios,
+use rustix::{
+    fs::OFlags,
+    termios::{
+        LocalModes,
+        OptionalActions,
+        Termios,
+    },
 };
 use zeroize::Zeroizing;
 
 const MAX_ANSWER_BYTES: usize = 1024;
+const NOT_READY_PAUSE: Duration = Duration::from_millis(10);
 
 /// Asks the user questions; the real one uses the controlling terminal.
 pub(crate) trait Prompt {
@@ -55,8 +69,13 @@ struct Answer<'a> {
 
 impl TerminalPrompt {
     pub(crate) fn open() -> io::Result<Self> {
-        let terminal = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
-        Ok(Self { terminal })
+        let alias = open_terminal(Path::new("/dev/tty"))?;
+        let device = rustix::termios::ttyname(&alias, Vec::new())
+            .ok()
+            .and_then(|name| open_terminal(Path::new(OsStr::from_bytes(name.as_bytes()))).ok());
+        Ok(Self {
+            terminal: device.unwrap_or(alias),
+        })
     }
 
     fn read_answer(&self, question: &str, echo: bool) -> io::Result<Zeroizing<Vec<u8>>> {
@@ -107,16 +126,32 @@ impl Prompt for TerminalPrompt {
 
 impl Read for Answer<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if let Some(signal) = self
-            .signals
-            .wait_for_input(self.terminal.as_fd())
-            .map_err(io::Error::other)?
-        {
-            self.stopped = Some(signal);
-            return Err(io::ErrorKind::Interrupted.into());
+        loop {
+            if let Some(signal) = self
+                .signals
+                .wait_for_input(self.terminal.as_fd())
+                .map_err(io::Error::other)?
+            {
+                self.stopped = Some(signal);
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            match (&mut &*self.terminal).read(buffer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(NOT_READY_PAUSE);
+                }
+                result => return result,
+            }
         }
-        (&mut &*self.terminal).read(buffer)
     }
+}
+
+fn open_terminal(path: &Path) -> io::Result<File> {
+    let flags = OFlags::NOCTTY | OFlags::NONBLOCK;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(flags.bits().cast_signed())
+        .open(path)
 }
 
 fn read_line(mut terminal: impl Read) -> io::Result<Zeroizing<Vec<u8>>> {
