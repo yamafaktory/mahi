@@ -1,6 +1,9 @@
 //! The `mahi` binary.
 
 mod cli;
+mod environment;
+mod init;
+mod prompt;
 mod run;
 mod terminal;
 
@@ -17,12 +20,26 @@ use crate::{
         Cli,
         Command,
     },
+    environment::Environment,
+    init::InitError,
+    prompt::TerminalPrompt,
     run::Outcome,
 };
 
 fn main() {
     let cli = Cli::parse();
+    let environment = Environment::read();
     let code = match cli.command {
+        Command::Init => match TerminalPrompt::open()
+            .map_err(InitError::Prompt)
+            .and_then(|mut prompt| init::init(&environment, &mut prompt))
+        {
+            Ok(()) => 0,
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
         Command::Run(command) => match run::run(&command) {
             Ok(Outcome::Exited(code)) => code,
             Ok(Outcome::Stopped(signal)) => {

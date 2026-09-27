@@ -10,14 +10,20 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+age = { workspace = true }
 clap = { workspace = true }
+mahi-identity = { workspace = true }
 mahi-sandbox = { workspace = true }
 rustix = { workspace = true }
+ssh-key = { workspace = true }
+subtle = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 libc = { workspace = true }
+ssh-key = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

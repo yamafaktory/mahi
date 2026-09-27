@@ -2046,12 +2046,17 @@ checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 name = "mahi"
 version = "0.1.0"
 dependencies = [
+ "age",
  "clap",
  "libc",
+ "mahi-identity",
  "mahi-sandbox",
  "rustix",
+ "ssh-key",
+ "subtle",
  "tempfile",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]

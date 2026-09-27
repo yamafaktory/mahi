@@ -23,6 +23,8 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub(crate) enum Command {
+    /// Creates your mahi key and chooses the SSH key that signs your threads.
+    Init,
     /// Runs an agent in a sandbox on the current directory.
     Run(RunCommand),
 }
@@ -112,7 +114,9 @@ mod tests {
             odd.clone(),
         ])
         .unwrap();
-        let Command::Run(command) = parsed.command;
+        let Command::Run(command) = parsed.command else {
+            panic!("expected the run command");
+        };
         assert_eq!(command.agent(), odd.as_os_str());
         assert_eq!(command.arguments(), [odd]);
     }
