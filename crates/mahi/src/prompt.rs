@@ -1,5 +1,4 @@
 use std::{
-    ffi::OsStr,
     fs::{
         File,
         OpenOptions,
@@ -9,10 +8,7 @@ use std::{
         Read,
         Write,
     },
-    os::unix::{
-        ffi::OsStrExt,
-        fs::OpenOptionsExt,
-    },
+    os::fd::AsFd,
     process,
 };
 
@@ -21,18 +17,10 @@ use mahi_sandbox::{
     Termination,
     TerminationSignals,
 };
-use rustix::{
-    event::{
-        PollFd,
-        PollFlags,
-    },
-    fs::OFlags,
-    io::Errno,
-    termios::{
-        LocalModes,
-        OptionalActions,
-        Termios,
-    },
+use rustix::termios::{
+    LocalModes,
+    OptionalActions,
+    Termios,
 };
 use zeroize::Zeroizing;
 
@@ -67,17 +55,7 @@ struct Answer<'a> {
 
 impl TerminalPrompt {
     pub(crate) fn open() -> io::Result<Self> {
-        let alias = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
-        let Ok(name) = rustix::termios::ttyname(&alias, Vec::new()) else {
-            return Ok(Self { terminal: alias });
-        };
-        let device = OsStr::from_bytes(name.as_bytes());
-        let terminal = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(OFlags::NOCTTY.bits().cast_signed())
-            .open(device)
-            .unwrap_or(alias);
+        let terminal = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
         Ok(Self { terminal })
     }
 
@@ -129,28 +107,15 @@ impl Prompt for TerminalPrompt {
 
 impl Read for Answer<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let mut fds = [
-                PollFd::new(self.terminal, PollFlags::IN),
-                PollFd::new(self.signals, PollFlags::IN),
-            ];
-            match rustix::event::poll(&mut fds, None) {
-                Ok(_) => {}
-                Err(Errno::INTR) => continue,
-                Err(error) => return Err(error.into()),
-            }
-            let [terminal, signals] = &fds;
-            if terminal.revents().contains(PollFlags::NVAL) {
-                return Err(io::Error::other("the terminal cannot be waited on"));
-            }
-            if !signals.revents().is_empty() {
-                self.stopped = Some(self.signals.wait().map_err(io::Error::other)?);
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            if !terminal.revents().is_empty() {
-                return (&mut &*self.terminal).read(buffer);
-            }
+        if let Some(signal) = self
+            .signals
+            .wait_for_input(self.terminal.as_fd())
+            .map_err(io::Error::other)?
+        {
+            self.stopped = Some(signal);
+            return Err(io::ErrorKind::Interrupted.into());
         }
+        (&mut &*self.terminal).read(buffer)
     }
 }
 

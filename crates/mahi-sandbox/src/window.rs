@@ -161,6 +161,29 @@ impl TerminationSignals {
     }
 }
 
+impl TerminationSignals {
+    /// Blocks until `input` has something to read, then returns `None`, or until one of the
+    /// signals arrives, then returns it. It waits with `select`, which, unlike `poll` on macOS,
+    /// works on terminals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignalError::Io`] if waiting or reading the pipe fails, including when a
+    /// descriptor is too large for `select`.
+    pub fn wait_for_input(
+        &self,
+        input: BorrowedFd<'_>,
+    ) -> Result<Option<Termination>, SignalError> {
+        loop {
+            match readable(input, self.0.read_end)? {
+                (_, true) => return self.wait().map(Some),
+                (true, false) => return Ok(None),
+                (false, false) => {}
+            }
+        }
+    }
+}
+
 impl AsFd for TerminationSignals {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.read_end
@@ -290,6 +313,45 @@ fn restore(index: usize) {
         && current != handler_address()
     {
         let _ = set_disposition(signal, current);
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "rustix has no select, which macOS needs to wait on a terminal"
+)]
+fn readable(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> io::Result<(bool, bool)> {
+    let (first, second) = (first.as_raw_fd(), second.as_raw_fd());
+    let limit = libc::c_int::try_from(libc::FD_SETSIZE).unwrap_or(libc::c_int::MAX);
+    if !(0..limit).contains(&first) || !(0..limit).contains(&second) {
+        return Err(Errno::INVAL.into());
+    }
+    // SAFETY: both descriptors are open and below FD_SETSIZE, so FD_SET and FD_ISSET stay inside
+    // the set, which FD_ZERO initialises first. The other sets and the timeout are null, and
+    // select only writes to the set it is given.
+    unsafe {
+        let mut set: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&raw mut set);
+        libc::FD_SET(first, &raw mut set);
+        libc::FD_SET(second, &raw mut set);
+        let ready = libc::select(
+            first.max(second) + 1,
+            &raw mut set,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                return Ok((false, false));
+            }
+            return Err(error);
+        }
+        Ok((
+            libc::FD_ISSET(first, &raw const set),
+            libc::FD_ISSET(second, &raw const set),
+        ))
     }
 }
 
@@ -506,6 +568,15 @@ mod tests {
         assert!(!readable(&changes, 0));
 
         let termination = TerminationSignals::listen().unwrap();
+        let (input, typed) = rustix::pipe::pipe().unwrap();
+        rustix::io::write(&typed, b"x").unwrap();
+        assert_eq!(termination.wait_for_input(input.as_fd()).unwrap(), None);
+        rustix::io::read(&input, &mut [0_u8; 1]).unwrap();
+        raise(libc::SIGTERM);
+        assert_eq!(
+            termination.wait_for_input(input.as_fd()).unwrap(),
+            Some(Termination::Terminate)
+        );
         raise(libc::SIGTERM);
         raise(libc::SIGHUP);
         assert!(readable(&termination, 5));
