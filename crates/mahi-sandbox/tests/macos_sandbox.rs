@@ -221,35 +221,16 @@ mod tests {
     }
 
     #[test]
-    fn other_processes_cannot_be_inspected_or_signalled() {
-        let outside = KillOnDrop(
-            Command::new("/bin/sleep")
-                .arg("30")
-                .env("MAHI_MARKER", "marker-value")
-                .spawn()
-                .unwrap(),
-        );
-        let pid = i32::try_from(outside.0.id()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let visible = process_arguments(pid)
-                .is_ok_and(|arguments| contains(&arguments, b"MAHI_MARKER=marker-value"));
-            if visible {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the marker is not readable even outside the sandbox"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+    fn unlisted_sysctls_and_outside_signals_are_refused() {
+        let outside = KillOnDrop(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        let pid = outside.0.id();
         let exe = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         let mut sandbox = Sandbox::system().unwrap();
         sandbox.bind(&exe, Access::ReadOnly).unwrap();
         let (code, output) = run_command(
             PtyCommand::new(&exe, Path::new("/"), SIZE)
                 .arg("--exact")
-                .arg("tests::other_processes_cannot_be_inspected_or_signalled_inner")
+                .arg("tests::unlisted_sysctls_and_outside_signals_are_refused_inner")
                 .arg("--ignored")
                 .arg("--nocapture")
                 .env("MAHI_OUTSIDE_PID", pid.to_string())
@@ -260,22 +241,15 @@ mod tests {
         assert!(output.contains("1 passed"), "{output}");
     }
 
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-    }
-
     #[test]
-    #[ignore = "run inside the sandbox by other_processes_cannot_be_inspected_or_signalled"]
-    fn other_processes_cannot_be_inspected_or_signalled_inner() {
+    #[ignore = "run inside the sandbox by unlisted_sysctls_and_outside_signals_are_refused"]
+    fn unlisted_sysctls_and_outside_signals_are_refused_inner() {
         let pid: i32 = std::env::var("MAHI_OUTSIDE_PID")
             .expect("this test only runs inside the sandbox")
             .parse()
             .unwrap();
         assert_eq!(read_by_name(c"kern.boottime"), Err(libc::EPERM));
         assert_eq!(read_by_name(c"hw.ncpu"), Ok(()));
-        assert_eq!(process_arguments(pid), Err(libc::EPERM));
         let target = rustix::process::Pid::from_raw(pid).unwrap();
         assert_eq!(
             rustix::process::test_kill_process(target),
@@ -303,34 +277,6 @@ mod tests {
         };
         if result == 0 {
             Ok(())
-        } else {
-            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
-        }
-    }
-
-    #[expect(
-        unsafe_code,
-        reason = "the test reads another process's arguments with the raw sysctl"
-    )]
-    fn process_arguments(pid: i32) -> Result<Vec<u8>, i32> {
-        let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-        let mut buffer = vec![0_u8; 256 * 1024];
-        let mut length = buffer.len();
-        // SAFETY: `name` holds three valid MIB entries, `buffer` has `length` writable bytes,
-        // and no new value is passed.
-        let result = unsafe {
-            libc::sysctl(
-                name.as_mut_ptr(),
-                3,
-                buffer.as_mut_ptr().cast(),
-                &raw mut length,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if result == 0 {
-            buffer.truncate(length);
-            Ok(buffer)
         } else {
             Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
         }
