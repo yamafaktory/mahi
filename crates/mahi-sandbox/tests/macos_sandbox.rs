@@ -29,13 +29,17 @@ mod tests {
     const SIZE: WindowSize = WindowSize { rows: 24, cols: 80 };
 
     fn run(sandbox: Sandbox, cwd: &Path, script: &str) -> (i32, String) {
-        let mut child = PtyCommand::new(Path::new("/bin/sh"), cwd, SIZE)
-            .arg("-c")
-            .arg(script)
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .sandbox(sandbox)
-            .spawn()
-            .unwrap();
+        run_command(
+            PtyCommand::new(Path::new("/bin/sh"), cwd, SIZE)
+                .arg("-c")
+                .arg(script)
+                .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                .sandbox(sandbox),
+        )
+    }
+
+    fn run_command(command: PtyCommand) -> (i32, String) {
+        let mut child = command.spawn().unwrap();
         let mut reader = child.reader().unwrap();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -207,26 +211,101 @@ mod tests {
         assert!(!output.contains("secret-content"), "{output}");
     }
 
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     #[test]
     fn other_processes_cannot_be_inspected_or_signalled() {
-        let mut outside = Command::new("/bin/sleep")
-            .arg("30")
-            .env("MAHI_MARKER", "marker-value")
-            .spawn()
-            .unwrap();
-        let pid = outside.id();
-        let (code, output) = run(
-            Sandbox::system().unwrap(),
-            Path::new("/"),
-            &format!(
-                "ps -wwE -o command= -p {pid} 2>&1; kill -0 {pid} 2>/dev/null || echo kill-denied"
-            ),
+        let outside = KillOnDrop(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .env("MAHI_MARKER", "marker-value")
+                .spawn()
+                .unwrap(),
         );
-        outside.kill().unwrap();
-        outside.wait().unwrap();
+        let pid = i32::try_from(outside.0.id()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let visible = process_arguments(pid)
+                .is_ok_and(|arguments| contains(&arguments, b"MAHI_MARKER=marker-value"));
+            if visible {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the marker is not readable even outside the sandbox"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let exe = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let mut sandbox = Sandbox::system().unwrap();
+        sandbox.bind(&exe, Access::ReadOnly).unwrap();
+        let (code, output) = run_command(
+            PtyCommand::new(&exe, Path::new("/"), SIZE)
+                .arg("--exact")
+                .arg("tests::other_processes_cannot_be_inspected_or_signalled_inner")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("MAHI_OUTSIDE_PID", pid.to_string())
+                .sandbox(sandbox),
+        );
+        drop(outside);
         assert_eq!(code, 0, "{output}");
-        assert!(output.contains("kill-denied"), "{output}");
-        assert!(output.contains("sleep"), "{output}");
-        assert!(!output.contains("marker-value"), "{output}");
+        assert!(output.contains("1 passed"), "{output}");
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    #[ignore = "run inside the sandbox by other_processes_cannot_be_inspected_or_signalled"]
+    fn other_processes_cannot_be_inspected_or_signalled_inner() {
+        let pid: i32 = std::env::var("MAHI_OUTSIDE_PID")
+            .expect("this test only runs inside the sandbox")
+            .parse()
+            .unwrap();
+        assert_eq!(process_arguments(pid), Err(libc::EPERM));
+        let target = rustix::process::Pid::from_raw(pid).unwrap();
+        assert_eq!(
+            rustix::process::test_kill_process(target),
+            Err(rustix::io::Errno::PERM)
+        );
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "the test reads another process's arguments with the raw sysctl"
+    )]
+    fn process_arguments(pid: i32) -> Result<Vec<u8>, i32> {
+        let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut buffer = vec![0_u8; 256 * 1024];
+        let mut length = buffer.len();
+        // SAFETY: `name` holds three valid MIB entries, `buffer` has `length` writable bytes,
+        // and no new value is passed.
+        let result = unsafe {
+            libc::sysctl(
+                name.as_mut_ptr(),
+                3,
+                buffer.as_mut_ptr().cast(),
+                &raw mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result == 0 {
+            buffer.truncate(length);
+            Ok(buffer)
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
     }
 }
