@@ -189,8 +189,22 @@ fn become_session_leader(command: &mut Command) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn open_master() -> io::Result<OwnedFd> {
+    Ok(openpt(
+        OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC,
+    )?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_master() -> io::Result<OwnedFd> {
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+    rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
+    Ok(master)
+}
+
 fn open_pty(size: WindowSize) -> io::Result<(OwnedFd, OwnedFd)> {
-    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC)?;
+    let master = open_master()?;
     grantpt(&master)?;
     unlockpt(&master)?;
     let name = ptsname(&master, Vec::new())?;
