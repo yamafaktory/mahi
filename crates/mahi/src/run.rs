@@ -153,8 +153,14 @@ pub(crate) fn run(command: &RunCommand) -> Result<i32, RunError> {
         fs::create_dir(directory).map_err(RunError::Scratch)?;
     }
     let mut sandbox = Sandbox::system()?;
+    let git = cwd.join(".git");
     for (path, access) in binds(&cwd, &agent, &scratch_path, search_path.as_deref(), &host)? {
-        sandbox.bind(&path, access)?;
+        let program_directory = access == Access::ReadOnly && path != git;
+        match sandbox.bind(&path, access) {
+            Ok(_) => {}
+            Err(SandboxError::Overlaps(_)) if program_directory => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     let mut pty = PtyCommand::new(&agent.program, &cwd, terminal::size());
     for argument in &command.arguments {

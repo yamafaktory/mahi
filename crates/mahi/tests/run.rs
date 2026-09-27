@@ -35,7 +35,7 @@ mod tests {
         command
             .args(arguments)
             .current_dir(cwd)
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", "/usr/bin:/bin:/usr")
             .env("HOME", test_home())
             .env("MAHI_TEST_SECRET", "secret-value");
         command

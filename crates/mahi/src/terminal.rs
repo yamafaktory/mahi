@@ -74,21 +74,21 @@ mod tests {
         let master = rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
         rustix::pty::grantpt(&master).unwrap();
         rustix::pty::unlockpt(&master).unwrap();
+        let name = rustix::pty::ptsname(&master, Vec::new()).unwrap();
+        let slave = rustix::fs::open(
+            name.as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .unwrap();
         rustix::termios::tcsetwinsize(
-            &master,
+            &slave,
             Winsize {
                 ws_row: rows,
                 ws_col: cols,
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             },
-        )
-        .unwrap();
-        let name = rustix::pty::ptsname(&master, Vec::new()).unwrap();
-        let slave = rustix::fs::open(
-            name.as_c_str(),
-            OFlags::RDWR | OFlags::NOCTTY,
-            Mode::empty(),
         )
         .unwrap();
         (master, slave)
