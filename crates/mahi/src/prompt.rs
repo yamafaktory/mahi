@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs::{
         File,
         OpenOptions,
@@ -8,20 +9,30 @@ use std::{
         Read,
         Write,
     },
-    process,
-    sync::{
-        Arc,
-        Mutex,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::OpenOptionsExt,
     },
-    thread,
+    process,
 };
 
 use age::secrecy::SecretString;
-use mahi_sandbox::TerminationSignals;
-use rustix::termios::{
-    LocalModes,
-    OptionalActions,
-    Termios,
+use mahi_sandbox::{
+    Termination,
+    TerminationSignals,
+};
+use rustix::{
+    event::{
+        PollFd,
+        PollFlags,
+    },
+    fs::OFlags,
+    io::Errno,
+    termios::{
+        LocalModes,
+        OptionalActions,
+        Termios,
+    },
 };
 use zeroize::Zeroizing;
 
@@ -36,42 +47,63 @@ pub(crate) trait Prompt {
 
 /// Asks through `/dev/tty`, so it works while standard input or output are redirected.
 ///
-/// While a secret is typed, echo is off; a signal that stops mahi then restores the terminal
-/// before mahi dies of it.
+/// While it waits for an answer it catches the signals that stop mahi. Echo, if it was
+/// turned off for a secret, is turned back on first, then mahi dies of the signal.
 #[derive(Debug)]
 pub(crate) struct TerminalPrompt {
     terminal: File,
-    echo_saved: Arc<Mutex<Option<Termios>>>,
 }
 
 struct EchoOff<'a> {
     terminal: &'a File,
-    echo_saved: &'a Mutex<Option<Termios>>,
+    saved: Termios,
+}
+
+struct Answer<'a> {
+    terminal: &'a File,
+    signals: &'a TerminationSignals,
+    stopped: Option<Termination>,
 }
 
 impl TerminalPrompt {
     pub(crate) fn open() -> io::Result<Self> {
-        let terminal = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
-        let echo_saved = Arc::new(Mutex::new(None));
+        let alias = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+        let Ok(name) = rustix::termios::ttyname(&alias, Vec::new()) else {
+            return Ok(Self { terminal: alias });
+        };
+        let device = OsStr::from_bytes(name.as_bytes());
+        let terminal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(OFlags::NOCTTY.bits().cast_signed())
+            .open(device)
+            .unwrap_or(alias);
+        Ok(Self { terminal })
+    }
+
+    fn read_answer(&self, question: &str, echo: bool) -> io::Result<Zeroizing<Vec<u8>>> {
         let signals = TerminationSignals::listen().map_err(io::Error::other)?;
-        let restorer = terminal.try_clone()?;
-        let saved = Arc::clone(&echo_saved);
-        thread::spawn(move || {
-            let Ok(signal) = signals.wait() else {
-                return;
+        let mut answer = Answer {
+            terminal: &self.terminal,
+            signals: &signals,
+            stopped: None,
+        };
+        let line = {
+            let _echo_off = if echo {
+                None
+            } else {
+                Some(EchoOff::new(&self.terminal)?)
             };
-            let mut guard = saved.lock();
-            if let Some(termios) = guard.as_mut().ok().and_then(|saved| saved.take()) {
-                let _ = rustix::termios::tcsetattr(&restorer, OptionalActions::Now, &termios);
-                let _ = writeln!(&restorer);
-            }
+            write!(&self.terminal, "{question}")?;
+            read_line(&mut answer)
+        };
+        if let Some(signal) = answer.stopped {
+            let _ = writeln!(&self.terminal);
+            drop(signals);
             signal.reraise();
             process::exit(128 + signal.number());
-        });
-        Ok(Self {
-            terminal,
-            echo_saved,
-        })
+        }
+        line
     }
 }
 
@@ -81,11 +113,7 @@ impl Prompt for TerminalPrompt {
     }
 
     fn secret(&mut self, question: &str) -> io::Result<SecretString> {
-        let line = {
-            let _echo_off = EchoOff::new(&self.terminal, &self.echo_saved)?;
-            write!(&self.terminal, "{question}")?;
-            read_line(&self.terminal)?
-        };
+        let line = self.read_answer(question, false)?;
         writeln!(self.terminal)?;
         let text = std::str::from_utf8(&line).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "the passphrase is not UTF-8")
@@ -94,9 +122,35 @@ impl Prompt for TerminalPrompt {
     }
 
     fn answer(&mut self, question: &str) -> io::Result<String> {
-        write!(self.terminal, "{question}")?;
-        let line = read_line(&self.terminal)?;
+        let line = self.read_answer(question, true)?;
         Ok(String::from_utf8_lossy(&line).trim().to_owned())
+    }
+}
+
+impl Read for Answer<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let mut fds = [
+                PollFd::new(self.terminal, PollFlags::IN),
+                PollFd::new(self.signals, PollFlags::IN),
+            ];
+            match rustix::event::poll(&mut fds, None) {
+                Ok(_) => {}
+                Err(Errno::INTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let [terminal, signals] = &fds;
+            if terminal.revents().contains(PollFlags::NVAL) {
+                return Err(io::Error::other("the terminal cannot be waited on"));
+            }
+            if !signals.revents().is_empty() {
+                self.stopped = Some(self.signals.wait().map_err(io::Error::other)?);
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if !terminal.revents().is_empty() {
+                return (&mut &*self.terminal).read(buffer);
+            }
+        }
     }
 }
 
@@ -133,30 +187,18 @@ fn read_line(mut terminal: impl Read) -> io::Result<Zeroizing<Vec<u8>>> {
 }
 
 impl<'a> EchoOff<'a> {
-    fn new(terminal: &'a File, echo_saved: &'a Mutex<Option<Termios>>) -> io::Result<Self> {
+    fn new(terminal: &'a File) -> io::Result<Self> {
         let saved = rustix::termios::tcgetattr(terminal)?;
         let mut quiet = saved.clone();
         quiet.local_modes.remove(LocalModes::ECHO);
-        let mut slot = echo_saved
-            .lock()
-            .map_err(|_| io::Error::other("the terminal state is poisoned"))?;
         rustix::termios::tcsetattr(terminal, OptionalActions::Flush, &quiet)?;
-        *slot = Some(saved);
-        drop(slot);
-        Ok(Self {
-            terminal,
-            echo_saved,
-        })
+        Ok(Self { terminal, saved })
     }
 }
 
 impl Drop for EchoOff<'_> {
     fn drop(&mut self) {
-        if let Ok(mut slot) = self.echo_saved.lock()
-            && let Some(saved) = slot.take()
-        {
-            let _ = rustix::termios::tcsetattr(self.terminal, OptionalActions::Now, &saved);
-        }
+        let _ = rustix::termios::tcsetattr(self.terminal, OptionalActions::Now, &self.saved);
     }
 }
 
