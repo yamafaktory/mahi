@@ -1,3 +1,5 @@
+mod process;
+
 use std::{
     ffi::{
         CStr,
@@ -42,6 +44,7 @@ use rustix::{
     },
 };
 
+use self::process::Forked;
 use super::{
     Access,
     Sandbox,
@@ -55,7 +58,35 @@ const DEVICES: [&str; 6] = [
     "/dev/urandom",
     "/dev/tty",
 ];
+const DEVICE_ATTRIBUTES: u64 = libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NOEXEC;
 const STAGING: &CStr = c"/tmp";
+const STAGED_PROC: &CStr = c"/tmp/proc";
+const PROC_READ_ONLY: [&CStr; 6] = [
+    c"/proc/bus",
+    c"/proc/dynamic_debug",
+    c"/proc/fs",
+    c"/proc/irq",
+    c"/proc/sys",
+    c"/proc/sysrq-trigger",
+];
+const PROC_MASKED: [&CStr; 12] = [
+    c"/proc/acpi",
+    c"/proc/asound",
+    c"/proc/kcore",
+    c"/proc/keys",
+    c"/proc/latency_stats",
+    c"/proc/pagetypeinfo",
+    c"/proc/sched_debug",
+    c"/proc/scsi",
+    c"/proc/slabinfo",
+    c"/proc/timer_list",
+    c"/proc/timer_stats",
+    c"/proc/vmallocinfo",
+];
+const LOCKED_DOWN: u64 = libc::MOUNT_ATTR_RDONLY
+    | libc::MOUNT_ATTR_NOSUID
+    | libc::MOUNT_ATTR_NODEV
+    | libc::MOUNT_ATTR_NOEXEC;
 
 /// Everything the child needs to enter the sandbox, prepared before the fork so the child
 /// allocates nothing.
@@ -84,15 +115,17 @@ struct PlannedLink {
 }
 
 impl Plan {
-    pub(crate) fn new(sandbox: &Sandbox, cwd: &Path) -> io::Result<Self> {
+    pub(crate) fn new(sandbox: &Sandbox, cwd: &Path, terminal: &Path) -> io::Result<Self> {
         let uid = rustix::process::geteuid().as_raw();
         let gid = rustix::process::getegid().as_raw();
-        let devices = DEVICES.iter().map(|device| {
-            planned_mount(
-                Path::new(device),
-                libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NOEXEC,
-            )
-        });
+        let devices = DEVICES
+            .iter()
+            .map(|device| planned_mount(Path::new(device), Path::new(device), DEVICE_ATTRIBUTES))
+            .chain([planned_mount(
+                terminal,
+                Path::new("/dev/console"),
+                DEVICE_ATTRIBUTES,
+            )]);
         let mut binds = sandbox.binds.iter().collect::<Vec<_>>();
         binds.sort_by_key(|bind| bind.path.components().count());
         let binds = binds.into_iter().map(|bind| {
@@ -101,6 +134,7 @@ impl Plan {
                 Access::ReadWrite => 0,
             };
             planned_mount(
+                &bind.path,
                 &bind.path,
                 libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV | read_only,
             )
@@ -124,13 +158,33 @@ impl Plan {
         })
     }
 
-    /// Moves the calling process into new user and mount namespaces and makes the sandbox its
-    /// root. Runs in the forked child, so it must not allocate.
+    /// Moves the calling process into new user, mount and PID namespaces, makes the sandbox the
+    /// root, and leaves the agent's process ready to exec in a session of its own with the
+    /// terminal. The calling process stays outside the PID namespace and waits for its init,
+    /// which waits for the agent. Runs in the forked child, so it must not allocate.
     pub(crate) fn enter(&mut self) -> io::Result<()> {
-        unshare_user_and_mounts()?;
+        unshare_namespaces()?;
         write_file(c"/proc/self/setgroups", b"deny")?;
         write_file(c"/proc/self/uid_map", &self.uid_map)?;
         write_file(c"/proc/self/gid_map", &self.gid_map)?;
+        process::hide_memory()?;
+        let monitor = process::open_self()?;
+        if let Forked::Parent(init) = process::fork()? {
+            process::watch(init);
+        }
+        process::die_with(&monitor)?;
+        drop(monitor);
+        self.build_root()?;
+        if let Forked::Parent(agent) = process::fork()? {
+            process::reap_all_until(agent);
+        }
+        process::take_terminal()?;
+        rustix::process::chdir(self.cwd.as_c_str())?;
+        drop_privileges()?;
+        mark_inherited_fds_close_on_exec()
+    }
+
+    fn build_root(&mut self) -> io::Result<()> {
         rustix::mount::mount_change(
             c"/",
             MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
@@ -144,6 +198,7 @@ impl Plan {
             mount.attach()?;
         }
         make_dev()?;
+        restrict_proc()?;
         for link in &self.links {
             let (parent, name) = open_parent(&link.names)?;
             rustix::fs::symlinkat(link.target.as_c_str(), &parent, name)?;
@@ -153,9 +208,7 @@ impl Plan {
             MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV,
             c"",
         )?;
-        rustix::process::chdir(self.cwd.as_c_str())?;
-        drop_privileges()?;
-        mark_inherited_fds_close_on_exec()
+        Ok(())
     }
 }
 
@@ -270,10 +323,10 @@ fn drop_privileges() -> io::Result<()> {
     Ok(())
 }
 
-fn planned_mount(path: &Path, attributes: u64) -> io::Result<PlannedMount> {
+fn planned_mount(source: &Path, target: &Path, attributes: u64) -> io::Result<PlannedMount> {
     Ok(PlannedMount {
-        source: c_path(path)?,
-        names: names(path)?,
+        source: c_path(source)?,
+        names: names(target)?,
         attributes,
         tree: None,
         is_dir: false,
@@ -287,6 +340,14 @@ fn pivot_to_empty_root() -> io::Result<()> {
         c"tmpfs",
         MountFlags::NOSUID | MountFlags::NODEV,
         c"mode=0755",
+    )?;
+    make_dir(STAGED_PROC)?;
+    rustix::mount::mount(
+        c"proc",
+        STAGED_PROC,
+        c"proc",
+        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+        None,
     )?;
     rustix::process::chdir(STAGING)?;
     rustix::process::pivot_root(c".", c".")?;
@@ -305,7 +366,64 @@ fn make_dev() -> io::Result<()> {
         c"newinstance,ptmxmode=0666,mode=620",
     )?;
     rustix::fs::symlink(c"pts/ptmx", c"/dev/ptmx")?;
+    rustix::fs::symlink(c"/proc/self/fd", c"/dev/fd")?;
+    rustix::fs::symlink(c"/proc/self/fd/0", c"/dev/stdin")?;
+    rustix::fs::symlink(c"/proc/self/fd/1", c"/dev/stdout")?;
+    rustix::fs::symlink(c"/proc/self/fd/2", c"/dev/stderr")?;
     mount_tmpfs(c"/dev/shm", c"mode=1777")
+}
+
+fn restrict_proc() -> io::Result<()> {
+    for path in PROC_READ_ONLY {
+        let tree = match clone_path(path) {
+            Ok(tree) => tree,
+            Err(Errno::NOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        set_attributes(tree.as_fd(), LOCKED_DOWN)?;
+        move_onto(&tree, path)?;
+    }
+    for path in PROC_MASKED {
+        let is_dir = match rustix::fs::stat(path) {
+            Ok(stat) => FileType::from_raw_mode(stat.st_mode) == FileType::Directory,
+            Err(Errno::NOENT) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if is_dir {
+            rustix::mount::mount(
+                c"tmpfs",
+                path,
+                c"tmpfs",
+                MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+                c"mode=0555",
+            )?;
+        } else {
+            move_onto(&clone_path(c"/dev/null")?, path)?;
+        }
+    }
+    Ok(())
+}
+
+fn clone_path(path: &CStr) -> Result<OwnedFd, Errno> {
+    rustix::mount::open_tree(
+        CWD,
+        path,
+        OpenTreeFlags::OPEN_TREE_CLONE
+            | OpenTreeFlags::OPEN_TREE_CLOEXEC
+            | OpenTreeFlags::AT_RECURSIVE
+            | OpenTreeFlags::AT_SYMLINK_NOFOLLOW,
+    )
+}
+
+fn move_onto(tree: &OwnedFd, path: &CStr) -> io::Result<()> {
+    rustix::mount::move_mount(
+        tree,
+        c"",
+        CWD,
+        path,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )?;
+    Ok(())
 }
 
 fn mount_tmpfs(path: &CStr, options: &CStr) -> io::Result<()> {
@@ -340,10 +458,14 @@ fn write_file(path: &CStr, contents: &[u8]) -> io::Result<()> {
     unsafe_code,
     reason = "rustix marks unshare unsafe because of the file table flag, which is not used here"
 )]
-fn unshare_user_and_mounts() -> io::Result<()> {
+fn unshare_namespaces() -> io::Result<()> {
     // SAFETY: the flags do not include `UnshareFlags::FILES`, so no thread can lose access to
     // file descriptors, and the forked child that calls this has a single thread.
-    unsafe { rustix::thread::unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS)? };
+    unsafe {
+        rustix::thread::unshare_unsafe(
+            UnshareFlags::NEWUSER | UnshareFlags::NEWNS | UnshareFlags::NEWPID,
+        )?;
+    };
     Ok(())
 }
 

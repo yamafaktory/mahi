@@ -6,7 +6,10 @@
 mod tests {
     use std::{
         fs,
-        io::Read,
+        io::{
+            Read,
+            Write,
+        },
         path::Path,
         process::Command,
         sync::mpsc,
@@ -23,7 +26,15 @@ mod tests {
         WindowSize,
         exit_code,
     };
-    use rustix::io::Errno;
+    use rustix::{
+        event::{
+            PollFd,
+            PollFlags,
+            Timespec,
+        },
+        io::Errno,
+        process::PidfdFlags,
+    };
 
     const SIZE: WindowSize = WindowSize { rows: 24, cols: 80 };
 
@@ -223,6 +234,179 @@ mod tests {
         assert!(output.contains("uid=0"), "{output}");
         assert!(output.contains("denied"), "{output}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "orig");
+    }
+
+    #[test]
+    fn the_agent_is_alone_in_its_own_process_namespace() {
+        let host_pid = std::process::id();
+        assert!(host_pid > 10);
+        let script = format!(
+            "echo pid=$$; echo procs=$(ls /proc | grep -c '^[0-9][0-9]*$'); \
+             test -e /proc/{host_pid} && echo host-visible; \
+             ls /proc/1/root >/dev/null 2>&1 || echo init-hidden; \
+             ls /proc/1/fd >/dev/null 2>&1 || echo init-fds-hidden"
+        );
+        let (code, output) = run(Sandbox::system().unwrap(), Path::new("/"), &script);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("pid=2"), "{output}");
+        assert!(output.contains("init-hidden"), "{output}");
+        assert!(output.contains("init-fds-hidden"), "{output}");
+        assert!(!output.contains("host-visible"), "{output}");
+        let procs = output
+            .split("procs=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|count| count.parse::<u32>().ok())
+            .unwrap();
+        assert!(procs <= 6, "{output}");
+    }
+
+    #[test]
+    fn the_terminal_has_a_name_and_fds_are_listed() {
+        let (code, output) = run(
+            Sandbox::system().unwrap(),
+            Path::new("/"),
+            "tty; test -e /dev/fd/0 && echo fd-ok",
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("/dev/console"), "{output}");
+        assert!(output.contains("fd-ok"), "{output}");
+    }
+
+    #[test]
+    fn processes_left_behind_end_with_the_agent() {
+        let (code, output) = run(
+            Sandbox::system().unwrap(),
+            Path::new("/"),
+            "setsid sleep 60 & echo started",
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("started"), "{output}");
+    }
+
+    #[test]
+    fn exit_codes_and_kills_come_through_the_watchers() {
+        let (code, _) = run(Sandbox::system().unwrap(), Path::new("/"), "exit 7");
+        assert_eq!(code, 7);
+
+        let mut child = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
+            .arg("-c")
+            .arg("sleep 30")
+            .sandbox(Sandbox::system().unwrap())
+            .spawn()
+            .unwrap();
+        child.kill().unwrap();
+        assert_eq!(exit_code(child.wait().unwrap()), 128 + 9);
+    }
+
+    #[test]
+    fn an_interrupt_reaches_the_agent_and_not_its_watchers() {
+        let mut child = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
+            .arg("-c")
+            .arg("trap 'echo caught; exit 5' INT; echo ready; while :; do sleep 0.1; done")
+            .sandbox(Sandbox::system().unwrap())
+            .spawn()
+            .unwrap();
+        let mut reader = child.reader().unwrap();
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("ready") {
+            let mut chunk = [0u8; 64];
+            let read = reader.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "the agent never became ready");
+            seen.extend_from_slice(&chunk[..read]);
+        }
+        child.writer().unwrap().write_all(b"\x03").unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest);
+            let _ = sender.send(rest);
+        });
+        let rest = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(String::from_utf8_lossy(&rest).contains("caught"));
+        assert_eq!(exit_code(child.wait().unwrap()), 5);
+    }
+
+    #[test]
+    fn kernel_controls_in_proc_are_read_only_or_hidden() {
+        let script = "awk '$5 == \"/proc/sys\" || $5 == \"/proc/sysrq-trigger\" \
+                      { split($6, o, \",\"); print $5 \"=\" o[1] }' /proc/self/mountinfo; \
+                      test -s /proc/kcore && echo kcore-readable; echo done";
+        let (code, output) = run(Sandbox::system().unwrap(), Path::new("/"), script);
+        assert_eq!(code, 0, "{output}");
+        for expected in ["/proc/sys=ro", "/proc/sysrq-trigger=ro", "done"] {
+            assert!(output.contains(expected), "{expected} missing: {output}");
+        }
+        assert!(!output.contains("kcore-readable"), "{output}");
+    }
+
+    #[test]
+    fn the_agent_leads_its_own_session_apart_from_its_watchers() {
+        let (code, output) = run(
+            Sandbox::system().unwrap(),
+            Path::new("/"),
+            "echo session=$(awk '{print $6}' /proc/$$/stat); trap '' TERM; kill -TERM 0; exit 3",
+        );
+        assert!(output.contains("session=2"), "{output}");
+        assert_eq!(code, 3, "{output}");
+    }
+
+    #[test]
+    fn a_sandbox_ignoring_hangup_ends_when_mahi_goes_away() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_sandbox_ignoring_hangup_ends_when_mahi_goes_away_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}"
+        );
+        let watcher = stdout
+            .split("watcher=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|pid| pid.parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw)
+            .unwrap_or_else(|| panic!("no watcher pid in {stdout}"));
+        let watcher = match rustix::process::pidfd_open(watcher, PidfdFlags::empty()) {
+            Ok(watcher) => watcher,
+            Err(Errno::SRCH) => return,
+            Err(error) => panic!("cannot watch the watcher: {error}"),
+        };
+        let mut fds = [PollFd::new(&watcher, PollFlags::IN)];
+        let timeout = Timespec {
+            tv_sec: 15,
+            tv_nsec: 0,
+        };
+        let ready = rustix::event::poll(&mut fds, Some(&timeout)).unwrap();
+        assert_eq!(ready, 1, "the sandbox outlived its terminal");
+    }
+
+    #[test]
+    #[ignore = "run by a_sandbox_ignoring_hangup_ends_when_mahi_goes_away, which outlives it"]
+    fn a_sandbox_ignoring_hangup_ends_when_mahi_goes_away_inner() {
+        let child = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
+            .arg("-c")
+            .arg("trap '' HUP; echo ready; while :; do sleep 0.1; done")
+            .sandbox(Sandbox::system().unwrap())
+            .spawn()
+            .unwrap();
+        let mut reader = child.reader().unwrap();
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("ready") {
+            let mut chunk = [0u8; 64];
+            let read = reader.read(&mut chunk).unwrap();
+            assert_ne!(read, 0);
+            seen.extend_from_slice(&chunk[..read]);
+        }
+        println!("watcher={}", child.id());
+        std::mem::forget(child);
     }
 
     fn spawn_errno(result: Result<PtyChild, PtyError>) -> Errno {

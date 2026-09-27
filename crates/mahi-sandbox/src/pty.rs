@@ -14,9 +14,12 @@ use std::{
             BorrowedFd,
             OwnedFd,
         },
-        unix::process::{
-            CommandExt,
-            ExitStatusExt,
+        unix::{
+            ffi::OsStringExt,
+            process::{
+                CommandExt,
+                ExitStatusExt,
+            },
         },
     },
     path::{
@@ -150,12 +153,12 @@ impl PtyCommand {
     /// [`PtyError::Spawn`] if the program cannot be started or the sandbox cannot be entered,
     /// or [`PtyError::Unsupported`] if a sandbox is set on an operating system without one.
     pub fn spawn(self) -> Result<PtyChild, PtyError> {
+        let (master, slave, terminal) = open_pty(self.size).map_err(PtyError::Open)?;
         let sandbox = self
             .sandbox
             .as_ref()
-            .map(|sandbox| prepare_sandbox(sandbox, &self.program, &self.cwd))
+            .map(|sandbox| prepare_sandbox(sandbox, &self.program, &self.cwd, &terminal))
             .transpose()?;
-        let (master, slave) = open_pty(self.size).map_err(PtyError::Open)?;
         let stdio = |fd: &OwnedFd| fd.try_clone().map(Stdio::from).map_err(PtyError::Io);
         let mut command = Command::new(&self.program);
         command
@@ -200,8 +203,14 @@ impl fmt::Debug for PtyCommand {
 type ChildSetup = crate::sandbox::linux::Plan;
 
 #[cfg(target_os = "linux")]
-fn prepare_sandbox(sandbox: &Sandbox, program: &Path, cwd: &Path) -> Result<ChildSetup, PtyError> {
-    ChildSetup::new(sandbox, cwd).map_err(|error| PtyError::Spawn(program.to_path_buf(), error))
+fn prepare_sandbox(
+    sandbox: &Sandbox,
+    program: &Path,
+    cwd: &Path,
+    terminal: &Path,
+) -> Result<ChildSetup, PtyError> {
+    ChildSetup::new(sandbox, cwd, terminal)
+        .map_err(|error| PtyError::Spawn(program.to_path_buf(), error))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -216,7 +225,7 @@ impl ChildSetup {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn prepare_sandbox(_: &Sandbox, _: &Path, _: &Path) -> Result<ChildSetup, PtyError> {
+fn prepare_sandbox(_: &Sandbox, _: &Path, _: &Path, _: &Path) -> Result<ChildSetup, PtyError> {
     Err(PtyError::Unsupported)
 }
 
@@ -232,11 +241,12 @@ fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>) {
     unsafe {
         command.pre_exec(move || {
             rustix::process::setsid()?;
-            rustix::process::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
             if let Some(sandbox) = sandbox.as_mut() {
-                sandbox.enter()?;
+                sandbox.enter()
+            } else {
+                rustix::process::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
+                Ok(())
             }
-            Ok(())
         });
     }
 }
@@ -255,7 +265,7 @@ fn open_master() -> io::Result<OwnedFd> {
     Ok(master)
 }
 
-fn open_pty(size: WindowSize) -> io::Result<(OwnedFd, OwnedFd)> {
+fn open_pty(size: WindowSize) -> io::Result<(OwnedFd, OwnedFd, PathBuf)> {
     let master = open_master()?;
     grantpt(&master)?;
     unlockpt(&master)?;
@@ -274,11 +284,16 @@ fn open_pty(size: WindowSize) -> io::Result<(OwnedFd, OwnedFd)> {
             ws_ypixel: 0,
         },
     )?;
-    Ok((master, slave))
+    Ok((
+        master,
+        slave,
+        PathBuf::from(OsString::from_vec(name.into_bytes())),
+    ))
 }
 
 impl PtyChild {
-    /// Returns the process id of the program.
+    /// Returns the process id of the program, or, in a Linux sandbox, of the process outside
+    /// the sandbox that watches it and exits with its status.
     #[must_use]
     pub fn id(&self) -> u32 {
         self.child.id()
@@ -346,7 +361,8 @@ impl PtyChild {
 
     /// Kills the program and every process in its process group, including what it started in
     /// the background. A process that left the group, by starting its own session or group, is
-    /// not reached here; on Linux the sandbox's PID namespace ends it.
+    /// not reached here. In a Linux sandbox the group is the program's watchers, and killing
+    /// them ends the sandbox's PID namespace and everything in it.
     ///
     /// The group is addressed by the program's process id, which stays reserved until the
     /// program is reaped by this handle, so nothing else in mahi may reap child processes (for
