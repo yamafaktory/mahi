@@ -32,6 +32,8 @@ pub use sandbox::{
     SandboxError,
 };
 pub use window::{
+    SignalError,
+    Termination,
+    TerminationSignals,
     WindowChanges,
-    WindowError,
 };

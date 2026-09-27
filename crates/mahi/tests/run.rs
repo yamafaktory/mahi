@@ -8,6 +8,7 @@ mod tests {
             Read,
             Write,
         },
+        os::unix::process::ExitStatusExt,
         path::{
             Path,
             PathBuf,
@@ -23,6 +24,13 @@ mod tests {
             Instant,
         },
     };
+
+    use mahi_sandbox::{
+        PtyCommand,
+        WindowSize,
+        exit_code,
+    };
+    use rustix::termios::LocalModes;
 
     fn test_home() -> PathBuf {
         let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("test-home");
@@ -185,6 +193,87 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(status.code(), Some(141));
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_stop_signal_ends_the_agent_and_restores_the_terminal() {
+        let (_dir, cwd) = outside_tmp();
+        let home = test_home();
+        let mut mahi = PtyCommand::new(
+            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            &cwd,
+            WindowSize { rows: 24, cols: 80 },
+        )
+        .arg("run")
+        .arg("sleep")
+        .arg("60")
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .spawn()
+        .unwrap();
+        let terminal = mahi.writer().unwrap();
+        let canonical = |terminal: &std::fs::File| {
+            rustix::termios::tcgetattr(terminal)
+                .unwrap()
+                .local_modes
+                .contains(LocalModes::ICANON)
+        };
+        wait_until("raw mode", || !canonical(&terminal));
+        let mut reader = mahi.reader().unwrap();
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        });
+        let pid = rustix::process::Pid::from_raw(i32::try_from(mahi.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        let mut status = None;
+        wait_until("mahi to exit", || {
+            status = mahi.try_wait().unwrap();
+            status.is_some()
+        });
+        assert_eq!(exit_code(status.unwrap()), 128 + 15);
+        assert!(canonical(&terminal));
+    }
+
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn a_stop_signal_without_a_terminal_makes_mahi_die_of_it() {
+        let (_dir, cwd) = outside_tmp();
+        let mut child = KillOnDrop(
+            mahi_command(&["run", "sh", "-c", "echo ready; exec sleep 60"], &cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = [0_u8; 5];
+        let mut output = child.0.stdout.take().unwrap();
+        output.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.0.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
+        let mut status = None;
+        wait_until("mahi to exit", || {
+            status = child.0.try_wait().unwrap();
+            status.is_some()
+        });
+        assert_eq!(status.unwrap().signal(), Some(libc::SIGHUP));
+        drop(output);
     }
 
     #[test]

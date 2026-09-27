@@ -48,6 +48,9 @@ use mahi_sandbox::{
     PtyError,
     Sandbox,
     SandboxError,
+    SignalError,
+    Termination,
+    TerminationSignals,
     WindowChanges,
     exit_code,
 };
@@ -92,6 +95,7 @@ const PRIVATE_ON_SYSTEM: [&str; 3] = ["/run", "/private/var/run", "/private/tmp"
 const OUTPUT_GRACE: Duration = Duration::from_millis(500);
 const OUTPUT_LIMIT: Duration = Duration::from_secs(5);
 const EXIT_POLL: Duration = Duration::from_millis(50);
+const KILL_GRACE: Duration = Duration::from_secs(2);
 const BROKEN_PIPE_CODE: i32 = 128 + 13;
 
 #[derive(Debug, Error)]
@@ -116,6 +120,8 @@ pub(crate) enum RunError {
     Output(#[source] io::Error),
     #[error("cannot run the agent")]
     Pty(#[from] PtyError),
+    #[error("cannot catch the signals that stop mahi")]
+    Signals(#[source] SignalError),
 }
 
 #[derive(Debug)]
@@ -130,12 +136,19 @@ struct Agent {
     canonical: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Exited(i32),
+    Stopped(Termination),
+}
+
 enum Event {
     Exited(Result<i32, PtyError>),
     OutputEnded(io::Result<()>),
+    Stopped(Termination),
 }
 
-pub(crate) fn run(command: &RunCommand) -> Result<i32, RunError> {
+pub(crate) fn run(command: &RunCommand) -> Result<Outcome, RunError> {
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(RunError::CurrentDirectory)?;
@@ -175,9 +188,10 @@ pub(crate) fn run(command: &RunCommand) -> Result<i32, RunError> {
         .env("HOME", &home)
         .env("TMPDIR", &temporary)
         .sandbox(sandbox);
+    let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
     let raw = RawMode::enable().map_err(RunError::Terminal)?;
     let interactive = raw.is_some();
-    let code = relay(pty.spawn()?, interactive);
+    let code = relay(pty.spawn()?, interactive, termination);
     drop(raw);
     code
 }
@@ -211,7 +225,11 @@ impl Host {
     }
 }
 
-fn relay(child: PtyChild, interactive: bool) -> Result<i32, RunError> {
+fn relay(
+    child: PtyChild,
+    interactive: bool,
+    termination: TerminationSignals,
+) -> Result<Outcome, RunError> {
     let writer = child.writer()?;
     thread::spawn(move || forward_input(writer, interactive));
     let resizer = child.resizer()?;
@@ -234,6 +252,12 @@ fn relay(child: PtyChild, interactive: bool) -> Result<i32, RunError> {
         let ended = copy_output(&mut reader, &output_progress);
         let _ = output_events.send(Event::OutputEnded(ended));
     });
+    let stop_events = events.clone();
+    thread::spawn(move || {
+        while let Ok(signal) = termination.wait() {
+            let _ = stop_events.send(Event::Stopped(signal));
+        }
+    });
     let child = Arc::new(Mutex::new(child));
     let waited = Arc::clone(&child);
     thread::spawn(move || {
@@ -242,16 +266,39 @@ fn relay(child: PtyChild, interactive: bool) -> Result<i32, RunError> {
     let mut output_done = false;
     loop {
         match received.recv() {
-            Ok(Event::Exited(code)) if output_done => return Ok(code?),
-            Ok(Event::Exited(code)) => return finish_output(&received, &progress, code?),
+            Ok(Event::Exited(code)) if output_done => return Ok(Outcome::Exited(code?)),
+            Ok(Event::Exited(code)) => {
+                return finish_output(&received, &progress, code?).map(Outcome::Exited);
+            }
             Ok(Event::OutputEnded(Ok(()))) => output_done = true,
             Ok(Event::OutputEnded(Err(error))) => {
-                if let Ok(mut child) = child.lock() {
-                    let _ = child.kill();
-                }
-                return output_failure(error);
+                kill(&child);
+                return output_failure(error).map(Outcome::Exited);
             }
-            Err(_) => return Ok(1),
+            Ok(Event::Stopped(signal)) => {
+                kill(&child);
+                if !output_done {
+                    await_output_end(&received);
+                }
+                return Ok(Outcome::Stopped(signal));
+            }
+            Err(_) => return Ok(Outcome::Exited(1)),
+        }
+    }
+}
+
+fn kill(child: &Mutex<PtyChild>) {
+    if let Ok(mut child) = child.lock() {
+        let _ = child.kill();
+    }
+}
+
+fn await_output_end(received: &Receiver<Event>) {
+    let deadline = Instant::now() + KILL_GRACE;
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match received.recv_timeout(left) {
+            Ok(Event::OutputEnded(_)) | Err(_) => return,
+            Ok(Event::Exited(_) | Event::Stopped(_)) => {}
         }
     }
 }
@@ -285,7 +332,7 @@ fn finish_output(
             Ok(Event::OutputEnded(Ok(()))) | Err(RecvTimeoutError::Disconnected) => {
                 return Ok(code);
             }
-            Ok(Event::Exited(_)) => {}
+            Ok(Event::Exited(_) | Event::Stopped(_)) => {}
             Err(RecvTimeoutError::Timeout) => {
                 let now = progress.load(Ordering::Relaxed);
                 if now == seen {

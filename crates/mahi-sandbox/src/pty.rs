@@ -596,9 +596,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_program_does_not_inherit_an_ignored_window_change_signal() {
-        let previous = crate::window::set_disposition(libc::SIG_IGN).unwrap();
+        let previous = crate::window::set_disposition(libc::SIGWINCH, libc::SIG_IGN).unwrap();
         let mut child = sh("grep SigIgn /proc/self/status").spawn().unwrap();
-        crate::window::set_disposition(previous).unwrap();
+        crate::window::set_disposition(libc::SIGWINCH, previous).unwrap();
         let output = output_of(&child);
         child.wait().unwrap();
         let mask = output

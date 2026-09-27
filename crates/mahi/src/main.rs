@@ -11,9 +11,12 @@ use std::{
     process,
 };
 
-use crate::cli::{
-    Command,
-    USAGE,
+use crate::{
+    cli::{
+        Command,
+        USAGE,
+    },
+    run::Outcome,
 };
 
 fn main() {
@@ -26,10 +29,17 @@ fn main() {
             println!("mahi {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        Ok(Command::Run(command)) => run::run(&command).unwrap_or_else(|error| {
-            report(&error);
-            1
-        }),
+        Ok(Command::Run(command)) => match run::run(&command) {
+            Ok(Outcome::Exited(code)) => code,
+            Ok(Outcome::Stopped(signal)) => {
+                signal.reraise();
+                128 + signal.number()
+            }
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
         Err(error) => {
             eprintln!("mahi: {error}\n{USAGE}");
             2
