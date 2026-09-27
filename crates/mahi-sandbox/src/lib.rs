@@ -4,6 +4,7 @@
 compile_error!("mahi supports Linux and macOS only");
 
 mod pty;
+mod sandbox;
 
 pub use pty::{
     PtyChild,
@@ -12,4 +13,9 @@ pub use pty::{
     PtyReader,
     WindowSize,
     exit_code,
+};
+pub use sandbox::{
+    Access,
+    Sandbox,
+    SandboxError,
 };

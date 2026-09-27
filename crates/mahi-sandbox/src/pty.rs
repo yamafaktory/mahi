@@ -51,6 +51,8 @@ use rustix::{
 };
 use thiserror::Error;
 
+use crate::Sandbox;
+
 /// The size of a terminal, in character cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowSize {
@@ -71,6 +73,7 @@ pub struct PtyCommand {
     env: Vec<(OsString, OsString)>,
     cwd: PathBuf,
     size: WindowSize,
+    sandbox: Option<Sandbox>,
 }
 
 /// A program running in a pseudo-terminal, and the terminal's controlling side.
@@ -93,6 +96,9 @@ pub enum PtyError {
     /// Starting the program failed.
     #[error("cannot start {}", .0.display())]
     Spawn(PathBuf, #[source] io::Error),
+    /// This operating system has no sandbox yet.
+    #[error("the sandbox is not supported on this operating system")]
+    Unsupported,
     /// Reading from, writing to or resizing the terminal failed.
     #[error("pseudo-terminal input or output failed")]
     Io(#[from] io::Error),
@@ -108,6 +114,7 @@ impl PtyCommand {
             env: Vec::new(),
             cwd: cwd.to_path_buf(),
             size,
+            sandbox: None,
         }
     }
 
@@ -126,14 +133,28 @@ impl PtyCommand {
         self
     }
 
+    /// Runs the program inside `sandbox`. The program path and `cwd` are then paths inside the
+    /// sandbox.
+    #[must_use]
+    pub fn sandbox(mut self, sandbox: Sandbox) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
     /// Starts the program in a new session, with a new pseudo-terminal as its controlling
     /// terminal and as its standard input, output and error.
     ///
     /// # Errors
     ///
     /// Returns [`PtyError::Open`] if the pseudo-terminal cannot be created, or
-    /// [`PtyError::Spawn`] if the program cannot be started.
+    /// [`PtyError::Spawn`] if the program cannot be started or the sandbox cannot be entered,
+    /// or [`PtyError::Unsupported`] if a sandbox is set on an operating system without one.
     pub fn spawn(self) -> Result<PtyChild, PtyError> {
+        let sandbox = self
+            .sandbox
+            .as_ref()
+            .map(|sandbox| prepare_sandbox(sandbox, &self.program, &self.cwd))
+            .transpose()?;
         let (master, slave) = open_pty(self.size).map_err(PtyError::Open)?;
         let stdio = |fd: &OwnedFd| fd.try_clone().map(Stdio::from).map_err(PtyError::Io);
         let mut command = Command::new(&self.program);
@@ -141,11 +162,13 @@ impl PtyCommand {
             .args(&self.args)
             .env_clear()
             .envs(self.env.iter().map(|(key, value)| (key, value)))
-            .current_dir(&self.cwd)
             .stdin(stdio(&slave)?)
             .stdout(stdio(&slave)?)
             .stderr(stdio(&slave)?);
-        become_session_leader(&mut command);
+        if sandbox.is_none() {
+            command.current_dir(&self.cwd);
+        }
+        set_up_child(&mut command, sandbox);
         let child = command
             .spawn()
             .map_err(|error| PtyError::Spawn(self.program.clone(), error))?;
@@ -168,22 +191,51 @@ impl fmt::Debug for PtyCommand {
             )
             .field("cwd", &self.cwd)
             .field("size", &self.size)
+            .field("sandbox", &self.sandbox)
             .finish()
     }
 }
 
+#[cfg(target_os = "linux")]
+type ChildSetup = crate::sandbox::linux::Plan;
+
+#[cfg(target_os = "linux")]
+fn prepare_sandbox(sandbox: &Sandbox, program: &Path, cwd: &Path) -> Result<ChildSetup, PtyError> {
+    ChildSetup::new(sandbox, cwd).map_err(|error| PtyError::Spawn(program.to_path_buf(), error))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+enum ChildSetup {}
+
+#[cfg(not(target_os = "linux"))]
+impl ChildSetup {
+    fn enter(&mut self) -> io::Result<()> {
+        match *self {}
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_sandbox(_: &Sandbox, _: &Path, _: &Path) -> Result<ChildSetup, PtyError> {
+    Err(PtyError::Unsupported)
+}
+
 #[expect(
     unsafe_code,
-    reason = "the child must start a session and take the terminal between fork and exec"
+    reason = "the child must start a session, take the terminal and enter the sandbox between fork and exec"
 )]
-fn become_session_leader(command: &mut Command) {
-    // SAFETY: the hook runs in the forked child before exec. It only makes the setsid and
-    // TIOCSCTTY system calls through rustix, which are async-signal-safe and allocate nothing,
-    // and fd 0 is the pseudo-terminal's slave that `Command` installed as standard input.
+fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>) {
+    // SAFETY: the hook runs in the forked child before exec, where only async-signal-safe work
+    // is allowed. It makes system calls through rustix and libc and allocates nothing: every
+    // path and buffer the sandbox needs was prepared before the fork. Fd 0 is the
+    // pseudo-terminal's slave that `Command` installed as standard input.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             rustix::process::setsid()?;
             rustix::process::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
+            if let Some(sandbox) = sandbox.as_mut() {
+                sandbox.enter()?;
+            }
             Ok(())
         });
     }
@@ -499,5 +551,12 @@ mod tests {
     fn a_missing_program_is_a_spawn_error() {
         let result = PtyCommand::new(Path::new("/nonexistent/agent"), Path::new("/"), SIZE).spawn();
         assert!(matches!(result, Err(PtyError::Spawn(..))));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_sandbox_is_unsupported_until_the_platform_has_one() {
+        let result = sh("true").sandbox(Sandbox::new()).spawn();
+        assert!(matches!(result, Err(PtyError::Unsupported)));
     }
 }
