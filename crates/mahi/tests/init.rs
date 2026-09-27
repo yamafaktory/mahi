@@ -98,9 +98,58 @@ mod tests {
         assert!(!echo(&terminal));
         let pid = rustix::process::Pid::from_raw(i32::try_from(mahi.id()).unwrap()).unwrap();
         rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
-        let status = mahi.wait().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest);
+            let _ = sender.send(rest);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = mahi.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let report = diagnose(mahi.id(), &receiver);
+                mahi.kill().unwrap();
+                panic!("mahi kept running after SIGTERM\n{report}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
         assert_eq!(status.signal(), Some(libc::SIGTERM));
         assert!(echo(&terminal));
+    }
+
+    fn diagnose(pid: u32, output: &mpsc::Receiver<Vec<u8>>) -> String {
+        let run = |program: &str, arguments: &[&str]| {
+            std::process::Command::new(program)
+                .args(arguments)
+                .output()
+                .map_or_else(
+                    |error| format!("{program} failed: {error}"),
+                    |output| {
+                        format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        )
+                    },
+                )
+        };
+        let pid = pid.to_string();
+        let (threads, stacks) = if cfg!(target_os = "macos") {
+            (run("ps", &["-M", "-p", &pid]), run("sample", &[&pid, "1"]))
+        } else {
+            (
+                run("ps", &["-L", "-o", "pid,lwp,stat,wchan", "-p", &pid]),
+                run("cat", &[&format!("/proc/{pid}/wchan")]),
+            )
+        };
+        let printed = output.try_recv().map_or_else(
+            |_| "(the terminal is still open)".to_owned(),
+            |bytes| String::from_utf8_lossy(&bytes).into_owned(),
+        );
+        format!("threads:\n{threads}\nstacks:\n{stacks}\nprinted after the signal:\n{printed}")
     }
 
     #[test]
