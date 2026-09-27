@@ -99,9 +99,6 @@ pub enum PtyError {
     /// Starting the program failed.
     #[error("cannot start {}", .0.display())]
     Spawn(PathBuf, #[source] io::Error),
-    /// This operating system has no sandbox yet.
-    #[error("the sandbox is not supported on this operating system")]
-    Unsupported,
     /// Reading from, writing to or resizing the terminal failed.
     #[error("pseudo-terminal input or output failed")]
     Io(#[from] io::Error),
@@ -150,8 +147,7 @@ impl PtyCommand {
     /// # Errors
     ///
     /// Returns [`PtyError::Open`] if the pseudo-terminal cannot be created, or
-    /// [`PtyError::Spawn`] if the program cannot be started or the sandbox cannot be entered,
-    /// or [`PtyError::Unsupported`] if a sandbox is set on an operating system without one.
+    /// [`PtyError::Spawn`] if the program cannot be started or the sandbox cannot be entered.
     pub fn spawn(self) -> Result<PtyChild, PtyError> {
         let (master, slave, terminal) = open_pty(self.size).map_err(PtyError::Open)?;
         let sandbox = self
@@ -168,7 +164,7 @@ impl PtyCommand {
             .stdin(stdio(&slave)?)
             .stdout(stdio(&slave)?)
             .stderr(stdio(&slave)?);
-        if sandbox.is_none() {
+        if sandbox.is_none() || cfg!(target_os = "macos") {
             command.current_dir(&self.cwd);
         }
         set_up_child(&mut command, sandbox);
@@ -213,20 +209,18 @@ fn prepare_sandbox(
         .map_err(|error| PtyError::Spawn(program.to_path_buf(), error))
 }
 
-#[cfg(not(target_os = "linux"))]
-#[derive(Debug)]
-enum ChildSetup {}
+#[cfg(target_os = "macos")]
+type ChildSetup = crate::sandbox::macos::Profile;
 
-#[cfg(not(target_os = "linux"))]
-impl ChildSetup {
-    fn enter(&mut self) -> io::Result<()> {
-        match *self {}
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn prepare_sandbox(_: &Sandbox, _: &Path, _: &Path, _: &Path) -> Result<ChildSetup, PtyError> {
-    Err(PtyError::Unsupported)
+#[cfg(target_os = "macos")]
+fn prepare_sandbox(
+    sandbox: &Sandbox,
+    program: &Path,
+    _: &Path,
+    terminal: &Path,
+) -> Result<ChildSetup, PtyError> {
+    ChildSetup::new(sandbox, terminal)
+        .map_err(|error| PtyError::Spawn(program.to_path_buf(), error))
 }
 
 #[expect(
@@ -235,9 +229,14 @@ fn prepare_sandbox(_: &Sandbox, _: &Path, _: &Path, _: &Path) -> Result<ChildSet
 )]
 fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>) {
     // SAFETY: the hook runs in the forked child before exec, where only async-signal-safe work
-    // is allowed. It makes system calls through rustix and libc and allocates nothing: every
-    // path and buffer the sandbox needs was prepared before the fork. Fd 0 is the
-    // pseudo-terminal's slave that `Command` installed as standard input.
+    // is allowed. On Linux it makes system calls through rustix and libc and allocates
+    // nothing: every path and buffer the sandbox needs was prepared before the fork. On macOS
+    // `sandbox_init` allocates while compiling the profile: libSystem's fork resets malloc
+    // and dyld in the child, and the parent never uses libsandbox, so no lock it needs can be
+    // held (the same pattern as Nix's macOS builder). Only libdispatch or XPC use would be
+    // unsafe here; profile compilation is not known to use them, and a crash, not a
+    // deadlock, would be the symptom. Fd 0 is the pseudo-terminal's slave that
+    // `Command` installed as standard input.
     unsafe {
         command.pre_exec(move || {
             rustix::process::setsid()?;
@@ -567,12 +566,5 @@ mod tests {
     fn a_missing_program_is_a_spawn_error() {
         let result = PtyCommand::new(Path::new("/nonexistent/agent"), Path::new("/"), SIZE).spawn();
         assert!(matches!(result, Err(PtyError::Spawn(..))));
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn a_sandbox_is_unsupported_until_the_platform_has_one() {
-        let result = sh("true").sandbox(Sandbox::new()).spawn();
-        assert!(matches!(result, Err(PtyError::Unsupported)));
     }
 }

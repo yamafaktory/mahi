@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 
 use std::{
     ffi::{
@@ -17,13 +19,31 @@ use std::{
 use thiserror::Error;
 
 const RESERVED: [&str; 2] = ["/dev", "/proc"];
-const SYSTEM: [&str; 7] = ["/usr", "/etc", "/bin", "/sbin", "/lib", "/lib32", "/lib64"];
+#[cfg(target_os = "linux")]
+const SYSTEM: &[&str] = &["/usr", "/etc", "/bin", "/sbin", "/lib", "/lib32", "/lib64"];
+#[cfg(target_os = "macos")]
+const SYSTEM: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System/Library",
+    "/System/Cryptexes",
+    "/System/Volumes/Preboot/Cryptexes",
+    "/Library/Apple",
+    "/private/etc",
+    "/private/var/db/dyld",
+    "/private/var/db/timezone",
+];
 
 /// What of the host filesystem an agent sees.
 ///
-/// The agent starts in an empty root. It sees the paths bound here, a private `/tmp`, a minimal
-/// `/dev`, and nothing else. A bound path is opened without following any symbolic link, so a
-/// link planted on the way cannot redirect the bind. The root itself is read-only.
+/// On Linux the agent starts in an empty root. It sees the paths bound here, a private `/tmp`, a
+/// minimal `/dev`, and nothing else. A bound path is opened without following any symbolic
+/// link, so a link planted on the way cannot redirect the bind. The root itself is read-only.
+///
+/// On macOS the agent sees the host's filesystem through a Seatbelt profile: it can read the
+/// bound paths and write the read-write ones, and it can read the metadata, but not the
+/// contents, of every other file.
 #[derive(Debug, Clone, Default)]
 pub struct Sandbox {
     binds: Vec<Bind>,
@@ -33,13 +53,6 @@ pub struct Sandbox {
 #[derive(Debug, Clone)]
 struct Bind {
     path: PathBuf,
-    #[cfg_attr(
-        not(target_os = "linux"),
-        expect(
-            dead_code,
-            reason = "only the Linux sandbox reads it until macOS has one"
-        )
-    )]
     access: Access,
 }
 
@@ -50,7 +63,7 @@ struct Link {
         not(target_os = "linux"),
         expect(
             dead_code,
-            reason = "only the Linux sandbox reads it until macOS has one"
+            reason = "macOS sees the host's own links, so only the Linux sandbox recreates them"
         )
     )]
     target: OsString,
@@ -99,7 +112,7 @@ impl Sandbox {
     /// Returns [`SandboxError::Inspect`] if a system path exists but cannot be inspected.
     pub fn system() -> Result<Self, SandboxError> {
         let mut sandbox = Self::new();
-        for path in SYSTEM.map(Path::new) {
+        for path in SYSTEM.iter().map(Path::new) {
             match path.symlink_metadata() {
                 Ok(metadata) if metadata.is_symlink() => {
                     let target = path
@@ -264,7 +277,7 @@ mod tests {
     #[test]
     fn the_system_sandbox_mirrors_the_host_layout() {
         let sandbox = Sandbox::system().unwrap();
-        for path in SYSTEM.map(Path::new) {
+        for path in SYSTEM.iter().map(Path::new) {
             let bound = sandbox.binds.iter().any(|bind| bind.path == path);
             let linked = sandbox.links.iter().any(|link| link.path == path);
             assert_eq!(bound || linked, path.exists(), "{}", path.display());

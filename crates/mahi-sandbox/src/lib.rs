@@ -1,6 +1,6 @@
 //! Runs an agent in a pseudo-terminal inside mahi's sandbox; the only crate with unsafe code.
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("mahi supports Linux and macOS only");
 
 #[cfg(all(
