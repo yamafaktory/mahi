@@ -261,10 +261,14 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
-        let mut ready = [0_u8; 5];
         let mut output = child.0.stdout.take().unwrap();
-        output.read_exact(&mut ready).unwrap();
-        assert_eq!(&ready, b"ready");
+        let mut seen = Vec::new();
+        while !seen.windows(5).any(|window| window == b"ready") {
+            let mut chunk = [0_u8; 64];
+            let read = output.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "the agent never became ready");
+            seen.extend_from_slice(&chunk[..read]);
+        }
         let pid = rustix::process::Pid::from_raw(i32::try_from(child.0.id()).unwrap()).unwrap();
         rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
         let mut status = None;
