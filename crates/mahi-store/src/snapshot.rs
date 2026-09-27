@@ -1556,6 +1556,10 @@ mod tests {
         assert_eq!(skipped.len(), 2000);
     }
 
+    fn past_a_clock_tick() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
     fn cached_snapshot(setup: &Setup, cache: &mut SnapshotCache) -> Snapshot {
         setup
             .store
@@ -1568,6 +1572,7 @@ mod tests {
         let setup = setup();
         let commit = default_base(&setup.store);
         checkout(&setup, commit);
+        past_a_clock_tick();
         let mut cache = SnapshotCache::default();
         let first = cached_snapshot(&setup, &mut cache);
         assert_eq!(first.read, 4);
@@ -1581,6 +1586,7 @@ mod tests {
     fn only_edited_files_are_read_again() {
         let setup = setup();
         let path = checkout(&setup, default_base(&setup.store));
+        past_a_clock_tick();
         let mut cache = SnapshotCache::default();
         cached_snapshot(&setup, &mut cache);
         fs::write(path.join("README.md"), b"edited\n").unwrap();
@@ -1623,9 +1629,11 @@ mod tests {
             ],
         );
         let path = checkout(&setup, commit);
+        past_a_clock_tick();
         let mut cache = SnapshotCache::default();
         cached_snapshot(&setup, &mut cache);
         fs::write(path.join("sub/.gitattributes"), b"*.txt ident\n").unwrap();
+        past_a_clock_tick();
         assert_eq!(cached_snapshot(&setup, &mut cache).read, 2);
         assert_eq!(cached_snapshot(&setup, &mut cache).read, 0);
     }
