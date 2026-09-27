@@ -71,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_signal_at_the_passphrase_prompt_turns_echo_back_on() {
+    fn an_interrupt_at_the_passphrase_prompt_turns_echo_back_on() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         fs::create_dir(&home).unwrap();
@@ -97,7 +97,7 @@ mod tests {
         };
         assert!(!echo(&terminal));
         let pid = rustix::process::Pid::from_raw(i32::try_from(mahi.id()).unwrap()).unwrap();
-        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let mut rest = Vec::new();
@@ -112,11 +112,11 @@ mod tests {
             if std::time::Instant::now() > deadline {
                 let report = diagnose(mahi.id(), &receiver);
                 mahi.kill().unwrap();
-                panic!("mahi kept running after SIGTERM\n{report}");
+                panic!("mahi kept running after SIGINT\n{report}");
             }
             thread::sleep(Duration::from_millis(50));
         };
-        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert_eq!(status.signal(), Some(libc::SIGINT));
         assert!(echo(&terminal));
     }
 
