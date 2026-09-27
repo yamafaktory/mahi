@@ -239,6 +239,7 @@ fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>) {
     // `Command` installed as standard input.
     unsafe {
         command.pre_exec(move || {
+            crate::window::reset_in_child()?;
             rustix::process::setsid()?;
             if let Some(sandbox) = sandbox.as_mut() {
                 sandbox.enter()
@@ -327,17 +328,16 @@ impl PtyChild {
     ///
     /// Returns [`PtyError::Io`] if the size cannot be set.
     pub fn resize(&self, size: WindowSize) -> Result<(), PtyError> {
-        tcsetwinsize(
-            &self.master,
-            Winsize {
-                ws_row: size.rows,
-                ws_col: size.cols,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            },
-        )
-        .map_err(io::Error::from)?;
-        Ok(())
+        set_size(&self.master, size)
+    }
+
+    /// Returns a handle that changes the terminal's size from another thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PtyError::Io`] if the handle cannot be duplicated.
+    pub fn resizer(&self) -> Result<PtyResizer, PtyError> {
+        Ok(PtyResizer(self.master.try_clone()?))
     }
 
     /// Waits for the program to exit.
@@ -389,6 +389,35 @@ impl Drop for PtyChild {
             let _ = self.child.wait();
         }
     }
+}
+
+/// Changes the size of a program's pseudo-terminal.
+#[derive(Debug)]
+pub struct PtyResizer(File);
+
+impl PtyResizer {
+    /// Changes the terminal's size; the program receives `SIGWINCH`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PtyError::Io`] if the size cannot be set.
+    pub fn resize(&self, size: WindowSize) -> Result<(), PtyError> {
+        set_size(&self.0, size)
+    }
+}
+
+fn set_size(master: &File, size: WindowSize) -> Result<(), PtyError> {
+    tcsetwinsize(
+        master,
+        Winsize {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .map_err(io::Error::from)?;
+    Ok(())
 }
 
 /// Reads what a program writes to its pseudo-terminal.
@@ -492,6 +521,8 @@ mod tests {
             seen.extend_from_slice(&chunk[..read]);
         }
         child
+            .resizer()
+            .unwrap()
             .resize(WindowSize {
                 rows: 40,
                 cols: 100,
@@ -560,6 +591,23 @@ mod tests {
         let result =
             PtyCommand::new(Path::new("/bin/sh"), Path::new("/nonexistent/dir"), SIZE).spawn();
         assert!(matches!(result, Err(PtyError::Spawn(..))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_program_does_not_inherit_an_ignored_window_change_signal() {
+        let previous = crate::window::set_disposition(libc::SIG_IGN).unwrap();
+        let mut child = sh("grep SigIgn /proc/self/status").spawn().unwrap();
+        crate::window::set_disposition(previous).unwrap();
+        let output = output_of(&child);
+        child.wait().unwrap();
+        let mask = output
+            .split_whitespace()
+            .nth(1)
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .unwrap();
+        let window_change = 1_u64 << (libc::SIGWINCH - 1);
+        assert_eq!(mask & window_change, 0, "{output}");
     }
 
     #[test]

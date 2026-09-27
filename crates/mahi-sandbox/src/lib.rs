@@ -15,12 +15,14 @@ compile_error!("the Linux sandbox supports little-endian x86_64 and aarch64 only
 
 mod pty;
 mod sandbox;
+mod window;
 
 pub use pty::{
     PtyChild,
     PtyCommand,
     PtyError,
     PtyReader,
+    PtyResizer,
     WindowSize,
     exit_code,
 };
@@ -28,4 +30,8 @@ pub use sandbox::{
     Access,
     Sandbox,
     SandboxError,
+};
+pub use window::{
+    WindowChanges,
+    WindowError,
 };

@@ -10,14 +10,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+libc = { workspace = true }
 rustix = { workspace = true }
 thiserror = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
-
 [dev-dependencies]
-libc = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
