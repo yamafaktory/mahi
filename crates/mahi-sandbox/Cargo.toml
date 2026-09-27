@@ -1,0 +1,17 @@
+[package]
+authors.workspace = true
+description = "Runs an agent in a pseudo-terminal inside mahi's sandbox; the only crate with unsafe code."
+edition.workspace = true
+license.workspace = true
+name = "mahi-sandbox"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+rustix = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

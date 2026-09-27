@@ -24,12 +24,13 @@ lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-dec
 mahi-core = { path = "crates/mahi-core" }
 mahi-crypto = { path = "crates/mahi-crypto" }
 mahi-identity = { path = "crates/mahi-identity" }
+mahi-sandbox = { path = "crates/mahi-sandbox" }
+mahi-schedule = { path = "crates/mahi-schedule" }
 mahi-store = { path = "crates/mahi-store" }
 mahi-thread = { path = "crates/mahi-thread" }
-mahi-schedule = { path = "crates/mahi-schedule" }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 proptest = "1.11.0"
-rustix = { version = "1.1.5", default-features = false, features = ["event", "fs", "process", "std"] }
+rustix = { version = "1.1.5", default-features = false, features = ["event", "fs", "process", "pty", "std", "termios"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive"] }
 sha2 = { version = "0.10.9", default-features = false }
 signature = "2.2.0"
