@@ -273,12 +273,39 @@ mod tests {
             .expect("this test only runs inside the sandbox")
             .parse()
             .unwrap();
+        assert_eq!(read_by_name(c"kern.boottime"), Err(libc::EPERM));
+        assert_eq!(read_by_name(c"hw.ncpu"), Ok(()));
         assert_eq!(process_arguments(pid), Err(libc::EPERM));
         let target = rustix::process::Pid::from_raw(pid).unwrap();
         assert_eq!(
             rustix::process::test_kill_process(target),
             Err(rustix::io::Errno::PERM)
         );
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "the test checks the sysctl allowlist with the raw call"
+    )]
+    fn read_by_name(name: &std::ffi::CStr) -> Result<(), i32> {
+        let mut buffer = [0_u8; 64];
+        let mut length = buffer.len();
+        // SAFETY: `name` is NUL-terminated, `buffer` has `length` writable bytes, and no new
+        // value is passed.
+        let result = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &raw mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
     }
 
     #[expect(
