@@ -37,6 +37,11 @@ use rustix::{
         OpenTreeFlags,
         UnmountFlags,
     },
+    net::{
+        AddressFamily,
+        SocketFlags,
+        SocketType,
+    },
     thread::{
         CapabilitiesSecureBits,
         CapabilitySet,
@@ -174,6 +179,7 @@ impl Plan {
         }
         process::die_with(&monitor)?;
         drop(monitor);
+        bring_up_loopback()?;
         self.build_root()?;
         if let Forked::Parent(agent) = process::fork()? {
             process::reap_all_until(agent);
@@ -198,6 +204,7 @@ impl Plan {
             mount.attach()?;
         }
         make_dev()?;
+        write_file(c"/proc/sys/user/max_user_namespaces", b"0")?;
         restrict_proc()?;
         for link in &self.links {
             let (parent, name) = open_parent(&link.names)?;
@@ -463,9 +470,45 @@ fn unshare_namespaces() -> io::Result<()> {
     // file descriptors, and the forked child that calls this has a single thread.
     unsafe {
         rustix::thread::unshare_unsafe(
-            UnshareFlags::NEWUSER | UnshareFlags::NEWNS | UnshareFlags::NEWPID,
+            UnshareFlags::NEWUSER
+                | UnshareFlags::NEWNS
+                | UnshareFlags::NEWPID
+                | UnshareFlags::NEWNET,
         )?;
     };
+    Ok(())
+}
+
+#[expect(
+    unsafe_code,
+    reason = "rustix has no ioctl for interface flags, so the request is made through libc"
+)]
+fn bring_up_loopback() -> io::Result<()> {
+    let socket = rustix::net::socket_with(
+        AddressFamily::INET,
+        SocketType::DGRAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    let mut request = libc::ifreq {
+        ifr_name: [0; libc::IFNAMSIZ],
+        ifr_ifru: libc::__c_anonymous_ifr_ifru { ifru_flags: 0 },
+    };
+    for (slot, byte) in request.ifr_name.iter_mut().zip(b"lo") {
+        *slot = libc::c_char::from_ne_bytes([*byte]);
+    }
+    let up = libc::c_short::try_from(libc::IFF_UP).map_err(|_| Errno::INVAL)?;
+    // SAFETY: `request` is a valid `ifreq` with a NUL-terminated name that outlives both calls,
+    // the socket is open, and these requests only read and write the flags in `request`.
+    unsafe {
+        if libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFFLAGS, &raw mut request) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        request.ifr_ifru.ifru_flags |= up;
+        if libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFFLAGS, &raw const request) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     Ok(())
 }
 

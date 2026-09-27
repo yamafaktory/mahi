@@ -10,6 +10,12 @@ mod tests {
             Read,
             Write,
         },
+        net::{
+            SocketAddr,
+            TcpListener,
+            TcpStream,
+        },
+        os::unix::net::UnixListener,
         path::Path,
         process::Command,
         sync::mpsc,
@@ -39,12 +45,14 @@ mod tests {
     const SIZE: WindowSize = WindowSize { rows: 24, cols: 80 };
 
     fn run(sandbox: Sandbox, cwd: &Path, script: &str) -> (i32, String) {
-        let mut child = PtyCommand::new(Path::new("/bin/sh"), cwd, SIZE)
+        let command = PtyCommand::new(Path::new("/bin/sh"), cwd, SIZE)
             .arg("-c")
-            .arg(script)
-            .sandbox(sandbox)
-            .spawn()
-            .unwrap();
+            .arg(script);
+        run_command(command.sandbox(sandbox))
+    }
+
+    fn run_command(command: PtyCommand) -> (i32, String) {
+        let mut child = command.spawn().unwrap();
         let mut reader = child.reader().unwrap();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -407,6 +415,70 @@ mod tests {
         }
         println!("watcher={}", child.id());
         std::mem::forget(child);
+    }
+
+    #[test]
+    fn the_agent_has_loopback_and_no_other_network() {
+        let host = tempfile::tempdir().unwrap();
+        let socket = host.path().join("host.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut sandbox = Sandbox::system().unwrap();
+        sandbox.bind(&exe, Access::ReadOnly).unwrap();
+        let (code, output) = run_command(
+            PtyCommand::new(&exe, Path::new("/"), SIZE)
+                .arg("--exact")
+                .arg("tests::the_agent_has_loopback_and_no_other_network_inner")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("MAHI_HOST_SOCKET", &socket)
+                .sandbox(sandbox),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("1 passed"), "{output}");
+    }
+
+    #[test]
+    #[ignore = "run inside the sandbox by the_agent_has_loopback_and_no_other_network"]
+    fn the_agent_has_loopback_and_no_other_network_inner() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let outside = TcpStream::connect_timeout(
+            &SocketAddr::from(([1, 1, 1, 1], 53)),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            outside.unwrap_err().kind(),
+            std::io::ErrorKind::NetworkUnreachable
+        );
+        let interfaces = fs::read_to_string("/proc/net/dev").unwrap();
+        assert!(
+            interfaces
+                .lines()
+                .any(|line| line.trim_start().starts_with("lo:")),
+            "{interfaces}"
+        );
+        let routes = fs::read_to_string("/proc/net/route").unwrap();
+        assert_eq!(routes.lines().count(), 1, "{routes}");
+        let host_socket =
+            std::env::var("MAHI_HOST_SOCKET").expect("this test only runs inside the sandbox");
+        let unix = fs::read_to_string("/proc/net/unix").unwrap();
+        assert!(!unix.contains(&host_socket), "{unix}");
+    }
+
+    #[test]
+    fn the_agent_cannot_create_nested_user_namespaces() {
+        let (code, output) = run(
+            Sandbox::system().unwrap(),
+            Path::new("/"),
+            "command -v unshare >/dev/null || echo missing-unshare; \
+             unshare --user true 2>&1 && echo nested-userns; echo done",
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("done"), "{output}");
+        assert!(!output.contains("missing-unshare"), "{output}");
+        assert!(!output.contains("nested-userns"), "{output}");
+        assert!(output.contains("No space left on device"), "{output}");
     }
 
     fn spawn_errno(result: Result<PtyChild, PtyError>) -> Errno {
