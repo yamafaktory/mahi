@@ -1,0 +1,28 @@
+[package]
+authors.workspace = true
+description = "A pure-Rust rustls crypto provider for mahi's QUIC and TLS 1.3 connections."
+edition.workspace = true
+license.workspace = true
+name = "mahi-tls"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+aes = { workspace = true }
+aes-gcm = { workspace = true }
+chacha20 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+ghash = { workspace = true }
+hmac = { workspace = true }
+polyval = { workspace = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+x25519-dalek = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true
