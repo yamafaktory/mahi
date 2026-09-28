@@ -90,6 +90,37 @@ impl Pins {
         self.accept_hash(meta.thread(), meta.generation(), meta.body_hash())
     }
 
+    /// Runs `remove_thread` and then removes `thread`'s pin, all under the pin's lock, but only
+    /// while the pin is missing or still at generation 0.
+    ///
+    /// A pin past generation 0 means the thread has been used, so nothing is removed and
+    /// [`PinError::Rollback`] is returned.
+    pub(crate) fn forget_new<E: From<PinError>>(
+        &self,
+        thread: ThreadId,
+        remove_thread: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let path = self.path(thread);
+        let lock = self.lock(&path)?;
+        if let Some((pinned, _)) = read_pin(&path, thread)?
+            && pinned != 0
+        {
+            return Err(PinError::Rollback { pinned, found: 0 }.into());
+        }
+        remove_thread()?;
+        match fs::remove_file(&path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(PinError::from(error).into());
+            }
+            _ => {}
+        }
+        File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(PinError::from)?;
+        drop(lock);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn get(&self, thread: ThreadId) -> Result<Option<(u64, [u8; 32])>, PinError> {
         read_pin(&self.path(thread), thread)
@@ -99,15 +130,9 @@ impl Pins {
         self.dir.join(thread.to_string())
     }
 
-    fn accept_hash(
-        &self,
-        thread: ThreadId,
-        generation: u64,
-        hash: [u8; 32],
-    ) -> Result<(), PinError> {
-        let path = self.path(thread);
-        let mut lock = gix_lock::File::acquire_to_update_resource(
-            &path,
+    fn lock(&self, path: &Path) -> Result<gix_lock::File, PinError> {
+        gix_lock::File::acquire_to_update_resource(
+            path,
             Fail::AfterDurationWithBackoff(LOCK_TIMEOUT),
             Some(self.boundary.clone()),
         )
@@ -118,7 +143,17 @@ impl Pins {
             } else {
                 PinError::Io(io::Error::other(error.to_string()))
             }
-        })?;
+        })
+    }
+
+    fn accept_hash(
+        &self,
+        thread: ThreadId,
+        generation: u64,
+        hash: [u8; 32],
+    ) -> Result<(), PinError> {
+        let path = self.path(thread);
+        let mut lock = self.lock(&path)?;
 
         if let Some((pinned, pinned_hash)) = read_pin(&path, thread)? {
             if generation < pinned {

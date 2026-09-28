@@ -28,7 +28,7 @@ pub const META_ENTRY: &str = "meta";
 
 const META_MESSAGE: &str = "meta";
 
-/// Creating a thread or loading its meta document failed.
+/// Creating, discarding or loading a thread failed.
 #[derive(Debug, Error)]
 pub enum ThreadError {
     /// Reading or writing the repository failed.
@@ -103,6 +103,32 @@ pub fn create_thread(
         .accept(&verified)
         .map_err(|source| ThreadError::CreatedButNotPinned { commit, source })?;
     Ok(commit)
+}
+
+/// Discards a thread [`create_thread`] just created and nobody has used: deletes its `meta`
+/// ref and its pin.
+///
+/// `created` is the `meta` commit [`create_thread`] returned. Nothing is deleted if the ref
+/// has moved since, or if the pin has moved past generation 0, so a thread that anyone has
+/// built on is never discarded and a pinned newer generation is never forgotten.
+///
+/// # Errors
+///
+/// Returns [`ThreadError::Store`] with [`StoreError::Conflict`] if the `meta` ref does not
+/// point at `created`, including when it no longer exists, [`ThreadError::Pin`] with
+/// [`PinError::Rollback`] if the pin is past generation 0, another [`ThreadError::Pin`] if the
+/// pin cannot be locked or removed (the ref may already be gone), or another
+/// [`ThreadError::Store`] if deleting the ref fails.
+pub fn discard_thread(
+    store: &Store,
+    thread: ThreadId,
+    created: ObjectId,
+) -> Result<(), ThreadError> {
+    Pins::new(store).forget_new(thread, || {
+        store
+            .remove(&ThreadRef::new(thread, RefKind::Meta), created)
+            .map_err(ThreadError::from)
+    })
 }
 
 /// Loads `thread`'s current meta document, checks that `trusted_owner` signed it, and checks it
@@ -230,6 +256,119 @@ mod tests {
             Pins::new(&setup.store).get(setup.thread).unwrap(),
             Some((0, meta.body_hash()))
         );
+    }
+
+    #[test]
+    fn a_discarded_thread_leaves_no_ref_or_pin() {
+        let setup = setup();
+        let created = create_thread(
+            &setup.store,
+            &draft(&setup, 0, "t"),
+            &ThreadKey::generate(),
+            &setup.owner,
+        )
+        .unwrap();
+        discard_thread(&setup.store, setup.thread, created).unwrap();
+        assert!(matches!(
+            load_meta(&setup.store, setup.thread, &setup.owner_key, 0),
+            Err(ThreadError::NotFound(_))
+        ));
+        assert_eq!(Pins::new(&setup.store).get(setup.thread).unwrap(), None);
+    }
+
+    #[test]
+    fn a_thread_that_moved_on_is_not_discarded() {
+        let setup = setup();
+        let thread_key = ThreadKey::generate();
+        let created = create_thread(
+            &setup.store,
+            &draft(&setup, 0, "t"),
+            &thread_key,
+            &setup.owner,
+        )
+        .unwrap();
+        let encoded = draft(&setup, 1, "u")
+            .sign(&thread_key, &setup.owner)
+            .unwrap();
+        put_meta(&setup, &encoded);
+        let pinned = Pins::new(&setup.store).get(setup.thread).unwrap();
+        assert!(matches!(
+            discard_thread(&setup.store, setup.thread, created),
+            Err(ThreadError::Store(StoreError::Conflict { .. }))
+        ));
+        assert_eq!(Pins::new(&setup.store).get(setup.thread).unwrap(), pinned);
+        assert_eq!(
+            load_meta(&setup.store, setup.thread, &setup.owner_key, 0)
+                .unwrap()
+                .generation(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_thread_pinned_past_its_first_generation_is_not_discarded() {
+        let setup = setup();
+        let thread_key = ThreadKey::generate();
+        let created = create_thread(
+            &setup.store,
+            &draft(&setup, 0, "t"),
+            &thread_key,
+            &setup.owner,
+        )
+        .unwrap();
+        let meta_ref = ThreadRef::new(setup.thread, RefKind::Meta);
+        let encoded = draft(&setup, 1, "u")
+            .sign(&thread_key, &setup.owner)
+            .unwrap();
+        put_meta(&setup, &encoded);
+        let newer = load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
+        gix::open(setup.store.common_dir())
+            .unwrap()
+            .reference(
+                meta_ref.to_string().as_str(),
+                created,
+                gix::refs::transaction::PreviousValue::Any,
+                "rolled back",
+            )
+            .unwrap();
+        assert!(matches!(
+            discard_thread(&setup.store, setup.thread, created),
+            Err(ThreadError::Pin(PinError::Rollback {
+                pinned: 1,
+                found: 0
+            }))
+        ));
+        assert_eq!(setup.store.head(&meta_ref).unwrap(), Some(created));
+        assert_eq!(
+            Pins::new(&setup.store).get(setup.thread).unwrap(),
+            Some((1, newer.body_hash()))
+        );
+    }
+
+    #[test]
+    fn an_unpinned_or_missing_thread_is_handled() {
+        let setup = setup();
+        let created = create_thread(
+            &setup.store,
+            &draft(&setup, 0, "t"),
+            &ThreadKey::generate(),
+            &setup.owner,
+        )
+        .unwrap();
+        std::fs::remove_file(
+            setup
+                .store
+                .common_dir()
+                .join("mahi/pins")
+                .join(setup.thread.to_string()),
+        )
+        .unwrap();
+        discard_thread(&setup.store, setup.thread, created).unwrap();
+        assert_eq!(Pins::new(&setup.store).get(setup.thread).unwrap(), None);
+        assert!(matches!(
+            discard_thread(&setup.store, setup.thread, created),
+            Err(ThreadError::Store(StoreError::Conflict { found: None, .. }))
+        ));
     }
 
     #[test]

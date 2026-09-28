@@ -30,6 +30,7 @@ pub use thread::{
     META_ENTRY,
     ThreadError,
     create_thread,
+    discard_thread,
     load_meta,
 };
 pub use transcript::{
