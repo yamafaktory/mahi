@@ -2047,12 +2047,15 @@ name = "mahi"
 version = "0.1.0"
 dependencies = [
  "age",
+ "base64",
  "clap",
+ "getrandom 0.4.3",
  "gix",
  "libc",
  "mahi-core",
  "mahi-crypto",
  "mahi-identity",
+ "mahi-proxy",
  "mahi-sandbox",
  "mahi-schedule",
  "mahi-store",

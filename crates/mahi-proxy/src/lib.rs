@@ -12,6 +12,7 @@ pub use host::{
 };
 pub use proxy::{
     Connector,
+    PROXY_USER,
     Proxy,
     ProxyToken,
     PublicConnector,

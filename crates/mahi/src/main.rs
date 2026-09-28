@@ -4,6 +4,7 @@ mod cli;
 mod environment;
 mod hook;
 mod init;
+mod network;
 mod prompt;
 mod recorder;
 mod run;
@@ -33,7 +34,11 @@ use crate::{
 
 fn main() {
     let cli = Cli::parse();
-    let environment = Environment::read();
+    let pass_env = match &cli.command {
+        Command::Run(command) => command.pass_env(),
+        _ => &[],
+    };
+    let environment = Environment::read(pass_env);
     let code = match cli.command {
         Command::Init => match TerminalPrompt::open()
             .map_err(InitError::Prompt)

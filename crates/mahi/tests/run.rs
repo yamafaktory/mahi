@@ -8,6 +8,11 @@ mod tests {
             Read,
             Write,
         },
+        net::{
+            SocketAddr,
+            TcpListener,
+            TcpStream,
+        },
         os::unix::{
             fs::PermissionsExt,
             net::UnixListener,
@@ -30,6 +35,10 @@ mod tests {
         },
     };
 
+    use base64::{
+        Engine,
+        engine::general_purpose::STANDARD,
+    };
     use gix::{
         ObjectId,
         date::Time,
@@ -338,6 +347,139 @@ mod tests {
         assert_eq!(turns.len(), 2, "{stderr}");
         assert_eq!(texts(&turns[0]), ["prompt\nfix it", "tool\n", "turn-end\n"]);
         assert_eq!(texts(&turns[1]), ["prompt\nagain"]);
+    }
+
+    #[test]
+    fn a_named_variable_reaches_the_agent_and_a_missing_one_stops_mahi() {
+        let fixture = fixture();
+        let output = fixture
+            .command(&[
+                "run",
+                "--pass-env",
+                "MAHI_TEST_TOKEN",
+                "sh",
+                "-c",
+                "echo token=$MAHI_TEST_TOKEN; echo secret=$MAHI_TEST_SECRET",
+            ])
+            .env("MAHI_TEST_TOKEN", "t0ken")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(0), "{stdout}");
+        assert!(stdout.contains("token=t0ken"), "{stdout}");
+        assert!(
+            stdout.contains("secret=\r") || stdout.contains("secret=\n"),
+            "{stdout}"
+        );
+        let threads = fixture.threads();
+        assert_eq!(threads.len(), 2, "{threads:?}");
+
+        let missing = fixture.mahi(&["run", "--pass-env", "MAHI_TEST_MISSING", "true"]);
+        assert_eq!(missing.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("MAHI_TEST_MISSING is not set"));
+        let reserved = fixture.mahi(&["run", "--pass-env", "HTTPS_PROXY", "true"]);
+        assert_eq!(reserved.status.code(), Some(2));
+        assert_eq!(fixture.threads(), threads);
+    }
+
+    #[test]
+    fn the_agent_reaches_only_allowed_hosts_through_the_proxy() {
+        let fixture = fixture();
+        let host = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_port = host.local_addr().unwrap().port().to_string();
+        let exe = std::env::current_exe().unwrap();
+        let output = fixture
+            .command(&[
+                "run",
+                "--allow-host",
+                "allowed.invalid",
+                "--pass-env",
+                "MAHI_TEST_HOST_PORT",
+                exe.to_str().unwrap(),
+                "--exact",
+                "tests::the_agent_reaches_only_allowed_hosts_through_the_proxy_inner",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MAHI_TEST_HOST_PORT", &host_port)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+    }
+
+    fn connect_through(proxy: &str, target: &str) -> String {
+        let (credentials, address) = match proxy.split_once('@') {
+            Some((credentials, address)) => (Some(credentials), address),
+            None => (None, proxy),
+        };
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let authorization = credentials.map_or_else(String::new, |credentials| {
+            format!(
+                "Proxy-Authorization: Basic {}\r\n",
+                STANDARD.encode(credentials)
+            )
+        });
+        let request = format!("CONNECT {target} HTTP/1.1\r\n{authorization}\r\n");
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        let mut byte = [0_u8; 1];
+        while !response.ends_with("\r\n") && stream.read(&mut byte).unwrap() == 1 {
+            response.push(char::from(byte[0]));
+        }
+        response.trim_end().to_owned()
+    }
+
+    #[test]
+    #[ignore = "run inside the sandbox by the_agent_reaches_only_allowed_hosts_through_the_proxy"]
+    fn the_agent_reaches_only_allowed_hosts_through_the_proxy_inner() {
+        let proxy = std::env::var("HTTPS_PROXY").expect("mahi sets the proxy");
+        assert_eq!(std::env::var("https_proxy").unwrap(), proxy);
+        let proxy = proxy.strip_prefix("http://").unwrap().to_owned();
+        assert_eq!(
+            connect_through(&proxy, "blocked.example.com:443"),
+            "HTTP/1.1 403 Forbidden"
+        );
+        assert_eq!(
+            connect_through(&proxy, "allowed.invalid:80"),
+            "HTTP/1.1 403 Forbidden"
+        );
+        assert_eq!(
+            connect_through(&proxy, "allowed.invalid:443"),
+            "HTTP/1.1 502 Bad Gateway"
+        );
+        let host_port: u16 = std::env::var("MAHI_TEST_HOST_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        for direct in [
+            SocketAddr::from(([127, 0, 0, 1], host_port)),
+            SocketAddr::from(([1, 1, 1, 1], 443)),
+        ] {
+            assert!(
+                TcpStream::connect_timeout(&direct, Duration::from_secs(3)).is_err(),
+                "{direct}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_allowed_hosts_the_agent_has_no_proxy() {
+        let fixture = fixture();
+        let output = fixture.mahi(&[
+            "run",
+            "sh",
+            "-c",
+            "echo proxy=${HTTPS_PROXY:-none}${https_proxy:-none}",
+        ]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(0), "{stdout}");
+        assert!(stdout.contains("proxy=nonenone"), "{stdout}");
     }
 
     #[test]
@@ -723,7 +865,7 @@ mod tests {
         assert!(run_help.status.success());
         let run_help_text = String::from_utf8_lossy(&run_help.stdout);
         assert!(
-            run_help_text.contains("Usage: mahi run <AGENT>"),
+            run_help_text.contains("Usage: mahi run [OPTIONS] <AGENT>"),
             "{run_help_text}"
         );
         let version = fixture.mahi(&["--version"]);

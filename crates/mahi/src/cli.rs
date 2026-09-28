@@ -8,8 +8,12 @@ use clap::{
     Parser,
     Subcommand,
 };
+use mahi_proxy::HostName;
 
-use crate::hook::HookKind;
+use crate::{
+    environment::EnvName,
+    hook::HookKind,
+};
 
 const EXIT_CODES: &str = "\
 Exit codes: mahi run exits with the agent's exit code, or 128 plus the signal that ended it.
@@ -44,6 +48,14 @@ pub(crate) struct HookCommand {
 #[derive(Debug, Args, PartialEq, Eq)]
 #[command(after_help = "Piped input reaches the agent through its terminal, as lines of text.")]
 pub(crate) struct RunCommand {
+    /// A host the agent may reach over HTTPS, through mahi's proxy; repeat it for several.
+    /// Without one, the agent has no network.
+    #[arg(long = "allow-host", value_name = "HOST")]
+    allow_hosts: Vec<HostName>,
+    /// An environment variable passed on to the agent unchanged, such as the token it signs
+    /// in with; repeat it for several. mahi never interprets or shows its value.
+    #[arg(long = "pass-env", value_name = "NAME")]
+    pass_env: Vec<EnvName>,
     /// The agent to run, looked up on PATH unless it contains a slash, then the arguments
     /// passed to it unchanged.
     #[arg(
@@ -66,6 +78,14 @@ impl RunCommand {
     pub(crate) fn arguments(&self) -> &[OsString] {
         self.command.get(1..).unwrap_or_default()
     }
+
+    pub(crate) fn allow_hosts(&self) -> &[HostName] {
+        &self.allow_hosts
+    }
+
+    pub(crate) fn pass_env(&self) -> &[EnvName] {
+        &self.pass_env
+    }
 }
 
 #[cfg(test)]
@@ -84,6 +104,8 @@ mod tests {
     fn run(agent: &str, arguments: &[&str]) -> Cli {
         Cli {
             command: Command::Run(RunCommand {
+                allow_hosts: Vec::new(),
+                pass_env: Vec::new(),
                 command: std::iter::once(agent)
                     .chain(arguments.iter().copied())
                     .map(OsString::from)
@@ -131,6 +153,43 @@ mod tests {
         };
         assert_eq!(command.agent(), odd.as_os_str());
         assert_eq!(command.arguments(), [odd]);
+    }
+
+    #[test]
+    fn hosts_and_passed_variables_come_before_the_agent() {
+        let parsed = parse(&[
+            "run",
+            "--allow-host",
+            "api.example.com",
+            "--pass-env",
+            "TOKEN",
+            "--allow-host",
+            "b.example.com",
+            "claude",
+            "--allow-host",
+            "x",
+        ])
+        .unwrap();
+        let Command::Run(command) = parsed.command else {
+            panic!("expected the run command");
+        };
+        let hosts: Vec<&str> = command.allow_hosts().iter().map(HostName::as_str).collect();
+        assert_eq!(hosts, ["api.example.com", "b.example.com"]);
+        assert_eq!(command.pass_env()[0].as_str(), "TOKEN");
+        assert_eq!(command.agent(), "claude");
+        assert_eq!(command.arguments(), ["--allow-host", "x"]);
+        for bad in [
+            ["run", "--allow-host", "127.0.0.1", "claude"],
+            ["run", "--allow-host", "localhost", "claude"],
+            ["run", "--pass-env", "HOME", "claude"],
+            ["run", "--pass-env", "A=B", "claude"],
+        ] {
+            assert_eq!(
+                parse(&bad).unwrap_err().kind(),
+                ErrorKind::ValueValidation,
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

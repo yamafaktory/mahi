@@ -54,7 +54,8 @@ const LIMITS: Limits = Limits {
     max_connections: 64,
 };
 const ERROR_PAUSE: Duration = Duration::from_millis(50);
-const USER: &str = "mahi";
+/// The user name the agent presents with the proxy password.
+pub const PROXY_USER: &str = "mahi";
 const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n";
 
 /// Opens the connection to an allowed host, deciding which addresses may be used.
@@ -105,7 +106,7 @@ impl ProxyToken {
     /// Creates the token that accepts `password`.
     #[must_use]
     pub fn new(password: &str) -> Self {
-        let credentials = Zeroizing::new(format!("{USER}:{password}"));
+        let credentials = Zeroizing::new(format!("{PROXY_USER}:{password}"));
         let encoded = Zeroizing::new(STANDARD.encode(credentials.as_bytes()));
         let expected = Zeroizing::new(format!("Basic {}", encoded.as_str()));
         Self { expected }

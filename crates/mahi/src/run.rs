@@ -94,11 +94,18 @@ use thiserror::Error;
 use crate::{
     cli::RunCommand,
     environment::{
+        EnvName,
         Environment,
         HOOK_SOCKET,
         MAHI_BIN,
+        PROXY_VARIABLES,
     },
     hook,
+    network::{
+        Network,
+        NetworkError,
+        Running,
+    },
     recorder::{
         RecordError,
         Recorder,
@@ -195,6 +202,10 @@ pub(crate) enum RunError {
     ParticipantName(#[source] NameError),
     #[error("cannot open the git repository")]
     Store(#[from] StoreError),
+    #[error("{0} is not set, so it cannot be passed on to the agent")]
+    MissingVariable(EnvName),
+    #[error("cannot set up the agent's network")]
+    Network(#[from] NetworkError),
     #[error("cannot start the thread")]
     Start(#[from] StartError),
 }
@@ -245,6 +256,13 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let store = Store::discover(&cwd)?;
     let agent = resolve(command.agent(), &cwd, environment.path.as_deref())?;
     require_program(&agent.canonical)?;
+    if let Some((name, _)) = environment
+        .pass_env
+        .iter()
+        .find(|(_, value)| value.is_none())
+    {
+        return Err(RunError::MissingVariable(name.clone()));
+    }
     let agent_name = session::agent_from(Path::new(command.agent()));
     let git_dir = fs::canonicalize(store.common_dir()).map_err(RunError::GitDirectory)?;
     if host.is_private(&git_dir) {
@@ -261,6 +279,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let hook_socket = scratch_path.join(HOOK_SOCKET_NAME);
     let hooks = UnixListener::bind(&hook_socket).map_err(RunError::Scratch)?;
     let sandbox = Sandbox::system()?;
+    let network = Network::prepare(command.allow_hosts())?;
     let globals = environment.git_patterns();
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
     let (started, caught) = until_stopped(&termination, |interrupt| {
@@ -298,9 +317,9 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         hook_socket: &hook_socket,
         host: &host,
     };
-    let (child, raw) = started.launch(&store, || launch.spawn(sandbox))?;
+    let (child, raw, proxy) = started.launch(&store, || launch.spawn(sandbox, network))?;
     let (recorder, turns) = start_background(&mut started, &git_dir, globals, hooks);
-    finish_run(child, raw, termination, recorder, turns)
+    finish_run(child, raw, termination, recorder, turns, proxy)
 }
 
 fn start_background(
@@ -367,6 +386,7 @@ fn finish_run(
     termination: TerminationSignals,
     recorder: Option<Recorder>,
     turns: Option<TurnWorker>,
+    proxy: Option<Running>,
 ) -> Result<Outcome, RunError> {
     let (code, received) = supervise(child, raw, termination);
     if matches!(code, Ok(Outcome::Stopped(_))) {
@@ -376,6 +396,9 @@ fn finish_run(
     let (caught, stopped) = mpsc::channel();
     thread::spawn(move || stop_on_signal(&received, abandon.as_deref(), &caught));
     finish_turns(turns);
+    for error in proxy.into_iter().flat_map(Running::stopped) {
+        eprintln!("mahi: the proxy stopped serving the agent: {error}");
+    }
     match recorder.map(Recorder::finish) {
         Some(Ok(skipped)) if skipped > 0 => {
             eprintln!("mahi: the last snapshot left out {skipped} paths it could not record");
@@ -476,7 +499,11 @@ struct Launch<'a> {
 }
 
 impl Launch<'_> {
-    fn spawn(&self, mut sandbox: Sandbox) -> Result<(PtyChild, Option<RawMode>), RunError> {
+    fn spawn(
+        &self,
+        mut sandbox: Sandbox,
+        network: Option<Network>,
+    ) -> Result<(PtyChild, Option<RawMode>, Option<Running>), RunError> {
         let git_file = self.worktree.join(".git");
         for (path, access) in binds(
             self.worktree,
@@ -501,6 +528,9 @@ impl Launch<'_> {
             }
         }
         sandbox.allow_connect(self.hook_socket)?;
+        if let Some(network) = &network {
+            sandbox.open_loopback_port(network.port())?;
+        }
         let mut pty = PtyCommand::new(&self.agent.program, self.worktree, terminal::size());
         for argument in self.command.arguments() {
             pty = pty.arg(argument);
@@ -515,10 +545,23 @@ impl Launch<'_> {
         if let Some(mahi) = &self.environment.mahi_exe {
             pty = pty.env(MAHI_BIN, mahi);
         }
+        for (name, value) in &self.environment.pass_env {
+            if let Some(value) = value {
+                pty = pty.env(name.as_str(), OsStr::from_bytes(value));
+            }
+        }
+        if let Some(network) = &network {
+            for variable in PROXY_VARIABLES {
+                pty = pty.env(variable, network.url());
+            }
+        }
         let pty = pty.sandbox(sandbox);
         let raw = RawMode::enable().map_err(RunError::Terminal)?;
-        let child = pty.spawn()?;
-        Ok((child, raw))
+        let mut child = pty.spawn()?;
+        let proxy = network
+            .map(|network| network.start(child.take_loopback_listener()))
+            .transpose()?;
+        Ok((child, raw, proxy))
     }
 }
 
