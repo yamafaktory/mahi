@@ -127,6 +127,12 @@ impl Profile {
                 )?;
             }
         }
+        if let Some(port) = sandbox.loopback_port {
+            push_rule(
+                &mut source,
+                format_args!("(allow network-outbound (remote ip \"localhost:{port}\"))"),
+            )?;
+        }
         for socket in &sandbox.sockets {
             push_rule(
                 &mut source,
@@ -267,6 +273,19 @@ mod tests {
             socket.display()
         );
         assert!(profile.source().to_str().unwrap().contains(&rule));
+    }
+
+    #[test]
+    fn only_the_opened_loopback_port_can_be_reached() {
+        let (_dir, _work, mut sandbox) = nested_policy();
+        sandbox.open_loopback_port(3128).unwrap();
+        let profile = Profile::new(&sandbox, Path::new("/dev/ttys000")).unwrap();
+        let source = profile.source().to_str().unwrap();
+        assert!(
+            source.contains("(allow network-outbound (remote ip \"localhost:3128\"))"),
+            "{source}"
+        );
+        assert_eq!(source.matches("remote ip").count(), 1, "{source}");
     }
 
     #[test]

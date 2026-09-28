@@ -49,6 +49,7 @@ pub struct Sandbox {
     binds: Vec<Bind>,
     links: Vec<Link>,
     sockets: Vec<PathBuf>,
+    loopback_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +96,9 @@ pub enum SandboxError {
     /// The path is not inside a bound path, so the agent could not reach it.
     #[error("{} is not inside a bound path", .0.display())]
     NotBound(PathBuf),
+    /// The loopback port is 0, or a second one was asked for.
+    #[error("cannot open loopback port {0} for the agent")]
+    LoopbackPort(u16),
     /// Inspecting a host system path failed.
     #[error("cannot inspect {}", .0.display())]
     Inspect(PathBuf, #[source] io::Error),
@@ -174,6 +178,26 @@ impl Sandbox {
             return Err(SandboxError::NotBound(path.to_path_buf()));
         }
         self.sockets.push(path.to_path_buf());
+        Ok(self)
+    }
+
+    /// Lets the agent reach the caller at `127.0.0.1:port`.
+    ///
+    /// On Linux the agent's network namespace has its own loopback, so the sandbox creates a
+    /// socket listening there, on `port`, and hands it back through
+    /// `PtyChild::take_loopback_listener`: the caller accepts the agent's connections on it from
+    /// outside. On macOS the agent shares the host's loopback, so the Seatbelt profile allows
+    /// connecting to `port` there and nowhere else on localhost, and the caller listens on the
+    /// host's `127.0.0.1:port` itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::LoopbackPort`] if `port` is 0 or a port was already opened.
+    pub fn open_loopback_port(&mut self, port: u16) -> Result<&mut Self, SandboxError> {
+        if port == 0 || self.loopback_port.is_some() {
+            return Err(SandboxError::LoopbackPort(port));
+        }
+        self.loopback_port = Some(port);
         Ok(self)
     }
 
@@ -260,6 +284,20 @@ mod tests {
         assert!(matches!(
             sandbox.allow_connect(Path::new("/scratch/../x.sock")),
             Err(SandboxError::NotPlain(_))
+        ));
+    }
+
+    #[test]
+    fn one_nonzero_loopback_port_can_be_opened() {
+        let mut sandbox = Sandbox::new();
+        assert!(matches!(
+            sandbox.open_loopback_port(0),
+            Err(SandboxError::LoopbackPort(0))
+        ));
+        sandbox.open_loopback_port(3128).unwrap();
+        assert!(matches!(
+            sandbox.open_loopback_port(3129),
+            Err(SandboxError::LoopbackPort(3129))
         ));
     }
 

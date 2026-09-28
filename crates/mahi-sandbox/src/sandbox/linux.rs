@@ -7,7 +7,17 @@ use std::{
         CStr,
         CString,
     },
-    io,
+    io::{
+        self,
+        IoSlice,
+        IoSliceMut,
+    },
+    mem::MaybeUninit,
+    net::{
+        Ipv4Addr,
+        SocketAddrV4,
+        TcpListener,
+    },
     os::{
         fd::{
             AsFd,
@@ -24,6 +34,11 @@ use std::{
 };
 
 use rustix::{
+    event::{
+        PollFd,
+        PollFlags,
+        Timespec,
+    },
     fs::{
         CWD,
         FileType,
@@ -41,6 +56,12 @@ use rustix::{
     },
     net::{
         AddressFamily,
+        RecvAncillaryBuffer,
+        RecvAncillaryMessage,
+        RecvFlags,
+        SendAncillaryBuffer,
+        SendAncillaryMessage,
+        SendFlags,
         SocketFlags,
         SocketType,
     },
@@ -94,6 +115,11 @@ const PROC_MASKED: [&CStr; 12] = [
     c"/proc/timer_stats",
     c"/proc/vmallocinfo",
 ];
+const LISTEN_BACKLOG: i32 = 128;
+const HAND_OVER_WAIT: Timespec = Timespec {
+    tv_sec: 10,
+    tv_nsec: 0,
+};
 const LOCKED_DOWN: u64 = libc::MOUNT_ATTR_RDONLY
     | libc::MOUNT_ATTR_NOSUID
     | libc::MOUNT_ATTR_NODEV
@@ -110,6 +136,14 @@ pub(crate) struct Plan {
     landlock: Landlock,
     filter: Filter,
     cwd: CString,
+    loopback: Option<Loopback>,
+    receiver: Option<OwnedFd>,
+}
+
+#[derive(Debug)]
+struct Loopback {
+    port: u16,
+    sender: OwnedFd,
 }
 
 #[derive(Debug)]
@@ -159,6 +193,18 @@ impl Plan {
                 libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV | read_only,
             )
         });
+        let (loopback, receiver) = match sandbox.loopback_port {
+            Some(port) => {
+                let (sender, receiver) = rustix::net::socketpair(
+                    AddressFamily::UNIX,
+                    SocketType::STREAM,
+                    SocketFlags::CLOEXEC,
+                    None,
+                )?;
+                (Some(Loopback { port, sender }), Some(receiver))
+            }
+            None => (None, None),
+        };
         let links = sandbox
             .links
             .iter()
@@ -177,6 +223,8 @@ impl Plan {
             landlock: Landlock::new(full_access),
             filter: Filter::new()?,
             cwd: c_path(cwd)?,
+            loopback,
+            receiver,
         })
     }
 
@@ -197,6 +245,9 @@ impl Plan {
         process::die_with(&monitor)?;
         drop(monitor);
         bring_up_loopback()?;
+        if let Some(loopback) = &self.loopback {
+            hand_over_listener(loopback)?;
+        }
         self.build_root()?;
         if let Forked::Parent(agent) = process::fork()? {
             process::reap_all_until(agent);
@@ -207,6 +258,12 @@ impl Plan {
         self.landlock.restrict_self()?;
         mark_inherited_fds_close_on_exec()?;
         self.filter.install()
+    }
+
+    /// Takes the end of the socket pair on which the sandbox sends back the loopback listener,
+    /// so the caller can keep it when the plan moves into the child.
+    pub(crate) fn take_receiver(&mut self) -> Option<OwnedFd> {
+        self.receiver.take()
     }
 
     fn build_root(&mut self) -> io::Result<()> {
@@ -496,6 +553,62 @@ fn unshare_namespaces() -> io::Result<()> {
         )?;
     };
     Ok(())
+}
+
+fn hand_over_listener(loopback: &Loopback) -> io::Result<()> {
+    let listener = rustix::net::socket_with(
+        AddressFamily::INET,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, loopback.port);
+    rustix::net::bind(&listener, &address)?;
+    rustix::net::listen(&listener, LISTEN_BACKLOG)?;
+    let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    let fds = [listener.as_fd()];
+    if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
+        return Err(Errno::NOBUFS.into());
+    }
+    let marker = [0_u8];
+    rustix::net::sendmsg(
+        &loopback.sender,
+        &[IoSlice::new(&marker)],
+        &mut control,
+        SendFlags::NOSIGNAL,
+    )?;
+    Ok(())
+}
+
+/// Receives the loopback listener the sandbox sends back on `receiver` once it is set up.
+pub(crate) fn receive_listener(receiver: &OwnedFd) -> io::Result<TcpListener> {
+    let mut fds = [PollFd::new(receiver, PollFlags::IN)];
+    loop {
+        match rustix::event::poll(&mut fds, Some(&HAND_OVER_WAIT)) {
+            Ok(0) => return Err(Errno::TIMEDOUT.into()),
+            Ok(_) => break,
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let mut marker = [0_u8];
+    rustix::net::recvmsg(
+        receiver,
+        &mut [IoSliceMut::new(&mut marker)],
+        &mut control,
+        RecvFlags::CMSG_CLOEXEC | RecvFlags::DONTWAIT,
+    )?;
+    let listener = control
+        .drain()
+        .find_map(|message| match message {
+            RecvAncillaryMessage::ScmRights(mut fds) => fds.next(),
+            _ => None,
+        })
+        .ok_or(Errno::PROTO)?;
+    Ok(TcpListener::from(listener))
 }
 
 #[expect(

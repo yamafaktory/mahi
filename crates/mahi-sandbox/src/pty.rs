@@ -9,6 +9,7 @@ use std::{
         self,
         Read,
     },
+    net::TcpListener,
     os::{
         fd::{
             BorrowedFd,
@@ -88,6 +89,7 @@ pub struct PtyCommand {
 pub struct PtyChild {
     master: File,
     child: Child,
+    loopback: Option<TcpListener>,
 }
 
 /// Starting or driving a program in a pseudo-terminal failed.
@@ -150,11 +152,12 @@ impl PtyCommand {
     /// [`PtyError::Spawn`] if the program cannot be started or the sandbox cannot be entered.
     pub fn spawn(self) -> Result<PtyChild, PtyError> {
         let (master, slave, terminal) = open_pty(self.size).map_err(PtyError::Open)?;
-        let sandbox = self
+        let mut sandbox = self
             .sandbox
             .as_ref()
             .map(|sandbox| prepare_sandbox(sandbox, &self.program, &self.cwd, &terminal))
             .transpose()?;
+        let receiver = sandbox.as_mut().and_then(take_receiver);
         let stdio = |fd: &OwnedFd| fd.try_clone().map(Stdio::from).map_err(PtyError::Io);
         let mut command = Command::new(&self.program);
         command
@@ -171,11 +174,15 @@ impl PtyCommand {
         let child = command
             .spawn()
             .map_err(|error| PtyError::Spawn(self.program.clone(), error))?;
+        drop(command);
         drop(slave);
-        Ok(PtyChild {
+        PtyChild {
             master: File::from(master),
             child,
-        })
+            loopback: None,
+        }
+        .with_loopback(receiver)
+        .map_err(|error| PtyError::Spawn(self.program.clone(), error))
     }
 }
 
@@ -209,8 +216,18 @@ fn prepare_sandbox(
         .map_err(|error| PtyError::Spawn(program.to_path_buf(), error))
 }
 
+#[cfg(target_os = "linux")]
+fn take_receiver(setup: &mut ChildSetup) -> Option<OwnedFd> {
+    setup.take_receiver()
+}
+
 #[cfg(target_os = "macos")]
 type ChildSetup = crate::sandbox::macos::Profile;
+
+#[cfg(target_os = "macos")]
+fn take_receiver(_: &mut ChildSetup) -> Option<OwnedFd> {
+    None
+}
 
 #[cfg(target_os = "macos")]
 fn prepare_sandbox(
@@ -292,6 +309,29 @@ fn open_pty(size: WindowSize) -> io::Result<(OwnedFd, OwnedFd, PathBuf)> {
 }
 
 impl PtyChild {
+    #[cfg(target_os = "linux")]
+    fn with_loopback(mut self, receiver: Option<OwnedFd>) -> io::Result<Self> {
+        if let Some(receiver) = receiver {
+            self.loopback = Some(crate::sandbox::linux::receive_listener(&receiver)?);
+        }
+        Ok(self)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the Linux version can fail and both share one signature"
+    )]
+    fn with_loopback(self, _: Option<OwnedFd>) -> io::Result<Self> {
+        Ok(self)
+    }
+
+    /// Takes the listener the sandbox opened on the agent's loopback for
+    /// `Sandbox::open_loopback_port`, on Linux; on macOS, and without that port, there is none.
+    pub fn take_loopback_listener(&mut self) -> Option<TcpListener> {
+        self.loopback.take()
+    }
+
     /// Returns the process id of the program, or, in a Linux sandbox, of the process outside
     /// the sandbox that watches it and exits with its status.
     #[must_use]

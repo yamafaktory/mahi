@@ -466,6 +466,85 @@ mod tests {
         assert!(!unix.contains(&host_socket), "{unix}");
     }
 
+    const OPENED_PORT: u16 = 3128;
+
+    #[test]
+    fn the_caller_accepts_the_agents_connections_on_the_opened_loopback_port() {
+        let exe = std::env::current_exe().unwrap();
+        let mut sandbox = Sandbox::system().unwrap();
+        sandbox.bind(&exe, Access::ReadOnly).unwrap();
+        sandbox.open_loopback_port(OPENED_PORT).unwrap();
+        let mut child = PtyCommand::new(&exe, Path::new("/"), SIZE)
+            .arg("--exact")
+            .arg("tests::the_caller_accepts_the_agents_connections_on_the_opened_loopback_port_inner")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .sandbox(sandbox)
+            .spawn()
+            .unwrap();
+        let listener = child.take_loopback_listener().unwrap();
+        assert!(child.take_loopback_listener().is_none());
+        assert_eq!(listener.local_addr().unwrap().port(), OPENED_PORT);
+        let answered = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut ping = [0_u8; 4];
+            stream.read_exact(&mut ping).unwrap();
+            assert_eq!(&ping, b"ping");
+            stream.write_all(b"pong").unwrap();
+        });
+        let mut reader = child.reader().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = reader.read_to_end(&mut output);
+            let _ = sender.send(output);
+        });
+        let output = receiver.recv_timeout(Duration::from_secs(20)).unwrap();
+        let output = String::from_utf8_lossy(&output);
+        assert_eq!(exit_code(child.wait().unwrap()), 0, "{output}");
+        assert!(output.contains("1 passed"), "{output}");
+        answered.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "run inside the sandbox by the_caller_accepts_the_agents_connections_on_the_opened_loopback_port"]
+    fn the_caller_accepts_the_agents_connections_on_the_opened_loopback_port_inner() {
+        for entry in fs::read_dir("/proc/self/fd").unwrap() {
+            let target = fs::read_link(entry.unwrap().path()).unwrap_or_default();
+            assert!(
+                !target.to_string_lossy().starts_with("socket:"),
+                "the agent inherited {}",
+                target.display()
+            );
+        }
+        for address in ["127.0.0.1", "0.0.0.0"] {
+            assert_eq!(
+                TcpListener::bind((address, OPENED_PORT))
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::AddrInUse,
+                "{address}"
+            );
+        }
+        let mut stream = TcpStream::connect(("127.0.0.1", OPENED_PORT)).unwrap();
+        stream.write_all(b"ping").unwrap();
+        let mut pong = [0_u8; 4];
+        stream.read_exact(&mut pong).unwrap();
+        assert_eq!(&pong, b"pong");
+    }
+
+    #[test]
+    fn without_an_opened_port_there_is_no_loopback_listener() {
+        let mut child = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
+            .arg("-c")
+            .arg("true")
+            .sandbox(Sandbox::system().unwrap())
+            .spawn()
+            .unwrap();
+        assert!(child.take_loopback_listener().is_none());
+        let _ = child.wait();
+    }
+
     #[test]
     fn the_agent_cannot_create_nested_user_namespaces() {
         let (code, output) = run(

@@ -69,6 +69,26 @@ mod tests {
     }
 
     #[test]
+    fn only_the_opened_loopback_port_can_be_reached() {
+        let (_dir, work) = canonical_tempdir();
+        let opened = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let opened_port = opened.local_addr().unwrap().port();
+        let closed_port = closed.local_addr().unwrap().port();
+        let mut sandbox = system_with(&[(&work, Access::ReadWrite)]);
+        sandbox.open_loopback_port(opened_port).unwrap();
+        let script = format!(
+            "nc -z -w 2 127.0.0.1 {opened_port} && echo opened=ok; \
+             nc -z -w 2 127.0.0.1 {closed_port} && echo closed=ok; echo done"
+        );
+        let (code, output) = run(sandbox, &work, &script);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("done"), "{output}");
+        assert!(output.contains("opened=ok"), "{output}");
+        assert!(!output.contains("closed=ok"), "{output}");
+    }
+
+    #[test]
     fn only_the_allowed_unix_socket_can_be_reached() {
         let (_dir, root) = canonical_tempdir();
         let work = root.join("work");
