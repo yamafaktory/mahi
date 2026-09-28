@@ -830,6 +830,29 @@ mod tests {
             require_program(&root.join("missing")),
             Err(RunError::AgentUnreadable(..))
         ));
+        let socket = root.join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            require_program(&socket),
+            Err(RunError::NotAProgram(_) | RunError::AgentUnreadable(..))
+        ));
+        assert!(matches!(
+            require_program(&root),
+            Err(RunError::NotAProgram(_) | RunError::AgentUnreadable(..))
+        ));
+        let hidden = root.join("execute-only");
+        fs::copy(&native, &hidden).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o111)).unwrap();
+        if File::open(&hidden).is_err() {
+            require_program(&hidden).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_agent_is_refused_without_blocking() {
+        let (_dir, root) = canonical_tempdir();
         let fifo = root.join("fifo");
         rustix::fs::mknodat(
             rustix::fs::CWD,
@@ -843,16 +866,6 @@ mod tests {
             require_program(&fifo),
             Err(RunError::NotAProgram(_))
         ));
-        assert!(matches!(
-            require_program(&root),
-            Err(RunError::NotAProgram(_))
-        ));
-        let hidden = root.join("execute-only");
-        fs::copy(&native, &hidden).unwrap();
-        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o111)).unwrap();
-        if File::open(&hidden).is_err() {
-            require_program(&hidden).unwrap();
-        }
     }
 
     #[test]
