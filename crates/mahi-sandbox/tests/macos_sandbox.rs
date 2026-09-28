@@ -69,6 +69,26 @@ mod tests {
     }
 
     #[test]
+    fn homebrew_programs_are_readable_but_its_service_data_is_not() {
+        let homebrew = Path::new("/opt/homebrew");
+        assert!(
+            homebrew.join("bin").is_dir() && homebrew.join("var").is_dir(),
+            "this test needs Homebrew in /opt/homebrew, as on GitHub's macOS runners"
+        );
+        let (_dir, work) = canonical_tempdir();
+        let (code, output) = run(
+            system_with(&[(&work, Access::ReadWrite)]),
+            &work,
+            "ls /opt/homebrew/bin > /dev/null && echo bin=ok; \
+             ls /opt/homebrew/var > /dev/null 2>&1 && echo var=ok; echo done",
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("done"), "{output}");
+        assert!(output.contains("bin=ok"), "{output}");
+        assert!(!output.contains("var=ok"), "{output}");
+    }
+
+    #[test]
     fn only_the_opened_loopback_port_can_be_reached() {
         let (_dir, work) = canonical_tempdir();
         let opened = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -20,12 +20,15 @@ use thiserror::Error;
 
 const RESERVED: [&str; 2] = ["/dev", "/proc"];
 #[cfg(target_os = "linux")]
-const SYSTEM: &[&str] = &["/usr", "/etc", "/bin", "/sbin", "/lib", "/lib32", "/lib64"];
+const SYSTEM: &[&str] = &[
+    "/usr", "/etc", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/opt",
+];
 #[cfg(target_os = "macos")]
 const SYSTEM: &[&str] = &[
     "/usr",
     "/bin",
     "/sbin",
+    "/opt",
     "/System/Library",
     "/System/Cryptexes",
     "/System/Volumes/Preboot/Cryptexes",
@@ -112,8 +115,10 @@ impl Sandbox {
     }
 
     /// A sandbox with the host's programs and libraries readable: `/usr`, `/etc`, `/bin`,
-    /// `/sbin`, `/lib`, `/lib32` and `/lib64` as they are on the host, each either bound
-    /// read-only or recreated as the same symbolic link.
+    /// `/sbin`, `/lib`, `/lib32`, `/lib64` and `/opt` (where distribution packages install
+    /// programs, and Homebrew on Apple Silicon) as they are on the host, each either bound
+    /// read-only or recreated as the same symbolic link. On macOS the data package managers
+    /// keep for their services, such as `/opt/homebrew/var`, stays unreadable.
     ///
     /// # Errors
     ///

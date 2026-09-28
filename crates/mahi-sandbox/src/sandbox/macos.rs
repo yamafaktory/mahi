@@ -61,6 +61,11 @@ unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
 }
 
+/// Where package managers keep the data of the services they run, such as local databases,
+/// inside the system paths the agent may read: Homebrew on Apple Silicon and on Intel, and
+/// `MacPorts`.
+const PACKAGE_DATA: [&str; 3] = ["/opt/homebrew/var", "/usr/local/var", "/opt/local/var"];
+
 /// A Seatbelt profile, written before the fork so the child only applies it.
 #[derive(Debug)]
 pub(crate) struct Profile {
@@ -95,6 +100,12 @@ impl Profile {
             push_rule(
                 &mut source,
                 format_args!("(allow file-read* (subpath {}))", quoted(path)?),
+            )?;
+        }
+        for data in PACKAGE_DATA {
+            push_rule(
+                &mut source,
+                format_args!("(deny file-read* (subpath {}))", quoted(Path::new(data))?),
             )?;
         }
         for (index, (path, access)) in binds.iter().enumerate() {
@@ -286,6 +297,18 @@ mod tests {
             "{source}"
         );
         assert_eq!(source.matches("remote ip").count(), 1, "{source}");
+    }
+
+    #[test]
+    fn package_manager_data_stays_unreadable() {
+        let profile = Profile::new(&Sandbox::system().unwrap(), Path::new("/dev/ttys000")).unwrap();
+        let source = profile.source().to_str().unwrap();
+        let allow_opt = source.find("(allow file-read* (subpath \"/opt\"))");
+        for data in PACKAGE_DATA {
+            let deny = format!("(deny file-read* (subpath \"{data}\"))");
+            let at = source.find(&deny).unwrap();
+            assert!(allow_opt.is_none_or(|allow| allow < at), "{source}");
+        }
     }
 
     #[test]

@@ -70,6 +70,8 @@ const CLAUDE_CODE_SETTINGS: &str = r#"{
 }
 "#;
 
+const CLAUDE_CODE_STATE: &str = "{\"hasCompletedOnboarding\": true}\n";
+
 impl Profile {
     /// Returns the optional variables of every profile, which mahi reads at startup, before it
     /// knows which profile applies.
@@ -104,7 +106,39 @@ impl Profile {
 }
 
 fn install_claude_code(state: &OwnedFd) -> io::Result<()> {
-    replace(state, "settings.json", CLAUDE_CODE_SETTINGS.as_bytes())
+    replace(state, "settings.json", CLAUDE_CODE_SETTINGS.as_bytes())?;
+    create_if_missing(state, ".claude.json", CLAUDE_CODE_STATE.as_bytes())
+}
+
+fn create_if_missing(directory: &OwnedFd, name: &str, contents: &[u8]) -> io::Result<()> {
+    let temporary = format!(".{name}.mahi");
+    match rustix::fs::unlinkat(directory, temporary.as_str(), AtFlags::empty()) {
+        Err(error) if error != Errno::NOENT => return Err(error.into()),
+        _ => {}
+    }
+    let file = rustix::fs::openat(
+        directory,
+        temporary.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    let mut file = File::from(file);
+    file.write_all(contents)?;
+    file.sync_all()?;
+    let linked = rustix::fs::linkat(
+        directory,
+        temporary.as_str(),
+        directory,
+        name,
+        AtFlags::empty(),
+    );
+    rustix::fs::unlinkat(directory, temporary.as_str(), AtFlags::empty())?;
+    match linked {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(error) => return Err(error.into()),
+    }
+    rustix::fs::fsync(directory)?;
+    Ok(())
 }
 
 fn replace(directory: &OwnedFd, name: &str, contents: &[u8]) -> io::Result<()> {
@@ -241,6 +275,41 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn claude_codes_own_state_is_seeded_once_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        CLAUDE_CODE.install(&open_dir(&state)).unwrap();
+        assert_eq!(
+            fs::read_to_string(state.join(".claude.json")).unwrap(),
+            CLAUDE_CODE_STATE
+        );
+        let mode = fs::metadata(state.join(".claude.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!state.join(".claude.json.mahi").exists());
+        fs::write(state.join(".claude.json"), "{\"kept\": true}").unwrap();
+        CLAUDE_CODE.install(&open_dir(&state)).unwrap();
+        assert_eq!(
+            fs::read_to_string(state.join(".claude.json")).unwrap(),
+            "{\"kept\": true}"
+        );
+        let outside = dir.path().join("outside");
+        let linked = dir.path().join("linked");
+        fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join(".claude.json")).unwrap();
+        CLAUDE_CODE.install(&open_dir(&linked)).unwrap();
+        assert!(!outside.exists());
+        assert!(
+            fs::symlink_metadata(linked.join(".claude.json"))
+                .unwrap()
+                .is_symlink()
+        );
     }
 
     #[test]
