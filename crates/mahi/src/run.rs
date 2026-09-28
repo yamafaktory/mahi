@@ -90,6 +90,7 @@ use rustix::{
         SpecialCodeIndex,
     },
 };
+use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::{
@@ -268,76 +269,158 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let participant = session::participant_from(environment.user.as_deref())
         .map_err(RunError::ParticipantName)?;
     let store = Store::discover(&cwd)?;
-    let agent = resolve(command.agent(), &cwd, environment.path.as_deref())?;
-    require_program(&agent.canonical)?;
     let profile = command.profile();
-    check_profile(profile, environment)?;
-    require_passed(environment)?;
+    let hosts = allowed_hosts(command.allow_hosts(), profile);
+    let prepared = Prepared::new(
+        environment,
+        host,
+        &cwd,
+        store,
+        &AgentRequest {
+            program: command.agent(),
+            arguments: command.arguments(),
+            profile,
+            hosts: &hosts,
+        },
+    )?;
     let agent_name = session::agent_from(Path::new(command.agent()));
-    let git_dir = fs::canonicalize(store.common_dir()).map_err(RunError::GitDirectory)?;
-    if host.is_private(&git_dir) {
-        return Err(RunError::PrivateDirectory(git_dir));
-    }
-    let scratch = tempfile::Builder::new()
-        .prefix("mahi-")
-        .tempdir_in(&environment.temp_dir)
-        .map_err(RunError::Scratch)?;
-    let scratch_path = fs::canonicalize(scratch.path()).map_err(RunError::Scratch)?;
-    for directory in [HOME, TMP] {
-        fs::create_dir(scratch_path.join(directory)).map_err(RunError::Scratch)?;
-    }
-    let hook_socket = scratch_path.join(HOOK_SOCKET_NAME);
-    let hooks = UnixListener::bind(&hook_socket).map_err(RunError::Scratch)?;
-    let sandbox = Sandbox::system()?;
-    let network = Network::prepare(&allowed_hosts(command, profile))?;
-    let globals = environment.git_patterns();
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
     let (started, caught) = until_stopped(&termination, |interrupt| {
         session::start(
-            &store,
+            &prepared.store,
             &public,
             &signer,
             participant,
             &agent_name,
-            &globals,
+            &prepared.globals,
             interrupt,
         )
     });
     if let Some(signal) = caught {
         match &started {
-            Ok(started) => started.discard_or_report(&store),
+            Ok(started) => started.discard_or_report(&prepared.store),
             Err(StartError::Store(StoreError::Interrupted)) => {}
             Err(error) => eprintln!("mahi: {error}"),
         }
         return Ok(Outcome::Stopped(signal));
     }
-    let mut started = started?;
-    eprintln!(
-        "mahi: thread {} in {}",
-        started.thread,
-        started.worktree.display()
-    );
-    if let Some(profile) = profile {
-        eprintln!(
-            "mahi: {} profile (--no-profile runs the agent without it)",
-            profile.name
-        );
+    prepared.launch(environment, started?, termination)
+}
+
+/// The agent to run and what it may reach.
+#[derive(Debug, Clone, Copy)]
+struct AgentRequest<'a> {
+    program: &'a OsStr,
+    arguments: &'a [OsString],
+    profile: Option<&'static Profile>,
+    hosts: &'a [HostName],
+}
+
+/// Everything `mahi run` sets up before the thread exists, so that a failure leaves nothing
+/// behind: the agent, its profile, its private directories, the hook socket, the sandbox and
+/// the network.
+struct Prepared {
+    host: Host,
+    store: Store,
+    git_dir: PathBuf,
+    agent: Agent,
+    arguments: Vec<OsString>,
+    profile: Option<&'static Profile>,
+    _scratch: TempDir,
+    scratch: PathBuf,
+    hook_socket: PathBuf,
+    hooks: UnixListener,
+    sandbox: Sandbox,
+    network: Option<Network>,
+    globals: GlobalPatterns,
+}
+
+impl Prepared {
+    fn new(
+        environment: &Environment,
+        host: Host,
+        cwd: &Path,
+        store: Store,
+        request: &AgentRequest<'_>,
+    ) -> Result<Self, RunError> {
+        let AgentRequest {
+            program,
+            arguments,
+            profile,
+            hosts,
+        } = *request;
+        let agent = resolve(program, cwd, environment.path.as_deref())?;
+        require_program(&agent.canonical)?;
+        check_profile(profile, environment)?;
+        require_passed(environment)?;
+        let git_dir = fs::canonicalize(store.common_dir()).map_err(RunError::GitDirectory)?;
+        if host.is_private(&git_dir) {
+            return Err(RunError::PrivateDirectory(git_dir));
+        }
+        let scratch_dir = tempfile::Builder::new()
+            .prefix("mahi-")
+            .tempdir_in(&environment.temp_dir)
+            .map_err(RunError::Scratch)?;
+        let scratch = fs::canonicalize(scratch_dir.path()).map_err(RunError::Scratch)?;
+        for directory in [HOME, TMP] {
+            fs::create_dir(scratch.join(directory)).map_err(RunError::Scratch)?;
+        }
+        let hook_socket = scratch.join(HOOK_SOCKET_NAME);
+        let hooks = UnixListener::bind(&hook_socket).map_err(RunError::Scratch)?;
+        let sandbox = Sandbox::system()?;
+        let network = Network::prepare(hosts)?;
+        Ok(Self {
+            host,
+            store,
+            git_dir,
+            agent,
+            arguments: arguments.to_vec(),
+            profile,
+            _scratch: scratch_dir,
+            scratch,
+            hook_socket,
+            hooks,
+            sandbox,
+            network,
+            globals: environment.git_patterns(),
+        })
     }
-    let launch = Launch {
-        command,
-        environment,
-        agent: &agent,
-        worktree: &started.worktree,
-        git_dir: &git_dir,
-        scratch: &scratch_path,
-        hook_socket: &hook_socket,
-        host: &host,
-        profile,
-        state: profile.map(|_| started.state_dir(&store)),
-    };
-    let (child, raw, proxy) = started.launch(&store, || launch.spawn(sandbox, network))?;
-    let (recorder, turns) = start_background(&mut started, &git_dir, globals, hooks);
-    finish_run(child, raw, termination, recorder, turns, proxy)
+
+    fn launch(
+        self,
+        environment: &Environment,
+        mut started: Started,
+        termination: TerminationSignals,
+    ) -> Result<Outcome, RunError> {
+        eprintln!(
+            "mahi: thread {} in {}",
+            started.thread,
+            started.worktree.display()
+        );
+        if let Some(profile) = self.profile {
+            eprintln!(
+                "mahi: {} profile (--no-profile runs the agent without it)",
+                profile.name
+            );
+        }
+        let launch = Launch {
+            arguments: &self.arguments,
+            environment,
+            agent: &self.agent,
+            worktree: &started.worktree,
+            git_dir: &self.git_dir,
+            scratch: &self.scratch,
+            hook_socket: &self.hook_socket,
+            host: &self.host,
+            profile: self.profile,
+            state: self.profile.map(|_| started.state_dir(&self.store)),
+        };
+        let (sandbox, network) = (self.sandbox, self.network);
+        let (child, raw, proxy) = started.launch(&self.store, || launch.spawn(sandbox, network))?;
+        let (recorder, turns) =
+            start_background(&mut started, &self.git_dir, self.globals, self.hooks);
+        finish_run(child, raw, termination, recorder, turns, proxy)
+    }
 }
 
 fn start_background(
@@ -504,18 +587,13 @@ fn require_passed(environment: &Environment) -> Result<(), RunError> {
     }
 }
 
-fn allowed_hosts(command: &RunCommand, profile: Option<&Profile>) -> Vec<HostName> {
+fn allowed_hosts(allowed: &[HostName], profile: Option<&Profile>) -> Vec<HostName> {
     let from_profile = profile
         .map(|profile| profile.hosts)
         .unwrap_or_default()
         .iter()
         .filter_map(|host| host.parse().ok());
-    command
-        .allow_hosts()
-        .iter()
-        .cloned()
-        .chain(from_profile)
-        .collect()
+    allowed.iter().cloned().chain(from_profile).collect()
 }
 
 fn stop_now(signal: Termination) -> ! {
@@ -557,7 +635,7 @@ fn until_stopped<T>(
 struct Launch<'a> {
     profile: Option<&'static Profile>,
     state: Option<PathBuf>,
-    command: &'a RunCommand,
+    arguments: &'a [OsString],
     environment: &'a Environment,
     agent: &'a Agent,
     worktree: &'a Path,
@@ -615,7 +693,7 @@ impl Launch<'_> {
             sandbox.open_loopback_port(network.port())?;
         }
         let mut pty = PtyCommand::new(&self.agent.program, self.worktree, terminal::size());
-        for argument in self.command.arguments() {
+        for argument in self.arguments {
             pty = pty.arg(argument);
         }
         for (name, value) in &self.environment.passed_on {
