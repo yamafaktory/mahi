@@ -1,5 +1,7 @@
 [advisories]
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "the Marvin timing attack recovers private keys; rsa is used only in mahi-tls, only to verify signatures with public keys, never to decrypt or sign" },
+]
 
 [licenses]
 allow = [

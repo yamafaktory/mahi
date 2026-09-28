@@ -18,11 +18,17 @@ ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
 ghash = { workspace = true }
 hmac = { workspace = true }
+p256 = { workspace = true }
+p384 = { workspace = true }
 polyval = { workspace = true }
+rsa = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
 x25519-dalek = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+webpki-roots = { workspace = true }
 
 [lints]
 workspace = true
