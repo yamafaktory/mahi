@@ -11,6 +11,7 @@ use std::{
 
 use mahi_core::{
     AgentName,
+    AgentSlot,
     NameError,
     ParticipantName,
     RandomError,
@@ -21,7 +22,9 @@ use mahi_core::{
 use mahi_crypto::ThreadKey;
 use mahi_identity::PublicIdentity;
 use mahi_store::{
+    GlobalPatterns,
     ObjectId,
+    SnapshotCache,
     Store,
     StoreError,
 };
@@ -41,13 +44,25 @@ use mahi_thread::{
 use thiserror::Error;
 
 const WORKTREES: [&str; 2] = ["mahi", "worktrees"];
+pub(crate) const SNAPSHOT_MESSAGE: &str = "snapshot";
 
-/// A thread `mahi run` started, and the worktree its agent works in.
+/// A thread `mahi run` started, the worktree its agent works in, and the worktree's first
+/// snapshot.
 #[derive(Debug)]
 pub(crate) struct Started {
     pub(crate) thread: ThreadId,
     pub(crate) worktree: PathBuf,
+    pub(crate) snapshots: ThreadRef,
+    pub(crate) first_snapshot: Option<Recorded>,
     meta: ObjectId,
+}
+
+/// The newest snapshot commit of a worktree, the tree it records, and the cache that took it.
+#[derive(Debug)]
+pub(crate) struct Recorded {
+    pub(crate) commit: ObjectId,
+    pub(crate) tree: ObjectId,
+    pub(crate) cache: SnapshotCache,
 }
 
 #[derive(Debug, Error)]
@@ -74,6 +89,7 @@ pub(crate) fn start(
     signer: &dyn SshSigner,
     participant: ParticipantName,
     agent: &AgentName,
+    globals: &GlobalPatterns,
     interrupt: &AtomicBool,
 ) -> Result<Started, StartError> {
     let base = store.head_commit()?;
@@ -84,6 +100,10 @@ pub(crate) fn start(
         ParticipantKey::from_public_key(signer.public_key())?,
         public.recipient().clone(),
     )?;
+    let snapshots = ThreadRef::new(
+        thread,
+        RefKind::Snapshots(AgentSlot::new(participant.clone(), agent.clone())),
+    );
     let title = format!("{} on {branch}", agent.as_str());
     let draft = MetaDraft::new(
         thread,
@@ -107,16 +127,29 @@ pub(crate) fn start(
     }
     match create_thread(store, &draft, &ThreadKey::generate(), signer) {
         Ok(meta) => {
-            let started = Started {
+            let mut started = Started {
                 thread,
                 worktree,
+                snapshots,
+                first_snapshot: None,
                 meta,
             };
-            if interrupt.load(Ordering::SeqCst) {
-                started.discard_or_report(store);
-                return Err(StoreError::Interrupted.into());
+            let recorded =
+                take_first_snapshot(store, &name, &started.snapshots, globals, interrupt);
+            match recorded {
+                Ok(recorded) if !interrupt.load(Ordering::SeqCst) => {
+                    started.first_snapshot = Some(recorded);
+                    Ok(started)
+                }
+                Ok(_) => {
+                    started.discard_or_report(store);
+                    Err(StoreError::Interrupted.into())
+                }
+                Err(error) => {
+                    started.discard_or_report(store);
+                    Err(error.into())
+                }
             }
-            Ok(started)
         }
         Err(error) => {
             if let ThreadError::CreatedButNotPinned { commit, .. } = &error
@@ -128,6 +161,23 @@ pub(crate) fn start(
             Err(error.into())
         }
     }
+}
+
+fn take_first_snapshot(
+    store: &Store,
+    name: &str,
+    snapshots: &ThreadRef,
+    globals: &GlobalPatterns,
+    interrupt: &AtomicBool,
+) -> Result<Recorded, StoreError> {
+    let mut cache = SnapshotCache::default();
+    let tree = store.snapshot(name, globals, &mut cache, interrupt)?.tree;
+    let commit = store.append(snapshots, None, tree, SNAPSHOT_MESSAGE)?;
+    Ok(Recorded {
+        commit,
+        tree,
+        cache,
+    })
 }
 
 fn remove_worktree_or_report(store: &Store, name: &str) {
@@ -155,8 +205,14 @@ impl Started {
 
     /// Removes the thread and its worktree, for an agent that never ran.
     pub(crate) fn discard(&self, store: &Store) -> Result<(), DiscardError> {
+        let snapshots = match store.head(&self.snapshots) {
+            Ok(Some(head)) => store.remove(&self.snapshots, head),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
         let thread = discard_thread(store, self.thread, self.meta);
         let worktree = store.remove_worktree(&self.thread.to_string());
+        snapshots?;
         thread?;
         worktree?;
         Ok(())
@@ -199,7 +255,7 @@ pub(crate) fn agent_from(program: &Path) -> AgentName {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use gix::{
         actor::Signature,
         date::Time,
@@ -239,7 +295,7 @@ mod tests {
         }
     }
 
-    fn repository_on_main() -> (TempDir, Store) {
+    pub(crate) fn repository_on_main() -> (TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let repo = gix::init(dir.path()).unwrap();
         let readme = repo.write_blob(b"hello\n").unwrap().detach();
@@ -273,7 +329,7 @@ mod tests {
         (dir, store)
     }
 
-    fn start_with(store: &Store, signer: &dyn SshSigner) -> Result<Started, StartError> {
+    pub(crate) fn start_with(store: &Store, signer: &dyn SshSigner) -> Result<Started, StartError> {
         start_until(store, signer, &AtomicBool::new(false))
     }
 
@@ -288,6 +344,7 @@ mod tests {
             signer,
             ParticipantName::new("alice").unwrap(),
             &agent_from(Path::new("claude")),
+            &GlobalPatterns::default(),
             interrupt,
         )
     }
@@ -377,6 +434,18 @@ mod tests {
         );
         let meta = ThreadRef::new(started.thread, RefKind::Meta);
         assert_eq!(store.head(&meta).unwrap(), Some(started.meta));
+        let first = started.first_snapshot.as_ref().unwrap();
+        assert_eq!(store.head(&started.snapshots).unwrap(), Some(first.commit));
+        let repo = gix::open(store.common_dir()).unwrap();
+        let base_tree = repo.head_commit().unwrap().tree_id().unwrap().detach();
+        assert_eq!(first.tree, base_tree);
+        assert_eq!(
+            started.snapshots.to_string(),
+            format!(
+                "refs/threads/{}/agents/alice.claude/snapshots",
+                started.thread
+            )
+        );
     }
 
     #[test]
@@ -386,6 +455,7 @@ mod tests {
         let started = start_with(&store, &signer).unwrap();
         started.discard(&store).unwrap();
         assert!(!started.worktree.exists());
+        assert_eq!(store.head(&started.snapshots).unwrap(), None);
         let meta = ThreadRef::new(started.thread, RefKind::Meta);
         assert_eq!(store.head(&meta).unwrap(), None);
         assert!(

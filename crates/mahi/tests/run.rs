@@ -269,7 +269,21 @@ mod tests {
         );
         assert!(!fixture.repo.join("file").exists());
         let thread = worktree.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(fixture.threads(), [format!("refs/threads/{thread}/meta")]);
+        let snapshots = format!("refs/threads/{thread}/agents/tester.sh/snapshots");
+        assert_eq!(
+            fixture.threads(),
+            [snapshots.clone(), format!("refs/threads/{thread}/meta")]
+        );
+        let repository = gix::open(&fixture.repo).unwrap();
+        let last = repository
+            .find_reference(snapshots.as_str())
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let tree = last.tree().unwrap();
+        let file = tree.find_entry("file").unwrap().object().unwrap();
+        assert_eq!(file.data, b"written\n");
+        assert!(tree.find_entry("README").is_some());
     }
 
     #[test]

@@ -16,6 +16,7 @@ mahi-core = { workspace = true }
 mahi-crypto = { workspace = true }
 mahi-identity = { workspace = true }
 mahi-sandbox = { workspace = true }
+mahi-schedule = { workspace = true }
 mahi-store = { workspace = true }
 mahi-thread = { workspace = true }
 rustix = { workspace = true }

@@ -4,6 +4,7 @@ mod cli;
 mod environment;
 mod init;
 mod prompt;
+mod recorder;
 mod run;
 mod session;
 mod terminal;

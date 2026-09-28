@@ -22,6 +22,10 @@ use std::{
         PathBuf,
     },
     rc::Rc,
+    sync::atomic::{
+        AtomicBool,
+        Ordering,
+    },
 };
 
 use gix::{
@@ -245,13 +249,15 @@ impl Store {
     ///
     /// Returns [`StoreError::NotAWorktree`] if `name` is not a linked worktree whose recorded
     /// directory is where it should be, [`StoreError::ChangedDuringSnapshot`] if a path changed
-    /// while it was read (the caller should snapshot again), or another [`StoreError`] if the
-    /// repository cannot be read or written.
+    /// while it was read (the caller should snapshot again), [`StoreError::Interrupted`] if
+    /// `interrupt` was set during the walk, or another [`StoreError`] if the repository cannot
+    /// be read or written.
     pub fn snapshot(
         &self,
         name: &str,
         globals: &GlobalPatterns,
         cache: &mut SnapshotCache,
+        interrupt: &AtomicBool,
     ) -> Result<Snapshot, StoreError> {
         let (repo, workdir) = self.open_worktree(name)?;
         let index = repo.index_or_empty()?;
@@ -307,6 +313,7 @@ impl Store {
             index: &index,
             lookup,
             repo: &repo,
+            interrupt,
         };
         let walked = walk.walk(root, root_attributes);
         let mut files = std::mem::take(&mut walk.cache_out);
@@ -405,6 +412,7 @@ struct Walk<'a> {
     index: &'a index::State,
     lookup: Option<AccelerateLookup<'a>>,
     repo: &'a Repository,
+    interrupt: &'a AtomicBool,
 }
 
 impl<'a> Walk<'a> {
@@ -422,6 +430,9 @@ impl<'a> Walk<'a> {
             root_attributes,
         )?];
         loop {
+            if self.interrupt.load(Ordering::Relaxed) {
+                return Err(StoreError::Interrupted);
+            }
             let Some(frame) = stack.last_mut() else {
                 return Ok(None);
             };
@@ -1061,7 +1072,7 @@ mod tests {
                 "agent",
                 &setup.dir.path().join("wt"),
                 commit,
-                &std::sync::atomic::AtomicBool::new(false),
+                &AtomicBool::new(false),
             )
             .unwrap()
     }
@@ -1073,6 +1084,7 @@ mod tests {
                 "agent",
                 &GlobalPatterns::default(),
                 &mut SnapshotCache::default(),
+                &AtomicBool::new(false),
             )
             .unwrap()
     }
@@ -1135,6 +1147,26 @@ mod tests {
         let snapshot = snapshot(&setup);
         assert_eq!(snapshot.tree, tree_of(&setup.store, commit));
         assert!(snapshot.skipped.is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_snapshot_stops_and_leaves_no_stamp() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let result = setup.store.snapshot(
+            "agent",
+            &GlobalPatterns::default(),
+            &mut SnapshotCache::default(),
+            &AtomicBool::new(true),
+        );
+        assert!(matches!(result, Err(StoreError::Interrupted)));
+        for entry in fs::read_dir(&path).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                !name.to_string_lossy().starts_with(STAMP_PREFIX),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]
@@ -1332,7 +1364,8 @@ mod tests {
                     setup.store.snapshot(
                         name,
                         &GlobalPatterns::default(),
-                        &mut SnapshotCache::default()
+                        &mut SnapshotCache::default(),
+                        &AtomicBool::new(false)
                     ),
                     Err(StoreError::NotAWorktree(_))
                 ),
@@ -1344,7 +1377,8 @@ mod tests {
             setup.store.snapshot(
                 "agent",
                 &GlobalPatterns::default(),
-                &mut SnapshotCache::default()
+                &mut SnapshotCache::default(),
+                &AtomicBool::new(false)
             ),
             Err(StoreError::NotAWorktree(_))
         ));
@@ -1413,6 +1447,7 @@ mod tests {
             "agent",
             &GlobalPatterns::default(),
             &mut SnapshotCache::default(),
+            &AtomicBool::new(false),
         );
         fs::set_permissions(path.join("closed"), fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
@@ -1568,7 +1603,12 @@ mod tests {
     fn cached_snapshot(setup: &Setup, cache: &mut SnapshotCache) -> Snapshot {
         setup
             .store
-            .snapshot("agent", &GlobalPatterns::default(), cache)
+            .snapshot(
+                "agent",
+                &GlobalPatterns::default(),
+                cache,
+                &AtomicBool::new(false),
+            )
             .unwrap()
     }
 
@@ -1706,9 +1746,12 @@ mod tests {
         let mut cache = SnapshotCache::default();
         cached_snapshot(&setup, &mut cache);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o555)).unwrap();
-        let result = setup
-            .store
-            .snapshot("agent", &GlobalPatterns::default(), &mut cache);
+        let result = setup.store.snapshot(
+            "agent",
+            &GlobalPatterns::default(),
+            &mut cache,
+            &AtomicBool::new(false),
+        );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result.unwrap().read, 4);
     }
@@ -1791,7 +1834,12 @@ mod tests {
         .unwrap();
         let store = Store::open(&setup.dir.path().join("repo")).unwrap();
         let again = store
-            .snapshot("agent", &GlobalPatterns::default(), &mut cache)
+            .snapshot(
+                "agent",
+                &GlobalPatterns::default(),
+                &mut cache,
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert_eq!(again.read, 4);
     }
@@ -1807,14 +1855,19 @@ mod tests {
                 "other",
                 &setup.dir.path().join("other"),
                 commit,
-                &std::sync::atomic::AtomicBool::new(false),
+                &AtomicBool::new(false),
             )
             .unwrap();
         let mut cache = SnapshotCache::default();
         cached_snapshot(&setup, &mut cache);
         let other = setup
             .store
-            .snapshot("other", &GlobalPatterns::default(), &mut cache)
+            .snapshot(
+                "other",
+                &GlobalPatterns::default(),
+                &mut cache,
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert_eq!(other.read, 4);
     }

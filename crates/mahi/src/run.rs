@@ -67,6 +67,7 @@ use mahi_sandbox::{
     WindowChanges,
     exit_code,
 };
+use mahi_schedule::Schedule;
 use mahi_store::{
     Store,
     StoreError,
@@ -88,6 +89,11 @@ use thiserror::Error;
 use crate::{
     cli::RunCommand,
     environment::Environment,
+    recorder::{
+        RecordError,
+        Recorder,
+        Target,
+    },
     session::{
         self,
         StartError,
@@ -235,6 +241,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         fs::create_dir(scratch_path.join(directory)).map_err(RunError::Scratch)?;
     }
     let sandbox = Sandbox::system()?;
+    let globals = environment.git_patterns();
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
     let (started, caught) = until_stopped(&termination, |interrupt| {
         session::start(
@@ -243,6 +250,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
             &signer,
             participant,
             &agent_name,
+            &globals,
             interrupt,
         )
     });
@@ -254,7 +262,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         }
         return Ok(Outcome::Stopped(signal));
     }
-    let started = started?;
+    let mut started = started?;
     eprintln!(
         "mahi: thread {} in {}",
         started.thread,
@@ -270,9 +278,84 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         host: &host,
     };
     let (child, raw) = started.launch(&store, || launch.spawn(sandbox))?;
-    let code = relay(child, raw.is_some(), termination);
+    let recorder = started.first_snapshot.take().map(|first| {
+        Recorder::start(
+            Target {
+                git_dir: git_dir.clone(),
+                worktree: started.thread.to_string(),
+                snapshots: started.snapshots.clone(),
+                globals,
+            },
+            first,
+            Schedule::default(),
+        )
+    });
+    finish_run(child, raw, termination, recorder)
+}
+
+fn finish_run(
+    child: PtyChild,
+    raw: Option<RawMode>,
+    termination: TerminationSignals,
+    recorder: Option<Recorder>,
+) -> Result<Outcome, RunError> {
+    let (code, received) = supervise(child, raw, termination);
+    if matches!(code, Ok(Outcome::Stopped(_))) {
+        while received.try_recv().is_ok() {}
+    }
+    let abandon = recorder.as_ref().map(Recorder::abandon_flag);
+    let (caught, stopped) = mpsc::channel();
+    thread::spawn(move || stop_on_signal(&received, abandon.as_deref(), &caught));
+    match recorder.map(Recorder::finish) {
+        Some(Ok(skipped)) if skipped > 0 => {
+            eprintln!("mahi: the last snapshot left out {skipped} paths it could not record");
+        }
+        Some(Err(RecordError::Store(StoreError::Interrupted))) => {
+            eprintln!("mahi: stopped before the last snapshot");
+        }
+        Some(Err(error)) => crate::report(&error),
+        _ => {}
+    }
+    match stopped.try_recv() {
+        Ok(signal) => Ok(Outcome::Stopped(signal)),
+        Err(_) => code,
+    }
+}
+
+fn supervise(
+    child: PtyChild,
+    raw: Option<RawMode>,
+    termination: TerminationSignals,
+) -> (Result<Outcome, RunError>, Receiver<Event>) {
+    let (events, received) = mpsc::channel();
+    let stop_events = events.clone();
+    thread::spawn(move || {
+        while let Ok(signal) = termination.wait() {
+            let _ = stop_events.send(Event::Stopped(signal));
+        }
+    });
+    let code = relay(child, raw.is_some(), events, &received);
     drop(raw);
-    code
+    (code, received)
+}
+
+fn stop_on_signal(
+    received: &Receiver<Event>,
+    abandon: Option<&AtomicBool>,
+    caught: &mpsc::Sender<Termination>,
+) {
+    let mut stopping = false;
+    while let Ok(event) = received.recv() {
+        let Event::Stopped(signal) = event else {
+            continue;
+        };
+        let Some(abandon) = abandon.filter(|_| !stopping) else {
+            stop_now(signal);
+        };
+        let _ = caught.send(signal);
+        abandon.store(true, Ordering::SeqCst);
+        stopping = true;
+    }
 }
 
 fn stop_now(signal: Termination) -> ! {
@@ -389,7 +472,8 @@ impl Host {
 fn relay(
     child: PtyChild,
     interactive: bool,
-    termination: TerminationSignals,
+    events: mpsc::Sender<Event>,
+    received: &Receiver<Event>,
 ) -> Result<Outcome, RunError> {
     let writer = child.writer()?;
     thread::spawn(move || forward_input(writer, interactive));
@@ -406,18 +490,11 @@ fn relay(
     });
     let mut reader = child.reader()?;
     let progress = Arc::new(AtomicU64::new(0));
-    let (events, received) = mpsc::channel();
     let output_events = events.clone();
     let output_progress = Arc::clone(&progress);
     thread::spawn(move || {
         let ended = copy_output(&mut reader, &output_progress);
         let _ = output_events.send(Event::OutputEnded(ended));
-    });
-    let stop_events = events.clone();
-    thread::spawn(move || {
-        while let Ok(signal) = termination.wait() {
-            let _ = stop_events.send(Event::Stopped(signal));
-        }
     });
     let child = Arc::new(Mutex::new(child));
     let waited = Arc::clone(&child);
@@ -429,7 +506,7 @@ fn relay(
         match received.recv() {
             Ok(Event::Exited(code)) if output_done => return Ok(Outcome::Exited(code?)),
             Ok(Event::Exited(code)) => {
-                return finish_output(&received, &progress, code?).map(Outcome::Exited);
+                return finish_output(received, &progress, code?);
             }
             Ok(Event::OutputEnded(Ok(()))) => output_done = true,
             Ok(Event::OutputEnded(Err(error))) => {
@@ -439,7 +516,7 @@ fn relay(
             Ok(Event::Stopped(signal)) => {
                 kill(&child);
                 if !output_done {
-                    await_output_end(&received);
+                    await_output_end(received);
                 }
                 return Ok(Outcome::Stopped(signal));
             }
@@ -481,23 +558,27 @@ fn finish_output(
     received: &Receiver<Event>,
     progress: &AtomicU64,
     code: i32,
-) -> Result<i32, RunError> {
+) -> Result<Outcome, RunError> {
+    let exited = Ok(Outcome::Exited(code));
     let mut seen = progress.load(Ordering::Relaxed);
     let deadline = Instant::now() + OUTPUT_LIMIT;
     loop {
         if Instant::now() > deadline {
-            return Ok(code);
+            return exited;
         }
         match received.recv_timeout(OUTPUT_GRACE) {
-            Ok(Event::OutputEnded(Err(error))) => return output_failure(error).map(|_| code),
-            Ok(Event::OutputEnded(Ok(()))) | Err(RecvTimeoutError::Disconnected) => {
-                return Ok(code);
+            Ok(Event::OutputEnded(Err(error))) => {
+                return output_failure(error).map(|_| Outcome::Exited(code));
             }
-            Ok(Event::Exited(_) | Event::Stopped(_)) => {}
+            Ok(Event::OutputEnded(Ok(()))) | Err(RecvTimeoutError::Disconnected) => {
+                return exited;
+            }
+            Ok(Event::Stopped(signal)) => return Ok(Outcome::Stopped(signal)),
+            Ok(Event::Exited(_)) => {}
             Err(RecvTimeoutError::Timeout) => {
                 let now = progress.load(Ordering::Relaxed);
                 if now == seen {
-                    return Ok(code);
+                    return exited;
                 }
                 seen = now;
             }

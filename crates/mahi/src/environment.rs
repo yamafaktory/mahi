@@ -4,6 +4,8 @@ use std::{
     path::PathBuf,
 };
 
+use mahi_store::GlobalPatterns;
+
 const PASSED_ON: [&str; 10] = [
     "TERM",
     "COLORTERM",
@@ -47,5 +49,43 @@ impl Environment {
                 .filter_map(|&name| value(name).map(|value| (name, value)))
                 .collect(),
         }
+    }
+
+    /// Returns the user's git ignore and attributes files, where git looks for them.
+    pub(crate) fn git_patterns(&self) -> GlobalPatterns {
+        let git = self
+            .xdg_config_home
+            .clone()
+            .or_else(|| self.home.as_ref().map(|home| home.join(".config")))
+            .map(|config| config.join("git"));
+        GlobalPatterns {
+            excludes: git.as_ref().map(|git| git.join("ignore")),
+            attributes: git.map(|git| git.join("attributes")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_pattern_files_follow_xdg_config_home_then_home() {
+        let mut environment = Environment {
+            home: Some(PathBuf::from("/home/alice")),
+            ..Environment::default()
+        };
+        assert_eq!(
+            environment.git_patterns().excludes,
+            Some(PathBuf::from("/home/alice/.config/git/ignore"))
+        );
+        environment.xdg_config_home = Some(PathBuf::from("/xdg"));
+        let patterns = environment.git_patterns();
+        assert_eq!(patterns.excludes, Some(PathBuf::from("/xdg/git/ignore")));
+        assert_eq!(
+            patterns.attributes,
+            Some(PathBuf::from("/xdg/git/attributes"))
+        );
+        assert_eq!(Environment::default().git_patterns().excludes, None);
     }
 }
