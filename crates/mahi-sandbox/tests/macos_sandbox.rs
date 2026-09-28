@@ -69,6 +69,38 @@ mod tests {
     }
 
     #[test]
+    fn only_the_allowed_unix_socket_can_be_reached() {
+        let (_dir, root) = canonical_tempdir();
+        let work = root.join("work");
+        let outside = root.join("outside");
+        fs::create_dir(&work).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let allowed = work.join("allowed.sock");
+        let other = work.join("other.sock");
+        let host = outside.join("host.sock");
+        let _allowed = std::os::unix::net::UnixListener::bind(&allowed).unwrap();
+        let _other = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        let _host = std::os::unix::net::UnixListener::bind(&host).unwrap();
+        let mut sandbox = system_with(&[(&work, Access::ReadWrite)]);
+        sandbox.allow_connect(&allowed).unwrap();
+        let script = format!(
+            "echo x | nc -U -w 1 {allowed} && echo allowed=ok; \
+             echo x | nc -U -w 1 {other} && echo other=ok; \
+             rm {allowed} && ln {host} {allowed} 2>/dev/null && echo linked=ok; \
+             echo x | nc -U -w 1 {allowed} && echo host=ok; echo done",
+            allowed = allowed.display(),
+            other = other.display(),
+            host = host.display(),
+        );
+        let (code, output) = run(sandbox, &work, &script);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("done"), "{output}");
+        assert!(output.contains("allowed=ok"), "{output}");
+        assert!(!output.contains("other=ok"), "{output}");
+        assert!(!output.contains("host=ok"), "{output}");
+    }
+
+    #[test]
     fn system_programs_run_with_a_working_terminal() {
         let (_dir, work) = canonical_tempdir();
         let (code, output) = run(

@@ -48,6 +48,7 @@ const SYSTEM: &[&str] = &[
 pub struct Sandbox {
     binds: Vec<Bind>,
     links: Vec<Link>,
+    sockets: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +92,9 @@ pub enum SandboxError {
     /// above another rule.
     #[error("{} overlaps another sandbox rule", .0.display())]
     Overlaps(PathBuf),
+    /// The path is not inside a bound path, so the agent could not reach it.
+    #[error("{} is not inside a bound path", .0.display())]
+    NotBound(PathBuf),
     /// Inspecting a host system path failed.
     #[error("cannot inspect {}", .0.display())]
     Inspect(PathBuf, #[source] io::Error),
@@ -151,6 +155,25 @@ impl Sandbox {
             path: path.to_path_buf(),
             access,
         });
+        Ok(self)
+    }
+
+    /// Lets the agent connect to the Unix socket at `path`, which must be inside a path
+    /// bound before.
+    ///
+    /// On Linux a socket in a bound path can always be reached, so this only checks the path.
+    /// On macOS, where Seatbelt refuses every outbound connection by default, it allows
+    /// connections to this one socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is not plain, is reserved, or is not inside a bound path.
+    pub fn allow_connect(&mut self, path: &Path) -> Result<&mut Self, SandboxError> {
+        check_plain(path)?;
+        if !self.binds.iter().any(|bind| path.starts_with(&bind.path)) {
+            return Err(SandboxError::NotBound(path.to_path_buf()));
+        }
+        self.sockets.push(path.to_path_buf());
         Ok(self)
     }
 
@@ -217,6 +240,27 @@ mod tests {
             );
         }
         assert!(sandbox.bind(Path::new("/a/b"), Access::ReadOnly).is_ok());
+    }
+
+    #[test]
+    fn a_socket_must_be_inside_a_bound_path() {
+        let mut sandbox = Sandbox::new();
+        assert!(matches!(
+            sandbox.allow_connect(Path::new("/run/mahi.sock")),
+            Err(SandboxError::NotBound(_))
+        ));
+        sandbox
+            .bind(Path::new("/scratch"), Access::ReadWrite)
+            .unwrap();
+        assert!(
+            sandbox
+                .allow_connect(Path::new("/scratch/mahi.sock"))
+                .is_ok()
+        );
+        assert!(matches!(
+            sandbox.allow_connect(Path::new("/scratch/../x.sock")),
+            Err(SandboxError::NotPlain(_))
+        ));
     }
 
     #[test]

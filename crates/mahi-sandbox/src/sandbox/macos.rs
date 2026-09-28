@@ -127,6 +127,15 @@ impl Profile {
                 )?;
             }
         }
+        for socket in &sandbox.sockets {
+            push_rule(
+                &mut source,
+                format_args!(
+                    "(allow network-outbound (remote unix-socket (path-literal {})))",
+                    quoted(socket)?
+                ),
+            )?;
+        }
         let source = CString::new(source)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         Ok(Self { source })
@@ -237,6 +246,27 @@ mod tests {
         assert!(outer < deny && deny < inner, "{source}");
         assert!(source.contains(&literal(&work.join("a"))), "{source}");
         assert!(!source.contains(&literal(&work)), "{source}");
+    }
+
+    #[test]
+    fn only_allowed_sockets_can_be_connected_to() {
+        let (_dir, work, mut sandbox) = nested_policy();
+        let socket = work.join("mahi.sock");
+        let without = Profile::new(&sandbox, Path::new("/dev/ttys000")).unwrap();
+        assert!(
+            !without
+                .source()
+                .to_str()
+                .unwrap()
+                .contains("network-outbound")
+        );
+        sandbox.allow_connect(&socket).unwrap();
+        let profile = Profile::new(&sandbox, Path::new("/dev/ttys000")).unwrap();
+        let rule = format!(
+            "(allow network-outbound (remote unix-socket (path-literal \"{}\")))",
+            socket.display()
+        );
+        assert!(profile.source().to_str().unwrap().contains(&rule));
     }
 
     #[test]
