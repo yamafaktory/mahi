@@ -63,7 +63,15 @@ pub(crate) struct Environment {
     pub(crate) user: Option<String>,
     pub(crate) temp_dir: PathBuf,
     pub(crate) passed_on: Vec<(&'static str, OsString)>,
-    pub(crate) pass_env: Vec<(EnvName, Option<Zeroizing<Vec<u8>>>)>,
+    pub(crate) pass_env: Vec<Passed>,
+}
+
+/// A variable passed on to the agent: its value, if set, and whether a missing one is an error
+/// (named with `--pass-env`) or is simply left out (named by a profile).
+pub(crate) struct Passed {
+    pub(crate) name: EnvName,
+    pub(crate) value: Option<Zeroizing<Vec<u8>>>,
+    pub(crate) required: bool,
 }
 
 impl fmt::Debug for Environment {
@@ -82,7 +90,7 @@ impl fmt::Debug for Environment {
                 &self
                     .pass_env
                     .iter()
-                    .map(|(name, _)| name)
+                    .map(|passed| &passed.name)
                     .collect::<Vec<_>>(),
             )
             .finish_non_exhaustive()
@@ -135,8 +143,8 @@ impl fmt::Display for EnvName {
 }
 
 impl Environment {
-    /// Reads the environment, including the variables named in `pass_env`.
-    pub(crate) fn read(pass_env: &[EnvName]) -> Self {
+    /// Reads the environment, including the variables named in `required` and `optional`.
+    pub(crate) fn read(required: &[EnvName], optional: &[EnvName]) -> Self {
         let value = |name| env::var_os(name).filter(|value| !value.is_empty());
         let path = |name| value(name).map(PathBuf::from);
         Self {
@@ -153,12 +161,14 @@ impl Environment {
                 .iter()
                 .filter_map(|&name| value(name).map(|value| (name, value)))
                 .collect(),
-            pass_env: pass_env
+            pass_env: required
                 .iter()
-                .map(|name| {
-                    let value =
-                        env::var_os(name.as_str()).map(|value| Zeroizing::new(value.into_vec()));
-                    (name.clone(), value)
+                .map(|name| (name, true))
+                .chain(optional.iter().map(|name| (name, false)))
+                .map(|(name, required)| Passed {
+                    name: name.clone(),
+                    value: env::var_os(name.as_str()).map(|value| Zeroizing::new(value.into_vec())),
+                    required,
                 })
                 .collect(),
         }
@@ -216,10 +226,11 @@ mod tests {
     #[test]
     fn debug_shows_passed_names_but_never_their_values() {
         let environment = Environment {
-            pass_env: vec![(
-                "TOKEN".parse().unwrap(),
-                Some(Zeroizing::new(b"s3cret".to_vec())),
-            )],
+            pass_env: vec![Passed {
+                name: "TOKEN".parse().unwrap(),
+                value: Some(Zeroizing::new(b"s3cret".to_vec())),
+                required: true,
+            }],
             ..Environment::default()
         };
         let shown = format!("{environment:?}");

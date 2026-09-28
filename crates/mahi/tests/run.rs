@@ -501,6 +501,114 @@ mod tests {
         assert!(output.stderr.is_empty());
     }
 
+    const FAKE_CLAUDE: &str = r#"#!/bin/sh
+echo config=$CLAUDE_CONFIG_DIR
+echo quiet=$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+echo updates=$DISABLE_AUTOUPDATER
+echo connectors=$ENABLE_CLAUDEAI_MCP_SERVERS
+echo token=${CLAUDE_CODE_OAUTH_TOKEN:-none}
+echo apikey=${ANTHROPIC_API_KEY:-none}
+echo proxy=${HTTPS_PROXY:-none}
+grep -q 'hook turn-end' "$CLAUDE_CONFIG_DIR/settings.json" && echo hooks=ok
+printf 'fix it' | "$MAHI_BIN" hook prompt
+"$MAHI_BIN" hook tool < /dev/null
+"$MAHI_BIN" hook turn-end < /dev/null
+{ echo kept > "$CLAUDE_CONFIG_DIR/written" && echo state=writable; } 2>/dev/null || echo state=none
+"#;
+
+    fn fake_claude(fixture: &Fixture) -> PathBuf {
+        let tools = fixture.root.join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        let claude = tools.join("claude");
+        fs::write(&claude, FAKE_CLAUDE).unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+        claude
+    }
+
+    #[test]
+    fn claude_gets_its_profile_hooks_state_and_subscription_token_only() {
+        let fixture = fixture();
+        let claude = fake_claude(&fixture);
+        let output = fixture
+            .command(&["run", claude.to_str().unwrap()])
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "subscription")
+            .env("ANTHROPIC_API_KEY", "per-token")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+        assert!(stderr.contains("claude-code profile"), "{stderr}");
+        let worktree = worktree_of(&stderr);
+        let thread_name = worktree.file_name().unwrap().to_str().unwrap();
+        let state = fixture
+            .repo
+            .join(".git/mahi/state")
+            .join(thread_name)
+            .join("tester.claude");
+        let state = fs::canonicalize(state).unwrap();
+        assert!(
+            stdout.contains(&format!("config={}", state.display())),
+            "{stdout}"
+        );
+        for expected in [
+            "quiet=1",
+            "updates=1",
+            "connectors=false",
+            "token=subscription",
+            "apikey=none",
+            "proxy=http://",
+            "hooks=ok",
+            "state=writable",
+        ] {
+            assert!(stdout.contains(expected), "{expected}: {stdout}");
+        }
+        assert_eq!(fs::read_to_string(state.join("written")).unwrap(), "kept\n");
+        assert_eq!(
+            fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let overridden = fixture.mahi(&[
+            "run",
+            "--pass-env",
+            "CLAUDE_CONFIG_DIR",
+            claude.to_str().unwrap(),
+        ]);
+        assert_eq!(overridden.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&overridden.stderr).contains("set by the claude-code profile")
+        );
+
+        let thread: ThreadId = thread_name.parse().unwrap();
+        let store = Store::open(&fixture.repo).unwrap();
+        let meta = load_meta(&store, thread, &fixture.owner, 0).unwrap();
+        let tester = ParticipantName::new("tester").unwrap();
+        let key = meta.thread_key(&tester, fixture.identity.as_age()).unwrap();
+        let slot = AgentSlot::new(tester, AgentName::new("claude").unwrap());
+        let turns = read_turns(&store, &key, thread, &slot, 10).unwrap();
+        assert_eq!(turns.len(), 1, "{stderr}");
+        assert_eq!(turns[0].events().len(), 3);
+    }
+
+    #[test]
+    fn no_profile_runs_claude_bare() {
+        let fixture = fixture();
+        let claude = fake_claude(&fixture);
+        let output = fixture
+            .command(&["run", "--no-profile", claude.to_str().unwrap()])
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "subscription")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+        assert!(!stderr.contains("profile"), "{stderr}");
+        for expected in ["config=\r", "token=none", "proxy=none", "state=none"] {
+            assert!(stdout.contains(expected), "{expected}: {stdout}");
+        }
+        assert!(!stdout.contains("hooks=ok"), "{stdout}");
+    }
+
     #[test]
     fn the_agent_cannot_write_to_the_checkout_or_the_git_directory() {
         let fixture = fixture();

@@ -58,6 +58,7 @@ use mahi_identity::{
     SigningKey,
     SshAgent,
 };
+use mahi_proxy::HostName;
 use mahi_sandbox::{
     Access,
     PtyChild,
@@ -105,6 +106,10 @@ use crate::{
         Network,
         NetworkError,
         Running,
+    },
+    profile::{
+        self,
+        Profile,
     },
     recorder::{
         RecordError,
@@ -206,6 +211,15 @@ pub(crate) enum RunError {
     MissingVariable(EnvName),
     #[error("cannot set up the agent's network")]
     Network(#[from] NetworkError),
+    #[error("the {0} profile needs the path of the mahi binary for its hooks, which is unknown")]
+    NoMahiBinary(&'static str),
+    #[error("{name} is set by the {profile} profile; use --no-profile to set it yourself")]
+    SetByProfile {
+        name: EnvName,
+        profile: &'static str,
+    },
+    #[error("cannot prepare the agent's state directory")]
+    State(#[source] io::Error),
     #[error("cannot start the thread")]
     Start(#[from] StartError),
 }
@@ -256,13 +270,9 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let store = Store::discover(&cwd)?;
     let agent = resolve(command.agent(), &cwd, environment.path.as_deref())?;
     require_program(&agent.canonical)?;
-    if let Some((name, _)) = environment
-        .pass_env
-        .iter()
-        .find(|(_, value)| value.is_none())
-    {
-        return Err(RunError::MissingVariable(name.clone()));
-    }
+    let profile = command.profile();
+    check_profile(profile, environment)?;
+    require_passed(environment)?;
     let agent_name = session::agent_from(Path::new(command.agent()));
     let git_dir = fs::canonicalize(store.common_dir()).map_err(RunError::GitDirectory)?;
     if host.is_private(&git_dir) {
@@ -279,7 +289,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let hook_socket = scratch_path.join(HOOK_SOCKET_NAME);
     let hooks = UnixListener::bind(&hook_socket).map_err(RunError::Scratch)?;
     let sandbox = Sandbox::system()?;
-    let network = Network::prepare(command.allow_hosts())?;
+    let network = Network::prepare(&allowed_hosts(command, profile))?;
     let globals = environment.git_patterns();
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
     let (started, caught) = until_stopped(&termination, |interrupt| {
@@ -307,6 +317,12 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         started.thread,
         started.worktree.display()
     );
+    if let Some(profile) = profile {
+        eprintln!(
+            "mahi: {} profile (--no-profile runs the agent without it)",
+            profile.name
+        );
+    }
     let launch = Launch {
         command,
         environment,
@@ -316,6 +332,8 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         scratch: &scratch_path,
         hook_socket: &hook_socket,
         host: &host,
+        profile,
+        state: profile.map(|_| started.state_dir(&store)),
     };
     let (child, raw, proxy) = started.launch(&store, || launch.spawn(sandbox, network))?;
     let (recorder, turns) = start_background(&mut started, &git_dir, globals, hooks);
@@ -451,6 +469,55 @@ fn stop_on_signal(
     }
 }
 
+fn check_profile(
+    profile: Option<&'static Profile>,
+    environment: &Environment,
+) -> Result<(), RunError> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    if environment.mahi_exe.is_none() {
+        return Err(RunError::NoMahiBinary(profile.name));
+    }
+    let set = profile.set_names();
+    match environment
+        .pass_env
+        .iter()
+        .find(|passed| passed.required && set.contains(&passed.name.as_str()))
+    {
+        Some(passed) => Err(RunError::SetByProfile {
+            name: passed.name.clone(),
+            profile: profile.name,
+        }),
+        None => Ok(()),
+    }
+}
+
+fn require_passed(environment: &Environment) -> Result<(), RunError> {
+    match environment
+        .pass_env
+        .iter()
+        .find(|passed| passed.required && passed.value.is_none())
+    {
+        Some(missing) => Err(RunError::MissingVariable(missing.name.clone())),
+        None => Ok(()),
+    }
+}
+
+fn allowed_hosts(command: &RunCommand, profile: Option<&Profile>) -> Vec<HostName> {
+    let from_profile = profile
+        .map(|profile| profile.hosts)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|host| host.parse().ok());
+    command
+        .allow_hosts()
+        .iter()
+        .cloned()
+        .chain(from_profile)
+        .collect()
+}
+
 fn stop_now(signal: Termination) -> ! {
     signal.reraise();
     process::exit(128 + signal.number())
@@ -488,6 +555,8 @@ fn until_stopped<T>(
 }
 
 struct Launch<'a> {
+    profile: Option<&'static Profile>,
+    state: Option<PathBuf>,
     command: &'a RunCommand,
     environment: &'a Environment,
     agent: &'a Agent,
@@ -499,6 +568,16 @@ struct Launch<'a> {
 }
 
 impl Launch<'_> {
+    fn prepare_state(&self) -> Result<Option<PathBuf>, RunError> {
+        let (Some(profile), Some(state)) = (self.profile, &self.state) else {
+            return Ok(None);
+        };
+        profile::create_private_dir(state).map_err(RunError::State)?;
+        let state = fs::canonicalize(state).map_err(RunError::State)?;
+        profile.install(&state).map_err(RunError::State)?;
+        Ok(Some(state))
+    }
+
     fn spawn(
         &self,
         mut sandbox: Sandbox,
@@ -528,6 +607,10 @@ impl Launch<'_> {
             }
         }
         sandbox.allow_connect(self.hook_socket)?;
+        let state = self.prepare_state()?;
+        if let Some(state) = &state {
+            sandbox.bind(state, Access::ReadWrite)?;
+        }
         if let Some(network) = &network {
             sandbox.open_loopback_port(network.port())?;
         }
@@ -545,9 +628,15 @@ impl Launch<'_> {
         if let Some(mahi) = &self.environment.mahi_exe {
             pty = pty.env(MAHI_BIN, mahi);
         }
-        for (name, value) in &self.environment.pass_env {
-            if let Some(value) = value {
-                pty = pty.env(name.as_str(), OsStr::from_bytes(value));
+        for passed in &self.environment.pass_env {
+            if let Some(value) = &passed.value {
+                pty = pty.env(passed.name.as_str(), OsStr::from_bytes(value));
+            }
+        }
+        if let (Some(profile), Some(state)) = (self.profile, &state) {
+            pty = pty.env(profile.state_env, state);
+            for (name, value) in profile.env {
+                pty = pty.env(name, value);
             }
         }
         if let Some(network) = &network {

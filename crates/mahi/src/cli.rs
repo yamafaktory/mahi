@@ -13,6 +13,7 @@ use mahi_proxy::HostName;
 use crate::{
     environment::EnvName,
     hook::HookKind,
+    profile::Profile,
 };
 
 const EXIT_CODES: &str = "\
@@ -56,6 +57,10 @@ pub(crate) struct RunCommand {
     /// in with; repeat it for several. mahi never interprets or shows its value.
     #[arg(long = "pass-env", value_name = "NAME")]
     pass_env: Vec<EnvName>,
+    /// Runs the agent bare, without the profile mahi has for it (such as claude-code for
+    /// `claude`): no hosts, variables, settings or hooks beyond what the options give.
+    #[arg(long = "no-profile")]
+    no_profile: bool,
     /// The agent to run, looked up on PATH unless it contains a slash, then the arguments
     /// passed to it unchanged.
     #[arg(
@@ -86,6 +91,14 @@ impl RunCommand {
     pub(crate) fn pass_env(&self) -> &[EnvName] {
         &self.pass_env
     }
+
+    /// Returns the profile for the agent, unless `--no-profile` was given.
+    pub(crate) fn profile(&self) -> Option<&'static Profile> {
+        if self.no_profile {
+            return None;
+        }
+        Profile::for_agent(self.agent())
+    }
 }
 
 #[cfg(test)]
@@ -106,6 +119,7 @@ mod tests {
             command: Command::Run(RunCommand {
                 allow_hosts: Vec::new(),
                 pass_env: Vec::new(),
+                no_profile: false,
                 command: std::iter::once(agent)
                     .chain(arguments.iter().copied())
                     .map(OsString::from)
@@ -178,6 +192,14 @@ mod tests {
         assert_eq!(command.pass_env()[0].as_str(), "TOKEN");
         assert_eq!(command.agent(), "claude");
         assert_eq!(command.arguments(), ["--allow-host", "x"]);
+        let Command::Run(claude) = parse(&["run", "claude"]).unwrap().command else {
+            panic!("expected the run command");
+        };
+        assert_eq!(claude.profile().unwrap().name, "claude-code");
+        let Command::Run(bare) = parse(&["run", "--no-profile", "claude"]).unwrap().command else {
+            panic!("expected the run command");
+        };
+        assert!(bare.profile().is_none());
         for bad in [
             ["run", "--allow-host", "127.0.0.1", "claude"],
             ["run", "--allow-host", "localhost", "claude"],

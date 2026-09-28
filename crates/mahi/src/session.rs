@@ -1,4 +1,6 @@
 use std::{
+    fs,
+    io,
     path::{
         Path,
         PathBuf,
@@ -44,6 +46,7 @@ use mahi_thread::{
 use thiserror::Error;
 
 const WORKTREES: [&str; 2] = ["mahi", "worktrees"];
+const STATE: [&str; 2] = ["mahi", "state"];
 pub(crate) const SNAPSHOT_MESSAGE: &str = "snapshot";
 
 /// A thread `mahi run` started, the worktree its agent works in, and the worktree's first
@@ -190,6 +193,24 @@ fn remove_worktree_or_report(store: &Store, name: &str) {
 }
 
 impl Started {
+    /// Returns where the agent keeps its own state for this thread, such as Claude Code's
+    /// config directory: `<common git dir>/mahi/state/<thread>/<participant>.<agent>`.
+    pub(crate) fn state_dir(&self, store: &Store) -> PathBuf {
+        self.state_root(store).join(format!(
+            "{}.{}",
+            self.slot.participant().as_str(),
+            self.slot.agent().as_str()
+        ))
+    }
+
+    fn state_root(&self, store: &Store) -> PathBuf {
+        store
+            .common_dir()
+            .join(STATE[0])
+            .join(STATE[1])
+            .join(self.thread.to_string())
+    }
+
     /// Runs `start_agent`, and removes the thread and its worktree if it fails.
     pub(crate) fn launch<T, E>(
         &self,
@@ -215,10 +236,14 @@ impl Started {
         };
         let thread = discard_thread(store, self.thread, self.meta);
         let worktree = store.remove_worktree(&self.thread.to_string());
+        let state = match fs::remove_dir_all(self.state_root(store)) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
         snapshots?;
         thread?;
         worktree?;
-        Ok(())
+        state.map_err(DiscardError::State)
     }
 }
 
@@ -228,6 +253,8 @@ pub(crate) enum DiscardError {
     Worktree(#[from] StoreError),
     #[error("cannot remove the thread")]
     Thread(#[from] ThreadError),
+    #[error("cannot remove the agent's state")]
+    State(#[source] io::Error),
 }
 
 /// Turns a login name or a program name into a mahi name: lowercase, with every other
@@ -458,8 +485,13 @@ pub(crate) mod tests {
         let (_dir, store) = repository_on_main();
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let started = start_with(&store, &signer).unwrap();
+        let state = started.state_dir(&store);
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("settings.json"), "{}").unwrap();
         started.discard(&store).unwrap();
         assert!(!started.worktree.exists());
+        assert!(!state.exists());
+        assert!(!state.parent().unwrap().exists());
         assert_eq!(store.head(&started.snapshots).unwrap(), None);
         let meta = ThreadRef::new(started.thread, RefKind::Meta);
         assert_eq!(store.head(&meta).unwrap(), None);
