@@ -304,6 +304,21 @@ mod tests {
     }
 
     #[test]
+    fn a_file_that_is_not_a_program_is_refused_before_a_thread_starts() {
+        let fixture = fixture();
+        let agent = fixture.root.join("tools").join("broken-agent");
+        fs::create_dir(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"\x00\x01\x02 not a program").unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = fixture.mahi(&["run", agent.to_str().unwrap()]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("is not a program"), "{stderr}");
+        assert!(fixture.threads().is_empty());
+        assert!(!fixture.repo.join(".git/mahi/worktrees").exists());
+    }
+
+    #[test]
     fn a_failure_before_the_agent_starts_leaves_no_thread_or_worktree() {
         let fixture = fixture();
         let output = fixture

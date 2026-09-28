@@ -69,9 +69,17 @@ use mahi_store::{
     Store,
     StoreError,
 };
-use rustix::termios::{
-    LocalModes,
-    SpecialCodeIndex,
+use rustix::{
+    fs::{
+        FileType,
+        Mode,
+        OFlags,
+    },
+    io::Errno,
+    termios::{
+        LocalModes,
+        SpecialCodeIndex,
+    },
 };
 use thiserror::Error;
 
@@ -88,6 +96,16 @@ use crate::{
     },
 };
 
+#[cfg(target_os = "linux")]
+const PROGRAM_HEADERS: [&[u8]; 1] = [b"\x7fELF"];
+#[cfg(target_os = "macos")]
+const PROGRAM_HEADERS: [&[u8]; 5] = [
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe",
+];
 const HOME: &str = "home";
 const TMP: &str = "tmp";
 const PRIVATE_IN_HOME: [&str; 9] = [
@@ -122,6 +140,10 @@ pub(crate) enum RunError {
     AgentNotFound(OsString),
     #[error("cannot find the agent {}", .0.display())]
     Agent(PathBuf, #[source] io::Error),
+    #[error("cannot read the agent {}", .0.display())]
+    AgentUnreadable(PathBuf, #[source] io::Error),
+    #[error("{} is not a program this system can run", .0.display())]
+    NotAProgram(PathBuf),
     #[error("cannot create the agent's private directories")]
     Scratch(#[source] io::Error),
     #[error("cannot build the sandbox")]
@@ -195,6 +217,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         .map_err(RunError::ParticipantName)?;
     let store = Store::discover(&cwd)?;
     let agent = resolve(command.agent(), &cwd, environment.path.as_deref())?;
+    require_program(&agent.canonical)?;
     let agent_name = session::agent_from(Path::new(command.agent()));
     let git_dir = fs::canonicalize(store.common_dir()).map_err(RunError::GitDirectory)?;
     if host.is_private(&git_dir) {
@@ -531,6 +554,30 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+fn require_program(path: &Path) -> Result<(), RunError> {
+    let unreadable = |error: Errno| RunError::AgentUnreadable(path.to_path_buf(), error.into());
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let file = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(file) => file,
+        Err(Errno::ACCESS) if is_executable(path) => return Ok(()),
+        Err(error) => return Err(unreadable(error)),
+    };
+    let stat = rustix::fs::fstat(&file).map_err(unreadable)?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return Err(RunError::NotAProgram(path.to_path_buf()));
+    }
+    let mut header = Vec::with_capacity(4);
+    File::from(file)
+        .take(4)
+        .read_to_end(&mut header)
+        .map_err(|error| RunError::AgentUnreadable(path.to_path_buf(), error))?;
+    if header.starts_with(b"#!") || PROGRAM_HEADERS.iter().any(|magic| header == *magic) {
+        Ok(())
+    } else {
+        Err(RunError::NotAProgram(path.to_path_buf()))
+    }
+}
+
 fn binds(
     cwd: &Path,
     git_dir: &Path,
@@ -621,6 +668,56 @@ mod tests {
         let search = env::join_paths([Path::new("."), &first, &root.join("linked")]).unwrap();
         let found = resolve(OsStr::new("agent"), &root, Some(&search)).unwrap();
         assert_eq!(found, agent_at(&real.join("agent")));
+    }
+
+    #[test]
+    fn only_native_programs_and_scripts_are_agents() {
+        let (_dir, root) = canonical_tempdir();
+        let native = fs::canonicalize("/bin/sh").unwrap();
+        require_program(&native).unwrap();
+        let script = root.join("script");
+        executable(&script);
+        require_program(&script).unwrap();
+        for (name, content) in [
+            ("garbage", b"\x00\x01\x02 not a program".as_slice()),
+            ("empty", b"".as_slice()),
+            ("text", b"echo no interpreter line".as_slice()),
+            ("short", b"\x7fEL".as_slice()),
+        ] {
+            let path = root.join(name);
+            fs::write(&path, content).unwrap();
+            assert!(
+                matches!(require_program(&path), Err(RunError::NotAProgram(_))),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            require_program(&root.join("missing")),
+            Err(RunError::AgentUnreadable(..))
+        ));
+        let fifo = root.join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            FileType::Fifo,
+            Mode::from_raw_mode(0o755),
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            require_program(&fifo),
+            Err(RunError::NotAProgram(_))
+        ));
+        assert!(matches!(
+            require_program(&root),
+            Err(RunError::NotAProgram(_))
+        ));
+        let hidden = root.join("execute-only");
+        fs::copy(&native, &hidden).unwrap();
+        fs::set_permissions(&hidden, fs::Permissions::from_mode(0o111)).unwrap();
+        if File::open(&hidden).is_err() {
+            require_program(&hidden).unwrap();
+        }
     }
 
     #[test]
