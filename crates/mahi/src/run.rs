@@ -41,6 +41,17 @@ use std::{
     },
 };
 
+use mahi_core::NameError;
+use mahi_identity::{
+    AgentError,
+    AgentSigner,
+    ConfigDir,
+    ConfigError,
+    IdentityError,
+    PublicIdentity,
+    SigningKey,
+    SshAgent,
+};
 use mahi_sandbox::{
     Access,
     PtyChild,
@@ -54,6 +65,10 @@ use mahi_sandbox::{
     WindowChanges,
     exit_code,
 };
+use mahi_store::{
+    Store,
+    StoreError,
+};
 use rustix::termios::{
     LocalModes,
     SpecialCodeIndex,
@@ -62,24 +77,19 @@ use thiserror::Error;
 
 use crate::{
     cli::RunCommand,
+    environment::Environment,
+    session::{
+        self,
+        StartError,
+    },
     terminal::{
         self,
         RawMode,
     },
 };
 
-const PASSED_ON: [&str; 10] = [
-    "TERM",
-    "COLORTERM",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LC_MESSAGES",
-    "PATH",
-    "USER",
-    "LOGNAME",
-    "TZ",
-];
+const HOME: &str = "home";
+const TMP: &str = "tmp";
 const PRIVATE_IN_HOME: [&str; 9] = [
     ".ssh",
     ".gnupg",
@@ -102,6 +112,8 @@ const BROKEN_PIPE_CODE: i32 = 128 + 13;
 pub(crate) enum RunError {
     #[error("cannot find the current directory")]
     CurrentDirectory(#[source] io::Error),
+    #[error("cannot find the repository's git directory")]
+    GitDirectory(#[source] io::Error),
     #[error("HOME is not set or does not exist, so mahi cannot tell which directories are private")]
     NoHome,
     #[error("refusing to give the agent {}, which holds private files", .0.display())]
@@ -122,6 +134,20 @@ pub(crate) enum RunError {
     Pty(#[from] PtyError),
     #[error("cannot catch the signals that stop mahi")]
     Signals(#[source] SignalError),
+    #[error("cannot find mahi's configuration directory")]
+    Config(#[from] ConfigError),
+    #[error("mahi is not set up; run mahi init first")]
+    NotInitialised(#[source] IdentityError),
+    #[error("SSH_AUTH_SOCK is not set; start ssh-agent and add your signing key (ssh-add)")]
+    NoSshAgent,
+    #[error("cannot sign with the SSH key")]
+    Signer(#[from] AgentError),
+    #[error("cannot make a participant name from USER")]
+    ParticipantName(#[source] NameError),
+    #[error("cannot open the git repository")]
+    Store(#[from] StoreError),
+    #[error("cannot start the thread")]
+    Start(#[from] StartError),
 }
 
 #[derive(Debug)]
@@ -148,60 +174,118 @@ enum Event {
     Stopped(Termination),
 }
 
-pub(crate) fn run(command: &RunCommand) -> Result<Outcome, RunError> {
+pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Outcome, RunError> {
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(RunError::CurrentDirectory)?;
-    let host = Host::from_environment()?;
-    let search_path = env::var_os("PATH");
-    let agent = resolve(command.agent(), &cwd, search_path.as_deref())?;
+    let host = Host::from_environment(environment)?;
+    let config = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )?;
+    let public =
+        PublicIdentity::load(&config.recipient_file()).map_err(RunError::NotInitialised)?;
+    let signing = SigningKey::load(&config.signing_key_file()).map_err(RunError::NotInitialised)?;
+    let socket = environment
+        .ssh_auth_sock
+        .as_deref()
+        .ok_or(RunError::NoSshAgent)?;
+    let signer = AgentSigner::new(SshAgent::new(socket), signing.public_key().clone())?;
+    let participant = session::participant_from(environment.user.as_deref())
+        .map_err(RunError::ParticipantName)?;
+    let store = Store::discover(&cwd)?;
+    let agent = resolve(command.agent(), &cwd, environment.path.as_deref())?;
+    let agent_name = session::agent_from(Path::new(command.agent()));
+    let git_dir = fs::canonicalize(store.common_dir()).map_err(RunError::GitDirectory)?;
+    if host.is_private(&git_dir) {
+        return Err(RunError::PrivateDirectory(git_dir));
+    }
     let scratch = tempfile::Builder::new()
         .prefix("mahi-")
-        .tempdir()
+        .tempdir_in(&environment.temp_dir)
         .map_err(RunError::Scratch)?;
     let scratch_path = fs::canonicalize(scratch.path()).map_err(RunError::Scratch)?;
-    let home = scratch_path.join("home");
-    let temporary = scratch_path.join("tmp");
-    for directory in [&home, &temporary] {
-        fs::create_dir(directory).map_err(RunError::Scratch)?;
+    for directory in [HOME, TMP] {
+        fs::create_dir(scratch_path.join(directory)).map_err(RunError::Scratch)?;
     }
-    let mut sandbox = Sandbox::system()?;
-    let git = cwd.join(".git");
-    for (path, access) in binds(&cwd, &agent, &scratch_path, search_path.as_deref(), &host)? {
-        let program_directory = access == Access::ReadOnly && path != git;
-        match sandbox.bind(&path, access) {
-            Ok(_) => {}
-            Err(SandboxError::Overlaps(_)) if program_directory => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let mut pty = PtyCommand::new(&agent.program, &cwd, terminal::size());
-    for argument in command.arguments() {
-        pty = pty.arg(argument);
-    }
-    for name in PASSED_ON {
-        if let Some(value) = env::var_os(name) {
-            pty = pty.env(name, value);
-        }
-    }
-    let pty = pty
-        .env("HOME", &home)
-        .env("TMPDIR", &temporary)
-        .sandbox(sandbox);
-    let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
-    let raw = RawMode::enable().map_err(RunError::Terminal)?;
-    let interactive = raw.is_some();
-    let code = relay(pty.spawn()?, interactive, termination);
+    let sandbox = Sandbox::system()?;
+    let started = session::start(&store, &public, &signer, participant, &agent_name)?;
+    eprintln!(
+        "mahi: thread {} in {}",
+        started.thread,
+        started.worktree.display()
+    );
+    let launch = Launch {
+        command,
+        environment,
+        agent: &agent,
+        worktree: &started.worktree,
+        git_dir: &git_dir,
+        scratch: &scratch_path,
+        host: &host,
+    };
+    let (child, raw, termination) = started.launch(&store, || launch.spawn(sandbox))?;
+    let code = relay(child, raw.is_some(), termination);
     drop(raw);
     code
 }
 
+struct Launch<'a> {
+    command: &'a RunCommand,
+    environment: &'a Environment,
+    agent: &'a Agent,
+    worktree: &'a Path,
+    git_dir: &'a Path,
+    scratch: &'a Path,
+    host: &'a Host,
+}
+
+impl Launch<'_> {
+    fn spawn(
+        &self,
+        mut sandbox: Sandbox,
+    ) -> Result<(PtyChild, Option<RawMode>, TerminationSignals), RunError> {
+        let git_file = self.worktree.join(".git");
+        for (path, access) in binds(
+            self.worktree,
+            self.git_dir,
+            self.agent,
+            self.scratch,
+            self.environment.path.as_deref(),
+            self.host,
+        )? {
+            let program_directory =
+                access == Access::ReadOnly && path != git_file && path != self.git_dir;
+            match sandbox.bind(&path, access) {
+                Ok(_) => {}
+                Err(SandboxError::Overlaps(_)) if program_directory => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut pty = PtyCommand::new(&self.agent.program, self.worktree, terminal::size());
+        for argument in self.command.arguments() {
+            pty = pty.arg(argument);
+        }
+        for (name, value) in &self.environment.passed_on {
+            pty = pty.env(name, value);
+        }
+        let pty = pty
+            .env("HOME", self.scratch.join(HOME))
+            .env("TMPDIR", self.scratch.join(TMP))
+            .sandbox(sandbox);
+        let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
+        let raw = RawMode::enable().map_err(RunError::Terminal)?;
+        let child = pty.spawn()?;
+        Ok((child, raw, termination))
+    }
+}
+
 impl Host {
-    fn from_environment() -> Result<Self, RunError> {
-        let canonical = |name| env::var_os(name).and_then(|path| fs::canonicalize(path).ok());
-        let home = canonical("HOME").ok_or(RunError::NoHome)?;
+    fn from_environment(environment: &Environment) -> Result<Self, RunError> {
+        let canonical = |path: Option<&Path>| path.and_then(|path| fs::canonicalize(path).ok());
+        let home = canonical(environment.home.as_deref()).ok_or(RunError::NoHome)?;
         let mut holders = vec![home.clone()];
-        holders.extend(fs::canonicalize(env::temp_dir()).ok());
+        holders.extend(canonical(Some(&environment.temp_dir)));
         let mut private: Vec<PathBuf> =
             PRIVATE_IN_HOME.iter().map(|name| home.join(name)).collect();
         let resolved: Vec<PathBuf> = private
@@ -210,7 +294,7 @@ impl Host {
             .collect();
         private.extend(resolved);
         private.extend(PRIVATE_ON_SYSTEM.iter().map(PathBuf::from));
-        private.extend(canonical("XDG_RUNTIME_DIR"));
+        private.extend(canonical(environment.xdg_runtime_dir.as_deref()));
         Ok(Self { holders, private })
     }
 
@@ -449,6 +533,7 @@ fn is_executable(path: &Path) -> bool {
 
 fn binds(
     cwd: &Path,
+    git_dir: &Path,
     agent: &Agent,
     scratch: &Path,
     search_path: Option<&OsStr>,
@@ -473,6 +558,7 @@ fn binds(
     {
         binds.push((git, Access::ReadOnly));
     }
+    binds.push((git_dir.to_path_buf(), Access::ReadOnly));
     let program_directories = [&agent.program, &agent.canonical]
         .into_iter()
         .filter_map(|path| path.parent().map(Path::to_path_buf));
@@ -562,13 +648,21 @@ mod tests {
         let agent = agent_at(Path::new("/usr/bin/true"));
         for cwd in [&home, &root.join("home"), &root, &home.join(".ssh/keys")] {
             assert!(matches!(
-                binds(cwd, &agent, Path::new("/scratch"), None, &host),
+                binds(
+                    cwd,
+                    Path::new("/repo/.git"),
+                    &agent,
+                    Path::new("/scratch"),
+                    None,
+                    &host
+                ),
                 Err(RunError::PrivateDirectory(_))
             ));
         }
         assert!(
             binds(
                 &home.join("project"),
+                Path::new("/repo/.git"),
                 &agent,
                 Path::new("/scratch"),
                 None,
@@ -603,6 +697,7 @@ mod tests {
         let agent = agent_at(&tools.join("agent"));
         let binds = binds(
             &project,
+            Path::new("/repo/.git"),
             &agent,
             &root.join("scratch"),
             Some(&search),
@@ -614,6 +709,7 @@ mod tests {
             [
                 (project.clone(), Access::ReadWrite),
                 (root.join("scratch"), Access::ReadWrite),
+                (PathBuf::from("/repo/.git"), Access::ReadOnly),
                 (tools, Access::ReadOnly),
             ]
         );
@@ -632,6 +728,7 @@ mod tests {
         };
         let binds = binds(
             &home.join("project"),
+            Path::new("/repo/.git"),
             &agent,
             &root.join("scratch"),
             None,
@@ -649,6 +746,7 @@ mod tests {
         let agent = agent_at(&home.join("agent.sh"));
         let binds = binds(
             &home.join("project"),
+            Path::new("/repo/.git"),
             &agent,
             &root.join("scratch"),
             None,
@@ -668,6 +766,7 @@ mod tests {
         let agent = agent_at(Path::new("/usr/bin/true"));
         let binds = binds(
             &project,
+            Path::new("/repo/.git"),
             &agent,
             Path::new("/scratch"),
             None,

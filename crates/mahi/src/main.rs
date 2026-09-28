@@ -5,6 +5,7 @@ mod environment;
 mod init;
 mod prompt;
 mod run;
+mod session;
 mod terminal;
 
 use std::{
@@ -40,7 +41,7 @@ fn main() {
                 1
             }
         },
-        Command::Run(command) => match run::run(&command) {
+        Command::Run(command) => match run::run(&command, &environment) {
             Ok(Outcome::Exited(code)) => code,
             Ok(Outcome::Stopped(signal)) => {
                 signal.reraise();

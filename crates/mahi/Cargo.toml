@@ -12,8 +12,12 @@ version.workspace = true
 [dependencies]
 age = { workspace = true }
 clap = { workspace = true }
+mahi-core = { workspace = true }
+mahi-crypto = { workspace = true }
 mahi-identity = { workspace = true }
 mahi-sandbox = { workspace = true }
+mahi-store = { workspace = true }
+mahi-thread = { workspace = true }
 rustix = { workspace = true }
 ssh-key = { workspace = true }
 subtle = { workspace = true }
@@ -22,7 +26,9 @@ thiserror = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+gix = { workspace = true }
 libc = { workspace = true }
+signature = { workspace = true }
 ssh-key = { workspace = true }
 tempfile = { workspace = true }
 

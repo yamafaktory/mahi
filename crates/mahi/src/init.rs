@@ -267,8 +267,8 @@ mod tests {
         serve_keys(&socket, keys.to_vec());
         let environment = Environment {
             home: Some(home.clone()),
-            xdg_config_home: None,
             ssh_auth_sock: Some(socket),
+            ..Environment::default()
         };
         let config = ConfigDir::resolve(Some(&home), None).unwrap();
         Setup {
@@ -472,8 +472,7 @@ mod tests {
         ));
         let environment = Environment {
             home: setup.environment.home.clone(),
-            xdg_config_home: None,
-            ssh_auth_sock: None,
+            ..Environment::default()
         };
         assert!(matches!(
             init(&environment, &mut Script::default()),

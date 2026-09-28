@@ -137,11 +137,11 @@ refs/threads/<id>/agents/<participant>.<agent>/session     # native agent sessio
 
 `mahi run -- claude` (or any agent):
 
-1. Find the repository that holds the current directory, as git does (a repository owned by another user is refused, as git refuses it), and create the thread: ID, thread key, `meta` ref (base commit, creator key, participants, landing branch). Optionally snapshot uncommitted changes as the real starting point.
-2. Add a linked worktree at the base with a detached `HEAD`, so no branch appears in the user's branch list; the agent's work is recorded in its `snapshots` ref. mahi writes git's linked-worktree layout itself and checks files out with gix. `.gitattributes` conversions (`text`, `eol`, `ident`, `working-tree-encoding`) apply as in git, so `git status` stays clean, but no filter driver is configured, so no filter program (such as git-lfs) runs: filtered files are checked out as stored. The worktree's git dir and the common git dir are read-only inside the sandbox (git config and hooks can execute code).
+1. Find the repository that holds the current directory, as git does (a repository owned by another user is refused, as git refuses it), and create the thread: ID, thread key, `meta` ref (base commit, creator key, participants, landing branch). `HEAD` must be on a local branch, which becomes the landing branch. The creator's participant name comes from `USER`, lowercased, and the agent's name from the file name of the agent program. Optionally snapshot uncommitted changes as the real starting point.
+2. Add a linked worktree at the base with a detached `HEAD`, at `<common git dir>/mahi/worktrees/<thread-id>`, so no branch appears in the user's branch list; the agent's work is recorded in its `snapshots` ref. mahi writes git's linked-worktree layout itself and checks files out with gix. `.gitattributes` conversions (`text`, `eol`, `ident`, `working-tree-encoding`) apply as in git, so `git status` stays clean, but no filter driver is configured, so no filter program (such as git-lfs) runs: filtered files are checked out as stored. The worktree's git dir and the common git dir are read-only inside the sandbox (git config and hooks can execute code).
 3. Start the proxies and the snapshot scheduler (snapshot zero = base).
 4. Create the per-thread agent config dir and install capture hooks.
-5. Launch the agent in the sandbox → PTY → the user's terminal.
+5. Launch the agent in the sandbox → PTY → the user's terminal. Everything that can fail without the thread is checked before step 1. If the agent still cannot start, the thread's `meta` ref, its pin and its worktree are removed, so a failed start leaves nothing to push.
 6. Join the gossip topic; print an invite ticket (node address, topic, key), bound to participant public keys.
 7. Each turn: events get host sequence numbers, are broadcast live, and are flushed as an encrypted turn commit at turn end, then pushed to the remote.
 
