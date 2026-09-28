@@ -95,6 +95,32 @@ impl Store {
         populated
     }
 
+    /// Removes the linked worktree `name`: its directory and its registration.
+    ///
+    /// The directory is removed only if its `.git` file points back to the registration and it
+    /// does not hold the repository's git directory. If removing the directory fails partway,
+    /// the registration stays and names a directory that no longer matches, so a later call
+    /// returns [`StoreError::NotAWorktree`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotAWorktree`] if `name` is not a linked worktree whose recorded
+    /// directory is where it should be and links back to it, or [`StoreError::Io`] if a
+    /// directory cannot be removed.
+    pub fn remove_worktree(&self, name: &str) -> Result<(), StoreError> {
+        let (repo, workdir) = self.open_worktree(name)?;
+        let admin = fs::canonicalize(repo.git_dir())?;
+        drop(repo);
+        let links_back = fs::read(workdir.join(".git"))
+            .is_ok_and(|link| link == line(&[b"gitdir: ", admin.as_os_str().as_bytes()]));
+        if !links_back || fs::canonicalize(self.common_dir())?.starts_with(&workdir) {
+            return Err(StoreError::NotAWorktree(name.to_owned()));
+        }
+        fs::remove_dir_all(&workdir)?;
+        fs::remove_dir_all(&admin)?;
+        Ok(())
+    }
+
     fn populate_worktree(
         &self,
         admin: &Path,
@@ -378,6 +404,71 @@ mod tests {
             assert_ne!(entry.stat.mtime.secs, 0);
             assert_ne!(entry.stat.size, 0);
         }
+    }
+
+    #[test]
+    fn a_removed_worktree_leaves_no_directory_or_registration() {
+        let (dir, store) = store();
+        let path = store
+            .add_worktree("agent", &dir.path().join("wt"), sample_commit(&store))
+            .unwrap();
+        fs::write(path.join("new"), b"work").unwrap();
+        store.remove_worktree("agent").unwrap();
+        assert!(!path.exists());
+        assert!(!store.common_dir().join(WORKTREES).join("agent").exists());
+        let main = gix::open(dir.path().join("repo")).unwrap();
+        assert!(main.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_a_registered_worktree_can_be_removed() {
+        let (dir, store) = store();
+        let path = store
+            .add_worktree("agent", &dir.path().join("wt"), sample_commit(&store))
+            .unwrap();
+        for name in ["other", "", "..", "agent/../agent"] {
+            assert!(
+                matches!(
+                    store.remove_worktree(name),
+                    Err(StoreError::NotAWorktree(_))
+                ),
+                "{name:?}"
+            );
+        }
+        let link = fs::read(path.join(".git")).unwrap();
+        fs::write(path.join(".git"), b"gitdir: /elsewhere\n").unwrap();
+        assert!(matches!(
+            store.remove_worktree("agent"),
+            Err(StoreError::NotAWorktree(_))
+        ));
+        fs::write(path.join(".git"), link).unwrap();
+        fs::rename(&path, dir.path().join("moved")).unwrap();
+        assert!(matches!(
+            store.remove_worktree("agent"),
+            Err(StoreError::NotAWorktree(_))
+        ));
+        assert!(dir.path().join("moved").join("README.md").exists());
+    }
+
+    #[test]
+    fn a_registration_pointing_at_the_main_checkout_removes_nothing() {
+        let (dir, store) = store();
+        store
+            .add_worktree("agent", &dir.path().join("wt"), sample_commit(&store))
+            .unwrap();
+        let main = fs::canonicalize(dir.path().join("repo")).unwrap();
+        let admin = store.common_dir().join(WORKTREES).join("agent");
+        fs::write(
+            admin.join("gitdir"),
+            line(&[main.join(".git").as_os_str().as_bytes()]),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.remove_worktree("agent"),
+            Err(StoreError::NotAWorktree(_))
+        ));
+        assert!(main.join(".git").join("HEAD").exists());
+        assert!(dir.path().join("wt").join("README.md").exists());
     }
 
     #[test]

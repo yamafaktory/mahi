@@ -327,7 +327,7 @@ impl Store {
         })
     }
 
-    fn open_worktree(&self, name: &str) -> Result<(Repository, PathBuf), StoreError> {
+    pub(crate) fn open_worktree(&self, name: &str) -> Result<(Repository, PathBuf), StoreError> {
         let not_a_worktree = || StoreError::NotAWorktree(name.to_owned());
         if name.is_empty() || name.contains('/') || name.starts_with('.') {
             return Err(not_a_worktree());

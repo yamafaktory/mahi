@@ -419,6 +419,34 @@ impl Store {
         Ok(id)
     }
 
+    /// Deletes `thread_ref` if it still points at `expected`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Conflict`] if the ref does not point at `expected`,
+    /// [`StoreError::Symbolic`] if it is a symbolic ref, or [`StoreError::Git`] if deleting
+    /// fails.
+    pub fn remove(&self, thread_ref: &ThreadRef, expected: ObjectId) -> Result<(), StoreError> {
+        self.require_head(thread_ref, Some(expected))?;
+        let full_name =
+            FullName::try_from(thread_ref.to_string()).map_err(gix::Error::from_error)?;
+        let edited = self.repo.edit_references_as(
+            Some(RefEdit::new(
+                full_name,
+                Change::Delete {
+                    expected: PreviousValue::MustExistAndMatch(Target::Object(expected)),
+                    log: RefLog::AndReference,
+                },
+            )),
+            None,
+        );
+        if let Err(error) = edited {
+            self.require_head(thread_ref, Some(expected))?;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     fn require_head(
         &self,
         thread_ref: &ThreadRef,
@@ -598,6 +626,26 @@ mod tests {
             [first]
         );
         assert_eq!(commit.message_raw_sloppy(), "turn 2");
+    }
+
+    #[test]
+    fn remove_deletes_a_ref_only_at_the_expected_commit() {
+        let (_dir, store) = store();
+        let r = transcript_ref();
+        let tree = empty_tree(&store);
+        let first = store.append(&r, None, tree, "turn 1").unwrap();
+        let second = store.append(&r, Some(first), tree, "turn 2").unwrap();
+        assert!(matches!(
+            store.remove(&r, first),
+            Err(StoreError::Conflict { .. })
+        ));
+        assert_eq!(store.head(&r).unwrap(), Some(second));
+        store.remove(&r, second).unwrap();
+        assert_eq!(store.head(&r).unwrap(), None);
+        assert!(matches!(
+            store.remove(&r, second),
+            Err(StoreError::Conflict { found: None, .. })
+        ));
     }
 
     #[test]
