@@ -267,7 +267,6 @@ pub(crate) mod tests {
                 EntryKind,
             },
         },
-        refs::transaction::PreviousValue,
     };
     use mahi_identity::LocalIdentity;
     use mahi_thread::SignError;
@@ -322,8 +321,11 @@ pub(crate) mod tests {
             extra_headers: Vec::new(),
         };
         let commit = repo.write_object(&commit).unwrap().detach();
-        repo.reference("refs/heads/main", commit, PreviousValue::Any, "test")
-            .unwrap();
+        std::fs::write(
+            repo.git_dir().join("refs/heads/main"),
+            format!("{commit}\n"),
+        )
+        .unwrap();
         std::fs::write(repo.git_dir().join("HEAD"), "ref: refs/heads/main\n").unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)

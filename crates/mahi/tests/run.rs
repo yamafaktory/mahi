@@ -41,7 +41,6 @@ mod tests {
                 EntryKind,
             },
         },
-        refs::transaction::PreviousValue,
     };
     use mahi_identity::{
         ConfigDir,
@@ -105,9 +104,8 @@ mod tests {
             extra_headers: Vec::new(),
         };
         let commit = repository.write_object(&commit).unwrap().detach();
-        repository
-            .reference("refs/heads/main", commit, PreviousValue::Any, "test")
-            .unwrap();
+        fs::create_dir_all(repo.join(".git/refs/heads")).unwrap();
+        fs::write(repo.join(".git/refs/heads/main"), format!("{commit}\n")).unwrap();
         fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         commit
     }
