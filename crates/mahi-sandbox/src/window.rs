@@ -15,6 +15,7 @@ use std::{
             Ordering,
         },
     },
+    time::Duration,
 };
 
 use rustix::{
@@ -157,6 +158,25 @@ impl TerminationSignals {
                 _ => continue,
             };
             return Ok(termination);
+        }
+    }
+
+    /// Waits up to `timeout` for one of the signals, and says which, or returns `None` if
+    /// none arrived in time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignalError::Io`] if waiting or reading the pipe fails.
+    pub fn wait_timeout(&self, timeout: Duration) -> Result<Option<Termination>, SignalError> {
+        let timeout = Timespec {
+            tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(timeout.subsec_nanos()),
+        };
+        let mut fds = [PollFd::new(&self.0.read_end, PollFlags::IN)];
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(0) | Err(Errno::INTR) => Ok(None),
+            Ok(_) => self.wait().map(Some),
+            Err(error) => Err(io::Error::from(error).into()),
         }
     }
 }
@@ -549,6 +569,22 @@ mod tests {
     }
 
     extern "C" fn foreign_handler(_: libc::c_int) {}
+
+    #[test]
+    fn a_timed_wait_returns_a_signal_or_nothing() {
+        for signal in WATCHED {
+            set_disposition(signal, libc::SIG_DFL).unwrap();
+        }
+        let termination = TerminationSignals::listen().unwrap();
+        let short = Duration::from_millis(10);
+        assert_eq!(termination.wait_timeout(short).unwrap(), None);
+        raise(libc::SIGINT);
+        assert_eq!(
+            termination.wait_timeout(Duration::from_secs(5)).unwrap(),
+            Some(Termination::Interrupt)
+        );
+        assert_eq!(termination.wait_timeout(short).unwrap(), None);
+    }
 
     #[test]
     fn listeners_wake_on_their_signals_and_give_the_actions_back() {

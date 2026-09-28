@@ -1057,7 +1057,12 @@ mod tests {
     fn checkout(setup: &Setup, commit: ObjectId) -> PathBuf {
         setup
             .store
-            .add_worktree("agent", &setup.dir.path().join("wt"), commit)
+            .add_worktree(
+                "agent",
+                &setup.dir.path().join("wt"),
+                commit,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
             .unwrap()
     }
 
@@ -1798,7 +1803,12 @@ mod tests {
         checkout(&setup, commit);
         setup
             .store
-            .add_worktree("other", &setup.dir.path().join("other"), commit)
+            .add_worktree(
+                "other",
+                &setup.dir.path().join("other"),
+                commit,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
             .unwrap();
         let mut cache = SnapshotCache::default();
         cached_snapshot(&setup, &mut cache);

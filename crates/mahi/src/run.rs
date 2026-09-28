@@ -21,10 +21,12 @@ use std::{
         Path,
         PathBuf,
     },
+    process,
     sync::{
         Arc,
         Mutex,
         atomic::{
+            AtomicBool,
             AtomicU64,
             Ordering,
         },
@@ -123,6 +125,7 @@ const PRIVATE_ON_SYSTEM: [&str; 3] = ["/run", "/private/var/run", "/private/tmp"
 const OUTPUT_GRACE: Duration = Duration::from_millis(500);
 const OUTPUT_LIMIT: Duration = Duration::from_secs(5);
 const EXIT_POLL: Duration = Duration::from_millis(50);
+const STOP_POLL: Duration = Duration::from_millis(50);
 const KILL_GRACE: Duration = Duration::from_secs(2);
 const BROKEN_PIPE_CODE: i32 = 128 + 13;
 
@@ -232,7 +235,26 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         fs::create_dir(scratch_path.join(directory)).map_err(RunError::Scratch)?;
     }
     let sandbox = Sandbox::system()?;
-    let started = session::start(&store, &public, &signer, participant, &agent_name)?;
+    let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
+    let (started, caught) = until_stopped(&termination, |interrupt| {
+        session::start(
+            &store,
+            &public,
+            &signer,
+            participant,
+            &agent_name,
+            interrupt,
+        )
+    });
+    if let Some(signal) = caught {
+        match &started {
+            Ok(started) => started.discard_or_report(&store),
+            Err(StartError::Store(StoreError::Interrupted)) => {}
+            Err(error) => eprintln!("mahi: {error}"),
+        }
+        return Ok(Outcome::Stopped(signal));
+    }
+    let started = started?;
     eprintln!(
         "mahi: thread {} in {}",
         started.thread,
@@ -247,10 +269,46 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         scratch: &scratch_path,
         host: &host,
     };
-    let (child, raw, termination) = started.launch(&store, || launch.spawn(sandbox))?;
+    let (child, raw) = started.launch(&store, || launch.spawn(sandbox))?;
     let code = relay(child, raw.is_some(), termination);
     drop(raw);
     code
+}
+
+fn stop_now(signal: Termination) -> ! {
+    signal.reraise();
+    process::exit(128 + signal.number())
+}
+
+fn until_stopped<T>(
+    termination: &TerminationSignals,
+    work: impl FnOnce(&AtomicBool) -> T,
+) -> (T, Option<Termination>) {
+    let interrupt = AtomicBool::new(false);
+    let finished = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            let mut caught = None;
+            while !finished.load(Ordering::SeqCst) {
+                match termination.wait_timeout(STOP_POLL) {
+                    Ok(Some(signal)) if caught.is_some() => stop_now(signal),
+                    Ok(Some(signal)) => {
+                        interrupt.store(true, Ordering::SeqCst);
+                        caught = Some(signal);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("mahi: cannot watch for stop signals: {error}");
+                        break;
+                    }
+                }
+            }
+            caught
+        });
+        let result = work(&interrupt);
+        finished.store(true, Ordering::SeqCst);
+        (result, watcher.join().ok().flatten())
+    })
 }
 
 struct Launch<'a> {
@@ -264,10 +322,7 @@ struct Launch<'a> {
 }
 
 impl Launch<'_> {
-    fn spawn(
-        &self,
-        mut sandbox: Sandbox,
-    ) -> Result<(PtyChild, Option<RawMode>, TerminationSignals), RunError> {
+    fn spawn(&self, mut sandbox: Sandbox) -> Result<(PtyChild, Option<RawMode>), RunError> {
         let git_file = self.worktree.join(".git");
         for (path, access) in binds(
             self.worktree,
@@ -296,10 +351,9 @@ impl Launch<'_> {
             .env("HOME", self.scratch.join(HOME))
             .env("TMPDIR", self.scratch.join(TMP))
             .sandbox(sandbox);
-        let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
         let raw = RawMode::enable().map_err(RunError::Terminal)?;
         let child = pty.spawn()?;
-        Ok((child, raw, termination))
+        Ok((child, raw))
     }
 }
 

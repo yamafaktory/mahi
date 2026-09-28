@@ -1,6 +1,12 @@
-use std::path::{
-    Path,
-    PathBuf,
+use std::{
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::atomic::{
+        AtomicBool,
+        Ordering,
+    },
 };
 
 use mahi_core::{
@@ -68,6 +74,7 @@ pub(crate) fn start(
     signer: &dyn SshSigner,
     participant: ParticipantName,
     agent: &AgentName,
+    interrupt: &AtomicBool,
 ) -> Result<Started, StartError> {
     let base = store.head_commit()?;
     let branch = store.head_branch()?.ok_or(StartError::NoBranch)?;
@@ -93,22 +100,39 @@ pub(crate) fn start(
             path.join(part)
         })
         .join(&name);
-    let worktree = store.add_worktree(&name, &path, base)?;
+    let worktree = store.add_worktree(&name, &path, base, interrupt)?;
+    if interrupt.load(Ordering::SeqCst) {
+        remove_worktree_or_report(store, &name);
+        return Err(StoreError::Interrupted.into());
+    }
     match create_thread(store, &draft, &ThreadKey::generate(), signer) {
-        Ok(meta) => Ok(Started {
-            thread,
-            worktree,
-            meta,
-        }),
+        Ok(meta) => {
+            let started = Started {
+                thread,
+                worktree,
+                meta,
+            };
+            if interrupt.load(Ordering::SeqCst) {
+                started.discard_or_report(store);
+                return Err(StoreError::Interrupted.into());
+            }
+            Ok(started)
+        }
         Err(error) => {
             if let ThreadError::CreatedButNotPinned { commit, .. } = &error
                 && discard_thread(store, thread, *commit).is_err()
             {
                 let _ = store.remove(&ThreadRef::new(thread, RefKind::Meta), *commit);
             }
-            let _ = store.remove_worktree(&name);
+            remove_worktree_or_report(store, &name);
             Err(error.into())
         }
+    }
+}
+
+fn remove_worktree_or_report(store: &Store, name: &str) {
+    if let Err(error) = store.remove_worktree(name) {
+        eprintln!("mahi: cannot remove worktree {name}: {error}");
     }
 }
 
@@ -119,11 +143,14 @@ impl Started {
         store: &Store,
         start_agent: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        start_agent().inspect_err(|_| {
-            if let Err(error) = self.discard(store) {
-                eprintln!("mahi: cannot remove thread {}: {error}", self.thread);
-            }
-        })
+        start_agent().inspect_err(|_| self.discard_or_report(store))
+    }
+
+    /// Removes the thread and its worktree, and says on standard error if that fails.
+    pub(crate) fn discard_or_report(&self, store: &Store) {
+        if let Err(error) = self.discard(store) {
+            eprintln!("mahi: cannot remove thread {}: {error}", self.thread);
+        }
     }
 
     /// Removes the thread and its worktree, for an agent that never ran.
@@ -247,13 +274,86 @@ mod tests {
     }
 
     fn start_with(store: &Store, signer: &dyn SshSigner) -> Result<Started, StartError> {
+        start_until(store, signer, &AtomicBool::new(false))
+    }
+
+    fn start_until(
+        store: &Store,
+        signer: &dyn SshSigner,
+        interrupt: &AtomicBool,
+    ) -> Result<Started, StartError> {
         start(
             store,
             &PublicIdentity::from(&LocalIdentity::generate()),
             signer,
             ParticipantName::new("alice").unwrap(),
             &agent_from(Path::new("claude")),
+            interrupt,
         )
+    }
+
+    struct InterruptedWhileSigning<'a>(PrivateKey, &'a AtomicBool);
+
+    impl SshSigner for InterruptedWhileSigning<'_> {
+        fn public_key(&self) -> &PublicKey {
+            self.0.public_key()
+        }
+
+        fn sign_sshsig(
+            &self,
+            namespace: &str,
+            hash: HashAlg,
+            message: &[u8],
+        ) -> Result<SshSig, SignError> {
+            self.1.store(true, Ordering::SeqCst);
+            self.0.sign_sshsig(namespace, hash, message)
+        }
+    }
+
+    fn no_thread_or_worktree(store: &Store) {
+        let repo = gix::open(store.common_dir()).unwrap();
+        let threads = repo
+            .references()
+            .unwrap()
+            .prefixed("refs/threads/")
+            .unwrap()
+            .count();
+        assert_eq!(threads, 0);
+        let registered = store.common_dir().join("worktrees");
+        for directory in [worktrees(store), registered] {
+            assert_eq!(
+                std::fs::read_dir(&directory).map_or(0, Iterator::count),
+                0,
+                "{}",
+                directory.display()
+            );
+        }
+    }
+
+    #[test]
+    fn an_interrupt_before_the_checkout_leaves_nothing() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        assert!(matches!(
+            start_until(&store, &signer, &AtomicBool::new(true)),
+            Err(StartError::Store(StoreError::Interrupted))
+        ));
+        no_thread_or_worktree(&store);
+    }
+
+    #[test]
+    fn an_interrupt_while_the_thread_is_signed_discards_it() {
+        let (_dir, store) = repository_on_main();
+        let interrupt = AtomicBool::new(false);
+        let signer = InterruptedWhileSigning(
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+            &interrupt,
+        );
+        assert!(matches!(
+            start_until(&store, &signer, &interrupt),
+            Err(StartError::Store(StoreError::Interrupted))
+        ));
+        no_thread_or_worktree(&store);
     }
 
     fn worktrees(store: &Store) -> PathBuf {
@@ -387,14 +487,7 @@ mod tests {
         gix::init(dir.path()).unwrap();
         let store = Store::open(dir.path()).unwrap();
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        let public = PublicIdentity::from(&LocalIdentity::generate());
-        let result = start(
-            &store,
-            &public,
-            &signer,
-            ParticipantName::new("alice").unwrap(),
-            &agent_from(Path::new("claude")),
-        );
+        let result = start_with(&store, &signer);
         assert!(matches!(
             result,
             Err(StartError::Store(StoreError::NoCommit))

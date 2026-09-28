@@ -121,6 +121,9 @@ pub enum StoreError {
     /// A path changed while it was being read; snapshot again.
     #[error("{0} changed while it was read")]
     ChangedDuringSnapshot(gix::bstr::BString),
+    /// The operation stopped because it was asked to.
+    #[error("interrupted")]
+    Interrupted,
     /// `HEAD` points to no commit yet.
     #[error("the repository has no commit yet")]
     NoCommit,

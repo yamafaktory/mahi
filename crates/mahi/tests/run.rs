@@ -22,6 +22,7 @@ mod tests {
             Output,
             Stdio,
         },
+        sync::mpsc,
         thread,
         time::{
             Duration,
@@ -112,6 +113,10 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with(None)
+    }
+
+    fn fixture_with(hold: Option<Hold>) -> Fixture {
         let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let root = fs::canonicalize(dir.path()).unwrap();
         let home = root.join("home");
@@ -122,7 +127,7 @@ mod tests {
         let socket = root.join("agent.sock");
         let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         initialise(&home, &key);
-        serve_signatures(&socket, key);
+        serve_signatures(&socket, key, hold);
         Fixture {
             _dir: dir,
             root,
@@ -160,7 +165,12 @@ mod tests {
         buffer.extend_from_slice(bytes);
     }
 
-    fn serve_signatures(socket: &Path, key: PrivateKey) {
+    struct Hold {
+        asked: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    fn serve_signatures(socket: &Path, key: PrivateKey, hold: Option<Hold>) {
         let listener = UnixListener::bind(socket).unwrap();
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -176,6 +186,10 @@ mod tests {
                 let Some((&SIGN_REQUEST, rest)) = request.split_first() else {
                     continue;
                 };
+                if let Some(hold) = &hold {
+                    let _ = hold.asked.send(());
+                    let _ = hold.release.recv();
+                }
                 let (_, rest) = take_string(rest);
                 let (data, _) = take_string(rest);
                 let signature: Signature = signature::Signer::try_sign(&key, data).unwrap();
@@ -316,6 +330,72 @@ mod tests {
         assert!(stderr.contains("is not a program"), "{stderr}");
         assert!(fixture.threads().is_empty());
         assert!(!fixture.repo.join(".git/mahi/worktrees").exists());
+    }
+
+    #[test]
+    fn a_stop_signal_while_the_thread_is_created_leaves_nothing_behind() {
+        let (asked, asked_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let fixture = fixture_with(Some(Hold {
+            asked,
+            release: release_rx,
+        }));
+        let mut child = KillOnDrop(
+            fixture
+                .command(&["run", "true"])
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        asked_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.0.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        release.send(()).unwrap();
+        let mut status = None;
+        wait_until("mahi to exit", || {
+            status = child.0.try_wait().unwrap();
+            status.is_some()
+        });
+        assert_eq!(status.unwrap().signal(), Some(libc::SIGTERM));
+        assert!(fixture.threads().is_empty());
+        for directory in [".git/mahi/worktrees", ".git/worktrees"] {
+            assert_eq!(
+                fs::read_dir(fixture.repo.join(directory)).map_or(0, Iterator::count),
+                0,
+                "{directory}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_stop_signal_ends_mahi_while_the_ssh_agent_waits() {
+        let (asked, asked_rx) = mpsc::channel();
+        let (_release, release_rx) = mpsc::channel();
+        let fixture = fixture_with(Some(Hold {
+            asked,
+            release: release_rx,
+        }));
+        let mut child = KillOnDrop(
+            fixture
+                .command(&["run", "true"])
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        asked_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.0.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(child.0.try_wait().unwrap().is_none());
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        let mut status = None;
+        wait_until("mahi to exit", || {
+            status = child.0.try_wait().unwrap();
+            status.is_some()
+        });
+        assert_eq!(status.unwrap().signal(), Some(libc::SIGTERM));
+        assert!(fixture.threads().is_empty());
     }
 
     #[test]

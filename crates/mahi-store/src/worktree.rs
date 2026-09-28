@@ -7,7 +7,10 @@ use std::{
         Path,
         PathBuf,
     },
-    sync::atomic::AtomicBool,
+    sync::atomic::{
+        AtomicBool,
+        Ordering,
+    },
 };
 
 use gix::{
@@ -34,15 +37,16 @@ impl Store {
     /// `working-tree-encoding`) are applied as git would, but no filter driver is configured,
     /// so no filter program (such as git-lfs) ever runs. Returns the worktree's canonical path.
     ///
-    /// If a step fails, the worktree directory and its registration are removed; missing parent
-    /// directories created for `path` may remain.
+    /// If a step fails, or `interrupt` is set during the checkout, the worktree directory and
+    /// its registration are removed; missing parent directories created for `path` may remain.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidWorktreeName`] if `name` is not a safe directory name,
     /// [`StoreError::InvalidWorktreePath`] if a path contains a newline,
     /// [`StoreError::WorktreeExists`] if `path` or a worktree called `name` exists,
-    /// [`StoreError::WrongObject`] if `commit` is not a commit, [`StoreError::Checkout`] or
+    /// [`StoreError::WrongObject`] if `commit` is not a commit, [`StoreError::Interrupted`] if
+    /// `interrupt` was set, [`StoreError::Checkout`] or
     /// [`StoreError::CheckoutPath`] if files could not be written, or another [`StoreError`] if
     /// reading or writing fails.
     pub fn add_worktree(
@@ -50,6 +54,7 @@ impl Store {
         name: &str,
         path: &Path,
         commit: ObjectId,
+        interrupt: &AtomicBool,
     ) -> Result<PathBuf, StoreError> {
         validate_name(name)?;
         self.require_kind(commit, Kind::Commit)?;
@@ -85,7 +90,7 @@ impl Store {
             .map_err(StoreError::from)
             .and_then(|canonical| {
                 refuse_newline(&canonical)?;
-                self.populate_worktree(&admin, &canonical, commit)?;
+                self.populate_worktree(&admin, &canonical, commit, interrupt)?;
                 Ok(canonical)
             });
         if populated.is_err() {
@@ -126,6 +131,7 @@ impl Store {
         admin: &Path,
         path: &Path,
         commit: ObjectId,
+        interrupt: &AtomicBool,
     ) -> Result<(), StoreError> {
         let tree = self
             .repo
@@ -153,15 +159,12 @@ impl Store {
             ..checkout::Options::default()
         };
         let outcome = checkout(
-            &mut index,
-            path,
-            objects,
-            &Discard,
-            &Discard,
-            &AtomicBool::new(false),
-            options,
-        )
-        .map_err(|error| StoreError::Checkout(error.into()))?;
+            &mut index, path, objects, &Discard, &Discard, interrupt, options,
+        );
+        if interrupt.load(Ordering::Relaxed) {
+            return Err(StoreError::Interrupted);
+        }
+        let outcome = outcome.map_err(|error| StoreError::Checkout(error.into()))?;
         if let Some(error) = outcome.errors.first() {
             return Err(StoreError::CheckoutPath(error.path.to_string()));
         }
@@ -272,7 +275,12 @@ mod tests {
         let (dir, store) = store();
         let base = sample_commit(&store);
         let path = store
-            .add_worktree("agent", &dir.path().join("wt"), base)
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                base,
+                &AtomicBool::new(false),
+            )
             .unwrap();
 
         assert_eq!(fs::read(path.join("README.md")).unwrap(), b"hello\n");
@@ -290,7 +298,12 @@ mod tests {
         let (dir, store) = store();
         let base = sample_commit(&store);
         let path = store
-            .add_worktree("agent", &dir.path().join("wt"), base)
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                base,
+                &AtomicBool::new(false),
+            )
             .unwrap();
 
         let repo = gix::open(&path).unwrap();
@@ -322,16 +335,16 @@ mod tests {
         let taken = dir.path().join("taken");
         fs::create_dir(&taken).unwrap();
         assert!(matches!(
-            store.add_worktree("a", &taken, base),
+            store.add_worktree("a", &taken, base, &AtomicBool::new(false)),
             Err(StoreError::WorktreeExists(_))
         ));
 
         store
-            .add_worktree("b", &dir.path().join("wt1"), base)
+            .add_worktree("b", &dir.path().join("wt1"), base, &AtomicBool::new(false))
             .unwrap();
         let second = dir.path().join("wt2");
         assert!(matches!(
-            store.add_worktree("b", &second, base),
+            store.add_worktree("b", &second, base, &AtomicBool::new(false)),
             Err(StoreError::WorktreeExists(_))
         ));
         assert!(!second.exists());
@@ -345,7 +358,7 @@ mod tests {
         for name in ["", ".", "..", "a/b", ".hidden", "git~1", long.as_str()] {
             assert!(
                 matches!(
-                    store.add_worktree(name, &dir.path().join("wt"), base),
+                    store.add_worktree(name, &dir.path().join("wt"), base, &AtomicBool::new(false)),
                     Err(StoreError::InvalidWorktreeName(_))
                 ),
                 "{name:?}"
@@ -359,7 +372,7 @@ mod tests {
         let (dir, store) = store();
         let blob = store.write_blob(b"x").unwrap();
         assert!(matches!(
-            store.add_worktree("a", &dir.path().join("wt"), blob),
+            store.add_worktree("a", &dir.path().join("wt"), blob, &AtomicBool::new(false)),
             Err(StoreError::WrongObject {
                 expected: Kind::Commit,
                 ..
@@ -383,7 +396,12 @@ mod tests {
             ])
             .unwrap();
         let path = store
-            .add_worktree("agent", &dir.path().join("wt"), commit(&store, root))
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                commit(&store, root),
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert_eq!(fs::read(path.join("a.txt")).unwrap(), b"one\r\ntwo\r\n");
         assert_eq!(
@@ -396,7 +414,12 @@ mod tests {
     fn the_index_records_file_stats() {
         let (dir, store) = store();
         let path = store
-            .add_worktree("agent", &dir.path().join("wt"), sample_commit(&store))
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                sample_commit(&store),
+                &AtomicBool::new(false),
+            )
             .unwrap();
         let repo = gix::open(&path).unwrap();
         let index = repo.index().unwrap();
@@ -407,10 +430,32 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_checkout_leaves_no_directory_or_registration() {
+        let (dir, store) = store();
+        let path = dir.path().join("wt");
+        assert!(matches!(
+            store.add_worktree(
+                "agent",
+                &path,
+                sample_commit(&store),
+                &AtomicBool::new(true)
+            ),
+            Err(StoreError::Interrupted)
+        ));
+        assert!(!path.exists());
+        assert!(!store.common_dir().join(WORKTREES).join("agent").exists());
+    }
+
+    #[test]
     fn a_removed_worktree_leaves_no_directory_or_registration() {
         let (dir, store) = store();
         let path = store
-            .add_worktree("agent", &dir.path().join("wt"), sample_commit(&store))
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                sample_commit(&store),
+                &AtomicBool::new(false),
+            )
             .unwrap();
         fs::write(path.join("new"), b"work").unwrap();
         store.remove_worktree("agent").unwrap();
@@ -424,7 +469,12 @@ mod tests {
     fn only_a_registered_worktree_can_be_removed() {
         let (dir, store) = store();
         let path = store
-            .add_worktree("agent", &dir.path().join("wt"), sample_commit(&store))
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                sample_commit(&store),
+                &AtomicBool::new(false),
+            )
             .unwrap();
         for name in ["other", "", "..", "agent/../agent"] {
             assert!(
@@ -454,7 +504,12 @@ mod tests {
     fn a_registration_pointing_at_the_main_checkout_removes_nothing() {
         let (dir, store) = store();
         store
-            .add_worktree("agent", &dir.path().join("wt"), sample_commit(&store))
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                sample_commit(&store),
+                &AtomicBool::new(false),
+            )
             .unwrap();
         let main = fs::canonicalize(dir.path().join("repo")).unwrap();
         let admin = store.common_dir().join(WORKTREES).join("agent");
@@ -501,7 +556,7 @@ mod tests {
         let path = dir.path().join("wt");
         assert!(
             store
-                .add_worktree("a", &path, commit(&store, hostile))
+                .add_worktree("a", &path, commit(&store, hostile), &AtomicBool::new(false))
                 .is_err()
         );
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
@@ -515,13 +570,23 @@ mod tests {
         let locked = dir.path().join("locked");
         fs::create_dir(&locked).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
-        let result = store.add_worktree("a", &locked.join("sub").join("wt"), sample_commit(&store));
+        let result = store.add_worktree(
+            "a",
+            &locked.join("sub").join("wt"),
+            sample_commit(&store),
+            &AtomicBool::new(false),
+        );
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(result, Err(StoreError::Io(_))));
         assert!(!store.common_dir().join(WORKTREES).join("a").exists());
         assert!(
             store
-                .add_worktree("a", &dir.path().join("wt"), sample_commit(&store))
+                .add_worktree(
+                    "a",
+                    &dir.path().join("wt"),
+                    sample_commit(&store),
+                    &AtomicBool::new(false)
+                )
                 .is_ok()
         );
     }
@@ -530,7 +595,12 @@ mod tests {
     fn a_path_with_a_newline_is_refused() {
         let (dir, store) = store();
         assert!(matches!(
-            store.add_worktree("a", &dir.path().join("w\nt"), sample_commit(&store)),
+            store.add_worktree(
+                "a",
+                &dir.path().join("w\nt"),
+                sample_commit(&store),
+                &AtomicBool::new(false)
+            ),
             Err(StoreError::InvalidWorktreePath(_))
         ));
     }
@@ -553,7 +623,7 @@ mod tests {
         let base = commit(&store, hostile);
         let path = dir.path().join("wt");
         assert!(matches!(
-            store.add_worktree("a", &path, base),
+            store.add_worktree("a", &path, base, &AtomicBool::new(false)),
             Err(StoreError::Checkout(_) | StoreError::CheckoutPath(_))
         ));
         assert!(!path.exists());
