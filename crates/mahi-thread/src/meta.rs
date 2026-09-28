@@ -626,6 +626,12 @@ impl VerifiedMeta {
         Ok(key)
     }
 
+    /// Says whether `thread_key` is this thread's key.
+    #[must_use]
+    pub fn is_thread_key(&self, thread_key: &ThreadKey) -> bool {
+        thread_key.recipient().to_string() == self.recipient.to_string()
+    }
+
     /// Opens the private part with the thread key.
     ///
     /// # Errors

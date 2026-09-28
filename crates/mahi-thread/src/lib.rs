@@ -39,6 +39,7 @@ pub use signer::{
 pub use thread::{
     META_ENTRY,
     ThreadError,
+    add_participant,
     create_thread,
     discard_thread,
     load_meta,

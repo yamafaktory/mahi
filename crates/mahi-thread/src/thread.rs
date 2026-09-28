@@ -16,6 +16,7 @@ use crate::{
     MAX_META_BYTES,
     MetaDraft,
     MetaError,
+    Participant,
     ParticipantKey,
     PinError,
     SshSigner,
@@ -63,6 +64,9 @@ pub enum ThreadError {
     /// A thread with this id already exists.
     #[error("thread {0} already exists")]
     AlreadyExists(ThreadId),
+    /// The meta document has reached the last generation a `u64` can count.
+    #[error("thread {0}'s meta document has no next generation")]
+    NoNextGeneration(ThreadId),
 }
 
 /// Creates the thread `draft` describes: signs its meta document with `owner_key`, commits it
@@ -150,14 +154,7 @@ pub fn load_meta(
     trusted_owner: &ParticipantKey,
     min_generation: u64,
 ) -> Result<VerifiedMeta, ThreadError> {
-    let meta_ref = ThreadRef::new(thread, RefKind::Meta);
-    let commit = store
-        .head(&meta_ref)?
-        .ok_or(ThreadError::NotFound(thread))?;
-    let encoded = store
-        .read_entry(commit, META_ENTRY, MAX_META_BYTES as u64)?
-        .ok_or(ThreadError::MissingMetaEntry(thread))?;
-    let verified = VerifiedMeta::decode(&encoded, thread, trusted_owner)?;
+    let (_, verified) = read_meta(store, thread, trusted_owner)?;
     if verified.generation() < min_generation {
         return Err(PinError::BelowMinimum {
             required: min_generation,
@@ -167,6 +164,77 @@ pub fn load_meta(
     }
     Pins::new(store).accept(&verified)?;
     Ok(verified)
+}
+
+/// Adds `participant` to `thread`, which `owner_key` owns: signs the next generation of its
+/// meta document, with the thread key also wrapped to the new participant, commits it on top of
+/// the current `meta` commit, and pins it.
+///
+/// Returns the new document.
+///
+/// # Errors
+///
+/// Returns [`ThreadError::Meta`] if the current document is not signed by `owner_key`,
+/// `thread_key` is not the thread's key, or the participant shares a name or key with one
+/// already there, [`ThreadError::Pin`] if the current document is older than the pinned one,
+/// [`ThreadError::Store`] with [`StoreError::Conflict`] if the `meta` ref moved meanwhile, or
+/// another [`ThreadError`] if reading, signing or writing fails.
+pub fn add_participant(
+    store: &Store,
+    thread: ThreadId,
+    thread_key: &ThreadKey,
+    owner_key: &dyn SshSigner,
+    participant: Participant,
+) -> Result<VerifiedMeta, ThreadError> {
+    let owner = ParticipantKey::from_public_key(owner_key.public_key()).map_err(MetaError::from)?;
+    let (commit, current) = read_meta(store, thread, &owner)?;
+    let pins = Pins::new(store);
+    pins.accept(&current)?;
+    if !current.is_thread_key(thread_key) {
+        return Err(MetaError::KeyMismatch.into());
+    }
+    let generation = current
+        .generation()
+        .checked_add(1)
+        .ok_or(ThreadError::NoNextGeneration(thread))?;
+    let mut participants: Vec<Participant> = current.participants().cloned().collect();
+    participants.push(participant);
+    let draft = MetaDraft::new(
+        thread,
+        generation,
+        current.base(),
+        current.owner().clone(),
+        participants,
+        current.private(thread_key)?,
+    )?;
+    let encoded = draft.sign(thread_key, owner_key)?;
+    let verified = VerifiedMeta::decode(&encoded, thread, &owner)?;
+    let blob = store.write_blob(&encoded)?;
+    let tree = store.write_tree(&[(META_ENTRY, EntryKind::Blob, blob)])?;
+    store.append(
+        &ThreadRef::new(thread, RefKind::Meta),
+        Some(commit),
+        tree,
+        META_MESSAGE,
+    )?;
+    pins.accept(&verified)?;
+    Ok(verified)
+}
+
+fn read_meta(
+    store: &Store,
+    thread: ThreadId,
+    trusted_owner: &ParticipantKey,
+) -> Result<(ObjectId, VerifiedMeta), ThreadError> {
+    let meta_ref = ThreadRef::new(thread, RefKind::Meta);
+    let commit = store
+        .head(&meta_ref)?
+        .ok_or(ThreadError::NotFound(thread))?;
+    let encoded = store
+        .read_entry(commit, META_ENTRY, MAX_META_BYTES as u64)?
+        .ok_or(ThreadError::MissingMetaEntry(thread))?;
+    let verified = VerifiedMeta::decode(&encoded, thread, trusted_owner)?;
+    Ok((commit, verified))
 }
 
 #[cfg(test)]
@@ -581,6 +649,181 @@ mod tests {
         assert!(matches!(
             load_meta(&target.store, target.thread, &other.owner_key, 0),
             Err(ThreadError::Meta(MetaError::ThreadMismatch))
+        ));
+    }
+
+    fn person(name: &str) -> (Participant, age::x25519::Identity) {
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mahi = age::x25519::Identity::generate();
+        let participant = Participant::new(
+            ParticipantName::new(name).unwrap(),
+            ParticipantKey::from_public_key(key.public_key()).unwrap(),
+            mahi.to_public(),
+            crate::node::tests::random_node(),
+        )
+        .unwrap();
+        (participant, mahi)
+    }
+
+    fn created(setup: &Setup) -> ThreadKey {
+        let thread_key = ThreadKey::generate();
+        create_thread(
+            &setup.store,
+            &draft(setup, 0, "t"),
+            &thread_key,
+            &setup.owner,
+        )
+        .unwrap();
+        thread_key
+    }
+
+    #[test]
+    fn an_added_participant_gets_the_thread_key_in_the_next_generation() {
+        let setup = setup();
+        let thread_key = created(&setup);
+        let alice_before = load_meta(&setup.store, setup.thread, &setup.owner_key, 0)
+            .unwrap()
+            .participants()
+            .next()
+            .cloned()
+            .unwrap();
+        let (bob, bob_mahi) = person("bob");
+        let added = add_participant(
+            &setup.store,
+            setup.thread,
+            &thread_key,
+            &setup.owner,
+            bob.clone(),
+        )
+        .unwrap();
+        assert_eq!(added.generation(), 1);
+
+        let meta = load_meta(&setup.store, setup.thread, &setup.owner_key, 1).unwrap();
+        assert_eq!(meta.body_hash(), added.body_hash());
+        let names: Vec<&str> = meta.participants().map(|p| p.name().as_str()).collect();
+        assert_eq!(names, ["alice", "bob"]);
+        assert_eq!(meta.participants().next(), Some(&alice_before));
+        assert_eq!(meta.participants().nth(1), Some(&bob));
+        let bobs_key = meta.thread_key(bob.name(), &bob_mahi).unwrap();
+        assert_eq!(
+            bobs_key.recipient().to_string(),
+            thread_key.recipient().to_string()
+        );
+        assert_eq!(meta.private(&bobs_key).unwrap().title(), "t");
+        meta.thread_key(&ParticipantName::new("alice").unwrap(), &setup.mahi)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_participant_already_there_a_wrong_key_or_another_owner_writes_nothing() {
+        let setup = setup();
+        let thread_key = created(&setup);
+        let (bob, _) = person("bob");
+        add_participant(
+            &setup.store,
+            setup.thread,
+            &thread_key,
+            &setup.owner,
+            bob.clone(),
+        )
+        .unwrap();
+        let meta_ref = ThreadRef::new(setup.thread, RefKind::Meta);
+        let head = setup.store.head(&meta_ref).unwrap();
+
+        assert!(matches!(
+            add_participant(&setup.store, setup.thread, &thread_key, &setup.owner, bob),
+            Err(ThreadError::Meta(MetaError::Invalid(
+                crate::InvalidMeta::DuplicateName
+            )))
+        ));
+        let (carol, _) = person("carol");
+        assert!(matches!(
+            add_participant(
+                &setup.store,
+                setup.thread,
+                &ThreadKey::generate(),
+                &setup.owner,
+                carol.clone()
+            ),
+            Err(ThreadError::Meta(MetaError::KeyMismatch))
+        ));
+        let mallory = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        assert!(matches!(
+            add_participant(
+                &setup.store,
+                setup.thread,
+                &thread_key,
+                &mallory,
+                carol.clone()
+            ),
+            Err(ThreadError::Meta(MetaError::BadSignature))
+        ));
+        assert!(matches!(
+            add_participant(
+                &setup.store,
+                ThreadId::random().unwrap(),
+                &thread_key,
+                &setup.owner,
+                carol
+            ),
+            Err(ThreadError::NotFound(_))
+        ));
+        assert_eq!(setup.store.head(&meta_ref).unwrap(), head);
+    }
+
+    #[test]
+    fn a_rolled_back_meta_ref_is_not_built_on() {
+        let setup = setup();
+        let thread_key = created(&setup);
+        let meta_ref = ThreadRef::new(setup.thread, RefKind::Meta);
+        let first = setup.store.head(&meta_ref).unwrap().unwrap();
+        let first_meta = setup
+            .store
+            .read_entry(first, META_ENTRY, MAX_META_BYTES as u64)
+            .unwrap()
+            .unwrap();
+        let (bob, _) = person("bob");
+        add_participant(&setup.store, setup.thread, &thread_key, &setup.owner, bob).unwrap();
+        put_meta(&setup, &first_meta);
+        let rolled_back = setup.store.head(&meta_ref).unwrap();
+        let (carol, _) = person("carol");
+        assert!(matches!(
+            add_participant(&setup.store, setup.thread, &thread_key, &setup.owner, carol),
+            Err(ThreadError::Pin(PinError::Rollback { .. }))
+        ));
+        assert_eq!(setup.store.head(&meta_ref).unwrap(), rolled_back);
+    }
+
+    #[test]
+    fn another_document_at_the_pinned_generation_is_not_built_on() {
+        let setup = setup();
+        let thread_key = created(&setup);
+        let other = draft(&setup, 0, "other")
+            .sign(&thread_key, &setup.owner)
+            .unwrap();
+        put_meta(&setup, &other);
+        let meta_ref = ThreadRef::new(setup.thread, RefKind::Meta);
+        let head = setup.store.head(&meta_ref).unwrap();
+        let (bob, _) = person("bob");
+        assert!(matches!(
+            add_participant(&setup.store, setup.thread, &thread_key, &setup.owner, bob),
+            Err(ThreadError::Pin(PinError::Equivocation { .. }))
+        ));
+        assert_eq!(setup.store.head(&meta_ref).unwrap(), head);
+    }
+
+    #[test]
+    fn the_last_generation_has_no_next_one() {
+        let setup = setup();
+        let thread_key = created(&setup);
+        let last = draft(&setup, u64::MAX, "t")
+            .sign(&thread_key, &setup.owner)
+            .unwrap();
+        put_meta(&setup, &last);
+        let (bob, _) = person("bob");
+        assert!(matches!(
+            add_participant(&setup.store, setup.thread, &thread_key, &setup.owner, bob),
+            Err(ThreadError::NoNextGeneration(thread)) if thread == setup.thread
         ));
     }
 }
