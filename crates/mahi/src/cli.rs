@@ -34,6 +34,9 @@ pub(crate) enum Command {
     Init,
     /// Runs an agent in a sandbox on the current directory.
     Run(RunCommand),
+    /// Lists the threads of this repository, with their agents and whether their worktree is
+    /// still there.
+    Threads,
     /// Reports an agent event, with its details on standard input, to the mahi run that
     /// started the agent. Agent hooks call it; it always exits with 0.
     Hook(HookCommand),

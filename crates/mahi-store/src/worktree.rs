@@ -100,6 +100,25 @@ impl Store {
         populated
     }
 
+    /// Returns the canonical directory of the linked worktree `name`, found through the
+    /// repository's own record of it, never through the worktree's `.git` file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotAWorktree`] if `name` is not a linked worktree whose recorded
+    /// directory is where it should be and links back to it, or another [`StoreError`] if the
+    /// repository cannot be read.
+    pub fn worktree_dir(&self, name: &str) -> Result<PathBuf, StoreError> {
+        let (repo, workdir) = self.open_worktree(name)?;
+        let admin = fs::canonicalize(repo.git_dir())?;
+        let links_back = fs::read(workdir.join(".git"))
+            .is_ok_and(|link| link == line(&[b"gitdir: ", admin.as_os_str().as_bytes()]));
+        if !links_back || fs::canonicalize(self.common_dir())?.starts_with(&workdir) {
+            return Err(StoreError::NotAWorktree(name.to_owned()));
+        }
+        Ok(workdir)
+    }
+
     /// Removes the linked worktree `name`: its directory and its registration.
     ///
     /// The directory is removed only if its `.git` file points back to the registration and it
@@ -113,14 +132,10 @@ impl Store {
     /// directory is where it should be and links back to it, or [`StoreError::Io`] if a
     /// directory cannot be removed.
     pub fn remove_worktree(&self, name: &str) -> Result<(), StoreError> {
-        let (repo, workdir) = self.open_worktree(name)?;
-        let admin = fs::canonicalize(repo.git_dir())?;
-        drop(repo);
-        let links_back = fs::read(workdir.join(".git"))
-            .is_ok_and(|link| link == line(&[b"gitdir: ", admin.as_os_str().as_bytes()]));
-        if !links_back || fs::canonicalize(self.common_dir())?.starts_with(&workdir) {
-            return Err(StoreError::NotAWorktree(name.to_owned()));
-        }
+        let workdir = self.worktree_dir(name)?;
+        let admin = fs::canonicalize(self.common_dir())?
+            .join(WORKTREES)
+            .join(name);
         fs::remove_dir_all(&workdir)?;
         fs::remove_dir_all(&admin)?;
         Ok(())
@@ -463,6 +478,29 @@ mod tests {
         assert!(!store.common_dir().join(WORKTREES).join("agent").exists());
         let main = gix::open(dir.path().join("repo")).unwrap();
         assert!(main.worktrees().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_registered_worktree_is_found_and_an_unknown_one_is_not() {
+        let (dir, store) = store();
+        let path = store
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                sample_commit(&store),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(store.worktree_dir("agent").unwrap(), path);
+        assert!(matches!(
+            store.worktree_dir("other"),
+            Err(StoreError::NotAWorktree(_))
+        ));
+        fs::write(path.join(".git"), b"gitdir: /elsewhere\n").unwrap();
+        assert!(matches!(
+            store.worktree_dir("agent"),
+            Err(StoreError::NotAWorktree(_))
+        ));
     }
 
     #[test]

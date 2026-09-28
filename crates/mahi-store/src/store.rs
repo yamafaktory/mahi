@@ -33,7 +33,10 @@ use gix_validate::path::component::{
     self,
     Mode,
 };
-use mahi_core::ThreadRef;
+use mahi_core::{
+    THREADS_PREFIX,
+    ThreadRef,
+};
 use mahi_crypto::{
     SealError,
     ThreadKey,
@@ -230,6 +233,35 @@ impl Store {
             .try_id()
             .map(|id| Some(id.to_owned()))
             .ok_or(StoreError::Symbolic(name))
+    }
+
+    /// Lists the thread refs in the repository, in name order, with the object each points to.
+    ///
+    /// Refs under `refs/threads/` that do not follow the thread layout, or that are symbolic,
+    /// are left out, since anything may have been pushed there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Git`] if the refs cannot be read.
+    pub fn thread_refs(&self) -> Result<Vec<(ThreadRef, ObjectId)>, StoreError> {
+        let platform = self.repo.references().map_err(gix::Error::from_error)?;
+        let mut refs = Vec::new();
+        for reference in platform
+            .prefixed(THREADS_PREFIX)
+            .map_err(gix::Error::from_error)?
+        {
+            let reference = reference.map_err(gix::Error::from_error)?;
+            let Ok(name) = std::str::from_utf8(reference.name().as_bstr()) else {
+                continue;
+            };
+            let target = reference.target();
+            let (Ok(thread_ref), Some(id)) = (name.parse::<ThreadRef>(), target.try_id()) else {
+                continue;
+            };
+            refs.push((thread_ref, id.to_owned()));
+        }
+        refs.sort();
+        Ok(refs)
     }
 
     /// Returns the repository's common git directory, shared by all its worktrees.
@@ -605,6 +637,43 @@ mod tests {
         let missing = "0123456789012345678901234567890123456789";
         std::fs::write(store.common_dir().join("HEAD"), format!("{missing}\n")).unwrap();
         assert!(matches!(store.head_commit(), Err(StoreError::Git(_))));
+    }
+
+    #[test]
+    fn thread_refs_are_listed_and_foreign_names_left_out() {
+        let (_dir, store) = store();
+        let tree = empty_tree(&store);
+        let transcript = transcript_ref();
+        let meta = ThreadRef::new(transcript.thread(), RefKind::Meta);
+        let first = store.append(&meta, None, tree, "meta").unwrap();
+        let second = store.append(&transcript, None, tree, "turn").unwrap();
+        for foreign in [
+            "refs/threads/not-an-id/meta",
+            "refs/threads/0123456789abcdef0123456789abcdef/unknown",
+        ] {
+            store
+                .repo
+                .reference(foreign, first, PreviousValue::Any, "test")
+                .unwrap();
+        }
+        let symbolic = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
+        std::fs::create_dir_all(
+            store
+                .common_dir()
+                .join(symbolic.to_string())
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            store.common_dir().join(symbolic.to_string()),
+            format!("ref: {meta}\n"),
+        )
+        .unwrap();
+        let listed = store.thread_refs().unwrap();
+        let mut expected = vec![(meta, first), (transcript, second)];
+        expected.sort();
+        assert_eq!(listed, expected);
     }
 
     #[test]

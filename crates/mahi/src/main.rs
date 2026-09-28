@@ -11,12 +11,16 @@ mod recorder;
 mod run;
 mod session;
 mod terminal;
+mod threads;
 mod turns;
 
 use std::{
     error::Error,
     fmt::Write,
-    io,
+    io::{
+        self,
+        Write as _,
+    },
     process,
 };
 
@@ -55,6 +59,19 @@ fn main() {
             .and_then(|mut prompt| init::init(&environment, &mut prompt))
         {
             Ok(()) => 0,
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
+        Command::Threads => match threads::threads() {
+            Ok(listing) => match io::stdout().lock().write_all(listing.as_bytes()) {
+                Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
+                    report(&error);
+                    1
+                }
+                _ => 0,
+            },
             Err(error) => {
                 report(&error);
                 1

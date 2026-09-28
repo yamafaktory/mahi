@@ -610,6 +610,32 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
     }
 
     #[test]
+    fn threads_lists_each_thread_with_its_agents_and_worktree() {
+        let fixture = fixture();
+        let empty = fixture.mahi(&["threads"]);
+        assert_eq!(empty.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8_lossy(&empty.stdout),
+            "no threads in this repository\n"
+        );
+        let run = fixture.mahi(&["run", "true"]);
+        let worktree = worktree_of(&String::from_utf8_lossy(&run.stderr));
+        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let listed = fixture.mahi(&["threads"]);
+        assert_eq!(listed.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8_lossy(&listed.stdout),
+            format!("{thread}  tester.true  worktree\n")
+        );
+        fs::remove_dir_all(&worktree).unwrap();
+        let listed = fixture.mahi(&["threads"]);
+        assert_eq!(
+            String::from_utf8_lossy(&listed.stdout),
+            format!("{thread}  tester.true  no worktree\n")
+        );
+    }
+
+    #[test]
     fn the_agent_cannot_write_to_the_checkout_or_the_git_directory() {
         let fixture = fixture();
         let outside = fixture.root.join("outside");
