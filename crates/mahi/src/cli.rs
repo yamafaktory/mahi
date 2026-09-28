@@ -8,6 +8,11 @@ use clap::{
     Parser,
     Subcommand,
 };
+use mahi_core::{
+    AgentName,
+    NameError,
+    ThreadId,
+};
 use mahi_proxy::HostName;
 
 use crate::{
@@ -34,6 +39,8 @@ pub(crate) enum Command {
     Init,
     /// Runs an agent in a sandbox on the current directory.
     Run(RunCommand),
+    /// Resumes a thread you started, in its worktree, with the same agent.
+    Resume(ResumeCommand),
     /// Lists the threads of this repository, with their agents and whether their worktree is
     /// still there.
     Threads,
@@ -49,9 +56,9 @@ pub(crate) struct HookCommand {
     pub(crate) kind: HookKind,
 }
 
-#[derive(Debug, Args, PartialEq, Eq)]
-#[command(after_help = "Piped input reaches the agent through its terminal, as lines of text.")]
-pub(crate) struct RunCommand {
+/// What the agent may reach and receive, for `mahi run` and `mahi resume`.
+#[derive(Debug, Args, Default, PartialEq, Eq)]
+pub(crate) struct LaunchOptions {
     /// A host the agent may reach over HTTPS, through mahi's proxy; repeat it for several.
     /// Without one, the agent has no network.
     #[arg(long = "allow-host", value_name = "HOST")]
@@ -64,6 +71,31 @@ pub(crate) struct RunCommand {
     /// `claude`): no hosts, variables, settings or hooks beyond what the options give.
     #[arg(long = "no-profile")]
     no_profile: bool,
+}
+
+impl LaunchOptions {
+    pub(crate) fn allow_hosts(&self) -> &[HostName] {
+        &self.allow_hosts
+    }
+
+    pub(crate) fn pass_env(&self) -> &[EnvName] {
+        &self.pass_env
+    }
+
+    /// Returns the profile for the agent program `program`, unless `--no-profile` was given.
+    pub(crate) fn profile_for(&self, program: &OsStr) -> Option<&'static Profile> {
+        if self.no_profile {
+            return None;
+        }
+        Profile::for_agent(program)
+    }
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+#[command(after_help = "Piped input reaches the agent through its terminal, as lines of text.")]
+pub(crate) struct RunCommand {
+    #[command(flatten)]
+    pub(crate) options: LaunchOptions,
     /// The agent to run, looked up on PATH unless it contains a slash, then the arguments
     /// passed to it unchanged.
     #[arg(
@@ -87,21 +119,29 @@ impl RunCommand {
         self.command.get(1..).unwrap_or_default()
     }
 
-    pub(crate) fn allow_hosts(&self) -> &[HostName] {
-        &self.allow_hosts
-    }
-
-    pub(crate) fn pass_env(&self) -> &[EnvName] {
-        &self.pass_env
-    }
-
     /// Returns the profile for the agent, unless `--no-profile` was given.
     pub(crate) fn profile(&self) -> Option<&'static Profile> {
-        if self.no_profile {
-            return None;
-        }
-        Profile::for_agent(self.agent())
+        self.options.profile_for(self.agent())
     }
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct ResumeCommand {
+    /// The thread to resume, as `mahi threads` lists it.
+    pub(crate) thread: ThreadId,
+    /// Which of your agents in the thread to resume, when it has several.
+    #[arg(long, value_name = "NAME", value_parser = parse_agent)]
+    pub(crate) agent: Option<AgentName>,
+    #[command(flatten)]
+    pub(crate) options: LaunchOptions,
+    /// A command to run instead of the thread's agent and its profile's resume arguments,
+    /// after `--`.
+    #[arg(last = true, value_name = "COMMAND")]
+    pub(crate) command: Vec<OsString>,
+}
+
+fn parse_agent(text: &str) -> Result<AgentName, NameError> {
+    AgentName::new(text)
 }
 
 #[cfg(test)]
@@ -120,9 +160,7 @@ mod tests {
     fn run(agent: &str, arguments: &[&str]) -> Cli {
         Cli {
             command: Command::Run(RunCommand {
-                allow_hosts: Vec::new(),
-                pass_env: Vec::new(),
-                no_profile: false,
+                options: LaunchOptions::default(),
                 command: std::iter::once(agent)
                     .chain(arguments.iter().copied())
                     .map(OsString::from)
@@ -190,9 +228,14 @@ mod tests {
         let Command::Run(command) = parsed.command else {
             panic!("expected the run command");
         };
-        let hosts: Vec<&str> = command.allow_hosts().iter().map(HostName::as_str).collect();
+        let hosts: Vec<&str> = command
+            .options
+            .allow_hosts()
+            .iter()
+            .map(HostName::as_str)
+            .collect();
         assert_eq!(hosts, ["api.example.com", "b.example.com"]);
-        assert_eq!(command.pass_env()[0].as_str(), "TOKEN");
+        assert_eq!(command.options.pass_env()[0].as_str(), "TOKEN");
         assert_eq!(command.agent(), "claude");
         assert_eq!(command.arguments(), ["--allow-host", "x"]);
         let Command::Run(claude) = parse(&["run", "claude"]).unwrap().command else {
@@ -214,6 +257,41 @@ mod tests {
                 ErrorKind::ValueValidation,
                 "{bad:?}"
             );
+        }
+    }
+
+    #[test]
+    fn resume_takes_a_thread_its_options_and_an_optional_command() {
+        let thread = "0123456789abcdef0123456789abcdef";
+        let parsed = parse(&[
+            "resume",
+            thread,
+            "--agent",
+            "claude",
+            "--allow-host",
+            "api.example.com",
+            "--",
+            "claude",
+            "--resume",
+        ])
+        .unwrap();
+        let Command::Resume(resume) = parsed.command else {
+            panic!("expected the resume command");
+        };
+        assert_eq!(resume.thread.to_string(), thread);
+        assert_eq!(resume.agent.unwrap().as_str(), "claude");
+        assert_eq!(resume.options.allow_hosts().len(), 1);
+        assert_eq!(resume.command, ["claude", "--resume"]);
+        let Command::Resume(bare) = parse(&["resume", thread]).unwrap().command else {
+            panic!("expected the resume command");
+        };
+        assert!(bare.command.is_empty() && bare.agent.is_none());
+        for bad in [
+            vec!["resume"],
+            vec!["resume", "not-an-id"],
+            vec!["resume", thread, "--agent", "Bad Name"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
         }
     }
 

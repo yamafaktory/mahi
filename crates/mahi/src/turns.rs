@@ -40,6 +40,7 @@ pub(crate) struct Transcript {
     pub(crate) key: ThreadKey,
     pub(crate) thread: ThreadId,
     pub(crate) slot: AgentSlot,
+    pub(crate) tip: Option<TranscriptTip>,
 }
 
 /// How recording the transcript went, and the first error it met.
@@ -74,7 +75,7 @@ pub(crate) fn record(
             };
         }
     };
-    let mut turns = Turns::default();
+    let mut turns = Turns::after(transcript.tip);
     while let Ok(delivery) = inputs.recv() {
         let message = match delivery {
             Delivery::Message(message) => message,
@@ -109,6 +110,17 @@ struct Turns {
 }
 
 impl Turns {
+    fn after(tip: Option<TranscriptTip>) -> Self {
+        Self {
+            tip,
+            next_turn: tip.map_or(0, |tip| tip.turn().saturating_add(1)),
+            next_seq: tip
+                .and_then(|tip| tip.last_seq())
+                .map_or(0, |last| last.saturating_add(1)),
+            ..Self::default()
+        }
+    }
+
     fn push(&mut self, message: &HookMessage) {
         let name = message.kind.as_str().as_bytes();
         let size = name.len() + 1 + message.payload.len() + EVENT_OVERHEAD;
@@ -166,7 +178,10 @@ mod tests {
         Scheduler,
         Trigger,
     };
-    use mahi_thread::read_turns;
+    use mahi_thread::{
+        read_tip,
+        read_turns,
+    };
     use ssh_key::{
         Algorithm,
         PrivateKey,
@@ -204,6 +219,7 @@ mod tests {
             key: started.key.take().unwrap(),
             thread: started.thread,
             slot: started.slot.clone(),
+            tip: None,
         };
         let (sender, inputs) = mpsc::channel();
         for input in [
@@ -237,6 +253,38 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_transcript_continues_after_its_tip() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut started = start_with(&store, &signer).unwrap();
+        let key = started.key.take().unwrap();
+        let first = Transcript {
+            git_dir: store.common_dir().to_path_buf(),
+            key,
+            thread: started.thread,
+            slot: started.slot.clone(),
+            tip: None,
+        };
+        let (sender, inputs) = mpsc::channel();
+        sender.send(hook(HookKind::Prompt, b"one")).unwrap();
+        sender.send(hook(HookKind::TurnEnd, b"")).unwrap();
+        sender.send(Delivery::End { dropped: 0 }).unwrap();
+        assert!(record(&first, &inputs, None).error.is_none());
+        let tip = read_tip(&store, &first.key, first.thread, &first.slot).unwrap();
+        let resumed = Transcript { tip, ..first };
+        let (sender, inputs) = mpsc::channel();
+        sender.send(hook(HookKind::Prompt, b"two")).unwrap();
+        sender.send(Delivery::End { dropped: 0 }).unwrap();
+        let summary = record(&resumed, &inputs, None);
+        assert!(summary.error.is_none(), "{:?}", summary.error);
+        let turns = read_turns(&store, &resumed.key, resumed.thread, &resumed.slot, 10).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].turn(), 1);
+        assert_eq!(turns[1].events()[0].seq(), 2);
+        assert_eq!(texts(&turns[1]), ["prompt\ntwo"]);
+    }
+
+    #[test]
     fn tools_and_turn_ends_poke_the_snapshot_scheduler() {
         let (_dir, store) = repository_on_main();
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
@@ -246,6 +294,7 @@ mod tests {
             key: started.key.take().unwrap(),
             thread: started.thread,
             slot: started.slot.clone(),
+            tip: None,
         };
         let (mut scheduler, poker) = Scheduler::new(
             Schedule::new(

@@ -2,17 +2,26 @@ use std::{
     ffi::OsStr,
     fs::{
         self,
-        OpenOptions,
+        File,
     },
     io::{
         self,
         Write,
     },
-    os::unix::fs::{
-        DirBuilderExt,
-        OpenOptionsExt,
+    os::{
+        fd::OwnedFd,
+        unix::fs::DirBuilderExt,
     },
     path::Path,
+};
+
+use rustix::{
+    fs::{
+        AtFlags,
+        Mode,
+        OFlags,
+    },
+    io::Errno,
 };
 
 /// What mahi knows about one agent: the hosts it needs, the variables it may be given, the
@@ -25,7 +34,8 @@ pub(crate) struct Profile {
     pub(crate) optional_env: &'static [&'static str],
     pub(crate) env: &'static [(&'static str, &'static str)],
     pub(crate) state_env: &'static str,
-    install: fn(&Path) -> io::Result<()>,
+    pub(crate) resume_args: &'static [&'static str],
+    install: fn(&OwnedFd) -> io::Result<()>,
 }
 
 const CLAUDE_CODE: Profile = Profile {
@@ -39,6 +49,7 @@ const CLAUDE_CODE: Profile = Profile {
         ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
     ],
     state_env: "CLAUDE_CONFIG_DIR",
+    resume_args: &["--continue"],
     install: install_claude_code,
 };
 
@@ -60,6 +71,14 @@ const CLAUDE_CODE_SETTINGS: &str = r#"{
 "#;
 
 impl Profile {
+    /// Returns the optional variables of every profile, which mahi reads at startup, before it
+    /// knows which profile applies.
+    pub(crate) fn optional_env_of_all() -> impl Iterator<Item = &'static str> {
+        PROFILES
+            .into_iter()
+            .flat_map(|profile| profile.optional_env.iter().copied())
+    }
+
     /// Returns the profile for the agent program `program`, found by its file name.
     pub(crate) fn for_agent(program: &OsStr) -> Option<&'static Self> {
         let name = Path::new(program).file_name()?;
@@ -77,27 +96,63 @@ impl Profile {
             .collect()
     }
 
-    /// Prepares the agent's state directory `state`, which must exist and be empty.
-    pub(crate) fn install(&self, state: &Path) -> io::Result<()> {
+    /// Writes the profile's files into the agent's state directory, open as `state`, replacing
+    /// what the agent may have left there without following any symbolic link it planted.
+    pub(crate) fn install(&self, state: &OwnedFd) -> io::Result<()> {
         (self.install)(state)
     }
 }
 
-fn install_claude_code(state: &Path) -> io::Result<()> {
-    write_new(
-        &state.join("settings.json"),
-        CLAUDE_CODE_SETTINGS.as_bytes(),
-    )
+fn install_claude_code(state: &OwnedFd) -> io::Result<()> {
+    replace(state, "settings.json", CLAUDE_CODE_SETTINGS.as_bytes())
 }
 
-fn write_new(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+fn replace(directory: &OwnedFd, name: &str, contents: &[u8]) -> io::Result<()> {
+    let temporary = format!(".{name}.mahi");
+    match rustix::fs::unlinkat(directory, temporary.as_str(), AtFlags::empty()) {
+        Err(error) if error != Errno::NOENT => return Err(error.into()),
+        _ => {}
+    }
+    let file = rustix::fs::openat(
+        directory,
+        temporary.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    let mut file = File::from(file);
     file.write_all(contents)?;
-    file.sync_all()
+    file.sync_all()?;
+    rustix::fs::renameat(directory, temporary.as_str(), directory, name)?;
+    rustix::fs::fsync(directory)?;
+    Ok(())
+}
+
+/// Opens the agent's state directory `name` inside `parent`, creating it if it is missing,
+/// without following a symbolic link, and makes sure it is a directory of the user's that only
+/// the user can use.
+///
+/// Returns `Ok(None)` when `name` exists but is not such a directory.
+pub(crate) fn open_state(parent: &OwnedFd, name: &str) -> io::Result<Option<OwnedFd>> {
+    match rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
+        Err(error) if error != Errno::EXIST => return Err(error.into()),
+        _ => {}
+    }
+    let directory = match rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(Errno::LOOP | Errno::NOTDIR) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let stat = rustix::fs::fstat(&directory)?;
+    if stat.st_uid != rustix::process::geteuid().as_raw() {
+        return Ok(None);
+    }
+    rustix::fs::fchmod(&directory, Mode::from_raw_mode(0o700))?;
+    Ok(Some(directory))
 }
 
 /// Creates the directory `path` and every missing parent, private to the user.
@@ -113,6 +168,40 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    fn open_dir(path: &Path) -> OwnedFd {
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_state_directory_is_created_private_and_a_planted_link_or_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = open_dir(dir.path());
+        assert!(open_state(&parent, "agent").unwrap().is_some());
+        let mode = fs::metadata(dir.path().join("agent"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        fs::set_permissions(dir.path().join("agent"), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open_state(&parent, "agent").unwrap().is_some());
+        let mode = fs::metadata(dir.path().join("agent"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("linked")).unwrap();
+        assert!(open_state(&parent, "linked").unwrap().is_none());
+        fs::write(dir.path().join("file"), "x").unwrap();
+        assert!(open_state(&parent, "file").unwrap().is_none());
+    }
 
     #[test]
     fn the_claude_program_gets_the_claude_code_profile() {
@@ -134,7 +223,7 @@ mod tests {
     #[test]
     fn claude_code_hooks_report_prompts_tools_and_turn_ends_to_mahi() {
         let dir = tempfile::tempdir().unwrap();
-        CLAUDE_CODE.install(dir.path()).unwrap();
+        CLAUDE_CODE.install(&open_dir(dir.path())).unwrap();
         let settings = fs::read_to_string(dir.path().join("settings.json")).unwrap();
         for (event, kind) in [
             ("UserPromptSubmit", "prompt"),
@@ -152,7 +241,24 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert!(CLAUDE_CODE.install(dir.path()).is_err());
+    }
+
+    #[test]
+    fn installing_again_replaces_files_and_planted_links_without_following_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, "untouched").unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("settings.json")).unwrap();
+        std::os::unix::fs::symlink(&outside, state.join(".settings.json.mahi")).unwrap();
+        CLAUDE_CODE.install(&open_dir(&state)).unwrap();
+        CLAUDE_CODE.install(&open_dir(&state)).unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
+        let settings = state.join("settings.json");
+        assert!(!fs::symlink_metadata(&settings).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(settings).unwrap(), CLAUDE_CODE_SETTINGS);
+        assert!(!state.join(".settings.json.mahi").exists());
     }
 
     #[test]

@@ -11,6 +11,7 @@ mod recorder;
 mod run;
 mod session;
 mod terminal;
+mod thread_lock;
 mod threads;
 mod turns;
 
@@ -33,25 +34,21 @@ use crate::{
     },
     environment::Environment,
     init::InitError,
+    profile::Profile,
     prompt::TerminalPrompt,
     run::Outcome,
 };
 
 fn main() {
     let cli = Cli::parse();
-    let (required, optional) = match &cli.command {
-        Command::Run(command) => (
-            command.pass_env().to_vec(),
-            command
-                .profile()
-                .map(|profile| profile.optional_env)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|name| name.parse().ok())
-                .collect(),
-        ),
-        _ => (Vec::new(), Vec::new()),
+    let required = match &cli.command {
+        Command::Run(command) => command.options.pass_env().to_vec(),
+        Command::Resume(command) => command.options.pass_env().to_vec(),
+        _ => Vec::new(),
     };
+    let optional: Vec<_> = Profile::optional_env_of_all()
+        .filter_map(|name| name.parse().ok())
+        .collect();
     let environment = Environment::read(&required, &optional);
     let code = match cli.command {
         Command::Init => match TerminalPrompt::open()
@@ -83,6 +80,17 @@ fn main() {
             }
             0
         }
+        Command::Resume(command) => match run::resume(&command, &environment) {
+            Ok(Outcome::Exited(code)) => code,
+            Ok(Outcome::Stopped(signal)) => {
+                signal.reraise();
+                128 + signal.number()
+            }
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
         Command::Run(command) => match run::run(&command, &environment) {
             Ok(Outcome::Exited(code)) => code,
             Ok(Outcome::Stopped(signal)) => {

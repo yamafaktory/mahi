@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io,
     path::{
@@ -22,7 +23,10 @@ use mahi_core::{
     ThreadRef,
 };
 use mahi_crypto::ThreadKey;
-use mahi_identity::PublicIdentity;
+use mahi_identity::{
+    LocalIdentity,
+    PublicIdentity,
+};
 use mahi_store::{
     GlobalPatterns,
     ObjectId,
@@ -40,8 +44,12 @@ use mahi_thread::{
     PrivateMeta,
     SshSigner,
     ThreadError,
+    TranscriptError,
+    TranscriptTip,
     create_thread,
     discard_thread,
+    load_meta,
+    read_tip,
 };
 use thiserror::Error;
 
@@ -59,7 +67,8 @@ pub(crate) struct Started {
     pub(crate) first_snapshot: Option<Recorded>,
     pub(crate) slot: AgentSlot,
     pub(crate) key: Option<ThreadKey>,
-    meta: ObjectId,
+    pub(crate) tip: Option<TranscriptTip>,
+    created: Option<ObjectId>,
 }
 
 /// The newest snapshot commit of a worktree, the tree it records, and the cache that took it.
@@ -138,7 +147,8 @@ pub(crate) fn start(
                 first_snapshot: None,
                 slot,
                 key: Some(key),
-                meta,
+                tip: None,
+                created: Some(meta),
             };
             let recorded =
                 take_first_snapshot(store, &name, &started.snapshots, globals, interrupt);
@@ -165,6 +175,122 @@ pub(crate) fn start(
             }
             remove_worktree_or_report(store, &name);
             Err(error.into())
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ResumeError {
+    #[error("cannot read the repository")]
+    Store(#[from] StoreError),
+    #[error("cannot open thread {0}; only a thread you started can be resumed for now")]
+    Meta(ThreadId, #[source] Box<ThreadError>),
+    #[error("you are not a participant of thread {0}")]
+    NotParticipant(ThreadId, #[source] Box<MetaError>),
+    #[error("thread {0} has no agent of yours")]
+    NoAgent(ThreadId),
+    #[error("thread {thread} has several agents of yours ({agents}); pick one with --agent")]
+    SeveralAgents { thread: ThreadId, agents: String },
+    #[error("thread {0} has no agent of yours called {1}")]
+    UnknownAgent(ThreadId, AgentName),
+    #[error("the worktree of thread {0} is gone, and rebuilding it is not supported yet")]
+    NoWorktree(ThreadId, #[source] StoreError),
+    #[error("cannot read the thread's transcript")]
+    Transcript(#[source] Box<TranscriptError>),
+}
+
+/// What `mahi resume` needs to reopen a thread: who the user is and which agent to resume.
+#[derive(Debug)]
+pub(crate) struct Reopen<'a> {
+    pub(crate) thread: ThreadId,
+    pub(crate) owner: &'a ParticipantKey,
+    pub(crate) identity: &'a LocalIdentity,
+    pub(crate) participant: &'a ParticipantName,
+    pub(crate) agent: Option<&'a AgentName>,
+}
+
+/// Reopens a thread the user started: checks its `meta` against the user's own signing key,
+/// unwraps the thread key, finds the user's agent and its registered worktree, and continues
+/// its snapshots and transcript where they stopped.
+pub(crate) fn resume(
+    store: &Store,
+    reopen: &Reopen<'_>,
+    globals: &GlobalPatterns,
+    interrupt: &AtomicBool,
+) -> Result<Started, ResumeError> {
+    let thread = reopen.thread;
+    let meta = load_meta(store, thread, reopen.owner, 0)
+        .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
+    let key = meta
+        .thread_key(reopen.participant, reopen.identity.as_age())
+        .map_err(|error| ResumeError::NotParticipant(thread, Box::new(error)))?;
+    let slot = pick_slot(store, thread, reopen.participant, reopen.agent)?;
+    let name = thread.to_string();
+    let worktree = store
+        .worktree_dir(&name)
+        .map_err(|error| ResumeError::NoWorktree(thread, error))?;
+    let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
+    let first_snapshot = match store.head(&snapshots)? {
+        Some(commit) => Recorded {
+            commit,
+            tree: store.commit_tree(commit)?,
+            cache: SnapshotCache::default(),
+        },
+        None => take_first_snapshot(store, &name, &snapshots, globals, interrupt)?,
+    };
+    let tip = read_tip(store, &key, thread, &slot)
+        .map_err(|error| ResumeError::Transcript(Box::new(error)))?;
+    Ok(Started {
+        thread,
+        worktree,
+        snapshots,
+        first_snapshot: Some(first_snapshot),
+        slot,
+        key: Some(key),
+        tip,
+        created: None,
+    })
+}
+
+/// Finds the user's agent in `thread`: the one named `agent`, or the only one.
+pub(crate) fn pick_slot(
+    store: &Store,
+    thread: ThreadId,
+    participant: &ParticipantName,
+    agent: Option<&AgentName>,
+) -> Result<AgentSlot, ResumeError> {
+    let mut mine = BTreeSet::new();
+    for (thread_ref, _) in store.thread_refs()? {
+        if thread_ref.thread() != thread {
+            continue;
+        }
+        if let RefKind::Snapshots(slot) | RefKind::Transcript(slot) | RefKind::Session(slot) =
+            thread_ref.kind()
+            && slot.participant() == participant
+        {
+            mine.insert(slot.clone());
+        }
+    }
+    if let Some(agent) = agent {
+        return mine
+            .into_iter()
+            .find(|slot| slot.agent() == agent)
+            .ok_or_else(|| ResumeError::UnknownAgent(thread, agent.clone()));
+    }
+    let mut slots = mine.into_iter();
+    match (slots.next(), slots.next()) {
+        (Some(slot), None) => Ok(slot),
+        (None, _) => Err(ResumeError::NoAgent(thread)),
+        (Some(first), Some(second)) => {
+            let agents: Vec<String> = [first, second]
+                .into_iter()
+                .chain(slots)
+                .map(|slot| slot.agent().as_str().to_owned())
+                .collect();
+            Err(ResumeError::SeveralAgents {
+                thread,
+                agents: agents.join(", "),
+            })
         }
     }
 }
@@ -229,12 +355,15 @@ impl Started {
 
     /// Removes the thread and its worktree, for an agent that never ran.
     pub(crate) fn discard(&self, store: &Store) -> Result<(), DiscardError> {
+        let Some(created) = self.created else {
+            return Ok(());
+        };
         let snapshots = match store.head(&self.snapshots) {
             Ok(Some(head)) => store.remove(&self.snapshots, head),
             Ok(None) => Ok(()),
             Err(error) => Err(error),
         };
-        let thread = discard_thread(store, self.thread, self.meta);
+        let thread = discard_thread(store, self.thread, created);
         let worktree = store.remove_worktree(&self.thread.to_string());
         let state = match fs::remove_dir_all(self.state_root(store)) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
@@ -465,7 +594,7 @@ pub(crate) mod tests {
             b"hello\n"
         );
         let meta = ThreadRef::new(started.thread, RefKind::Meta);
-        assert_eq!(store.head(&meta).unwrap(), Some(started.meta));
+        assert_eq!(store.head(&meta).unwrap(), started.created);
         let first = started.first_snapshot.as_ref().unwrap();
         assert_eq!(store.head(&started.snapshots).unwrap(), Some(first.commit));
         let repo = gix::open(store.common_dir()).unwrap();
@@ -526,7 +655,7 @@ pub(crate) mod tests {
         assert_eq!(started.launch(&store, || Ok::<_, ()>(7)), Ok(7));
         assert!(started.worktree.join("README").exists());
         let meta = ThreadRef::new(started.thread, RefKind::Meta);
-        assert_eq!(store.head(&meta).unwrap(), Some(started.meta));
+        assert_eq!(store.head(&meta).unwrap(), started.created);
     }
 
     #[test]
@@ -586,6 +715,60 @@ pub(crate) mod tests {
         assert_eq!(agent_from(Path::new("…")).as_str(), "agent");
         assert_eq!(agent_from(Path::new("lock")).as_str(), "agent");
         assert_eq!(agent_from(Path::new("/")).as_str(), "agent");
+    }
+
+    #[test]
+    fn the_users_only_agent_is_picked_or_the_one_named() {
+        let (_dir, store) = repository_on_main();
+        let tree = store.write_tree(&[]).unwrap();
+        let thread = ThreadId::random().unwrap();
+        let slot = |participant: &str, agent: &str| {
+            AgentSlot::new(
+                ParticipantName::new(participant).unwrap(),
+                AgentName::new(agent).unwrap(),
+            )
+        };
+        let alice = ParticipantName::new("alice").unwrap();
+        let claude = AgentName::new("claude").unwrap();
+        assert!(matches!(
+            pick_slot(&store, thread, &alice, None),
+            Err(ResumeError::NoAgent(_))
+        ));
+        for thread_ref in [
+            ThreadRef::new(thread, RefKind::Snapshots(slot("alice", "claude"))),
+            ThreadRef::new(thread, RefKind::Transcript(slot("alice", "claude"))),
+            ThreadRef::new(thread, RefKind::Snapshots(slot("bob", "codex"))),
+            ThreadRef::new(
+                ThreadId::random().unwrap(),
+                RefKind::Snapshots(slot("alice", "sh")),
+            ),
+        ] {
+            store.append(&thread_ref, None, tree, "test").unwrap();
+        }
+        assert_eq!(
+            pick_slot(&store, thread, &alice, None).unwrap(),
+            slot("alice", "claude")
+        );
+        store
+            .append(
+                &ThreadRef::new(thread, RefKind::Transcript(slot("alice", "codex"))),
+                None,
+                tree,
+                "test",
+            )
+            .unwrap();
+        assert!(matches!(
+            pick_slot(&store, thread, &alice, None),
+            Err(ResumeError::SeveralAgents { ref agents, .. }) if agents == "claude, codex"
+        ));
+        assert_eq!(
+            pick_slot(&store, thread, &alice, Some(&claude)).unwrap(),
+            slot("alice", "claude")
+        );
+        assert!(matches!(
+            pick_slot(&store, thread, &alice, Some(&AgentName::new("sh").unwrap())),
+            Err(ResumeError::UnknownAgent(..))
+        ));
     }
 
     #[test]

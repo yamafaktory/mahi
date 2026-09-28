@@ -47,13 +47,17 @@ use std::{
     },
 };
 
-use mahi_core::NameError;
+use mahi_core::{
+    AgentSlot,
+    NameError,
+};
 use mahi_identity::{
     AgentError,
     AgentSigner,
     ConfigDir,
     ConfigError,
     IdentityError,
+    LocalIdentity,
     PublicIdentity,
     SigningKey,
     SshAgent,
@@ -78,6 +82,11 @@ use mahi_store::{
     Store,
     StoreError,
 };
+use mahi_thread::{
+    KeyError,
+    ParticipantKey,
+    load_meta,
+};
 use rustix::{
     fs::{
         FileType,
@@ -94,13 +103,17 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::{
-    cli::RunCommand,
+    cli::{
+        ResumeCommand,
+        RunCommand,
+    },
     environment::{
         EnvName,
         Environment,
         HOOK_SOCKET,
         MAHI_BIN,
         PROXY_VARIABLES,
+        Passed,
     },
     hook,
     network::{
@@ -112,6 +125,10 @@ use crate::{
         self,
         Profile,
     },
+    prompt::{
+        Prompt,
+        TerminalPrompt,
+    },
     recorder::{
         RecordError,
         Recorder,
@@ -119,12 +136,17 @@ use crate::{
     },
     session::{
         self,
+        ResumeError,
         StartError,
         Started,
     },
     terminal::{
         self,
         RawMode,
+    },
+    thread_lock::{
+        LockError,
+        ThreadLock,
     },
     turns::{
         self,
@@ -219,6 +241,16 @@ pub(crate) enum RunError {
         name: EnvName,
         profile: &'static str,
     },
+    #[error(transparent)]
+    Lock(#[from] LockError),
+    #[error("the signing key cannot identify thread owners")]
+    OwnerKey(#[source] KeyError),
+    #[error("cannot unlock your mahi key")]
+    Unlock(#[source] IdentityError),
+    #[error("cannot resume the thread")]
+    Resume(#[from] ResumeError),
+    #[error("{} is not a private directory of yours, so it is not reused", .0.display())]
+    StateNotPrivate(PathBuf),
     #[error("cannot prepare the agent's state directory")]
     State(#[source] io::Error),
     #[error("cannot start the thread")]
@@ -270,7 +302,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         .map_err(RunError::ParticipantName)?;
     let store = Store::discover(&cwd)?;
     let profile = command.profile();
-    let hosts = allowed_hosts(command.allow_hosts(), profile);
+    let hosts = allowed_hosts(command.options.allow_hosts(), profile);
     let prepared = Prepared::new(
         environment,
         host,
@@ -304,7 +336,102 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         }
         return Ok(Outcome::Stopped(signal));
     }
+    let started = started?;
+    let _lock = match ThreadLock::acquire(&config, started.thread) {
+        Ok(lock) => lock,
+        Err(error) => {
+            started.discard_or_report(&prepared.store);
+            return Err(error.into());
+        }
+    };
+    prepared.launch(environment, started, termination)
+}
+
+pub(crate) fn resume(
+    command: &ResumeCommand,
+    environment: &Environment,
+) -> Result<Outcome, RunError> {
+    let cwd = env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(RunError::CurrentDirectory)?;
+    let host = Host::from_environment(environment)?;
+    let config = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )?;
+    let signing = SigningKey::load(&config.signing_key_file()).map_err(RunError::NotInitialised)?;
+    let owner =
+        ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)?;
+    let participant = session::participant_from(environment.user.as_deref())
+        .map_err(RunError::ParticipantName)?;
+    let store = Store::discover(&cwd)?;
+    let slot = session::pick_slot(&store, command.thread, &participant, command.agent.as_ref())?;
+    store
+        .worktree_dir(&command.thread.to_string())
+        .map_err(|error| ResumeError::NoWorktree(command.thread, error))?;
+    let _lock = ThreadLock::acquire(&config, command.thread)?;
+    let (program, arguments, profile) = resumed_command(command, &slot);
+    let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let prepared = Prepared::new(
+        environment,
+        host,
+        &cwd,
+        store,
+        &AgentRequest {
+            program: &program,
+            arguments: &arguments,
+            profile,
+            hosts: &hosts,
+        },
+    )?;
+    load_meta(&prepared.store, command.thread, &owner, 0)
+        .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
+    let passphrase = TerminalPrompt::open()
+        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
+        .map_err(RunError::Terminal)?;
+    let identity =
+        LocalIdentity::load(&config.identity_file(), &passphrase).map_err(RunError::Unlock)?;
+    drop(passphrase);
+    let reopen = session::Reopen {
+        thread: command.thread,
+        owner: &owner,
+        identity: &identity,
+        participant: &participant,
+        agent: Some(slot.agent()),
+    };
+    let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
+    let (started, caught) = until_stopped(&termination, |interrupt| {
+        session::resume(&prepared.store, &reopen, &prepared.globals, interrupt)
+    });
+    drop(identity);
+    if let Some(signal) = caught {
+        return Ok(Outcome::Stopped(signal));
+    }
     prepared.launch(environment, started?, termination)
+}
+
+/// Returns what `mahi resume` runs: the command after `--`, or the program named after the
+/// thread's agent with its profile's resume arguments.
+fn resumed_command(
+    command: &ResumeCommand,
+    slot: &AgentSlot,
+) -> (OsString, Vec<OsString>, Option<&'static Profile>) {
+    if let Some((program, arguments)) = command.command.split_first() {
+        return (
+            program.clone(),
+            arguments.to_vec(),
+            command.options.profile_for(program),
+        );
+    }
+    let program = OsString::from(slot.agent().as_str());
+    let profile = command.options.profile_for(&program);
+    let arguments = profile
+        .map(|profile| profile.resume_args)
+        .unwrap_or_default()
+        .iter()
+        .map(OsString::from)
+        .collect();
+    (program, arguments, profile)
 }
 
 /// The agent to run and what it may reach.
@@ -447,6 +574,7 @@ fn start_background(
             key,
             thread: started.thread,
             slot: started.slot.clone(),
+            tip: started.tip,
         };
         let poker = recorder.as_ref().map(Recorder::poker);
         let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
@@ -650,10 +778,24 @@ impl Launch<'_> {
         let (Some(profile), Some(state)) = (self.profile, &self.state) else {
             return Ok(None);
         };
-        profile::create_private_dir(state).map_err(RunError::State)?;
-        let state = fs::canonicalize(state).map_err(RunError::State)?;
-        profile.install(&state).map_err(RunError::State)?;
-        Ok(Some(state))
+        let not_private = || RunError::StateNotPrivate(state.clone());
+        let (Some(parent), Some(name)) = (state.parent(), state.file_name()) else {
+            return Err(not_private());
+        };
+        let name = name.to_str().ok_or_else(not_private)?;
+        profile::create_private_dir(parent).map_err(RunError::State)?;
+        let parent = fs::canonicalize(parent).map_err(RunError::State)?;
+        let parent_dir = rustix::fs::open(
+            &parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| RunError::State(error.into()))?;
+        let directory = profile::open_state(&parent_dir, name)
+            .map_err(RunError::State)?
+            .ok_or_else(not_private)?;
+        profile.install(&directory).map_err(RunError::State)?;
+        Ok(Some(parent.join(name)))
     }
 
     fn spawn(
@@ -706,7 +848,13 @@ impl Launch<'_> {
         if let Some(mahi) = &self.environment.mahi_exe {
             pty = pty.env(MAHI_BIN, mahi);
         }
-        for passed in &self.environment.pass_env {
+        let offered = |passed: &&Passed| {
+            passed.required
+                || self
+                    .profile
+                    .is_some_and(|profile| profile.optional_env.contains(&passed.name.as_str()))
+        };
+        for passed in self.environment.pass_env.iter().filter(offered) {
             if let Some(value) = &passed.value {
                 pty = pty.env(passed.name.as_str(), OsStr::from_bytes(value));
             }

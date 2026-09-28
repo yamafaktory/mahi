@@ -27,7 +27,11 @@ mod tests {
             Output,
             Stdio,
         },
-        sync::mpsc,
+        sync::{
+            Arc,
+            Mutex,
+            mpsc,
+        },
         thread,
         time::{
             Duration,
@@ -35,6 +39,7 @@ mod tests {
         },
     };
 
+    use age::secrecy::SecretString;
     use base64::{
         Engine,
         engine::general_purpose::STANDARD,
@@ -502,6 +507,7 @@ mod tests {
     }
 
     const FAKE_CLAUDE: &str = r#"#!/bin/sh
+echo args=$*
 echo config=$CLAUDE_CONFIG_DIR
 echo quiet=$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
 echo updates=$DISABLE_AUTOUPDATER
@@ -632,6 +638,305 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(
             String::from_utf8_lossy(&listed.stdout),
             format!("{thread}  tester.true  no worktree\n")
+        );
+    }
+
+    const PASSPHRASE: &str = "correct horse battery";
+
+    fn save_identity(fixture: &Fixture) {
+        fixture
+            .identity
+            .save(
+                &config_dir(&fixture.home).identity_file(),
+                &SecretString::from(PASSPHRASE.to_owned()),
+            )
+            .unwrap();
+    }
+
+    fn in_terminal(
+        fixture: &Fixture,
+        arguments: &[&str],
+        passphrase: Option<&str>,
+    ) -> (i32, String) {
+        let mut command = PtyCommand::new(
+            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            &fixture.repo,
+            WindowSize {
+                rows: 24,
+                cols: 200,
+            },
+        );
+        for argument in arguments {
+            command = command.arg(argument);
+        }
+        let command = command
+            .env("PATH", "/usr/bin:/bin:/usr")
+            .env("HOME", &fixture.home)
+            .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+            .env("SSH_AUTH_SOCK", &fixture.socket)
+            .env("USER", "tester");
+        in_terminal_with(command, passphrase)
+    }
+
+    fn in_terminal_with(command: PtyCommand, passphrase: Option<&str>) -> (i32, String) {
+        let mut mahi = command.spawn().unwrap();
+        let mut terminal = mahi.writer().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&output);
+        let mut reader = mahi.reader().unwrap();
+        thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                collected.lock().unwrap().extend_from_slice(&buffer[..read]);
+            }
+        });
+        if let Some(passphrase) = passphrase {
+            wait_until("the passphrase question", || {
+                String::from_utf8_lossy(&output.lock().unwrap()).contains("Passphrase")
+            });
+            terminal
+                .write_all(format!("{passphrase}\n").as_bytes())
+                .unwrap();
+        }
+        let mut status = None;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while status.is_none() {
+            assert!(Instant::now() < deadline, "mahi did not finish");
+            status = mahi.try_wait().unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(100));
+        let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
+        (exit_code(status.unwrap()), text)
+    }
+
+    fn snapshot_head(fixture: &Fixture, thread: &str) -> gix::ObjectId {
+        gix::open(&fixture.repo)
+            .unwrap()
+            .find_reference(format!("refs/threads/{thread}/agents/tester.sh/snapshots").as_str())
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn resume_reopens_the_worktree_and_continues_snapshots_and_turns() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let first = fixture.mahi(&[
+            "run",
+            "sh",
+            "-c",
+            "echo one > notes; printf first | \"$MAHI_BIN\" hook prompt; \
+             \"$MAHI_BIN\" hook turn-end < /dev/null",
+        ]);
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert_eq!(first.status.code(), Some(0), "{stderr}");
+        let worktree = worktree_of(&stderr);
+        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let before = snapshot_head(&fixture, &thread);
+
+        let (code, output) = in_terminal(
+            &fixture,
+            &[
+                "resume",
+                &thread,
+                "--",
+                "sh",
+                "-c",
+                "echo seen=$(cat notes); echo two >> notes; \
+                 printf second | \"$MAHI_BIN\" hook prompt; pwd",
+            ],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("seen=one"), "{output}");
+        assert!(output.contains(&worktree.display().to_string()), "{output}");
+        assert_eq!(
+            fs::read_to_string(worktree.join("notes")).unwrap(),
+            "one\ntwo\n"
+        );
+
+        let repository = gix::open(&fixture.repo).unwrap();
+        let after = snapshot_head(&fixture, &thread);
+        let head = repository.find_commit(after).unwrap();
+        assert_eq!(head.parent_ids().next().unwrap().detach(), before);
+        let notes = head
+            .tree()
+            .unwrap()
+            .find_entry("notes")
+            .unwrap()
+            .object()
+            .unwrap();
+        assert_eq!(notes.data, b"one\ntwo\n");
+
+        let thread_id: ThreadId = thread.parse().unwrap();
+        let store = Store::open(&fixture.repo).unwrap();
+        let meta = load_meta(&store, thread_id, &fixture.owner, 0).unwrap();
+        let tester = ParticipantName::new("tester").unwrap();
+        let key = meta.thread_key(&tester, fixture.identity.as_age()).unwrap();
+        let slot = AgentSlot::new(tester, AgentName::new("sh").unwrap());
+        let turns = read_turns(&store, &key, thread_id, &slot, 10).unwrap();
+        assert_eq!(turns.len(), 2, "{output}");
+        assert_eq!(turns[1].turn(), 1);
+        assert_eq!(turns[1].events()[0].payload(), b"prompt\nsecond");
+    }
+
+    #[test]
+    fn resuming_claude_continues_its_conversation_in_the_same_state() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let claude = fake_claude(&fixture);
+        let first = fixture
+            .command(&["run", claude.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert_eq!(first.status.code(), Some(0), "{stderr}");
+        let thread = worktree_of(&stderr)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let state = fs::canonicalize(
+            fixture
+                .repo
+                .join(".git/mahi/state")
+                .join(&thread)
+                .join("tester.claude"),
+        )
+        .unwrap();
+        fs::write(state.join("settings.json"), "{}").unwrap();
+
+        let tools = claude.parent().unwrap().display().to_string();
+        let command = PtyCommand::new(
+            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            &fixture.repo,
+            WindowSize {
+                rows: 24,
+                cols: 200,
+            },
+        )
+        .arg("resume")
+        .arg(&thread)
+        .env("PATH", format!("{tools}:/usr/bin:/bin:/usr"))
+        .env("HOME", &fixture.home)
+        .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+        .env("SSH_AUTH_SOCK", &fixture.socket)
+        .env("USER", "tester");
+        let (code, output) = in_terminal_with(command, Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("args=--continue"), "{output}");
+        assert!(
+            output.contains(&format!("config={}", state.display())),
+            "{output}"
+        );
+        assert!(output.contains("hooks=ok"), "{output}");
+        assert_eq!(fs::read_to_string(state.join("written")).unwrap(), "kept\n");
+
+        let elsewhere = fixture.root.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::remove_dir_all(&state).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &state).unwrap();
+        let (code, output) = in_terminal(
+            &fixture,
+            &["resume", &thread, "--", claude.to_str().unwrap()],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("is not a private directory"), "{output}");
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+        assert_eq!(fixture.threads().len(), 3);
+        assert!(
+            fixture
+                .repo
+                .join(".git/mahi/worktrees")
+                .join(&thread)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn resume_refuses_a_thread_signed_by_another_key_before_the_passphrase() {
+        let fixture = fixture();
+        let first = fixture.mahi(&["run", "true"]);
+        let worktree = worktree_of(&String::from_utf8_lossy(&first.stderr));
+        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let config = config_dir(&fixture.home);
+        fs::remove_file(config.signing_key_file()).unwrap();
+        let other = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        SigningKey::try_from(other.public_key().clone())
+            .unwrap()
+            .save(&config.signing_key_file())
+            .unwrap();
+        let refused = fixture.mahi(&["resume", &thread, "--", "true"]);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("only a thread you started"), "{stderr}");
+        assert!(!stderr.contains("Passphrase"), "{stderr}");
+    }
+
+    #[test]
+    fn a_running_thread_cannot_be_resumed_by_another_mahi() {
+        let fixture = fixture();
+        let mut running = KillOnDrop(
+            fixture
+                .command(&["run", "sh", "-c", "sleep 30"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut stderr = running.0.stderr.take().unwrap();
+        let mut seen = Vec::new();
+        let has_thread_line = |seen: &[u8]| {
+            let text = String::from_utf8_lossy(seen);
+            text.split_once("mahi: thread ")
+                .is_some_and(|(_, rest)| rest.contains('\n'))
+        };
+        while !has_thread_line(&seen) {
+            let mut chunk = [0_u8; 256];
+            let read = stderr.read(&mut chunk).unwrap();
+            assert_ne!(read, 0, "mahi run ended early");
+            seen.extend_from_slice(&chunk[..read]);
+        }
+        let worktree = worktree_of(&String::from_utf8_lossy(&seen));
+        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let busy = fixture.mahi(&["resume", &thread, "--", "true"]);
+        assert_eq!(busy.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&busy.stderr).contains("already running"));
+    }
+
+    #[test]
+    fn resume_refuses_unknown_threads_wrong_passphrases_and_missing_worktrees() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let unknown = fixture.mahi(&["resume", "0123456789abcdef0123456789abcdef"]);
+        assert_eq!(unknown.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&unknown.stderr).contains("no agent of yours"));
+
+        let first = fixture.mahi(&["run", "true"]);
+        let worktree = worktree_of(&String::from_utf8_lossy(&first.stderr));
+        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let (code, output) = in_terminal(
+            &fixture,
+            &["resume", &thread, "--", "true"],
+            Some("wrong passphrase"),
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("cannot unlock your mahi key"), "{output}");
+
+        fs::remove_dir_all(&worktree).unwrap();
+        let gone = fixture.mahi(&["resume", &thread]);
+        assert_eq!(gone.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&gone.stderr).contains("rebuilding it is not supported yet")
         );
     }
 

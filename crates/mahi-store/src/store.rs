@@ -314,6 +314,22 @@ impl Store {
         Ok(Some(data))
     }
 
+    /// Returns the tree `commit` records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `commit` is not a commit, or [`StoreError::Git`]
+    /// if it cannot be read.
+    pub fn commit_tree(&self, commit: ObjectId) -> Result<ObjectId, StoreError> {
+        self.require_kind(commit, Kind::Commit)?;
+        Ok(self
+            .repo
+            .find_commit(commit)?
+            .tree_id()
+            .map_err(gix::Error::from)?
+            .detach())
+    }
+
     /// Returns the parent of `commit`, or `None` for the first commit of a history.
     ///
     /// mahi's histories are linear, so a commit with more than one parent is refused. The
@@ -674,6 +690,18 @@ mod tests {
         let mut expected = vec![(meta, first), (transcript, second)];
         expected.sort();
         assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn a_commit_gives_its_tree_and_other_objects_are_refused() {
+        let (_dir, store) = store();
+        let tree = empty_tree(&store);
+        let commit = store.append(&transcript_ref(), None, tree, "turn").unwrap();
+        assert_eq!(store.commit_tree(commit).unwrap(), tree);
+        assert!(matches!(
+            store.commit_tree(tree),
+            Err(StoreError::WrongObject { .. })
+        ));
     }
 
     #[test]
