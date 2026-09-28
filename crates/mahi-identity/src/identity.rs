@@ -72,6 +72,9 @@ pub enum IdentityError {
     /// The file is not a passphrase-encrypted mahi identity, or it is truncated.
     #[error("identity file is malformed")]
     Malformed,
+    /// The operating system's random source failed.
+    #[error("random source unavailable")]
+    Random(#[source] getrandom::Error),
     /// Reading or writing failed.
     #[error("cannot read or write the identity file")]
     Io(#[from] io::Error),

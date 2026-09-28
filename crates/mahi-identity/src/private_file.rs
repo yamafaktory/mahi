@@ -10,6 +10,7 @@ use std::{
         Read,
         Write,
     },
+    mem,
     os::unix::fs::{
         DirBuilderExt,
         MetadataExt,
@@ -20,6 +21,8 @@ use std::{
         PathBuf,
     },
 };
+
+use zeroize::Zeroizing;
 
 use crate::IdentityError;
 
@@ -78,12 +81,14 @@ pub(crate) fn read(path: &Path, max_bytes: u64) -> Result<Vec<u8>, IdentityError
     if !is_private(&metadata) {
         return Err(IdentityError::NotPrivate(path.to_path_buf()));
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(max_bytes + 1).unwrap_or(0));
+    let mut bytes = Zeroizing::new(Vec::with_capacity(
+        usize::try_from(max_bytes + 1).unwrap_or(0),
+    ));
     file.take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
         return Err(IdentityError::Malformed);
     }
-    Ok(bytes)
+    Ok(mem::take(&mut *bytes))
 }
 
 fn no_follow() -> i32 {

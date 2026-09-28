@@ -11,6 +11,8 @@ version.workspace = true
 
 [dependencies]
 age = { workspace = true }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
 rustix = { workspace = true }
 ssh-key = { workspace = true }
 thiserror = { workspace = true }

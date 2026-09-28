@@ -305,6 +305,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let public =
         PublicIdentity::load(&config.recipient_file()).map_err(RunError::NotInitialised)?;
     let signing = SigningKey::load(&config.signing_key_file()).map_err(RunError::NotInitialised)?;
+    let node = session::own_node(&config).map_err(RunError::NotInitialised)?;
     let socket = environment
         .ssh_auth_sock
         .as_deref()
@@ -337,6 +338,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
             &prepared.store,
             session::NewThread {
                 public: &public,
+                node,
                 signer: &signer,
                 participant,
                 agent: &agent_name,

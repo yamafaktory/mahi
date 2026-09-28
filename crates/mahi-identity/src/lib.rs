@@ -6,6 +6,7 @@ compile_error!("mahi supports Linux and macOS only");
 mod config;
 mod credential;
 mod identity;
+mod node;
 mod private_file;
 mod public;
 mod ssh_agent;
@@ -26,6 +27,7 @@ pub use identity::{
     IdentityError,
     LocalIdentity,
 };
+pub use node::NodeKey;
 pub use public::{
     PublicIdentity,
     SigningKey,

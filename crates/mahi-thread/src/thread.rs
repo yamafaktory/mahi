@@ -217,7 +217,15 @@ mod tests {
             generation,
             ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
             alice.clone(),
-            vec![Participant::new(alice, setup.owner_key.clone(), setup.mahi.to_public()).unwrap()],
+            vec![
+                Participant::new(
+                    alice,
+                    setup.owner_key.clone(),
+                    setup.mahi.to_public(),
+                    crate::node::tests::random_node(),
+                )
+                .unwrap(),
+            ],
             PrivateMeta::new(title, "main").unwrap(),
         )
         .unwrap()
@@ -493,6 +501,7 @@ mod tests {
                     alice,
                     mallory_key,
                     age::x25519::Identity::generate().to_public(),
+                    crate::node::tests::random_node(),
                 )
                 .unwrap(),
             ],

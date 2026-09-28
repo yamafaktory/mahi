@@ -619,6 +619,7 @@ dependencies = [
  "ed25519",
  "sha2 0.10.9",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2115,6 +2116,8 @@ name = "mahi-identity"
 version = "0.1.0"
 dependencies = [
  "age",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
  "rustix",
  "signature",
  "ssh-key",
@@ -2172,6 +2175,7 @@ dependencies = [
  "age",
  "bech32",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "gix",
  "gix-hash",
  "gix-lock",

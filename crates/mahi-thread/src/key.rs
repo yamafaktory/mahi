@@ -57,7 +57,7 @@ impl ParticipantKey {
             return Err(KeyError::Unsupported(key.algorithm().to_string()));
         }
         let point = VerifyingKey::from_bytes(&ed25519.0).map_err(|_| KeyError::Weak)?;
-        if point.is_weak() {
+        if point.is_weak() || point.to_edwards().compress().to_bytes() != ed25519.0 {
             return Err(KeyError::Weak);
         }
         let key = PublicKey::new(key.key_data().clone(), "");

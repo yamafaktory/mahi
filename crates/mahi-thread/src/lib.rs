@@ -2,6 +2,7 @@
 
 mod key;
 mod meta;
+mod node;
 mod pins;
 mod signer;
 mod thread;
@@ -20,6 +21,10 @@ pub use meta::{
     Participant,
     PrivateMeta,
     VerifiedMeta,
+};
+pub use node::{
+    NodeId,
+    NodeIdError,
 };
 pub use pins::PinError;
 pub use signer::{

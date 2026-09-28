@@ -7,10 +7,12 @@ use mahi_identity::{
     ConfigError,
     IdentityError,
     LocalIdentity,
+    NodeKey,
     PublicIdentity,
     SigningKey,
     SshAgent,
 };
+use mahi_thread::NodeId;
 use ssh_key::HashAlg;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -18,6 +20,7 @@ use thiserror::Error;
 use crate::{
     environment::Environment,
     prompt::Prompt,
+    session,
 };
 
 const MIN_PASSPHRASE_CHARS: usize = 8;
@@ -44,6 +47,8 @@ pub(crate) enum InitError {
     NoSuchKey { count: usize },
     #[error("{} exists without identity.age; remove it and run mahi init again", .0.display())]
     OrphanPublicIdentity(std::path::PathBuf),
+    #[error("cannot set up your node key {}", .0.display())]
+    NodeKey(std::path::PathBuf, #[source] IdentityError),
 }
 
 pub(crate) fn init(environment: &Environment, prompt: &mut dyn Prompt) -> Result<(), InitError> {
@@ -53,6 +58,7 @@ pub(crate) fn init(environment: &Environment, prompt: &mut dyn Prompt) -> Result
     )?;
     let public = public_identity(&config, prompt)?;
     let signing = signing_key(&config, environment, prompt)?;
+    let node = node_id(&config)?;
     prompt
         .say(&format!("mahi key:    {}", public.recipient()))
         .map_err(InitError::Prompt)?;
@@ -62,7 +68,23 @@ pub(crate) fn init(environment: &Environment, prompt: &mut dyn Prompt) -> Result
             signing.public_key().fingerprint(HashAlg::Sha256)
         ))
         .map_err(InitError::Prompt)?;
+    prompt
+        .say(&format!("node id:     {node}"))
+        .map_err(InitError::Prompt)?;
     Ok(())
+}
+
+fn node_id(config: &ConfigDir) -> Result<NodeId, InitError> {
+    let path = config.node_key_file();
+    let failed = |error| InitError::NodeKey(path.clone(), error);
+    match NodeKey::load(&path) {
+        Err(IdentityError::NotFound(_)) => NodeKey::generate()
+            .and_then(|key| key.save(&path))
+            .map_err(failed)?,
+        Err(error) => return Err(failed(error)),
+        Ok(_) => {}
+    }
+    session::own_node(config).map_err(failed)
 }
 
 fn public_identity(
@@ -310,11 +332,12 @@ mod tests {
             .clone()
     }
 
-    fn files(config: &ConfigDir) -> [PathBuf; 3] {
+    fn files(config: &ConfigDir) -> [PathBuf; 4] {
         [
             config.identity_file(),
             config.recipient_file(),
             config.signing_key_file(),
+            config.node_key_file(),
         ]
     }
 
@@ -343,9 +366,12 @@ mod tests {
                 .belongs_to(&identity)
         );
 
+        let node = session::own_node(&setup.config).unwrap();
         let mut again = Script::default();
         init(&setup.environment, &mut again).unwrap();
         assert!(again.said.iter().any(|line| line.starts_with("mahi key:")));
+        assert!(again.said.contains(&format!("node id:     {node}")));
+        assert_eq!(session::own_node(&setup.config).unwrap(), node);
     }
 
     #[test]
@@ -403,6 +429,42 @@ mod tests {
         let signing = SigningKey::load(&setup.config.signing_key_file()).unwrap();
         assert_eq!(signing.public_key().key_data(), keys[1].key_data());
         assert!(right.said.iter().any(|line| line.contains("SHA256:")));
+    }
+
+    #[test]
+    fn a_setup_from_before_node_keys_gets_one_without_any_question() {
+        let setup = setup(&[ed25519()]);
+        let mut first = Script {
+            secrets: ["correct horse", "correct horse"].into(),
+            ..Script::default()
+        };
+        init(&setup.environment, &mut first).unwrap();
+        std::fs::remove_file(setup.config.node_key_file()).unwrap();
+        let mut again = Script::default();
+        init(&setup.environment, &mut again).unwrap();
+        let node = session::own_node(&setup.config).unwrap();
+        assert!(again.said.contains(&format!("node id:     {node}")));
+    }
+
+    #[test]
+    fn a_malformed_node_key_is_reported_by_its_path_and_kept() {
+        let setup = setup(&[ed25519()]);
+        let mut first = Script {
+            secrets: ["correct horse", "correct horse"].into(),
+            ..Script::default()
+        };
+        init(&setup.environment, &mut first).unwrap();
+        let path = setup.config.node_key_file();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, [1; 5]).unwrap();
+        std::fs::set_permissions(
+            &path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .unwrap();
+        let error = init(&setup.environment, &mut Script::default()).unwrap_err();
+        assert!(matches!(&error, InitError::NodeKey(reported, _) if reported == &path));
+        assert_eq!(std::fs::read(&path).unwrap(), [1; 5]);
     }
 
     #[test]

@@ -34,6 +34,7 @@ use thiserror::Error;
 
 use crate::{
     KeyError,
+    NodeId,
     ParticipantKey,
     SignError,
     SshSigner,
@@ -44,7 +45,7 @@ pub const MAX_META_BYTES: usize = 256 * 1024;
 /// The most participants a thread can have.
 pub const MAX_PARTICIPANTS: usize = 256;
 
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const NAMESPACE: &str = "mahi-meta";
 const HASH: HashAlg = HashAlg::Sha512;
 const MAX_TITLE_BYTES: usize = 256;
@@ -53,13 +54,14 @@ const MAX_SIGNATURE_BYTES: usize = 4096;
 const MAX_PRIVATE_BYTES: usize = 4096;
 const LOW_ORDER_PROBE: [u8; 32] = [0x5a; 32];
 
-/// A person in a thread: their name, the SSH key they sign with, and the mahi key that the
-/// thread key is wrapped to.
+/// A person in a thread: their name, the SSH key they sign with, the mahi key that the thread
+/// key is wrapped to, and the node key of their machine on the live layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Participant {
     name: ParticipantName,
     key: ParticipantKey,
     recipient: x25519::Recipient,
+    node: NodeId,
 }
 
 /// The encrypted part of a thread's meta document.
@@ -113,6 +115,12 @@ pub enum InvalidMeta {
     /// Two participants share a mahi key.
     #[error("two participants share a mahi key")]
     DuplicateRecipient,
+    /// Two participants share a node key.
+    #[error("two participants share a node key")]
+    DuplicateNode,
+    /// A participant's node key is not a usable ed25519 key.
+    #[error("a participant's node key is invalid or weak")]
+    ParticipantNode,
     /// A participant's mahi key is not an age X25519 recipient.
     #[error("a participant's mahi key is not an age X25519 recipient")]
     ParticipantRecipient,
@@ -230,6 +238,7 @@ struct WireParticipant<'a> {
     name: &'a str,
     key: &'a str,
     recipient: &'a str,
+    node: [u8; 32],
     wrapped: &'a [u8],
 }
 
@@ -240,7 +249,8 @@ struct WirePrivate<'a> {
 }
 
 impl Participant {
-    /// Creates a participant who signs with `key` and receives the thread key at `recipient`.
+    /// Creates a participant who signs with `key`, receives the thread key at `recipient` and
+    /// speaks on the live layer as `node`.
     ///
     /// # Errors
     ///
@@ -250,6 +260,7 @@ impl Participant {
         name: ParticipantName,
         key: ParticipantKey,
         recipient: x25519::Recipient,
+        node: NodeId,
     ) -> Result<Self, InvalidMeta> {
         if is_low_order(&recipient) {
             return Err(InvalidMeta::WeakRecipient);
@@ -258,6 +269,7 @@ impl Participant {
             name,
             key,
             recipient,
+            node,
         })
     }
 
@@ -277,6 +289,12 @@ impl Participant {
     #[must_use]
     pub fn recipient(&self) -> &x25519::Recipient {
         &self.recipient
+    }
+
+    /// Returns the node key of the participant's machine on the live layer.
+    #[must_use]
+    pub fn node(&self) -> &NodeId {
+        &self.node
     }
 }
 
@@ -420,6 +438,7 @@ impl MetaDraft {
                         name,
                         key: participant.key.to_openssh(),
                         recipient,
+                        node: *participant.node.as_bytes(),
                         wrapped,
                     },
                 )
@@ -524,6 +543,7 @@ impl VerifiedMeta {
                 wire.recipient
                     .parse()
                     .map_err(|_| InvalidMeta::ParticipantRecipient)?,
+                NodeId::from_bytes(wire.node).map_err(|_| InvalidMeta::ParticipantNode)?,
             )?;
             participants.push((participant, wire.wrapped.to_vec()));
         }
@@ -667,6 +687,7 @@ fn validate_participants<'a>(
     let mut names = HashSet::new();
     let mut keys = HashSet::new();
     let mut recipients = HashSet::new();
+    let mut nodes = HashSet::new();
     let mut has_owner = false;
     for participant in participants {
         if !names.insert(&participant.name) {
@@ -677,6 +698,9 @@ fn validate_participants<'a>(
         }
         if !recipients.insert(&participant.recipient) {
             return Err(InvalidMeta::DuplicateRecipient);
+        }
+        if !nodes.insert(participant.node) {
+            return Err(InvalidMeta::DuplicateNode);
         }
         has_owner |= &participant.name == owner;
     }
@@ -747,6 +771,7 @@ mod tests {
         name: ParticipantName,
         private: PrivateKey,
         mahi: x25519::Identity,
+        node: NodeId,
     }
 
     impl Person {
@@ -755,6 +780,7 @@ mod tests {
                 name: ParticipantName::new(name).unwrap(),
                 private: PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
                 mahi: x25519::Identity::generate(),
+                node: crate::node::tests::random_node(),
             }
         }
 
@@ -763,7 +789,13 @@ mod tests {
         }
 
         fn participant(&self) -> Participant {
-            Participant::new(self.name.clone(), self.key(), self.mahi.to_public()).unwrap()
+            Participant::new(
+                self.name.clone(),
+                self.key(),
+                self.mahi.to_public(),
+                self.node,
+            )
+            .unwrap()
         }
 
         fn identity(&self) -> &x25519::Identity {
@@ -915,6 +947,7 @@ mod tests {
             name: alice.name.clone(),
             private: mallory.private.clone(),
             mahi: x25519::Identity::generate(),
+            node: crate::node::tests::random_node(),
         };
         let forged = draft(&forged_owner, &[&bob]);
         let encoded = forged
@@ -1001,11 +1034,14 @@ mod tests {
         let alice = Person::new("alice");
         let draft = draft(&alice, &[]);
         let encoded = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
-        let v2 = signed_envelope(&alice.private, &body_of(&encoded), HASH, NAMESPACE, 2);
-        assert!(matches!(
-            VerifiedMeta::decode(&v2, draft.thread, &alice.key()),
-            Err(MetaError::UnsupportedVersion(2))
-        ));
+        for version in [VERSION - 1, VERSION + 1] {
+            let other =
+                signed_envelope(&alice.private, &body_of(&encoded), HASH, NAMESPACE, version);
+            assert!(matches!(
+                VerifiedMeta::decode(&other, draft.thread, &alice.key()),
+                Err(MetaError::UnsupportedVersion(refused)) if refused == version
+            ));
+        }
         let mut trailing = encoded.clone();
         trailing.push(0);
         assert!(matches!(
@@ -1030,6 +1066,7 @@ mod tests {
             name: "alice",
             key: key.to_openssh(),
             recipient: &mahi,
+            node: *alice.node.as_bytes(),
             wrapped: b"",
         };
         let fresh = || WireBody {
@@ -1095,6 +1132,16 @@ mod tests {
         let mut body = fresh();
         body.participants[0].key = "ssh-ed25519 AAAA";
         assert!(matches!(decode(&body), Err(MetaError::Key(_))));
+        let mut small_order = [0_u8; 32];
+        small_order[0] = 1;
+        for weak in [small_order, [0; 32]] {
+            let mut body = fresh();
+            body.participants[0].node = weak;
+            assert!(matches!(
+                decode(&body),
+                Err(MetaError::Invalid(InvalidMeta::ParticipantNode))
+            ));
+        }
     }
 
     #[test]
@@ -1232,10 +1279,27 @@ mod tests {
             make(vec![alice.participant(), alice.participant()]),
             Err(InvalidMeta::DuplicateName)
         );
-        let same_key =
-            Participant::new(bob.name.clone(), alice.key(), bob.mahi.to_public()).unwrap();
-        let same_recipient =
-            Participant::new(bob.name.clone(), bob.key(), alice.mahi.to_public()).unwrap();
+        let same_key = Participant::new(
+            bob.name.clone(),
+            alice.key(),
+            bob.mahi.to_public(),
+            bob.node,
+        )
+        .unwrap();
+        let same_recipient = Participant::new(
+            bob.name.clone(),
+            bob.key(),
+            alice.mahi.to_public(),
+            bob.node,
+        )
+        .unwrap();
+        let same_node = Participant::new(
+            bob.name.clone(),
+            bob.key(),
+            bob.mahi.to_public(),
+            alice.node,
+        )
+        .unwrap();
         assert_eq!(
             make(vec![alice.participant(), same_key]),
             Err(InvalidMeta::DuplicateKey)
@@ -1243,6 +1307,10 @@ mod tests {
         assert_eq!(
             make(vec![alice.participant(), same_recipient]),
             Err(InvalidMeta::DuplicateRecipient)
+        );
+        assert_eq!(
+            make(vec![alice.participant(), same_node]),
+            Err(InvalidMeta::DuplicateNode)
         );
         assert_eq!(make(vec![alice.participant(), bob.participant()]), Ok(()));
     }
@@ -1276,12 +1344,25 @@ mod tests {
         let alice = Person::new("alice");
         for point in low_order_points() {
             assert_eq!(
-                Participant::new(alice.name.clone(), alice.key(), recipient_from_bytes(point)),
+                Participant::new(
+                    alice.name.clone(),
+                    alice.key(),
+                    recipient_from_bytes(point),
+                    alice.node
+                ),
                 Err(InvalidMeta::WeakRecipient),
                 "{point:02x?}"
             );
         }
-        assert!(Participant::new(alice.name.clone(), alice.key(), alice.mahi.to_public()).is_ok());
+        assert!(
+            Participant::new(
+                alice.name.clone(),
+                alice.key(),
+                alice.mahi.to_public(),
+                alice.node
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1301,6 +1382,7 @@ mod tests {
                 name: "alice",
                 key: key.to_openssh(),
                 recipient: &weak,
+                node: *alice.node.as_bytes(),
                 wrapped: b"",
             }],
             private: b"",
@@ -1322,7 +1404,7 @@ mod tests {
             .to_uppercase()
             .parse()
             .unwrap();
-        let copy = Participant::new(bob.name.clone(), bob.key(), upper).unwrap();
+        let copy = Participant::new(bob.name.clone(), bob.key(), upper, bob.node).unwrap();
         assert!(matches!(
             MetaDraft::new(
                 ThreadId::random().unwrap(),

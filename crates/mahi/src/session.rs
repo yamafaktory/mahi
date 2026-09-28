@@ -26,7 +26,10 @@ use mahi_core::{
 };
 use mahi_crypto::ThreadKey;
 use mahi_identity::{
+    ConfigDir,
+    IdentityError,
     LocalIdentity,
+    NodeKey,
     PublicIdentity,
 };
 use mahi_store::{
@@ -41,6 +44,7 @@ use mahi_thread::{
     KeyError,
     MetaDraft,
     MetaError,
+    NodeId,
     Participant,
     ParticipantKey,
     PrivateMeta,
@@ -106,6 +110,7 @@ pub(crate) enum StartError {
 /// Who starts a new thread, for which agent, and where its worktree goes.
 pub(crate) struct NewThread<'a> {
     pub(crate) public: &'a PublicIdentity,
+    pub(crate) node: NodeId,
     pub(crate) signer: &'a dyn SshSigner,
     pub(crate) participant: ParticipantName,
     pub(crate) agent: &'a AgentName,
@@ -120,6 +125,7 @@ pub(crate) fn start(
 ) -> Result<Started, StartError> {
     let NewThread {
         public,
+        node,
         signer,
         participant,
         agent,
@@ -132,6 +138,7 @@ pub(crate) fn start(
         participant.clone(),
         ParticipantKey::from_public_key(signer.public_key())?,
         public.recipient().clone(),
+        node,
     )?;
     let slot = AgentSlot::new(participant.clone(), agent.clone());
     let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
@@ -448,6 +455,12 @@ pub(crate) fn name_from(text: &str) -> String {
     mapped.trim_matches('-').to_owned()
 }
 
+/// Returns the node id of the user's iroh node, from the node key `mahi init` wrote.
+pub(crate) fn own_node(config: &ConfigDir) -> Result<NodeId, IdentityError> {
+    let key = NodeKey::load(&config.node_key_file())?;
+    NodeId::from_bytes(key.public()).map_err(|_| IdentityError::Malformed)
+}
+
 pub(crate) fn participant_from(user: Option<&str>) -> Result<ParticipantName, NameError> {
     ParticipantName::new(&name_from(user.unwrap_or_default()))
 }
@@ -549,6 +562,7 @@ pub(crate) mod tests {
             store,
             NewThread {
                 public: &public,
+                node: NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
                 signer,
                 participant: ParticipantName::new("alice").unwrap(),
                 agent: &agent_from(Path::new("claude")),

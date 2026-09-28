@@ -65,6 +65,7 @@ mod tests {
     use mahi_identity::{
         ConfigDir,
         LocalIdentity,
+        NodeKey,
         PublicIdentity,
         SigningKey,
     };
@@ -183,6 +184,10 @@ mod tests {
         SigningKey::try_from(key.public_key().clone())
             .unwrap()
             .save(&config.signing_key_file())
+            .unwrap();
+        NodeKey::generate()
+            .unwrap()
+            .save(&config.node_key_file())
             .unwrap();
         identity
     }
@@ -358,6 +363,11 @@ mod tests {
         let store = Store::open(&fixture.repo).unwrap();
         let meta = load_meta(&store, thread, &fixture.owner, 0).unwrap();
         let tester = ParticipantName::new("tester").unwrap();
+        let node = NodeKey::load(&config_dir(&fixture.home).node_key_file())
+            .unwrap()
+            .public();
+        let owner = meta.participants().next().unwrap();
+        assert_eq!(owner.node().as_bytes(), &node);
         let key = meta.thread_key(&tester, fixture.identity.as_age()).unwrap();
         let slot = AgentSlot::new(tester, AgentName::new("sh").unwrap());
         let turns = read_turns(&store, &key, thread, &slot, 10).unwrap();
@@ -1380,6 +1390,16 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&output.stderr).contains("run mahi init first"));
+
+        let node_key = config_dir(&fixture.home).node_key_file();
+        let saved = fs::read(&node_key).unwrap();
+        fs::remove_file(&node_key).unwrap();
+        let output = fixture.command(&["run", "true"]).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("run mahi init first"));
+        assert!(fixture.threads().is_empty());
+        fs::write(&node_key, saved).unwrap();
+        fs::set_permissions(&node_key, fs::Permissions::from_mode(0o600)).unwrap();
 
         let elsewhere = tempfile::tempdir().unwrap();
         let output = fixture

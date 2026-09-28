@@ -9,6 +9,7 @@ const APP: &str = "mahi";
 const IDENTITY_FILE: &str = "identity.age";
 const RECIPIENT_FILE: &str = "identity.pub";
 const SIGNING_KEY_FILE: &str = "signing-key.pub";
+const NODE_KEY_FILE: &str = "node.key";
 
 /// mahi's per-user configuration directory.
 ///
@@ -65,6 +66,12 @@ impl ConfigDir {
     #[must_use]
     pub fn signing_key_file(&self) -> PathBuf {
         self.0.join(SIGNING_KEY_FILE)
+    }
+
+    /// Returns the path of the secret key of the user's iroh node.
+    #[must_use]
+    pub fn node_key_file(&self) -> PathBuf {
+        self.0.join(NODE_KEY_FILE)
     }
 }
 
