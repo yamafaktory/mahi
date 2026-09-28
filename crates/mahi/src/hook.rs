@@ -155,6 +155,24 @@ pub(crate) fn serve(
     let _ = messages.send(Delivery::End { dropped });
 }
 
+fn readable_by(stream: &UnixStream, deadline: Instant) -> bool {
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        let timeout = Timespec {
+            tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(left.subsec_nanos()),
+        };
+        let mut fds = [PollFd::new(stream, PollFlags::IN)];
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+            Ok(ready) => return ready > 0,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 fn wait_for_connection(listener: &UnixListener) {
     let mut fds = [PollFd::new(listener, PollFlags::IN)];
     let _ = rustix::event::poll(&mut fds, Some(&POLL));
@@ -189,9 +207,14 @@ fn receive(mut stream: UnixStream) -> Option<HookMessage> {
     let mut received = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {
-        let left = deadline.checked_duration_since(Instant::now())?;
-        stream.set_read_timeout(Some(left)).ok()?;
-        let read = stream.read(&mut buffer).ok()?;
+        if !readable_by(&stream, deadline) {
+            return None;
+        }
+        let read = match stream.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
         if read == 0 {
             break;
         }
