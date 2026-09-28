@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs,
     io,
     os::unix::ffi::OsStrExt,
@@ -117,6 +118,40 @@ impl Store {
             return Err(StoreError::NotAWorktree(name.to_owned()));
         }
         Ok(workdir)
+    }
+
+    /// Removes the registration of the linked worktree `name` when the directory it records
+    /// no longer exists, as `git worktree prune` does. Returns whether it removed one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidWorktreeName`] if `name` is not a safe directory name, or
+    /// [`StoreError::Io`] if the registration cannot be read or removed.
+    pub fn prune_worktree(&self, name: &str) -> Result<bool, StoreError> {
+        validate_name(name)?;
+        let admin = fs::canonicalize(self.common_dir())?
+            .join(WORKTREES)
+            .join(name);
+        let recorded = match fs::read(admin.join("gitdir")) {
+            Ok(recorded) => recorded,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let recorded = recorded.strip_suffix(b"\n").unwrap_or(&recorded);
+        let recorded = Path::new(OsStr::from_bytes(recorded));
+        if !recorded.is_absolute() {
+            return Ok(false);
+        }
+        let Some(workdir) = recorded.parent() else {
+            return Ok(false);
+        };
+        match fs::symlink_metadata(workdir) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::remove_dir_all(&admin)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Removes the linked worktree `name`: its directory and its registration.
@@ -501,6 +536,40 @@ mod tests {
             store.worktree_dir("agent"),
             Err(StoreError::NotAWorktree(_))
         ));
+    }
+
+    #[test]
+    fn a_registration_is_pruned_only_when_its_directory_is_gone() {
+        let (dir, store) = store();
+        let path = store
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                sample_commit(&store),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(!store.prune_worktree("agent").unwrap());
+        assert!(!store.prune_worktree("unknown").unwrap());
+        fs::remove_dir_all(&path).unwrap();
+        assert!(store.prune_worktree("agent").unwrap());
+        assert!(!store.common_dir().join(WORKTREES).join("agent").exists());
+        assert!(matches!(
+            store.prune_worktree("../x"),
+            Err(StoreError::InvalidWorktreeName(_))
+        ));
+        store
+            .add_worktree(
+                "relative",
+                &dir.path().join("wt2"),
+                sample_commit(&store),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let admin = store.common_dir().join(WORKTREES).join("relative");
+        fs::write(admin.join("gitdir"), b"gone/.git\n").unwrap();
+        assert!(!store.prune_worktree("relative").unwrap());
+        assert!(admin.exists());
     }
 
     #[test]

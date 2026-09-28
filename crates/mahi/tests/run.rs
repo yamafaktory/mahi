@@ -879,6 +879,118 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
     }
 
     #[test]
+    fn end_records_the_last_changes_and_removes_the_worktree_and_state() {
+        let fixture = fixture();
+        let claude = fake_claude(&fixture);
+        let run = fixture
+            .command(&["run", claude.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(0), "{stderr}");
+        let worktree = worktree_of(&stderr);
+        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let state = fixture.repo.join(".git/mahi/state").join(&thread);
+        assert!(state.exists());
+        let lock = config_dir(&fixture.home).path().join("locks").join(&thread);
+        assert!(lock.exists());
+        fs::write(worktree.join("late"), "written after the agent\n").unwrap();
+
+        let ended = fixture.mahi(&["end", &thread]);
+        let report = String::from_utf8_lossy(&ended.stderr);
+        assert_eq!(ended.status.code(), Some(0), "{report}");
+        assert!(
+            report.contains("recorded the worktree's last changes"),
+            "{report}"
+        );
+        assert!(!worktree.exists());
+        assert!(!state.exists());
+        assert!(!lock.exists());
+        assert!(fixture.thread_worktrees().is_empty());
+        let repository = gix::open(&fixture.repo).unwrap();
+        let last = repository
+            .find_reference(
+                format!("refs/threads/{thread}/agents/tester.claude/snapshots").as_str(),
+            )
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let late = last
+            .tree()
+            .unwrap()
+            .find_entry("late")
+            .unwrap()
+            .object()
+            .unwrap();
+        assert_eq!(late.data, b"written after the agent\n");
+        assert_eq!(fixture.threads().len(), 3);
+        let listed = fixture.mahi(&["threads"]);
+        assert!(String::from_utf8_lossy(&listed.stdout).contains("no worktree"));
+
+        let again = fixture.mahi(&["end", &thread]);
+        assert_eq!(again.status.code(), Some(0));
+        assert!(!String::from_utf8_lossy(&again.stderr).contains("recorded"));
+    }
+
+    fn ended_thread(fixture: &Fixture) -> (PathBuf, String) {
+        let run = fixture.mahi(&["run", "true"]);
+        let worktree = worktree_of(&String::from_utf8_lossy(&run.stderr));
+        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        (worktree, thread)
+    }
+
+    #[test]
+    fn end_without_changes_records_nothing_new() {
+        let fixture = fixture();
+        let (_, thread) = ended_thread(&fixture);
+        let ended = fixture.mahi(&["end", &thread]);
+        let report = String::from_utf8_lossy(&ended.stderr);
+        assert_eq!(ended.status.code(), Some(0), "{report}");
+        assert!(!report.contains("recorded"), "{report}");
+        assert!(report.contains("removed the worktree"), "{report}");
+    }
+
+    #[test]
+    fn end_leaves_a_worktree_that_no_longer_links_back_and_prunes_a_deleted_one() {
+        let fixture = fixture();
+        let (worktree, thread) = ended_thread(&fixture);
+        fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let broken = fixture.mahi(&["end", &thread]);
+        assert_eq!(broken.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&broken.stderr).contains("no longer links back"));
+        assert!(worktree.exists());
+
+        let (worktree, thread) = ended_thread(&fixture);
+        fs::remove_dir_all(&worktree).unwrap();
+        let pruned = fixture.mahi(&["end", &thread]);
+        let report = String::from_utf8_lossy(&pruned.stderr);
+        assert_eq!(pruned.status.code(), Some(0), "{report}");
+        assert!(report.contains("already gone"), "{report}");
+        assert!(!fixture.repo.join(".git/worktrees").join(&thread).exists());
+    }
+
+    #[test]
+    fn end_refuses_to_lose_unrecorded_files_unless_forced() {
+        let fixture = fixture();
+        let (worktree, thread) = ended_thread(&fixture);
+        let secret = worktree.join("unreadable");
+        fs::write(&secret, "x").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = fixture.mahi(&["end", &thread]);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("leaves out unreadable"), "{stderr}");
+        assert!(worktree.exists());
+        let forced = fixture.mahi(&["end", "--force", &thread]);
+        assert_eq!(forced.status.code(), Some(0));
+        assert!(
+            String::from_utf8_lossy(&forced.stderr)
+                .contains("discarded what the snapshot left out: unreadable")
+        );
+        assert!(!worktree.exists());
+    }
+
+    #[test]
     fn resume_refuses_a_thread_signed_by_another_key_before_the_passphrase() {
         let fixture = fixture();
         let first = fixture.mahi(&["run", "true"]);
@@ -896,6 +1008,10 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(refused.status.code(), Some(1), "{stderr}");
         assert!(stderr.contains("only a thread you started"), "{stderr}");
         assert!(!stderr.contains("Passphrase"), "{stderr}");
+        let ending = fixture.mahi(&["end", &thread]);
+        assert_eq!(ending.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&ending.stderr).contains("only a thread you started"));
+        assert!(worktree.exists());
     }
 
     #[test]
@@ -928,6 +1044,10 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         let busy = fixture.mahi(&["resume", &thread, "--", "true"]);
         assert_eq!(busy.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&busy.stderr).contains("already running"));
+        let ending = fixture.mahi(&["end", &thread]);
+        assert_eq!(ending.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&ending.stderr).contains("stop it before ending"));
+        assert!(worktree.exists());
     }
 
     #[test]

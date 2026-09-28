@@ -1,6 +1,7 @@
 //! The `mahi` binary.
 
 mod cli;
+mod end;
 mod environment;
 mod hook;
 mod init;
@@ -56,6 +57,20 @@ fn main() {
             .and_then(|mut prompt| init::init(&environment, &mut prompt))
         {
             Ok(()) => 0,
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
+        Command::End(command) => match end::end(&command, &environment) {
+            Ok(end::Ended::Done(done)) => {
+                eprint!("{done}");
+                0
+            }
+            Ok(end::Ended::Stopped(signal)) => {
+                signal.reraise();
+                128 + signal.number()
+            }
             Err(error) => {
                 report(&error);
                 1

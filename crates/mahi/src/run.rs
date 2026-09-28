@@ -805,7 +805,7 @@ fn stop_now(signal: Termination) -> ! {
     process::exit(128 + signal.number())
 }
 
-fn until_stopped<T>(
+pub(crate) fn until_stopped<T>(
     termination: &TerminationSignals,
     work: impl FnOnce(&AtomicBool) -> T,
 ) -> (T, Option<Termination>) {

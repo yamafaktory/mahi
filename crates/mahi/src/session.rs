@@ -344,11 +344,7 @@ impl Started {
     }
 
     fn state_root(&self, store: &Store) -> PathBuf {
-        store
-            .common_dir()
-            .join(STATE[0])
-            .join(STATE[1])
-            .join(self.thread.to_string())
+        state_root(store, self.thread)
     }
 
     /// Runs `start_agent`, and removes the thread and its worktree if it fails.
@@ -401,6 +397,15 @@ pub(crate) enum DiscardError {
     Thread(#[from] ThreadError),
     #[error("cannot remove the agent's state")]
     State(#[source] io::Error),
+}
+
+/// Returns where the agents of `thread` keep their state: `<common git dir>/mahi/state/<thread>`.
+pub(crate) fn state_root(store: &Store, thread: ThreadId) -> PathBuf {
+    store
+        .common_dir()
+        .join(STATE[0])
+        .join(STATE[1])
+        .join(thread.to_string())
 }
 
 /// Returns the directory, under the user's worktree root, that holds the worktrees of the

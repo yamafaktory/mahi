@@ -41,6 +41,9 @@ pub(crate) enum Command {
     Run(RunCommand),
     /// Resumes a thread you started, in its worktree, with the same agent.
     Resume(ResumeCommand),
+    /// Ends a thread you started that is not running: records its worktree in a last
+    /// snapshot, then removes the worktree and the agent's state. Its history stays.
+    End(EndCommand),
     /// Lists the threads of this repository, with their agents and whether their worktree is
     /// still there.
     Threads,
@@ -138,6 +141,19 @@ pub(crate) struct ResumeCommand {
     /// after `--`.
     #[arg(last = true, value_name = "COMMAND")]
     pub(crate) command: Vec<OsString>,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct EndCommand {
+    /// The thread to end, as `mahi threads` lists it.
+    pub(crate) thread: ThreadId,
+    /// Which of your agents in the thread to record last, when it has several.
+    #[arg(long, value_name = "NAME", value_parser = parse_agent)]
+    pub(crate) agent: Option<AgentName>,
+    /// Removes the worktree even when its last snapshot leaves out paths it cannot record,
+    /// such as files too large or unreadable, which are then lost.
+    #[arg(long)]
+    pub(crate) force: bool,
 }
 
 fn parse_agent(text: &str) -> Result<AgentName, NameError> {
