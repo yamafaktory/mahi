@@ -112,9 +112,8 @@ impl Prompt for TerminalPrompt {
     fn secret(&mut self, question: &str) -> io::Result<SecretString> {
         let line = self.read_answer(question, false)?;
         writeln!(self.terminal)?;
-        let text = std::str::from_utf8(&line).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "the passphrase is not UTF-8")
-        })?;
+        let text = std::str::from_utf8(&line)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the answer is not UTF-8"))?;
         Ok(SecretString::from(text.to_owned()))
     }
 

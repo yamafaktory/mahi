@@ -1,6 +1,7 @@
 //! The `mahi` binary.
 
 mod cli;
+mod credentials;
 mod end;
 mod environment;
 mod hook;
@@ -32,6 +33,7 @@ use crate::{
     cli::{
         Cli,
         Command,
+        CredentialCommand,
     },
     environment::Environment,
     init::InitError,
@@ -76,14 +78,19 @@ fn main() {
                 1
             }
         },
+        Command::Credential(command) => match credentials::credential(&command, &environment) {
+            Ok(done) if command == CredentialCommand::List => print_out(&done),
+            Ok(done) => {
+                eprint!("{done}");
+                0
+            }
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
         Command::Threads => match threads::threads() {
-            Ok(listing) => match io::stdout().lock().write_all(listing.as_bytes()) {
-                Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
-                    report(&error);
-                    1
-                }
-                _ => 0,
-            },
+            Ok(listing) => print_out(&listing),
             Err(error) => {
                 report(&error);
                 1
@@ -119,6 +126,17 @@ fn main() {
         },
     };
     process::exit(code);
+}
+
+/// Writes `text` to standard output, where a reader that stopped early is not an error.
+fn print_out(text: &str) -> i32 {
+    match io::stdout().lock().write_all(text.as_bytes()) {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
+            report(&error);
+            1
+        }
+        _ => 0,
+    }
 }
 
 fn report(error: &dyn Error) {

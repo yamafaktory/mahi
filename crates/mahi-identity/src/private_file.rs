@@ -78,7 +78,7 @@ pub(crate) fn read(path: &Path, max_bytes: u64) -> Result<Vec<u8>, IdentityError
     if !is_private(&metadata) {
         return Err(IdentityError::NotPrivate(path.to_path_buf()));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(usize::try_from(max_bytes + 1).unwrap_or(0));
     file.take(max_bytes + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max_bytes {
         return Err(IdentityError::Malformed);
@@ -118,7 +118,7 @@ fn is_private(metadata: &Metadata) -> bool {
         && metadata.mode() & 0o777 & !PRIVATE_FILE == 0
 }
 
-fn check_private_dir(dir: &Path) -> Result<(), IdentityError> {
+pub(crate) fn check_private_dir(dir: &Path) -> Result<(), IdentityError> {
     let metadata = fs::metadata(dir)?;
     let owned = metadata.uid() == rustix::process::geteuid().as_raw();
     if !metadata.is_dir() || !owned || metadata.mode() & 0o022 != 0 {

@@ -12,7 +12,8 @@ use mahi_store::GlobalPatterns;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-const PASSED_ON: [&str; 10] = [
+/// The variables of the user's environment every agent gets.
+pub(crate) const PASSED_ON: [&str; 10] = [
     "TERM",
     "COLORTERM",
     "LANG",

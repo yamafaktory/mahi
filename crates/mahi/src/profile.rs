@@ -35,6 +35,7 @@ pub(crate) struct Profile {
     pub(crate) env: &'static [(&'static str, &'static str)],
     pub(crate) state_env: &'static str,
     pub(crate) resume_args: &'static [&'static str],
+    pub(crate) credential: Option<(&'static str, &'static str)>,
     install: fn(&OwnedFd) -> io::Result<()>,
 }
 
@@ -50,6 +51,7 @@ const CLAUDE_CODE: Profile = Profile {
     ],
     state_env: "CLAUDE_CONFIG_DIR",
     resume_args: &["--continue"],
+    credential: Some(("claude", "CLAUDE_CODE_OAUTH_TOKEN")),
     install: install_claude_code,
 };
 

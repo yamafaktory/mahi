@@ -56,6 +56,8 @@ use mahi_identity::{
     AgentSigner,
     ConfigDir,
     ConfigError,
+    Credential,
+    CredentialName,
     IdentityError,
     LocalIdentity,
     PublicIdentity,
@@ -104,6 +106,7 @@ use thiserror::Error;
 
 use crate::{
     cli::{
+        LaunchOptions,
         ResumeCommand,
         RunCommand,
     },
@@ -112,6 +115,7 @@ use crate::{
         Environment,
         HOOK_SOCKET,
         MAHI_BIN,
+        PASSED_ON,
         PROXY_VARIABLES,
         Passed,
     },
@@ -253,6 +257,12 @@ pub(crate) enum RunError {
     StateNotPrivate(PathBuf),
     #[error("cannot create the directory for the thread's worktree")]
     Worktrees(#[source] io::Error),
+    #[error("there is no credential named {0}; store it with mahi credential add {0}")]
+    NoCredential(CredentialName),
+    #[error("cannot read the stored credential {0}")]
+    Credential(CredentialName, #[source] IdentityError),
+    #[error("{0} is given to the agent more than one way")]
+    GivenTwice(String),
     #[error("cannot prepare the agent's state directory")]
     State(#[source] io::Error),
     #[error("cannot start the thread")]
@@ -305,6 +315,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let store = Store::discover(&cwd)?;
     let profile = command.profile();
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let credentials = gather_credentials(&config, &command.options, profile, environment)?;
     let prepared = Prepared::new(
         environment,
         host,
@@ -316,6 +327,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
             profile,
             hosts: &hosts,
         },
+        credentials,
     )?;
     let agent_name = session::agent_from(Path::new(command.agent()));
     let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
@@ -385,6 +397,7 @@ pub(crate) fn resume(
     let _lock = ThreadLock::acquire(&config, command.thread)?;
     let (program, arguments, profile) = resumed_command(command, &slot);
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let credentials = gather_credentials(&config, &command.options, profile, environment)?;
     let prepared = Prepared::new(
         environment,
         host,
@@ -396,6 +409,7 @@ pub(crate) fn resume(
             profile,
             hosts: &hosts,
         },
+        credentials,
     )?;
     load_meta(&prepared.store, command.thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
@@ -447,6 +461,65 @@ fn resumed_command(
     (program, arguments, profile)
 }
 
+/// A stored credential handed to the agent, and the variable it becomes.
+#[derive(Debug)]
+struct Handed {
+    variable: String,
+    credential: Credential,
+}
+
+/// Loads the credentials the agent gets: those named with `--credential`, which must exist, and
+/// the profile's, when stored; a variable may be given only one way.
+fn gather_credentials(
+    config: &ConfigDir,
+    options: &LaunchOptions,
+    profile: Option<&Profile>,
+    environment: &Environment,
+) -> Result<Vec<Handed>, RunError> {
+    let mut handed: Vec<Handed> = Vec::new();
+    let mut hand = |variable: &str, credential: Credential| {
+        if handed.iter().any(|earlier| earlier.variable == variable) {
+            return Err(RunError::GivenTwice(variable.to_owned()));
+        }
+        handed.push(Handed {
+            variable: variable.to_owned(),
+            credential,
+        });
+        Ok(())
+    };
+    for binding in options.credentials() {
+        let credential = Credential::load(config, &binding.name)
+            .map_err(|error| RunError::Credential(binding.name.clone(), error))?
+            .ok_or_else(|| RunError::NoCredential(binding.name.clone()))?;
+        hand(binding.variable.as_str(), credential)?;
+    }
+    if let Some((name, variable)) = profile.and_then(|profile| profile.credential)
+        && !options
+            .credentials()
+            .iter()
+            .any(|binding| binding.variable.as_str() == variable)
+        && let Ok(name) = name.parse::<CredentialName>()
+        && let Some(credential) = Credential::load(config, &name)
+            .map_err(|error| RunError::Credential(name.clone(), error))?
+    {
+        hand(variable, credential)?;
+    }
+    let set_by_profile = profile.map(Profile::set_names).unwrap_or_default();
+    for handed in &handed {
+        let passed = environment
+            .pass_env
+            .iter()
+            .any(|passed| passed.required && passed.name.as_str() == handed.variable);
+        if passed
+            || set_by_profile.contains(&handed.variable.as_str())
+            || PASSED_ON.contains(&handed.variable.as_str())
+        {
+            return Err(RunError::GivenTwice(handed.variable.clone()));
+        }
+    }
+    Ok(handed)
+}
+
 /// The agent to run and what it may reach.
 #[derive(Debug, Clone, Copy)]
 struct AgentRequest<'a> {
@@ -473,6 +546,7 @@ struct Prepared {
     sandbox: Sandbox,
     network: Option<Network>,
     globals: GlobalPatterns,
+    credentials: Vec<Handed>,
 }
 
 impl Prepared {
@@ -482,6 +556,7 @@ impl Prepared {
         cwd: &Path,
         store: Store,
         request: &AgentRequest<'_>,
+        credentials: Vec<Handed>,
     ) -> Result<Self, RunError> {
         let AgentRequest {
             program,
@@ -523,6 +598,7 @@ impl Prepared {
             sandbox,
             network,
             globals: environment.git_patterns(),
+            credentials,
         })
     }
 
@@ -554,6 +630,7 @@ impl Prepared {
             host: &self.host,
             profile: self.profile,
             state: self.profile.map(|_| started.state_dir(&self.store)),
+            credentials: &self.credentials,
         };
         let (sandbox, network) = (self.sandbox, self.network);
         let (child, raw, proxy) = started.launch(&self.store, || launch.spawn(sandbox, network))?;
@@ -837,6 +914,7 @@ pub(crate) fn until_stopped<T>(
 }
 
 struct Launch<'a> {
+    credentials: &'a [Handed],
     profile: Option<&'static Profile>,
     state: Option<PathBuf>,
     arguments: &'a [OsString],
@@ -924,16 +1002,28 @@ impl Launch<'_> {
         if let Some(mahi) = &self.environment.mahi_exe {
             pty = pty.env(MAHI_BIN, mahi);
         }
+        let handed = |name: &str| {
+            self.credentials
+                .iter()
+                .any(|handed| handed.variable == name)
+        };
         let offered = |passed: &&Passed| {
             passed.required
-                || self
+                || (self
                     .profile
                     .is_some_and(|profile| profile.optional_env.contains(&passed.name.as_str()))
+                    && !handed(passed.name.as_str()))
         };
         for passed in self.environment.pass_env.iter().filter(offered) {
             if let Some(value) = &passed.value {
                 pty = pty.env(passed.name.as_str(), OsStr::from_bytes(value));
             }
+        }
+        for handed in self.credentials {
+            pty = pty.env(
+                &handed.variable,
+                OsStr::from_bytes(handed.credential.expose()),
+            );
         }
         if let (Some(profile), Some(state)) = (self.profile, &state) {
             pty = pty.env(profile.state_env, state);

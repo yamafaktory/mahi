@@ -13,10 +13,17 @@ use mahi_core::{
     NameError,
     ThreadId,
 };
+use mahi_identity::{
+    CredentialName,
+    CredentialNameError,
+};
 use mahi_proxy::HostName;
 
 use crate::{
-    environment::EnvName,
+    environment::{
+        EnvName,
+        EnvNameError,
+    },
     hook::HookKind,
     profile::Profile,
 };
@@ -47,6 +54,9 @@ pub(crate) enum Command {
     /// Lists the threads of this repository, with their agents and whether their worktree is
     /// still there.
     Threads,
+    /// Keeps the tokens agents sign in with, so no shell has to export them.
+    #[command(subcommand)]
+    Credential(CredentialCommand),
     /// Reports an agent event, with its details on standard input, to the mahi run that
     /// started the agent. Agent hooks call it; it always exits with 0.
     Hook(HookCommand),
@@ -74,6 +84,48 @@ pub(crate) struct LaunchOptions {
     /// `claude`): no hosts, variables, settings or hooks beyond what the options give.
     #[arg(long = "no-profile")]
     no_profile: bool,
+    /// A stored credential handed to the agent as an environment variable, written
+    /// NAME=VARIABLE, such as `claude=CLAUDE_CODE_OAUTH_TOKEN`; repeat it for several.
+    #[arg(long = "credential", value_name = "NAME=VARIABLE", value_parser = parse_binding)]
+    credentials: Vec<CredentialBinding>,
+}
+
+/// A stored credential and the variable it becomes in the agent's environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CredentialBinding {
+    pub(crate) name: CredentialName,
+    pub(crate) variable: EnvName,
+}
+
+fn parse_binding(text: &str) -> Result<CredentialBinding, String> {
+    let (name, variable) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=VARIABLE"))?;
+    Ok(CredentialBinding {
+        name: name
+            .parse()
+            .map_err(|error: CredentialNameError| error.to_string())?,
+        variable: variable
+            .parse()
+            .map_err(|error: EnvNameError| error.to_string())?,
+    })
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub(crate) enum CredentialCommand {
+    /// Stores a token under NAME, read hidden from the terminal or from standard input, such
+    /// as `claude setup-token | mahi credential add claude`. An existing one is never replaced.
+    Add {
+        /// The name to store it under.
+        name: CredentialName,
+    },
+    /// Lists the names of the stored credentials, never their values.
+    List,
+    /// Removes the credential stored under NAME.
+    Remove {
+        /// The name it is stored under.
+        name: CredentialName,
+    },
 }
 
 impl LaunchOptions {
@@ -83,6 +135,10 @@ impl LaunchOptions {
 
     pub(crate) fn pass_env(&self) -> &[EnvName] {
         &self.pass_env
+    }
+
+    pub(crate) fn credentials(&self) -> &[CredentialBinding] {
+        &self.credentials
     }
 
     /// Returns the profile for the agent program `program`, unless `--no-profile` was given.
@@ -309,6 +365,34 @@ mod tests {
         ] {
             assert!(parse(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn credentials_are_named_and_bound_to_a_variable() {
+        let Command::Run(run) = parse(&[
+            "run",
+            "--credential",
+            "claude=CLAUDE_CODE_OAUTH_TOKEN",
+            "sh",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected the run command");
+        };
+        let binding = &run.options.credentials()[0];
+        assert_eq!(binding.name.as_str(), "claude");
+        assert_eq!(binding.variable.as_str(), "CLAUDE_CODE_OAUTH_TOKEN");
+        for bad in ["claude", "Claude=TOKEN", "claude=HOME", "claude=A-B"] {
+            assert!(parse(&["run", "--credential", bad, "sh"]).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse(&["credential", "add", "claude"]).unwrap().command,
+            Command::Credential(CredentialCommand::Add {
+                name: "claude".parse().unwrap()
+            })
+        );
+        assert!(parse(&["credential", "add", "Bad"]).is_err());
     }
 
     #[test]

@@ -1132,6 +1132,101 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(fixture.threads(), threads);
     }
 
+    fn credential(fixture: &Fixture, arguments: &[&str], input: &[u8]) -> Output {
+        let mut child = fixture
+            .command(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn a_stored_credential_reaches_claude_instead_of_the_shells_token() {
+        let fixture = fixture();
+        let added = credential(
+            &fixture,
+            &["credential", "add", "claude"],
+            b"stored-token\n",
+        );
+        assert_eq!(added.status.code(), Some(0));
+        let again = credential(&fixture, &["credential", "add", "claude"], b"other\n");
+        assert_eq!(again.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&again.stderr).contains("remove it first"));
+        let listed = fixture.mahi(&["credential", "list"]);
+        assert_eq!(String::from_utf8_lossy(&listed.stdout), "claude\n");
+
+        let claude = fake_claude(&fixture);
+        let output = fixture
+            .command(&["run", claude.to_str().unwrap()])
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "shell-token")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(0), "{stdout}");
+        assert!(stdout.contains("token=stored-token"), "{stdout}");
+        assert!(!stdout.contains("shell-token"), "{stdout}");
+
+        let removed = fixture.mahi(&["credential", "remove", "claude"]);
+        assert_eq!(removed.status.code(), Some(0));
+        let listed = fixture.mahi(&["credential", "list"]);
+        assert!(listed.stdout.is_empty());
+    }
+
+    #[test]
+    fn any_agent_gets_a_named_credential_given_one_way() {
+        let fixture = fixture();
+        let added = credential(&fixture, &["credential", "add", "service"], b"s3cret");
+        assert_eq!(added.status.code(), Some(0));
+        let long = vec![b'a'; 16 * 1024 + 3];
+        let too_long = credential(&fixture, &["credential", "add", "long"], &long);
+        assert_eq!(too_long.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&too_long.stderr).contains("larger than 16 KiB"));
+        let output = fixture.mahi(&[
+            "run",
+            "--credential",
+            "service=SERVICE_TOKEN",
+            "sh",
+            "-c",
+            "echo token=$SERVICE_TOKEN",
+        ]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(0), "{stdout}");
+        assert!(stdout.contains("token=s3cret"), "{stdout}");
+        let threads = fixture.threads();
+
+        let missing = fixture.mahi(&["run", "--credential", "absent=TOKEN", "true"]);
+        assert_eq!(missing.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("mahi credential add absent"));
+        let twice = fixture
+            .command(&[
+                "run",
+                "--credential",
+                "service=SERVICE_TOKEN",
+                "--pass-env",
+                "SERVICE_TOKEN",
+                "true",
+            ])
+            .env("SERVICE_TOKEN", "x")
+            .output()
+            .unwrap();
+        assert_eq!(twice.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&twice.stderr).contains("more than one way"));
+        for clash in ["service=PATH", "service=CLAUDE_CONFIG_DIR"] {
+            let claude = fake_claude(&fixture);
+            let refused = fixture.mahi(&["run", "--credential", clash, claude.to_str().unwrap()]);
+            assert_eq!(refused.status.code(), Some(1), "{clash}");
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("more than one way"),
+                "{clash}"
+            );
+        }
+        assert_eq!(fixture.threads(), threads);
+    }
+
     #[test]
     fn the_agent_cannot_write_to_the_checkout_or_the_git_directory() {
         let fixture = fixture();
