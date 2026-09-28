@@ -2101,6 +2101,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mahi-proxy"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rustix",
+ "subtle",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "mahi-sandbox"
 version = "0.1.0"
 dependencies = [

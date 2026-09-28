@@ -1,0 +1,20 @@
+[package]
+authors.workspace = true
+description = "The allowlist network proxy that is a sandboxed agent's only way out."
+edition.workspace = true
+license.workspace = true
+name = "mahi-proxy"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+rustix = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

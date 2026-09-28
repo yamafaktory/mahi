@@ -13,6 +13,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 age = "0.12.1"
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 bech32 = { version = "0.11.1", default-features = false, features = ["alloc"] }
 clap = { version = "4.6.7", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
 ed25519-dalek = { version = "2.2.0", default-features = false }
@@ -26,6 +27,7 @@ lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-dec
 mahi-core = { path = "crates/mahi-core" }
 mahi-crypto = { path = "crates/mahi-crypto" }
 mahi-identity = { path = "crates/mahi-identity" }
+mahi-proxy = { path = "crates/mahi-proxy" }
 mahi-sandbox = { path = "crates/mahi-sandbox" }
 mahi-schedule = { path = "crates/mahi-schedule" }
 mahi-store = { path = "crates/mahi-store" }
