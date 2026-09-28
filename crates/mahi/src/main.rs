@@ -2,16 +2,19 @@
 
 mod cli;
 mod environment;
+mod hook;
 mod init;
 mod prompt;
 mod recorder;
 mod run;
 mod session;
 mod terminal;
+mod turns;
 
 use std::{
     error::Error,
     fmt::Write,
+    io,
     process,
 };
 
@@ -42,6 +45,12 @@ fn main() {
                 1
             }
         },
+        Command::Hook(hook) => {
+            if let Some(socket) = &environment.hook_socket {
+                let _ = hook::send(socket, hook.kind, io::stdin().lock());
+            }
+            0
+        }
         Command::Run(command) => match run::run(&command, &environment) {
             Ok(Outcome::Exited(code)) => code,
             Ok(Outcome::Stopped(signal)) => {

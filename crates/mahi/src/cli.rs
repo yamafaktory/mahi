@@ -9,6 +9,8 @@ use clap::{
     Subcommand,
 };
 
+use crate::hook::HookKind;
+
 const EXIT_CODES: &str = "\
 Exit codes: mahi run exits with the agent's exit code, or 128 plus the signal that ended it.
 It exits with 1 when it cannot run the agent and 2 on a usage error.";
@@ -27,6 +29,16 @@ pub(crate) enum Command {
     Init,
     /// Runs an agent in a sandbox on the current directory.
     Run(RunCommand),
+    /// Reports an agent event, with its details on standard input, to the mahi run that
+    /// started the agent. Agent hooks call it; it always exits with 0.
+    Hook(HookCommand),
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct HookCommand {
+    /// What happened.
+    #[arg(value_enum)]
+    pub(crate) kind: HookKind,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -119,6 +131,22 @@ mod tests {
         };
         assert_eq!(command.agent(), odd.as_os_str());
         assert_eq!(command.arguments(), [odd]);
+    }
+
+    #[test]
+    fn hook_takes_one_known_event() {
+        assert_eq!(
+            parse(&["hook", "turn-end"]).unwrap(),
+            Cli {
+                command: Command::Hook(HookCommand {
+                    kind: HookKind::TurnEnd
+                })
+            }
+        );
+        assert_eq!(
+            parse(&["hook", "reboot"]).unwrap_err().kind(),
+            ErrorKind::InvalidValue
+        );
     }
 
     #[test]

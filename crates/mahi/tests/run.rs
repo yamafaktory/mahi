@@ -42,6 +42,12 @@ mod tests {
             },
         },
     };
+    use mahi_core::{
+        AgentName,
+        AgentSlot,
+        ParticipantName,
+        ThreadId,
+    };
     use mahi_identity::{
         ConfigDir,
         LocalIdentity,
@@ -52,6 +58,13 @@ mod tests {
         PtyCommand,
         WindowSize,
         exit_code,
+    };
+    use mahi_store::Store;
+    use mahi_thread::{
+        ParticipantKey,
+        TurnRecord,
+        load_meta,
+        read_turns,
     };
     use rustix::termios::LocalModes;
     use ssh_key::{
@@ -72,6 +85,8 @@ mod tests {
         repo: PathBuf,
         socket: PathBuf,
         base: ObjectId,
+        identity: LocalIdentity,
+        owner: ParticipantKey,
     }
 
     fn repository_on_main(repo: &Path) -> ObjectId {
@@ -124,7 +139,8 @@ mod tests {
         let base = repository_on_main(&repo);
         let socket = root.join("agent.sock");
         let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        initialise(&home, &key);
+        let identity = initialise(&home, &key);
+        let owner = ParticipantKey::from_public_key(key.public_key()).unwrap();
         serve_signatures(&socket, key, hold);
         Fixture {
             _dir: dir,
@@ -133,6 +149,8 @@ mod tests {
             repo,
             socket,
             base,
+            identity,
+            owner,
         }
     }
 
@@ -140,17 +158,19 @@ mod tests {
         ConfigDir::resolve(Some(home), Some(&home.join(".config"))).unwrap()
     }
 
-    fn initialise(home: &Path, key: &PrivateKey) {
+    fn initialise(home: &Path, key: &PrivateKey) -> LocalIdentity {
         let config = config_dir(home);
         fs::create_dir_all(config.path()).unwrap();
         fs::set_permissions(config.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        PublicIdentity::from(&LocalIdentity::generate())
+        let identity = LocalIdentity::generate();
+        PublicIdentity::from(&identity)
             .save(&config.recipient_file())
             .unwrap();
         SigningKey::try_from(key.public_key().clone())
             .unwrap()
             .save(&config.signing_key_file())
             .unwrap();
+        identity
     }
 
     fn take_string(bytes: &[u8]) -> (&[u8], &[u8]) {
@@ -282,6 +302,61 @@ mod tests {
         let file = tree.find_entry("file").unwrap().object().unwrap();
         assert_eq!(file.data, b"written\n");
         assert!(tree.find_entry("README").is_some());
+    }
+
+    #[test]
+    fn hook_events_from_inside_the_sandbox_become_encrypted_turns() {
+        let fixture = fixture();
+        let script = "printf 'fix it' | \"$MAHI_BIN\" hook prompt; \
+                      echo edit > file; \
+                      \"$MAHI_BIN\" hook tool < /dev/null; \
+                      \"$MAHI_BIN\" hook turn-end < /dev/null; \
+                      printf again | \"$MAHI_BIN\" hook prompt";
+        let output = fixture.mahi(&["run", "sh", "-c", script]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        let worktree = worktree_of(&stderr);
+        let thread: ThreadId = worktree
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = Store::open(&fixture.repo).unwrap();
+        let meta = load_meta(&store, thread, &fixture.owner, 0).unwrap();
+        let tester = ParticipantName::new("tester").unwrap();
+        let key = meta.thread_key(&tester, fixture.identity.as_age()).unwrap();
+        let slot = AgentSlot::new(tester, AgentName::new("sh").unwrap());
+        let turns = read_turns(&store, &key, thread, &slot, 10).unwrap();
+        let texts = |turn: &TurnRecord| -> Vec<String> {
+            turn.events()
+                .iter()
+                .map(|event| String::from_utf8_lossy(event.payload()).into_owned())
+                .collect()
+        };
+        assert_eq!(turns.len(), 2, "{stderr}");
+        assert_eq!(texts(&turns[0]), ["prompt\nfix it", "tool\n", "turn-end\n"]);
+        assert_eq!(texts(&turns[1]), ["prompt\nagain"]);
+    }
+
+    #[test]
+    fn a_hook_outside_mahi_run_succeeds_and_does_nothing() {
+        let fixture = fixture();
+        let output = fixture
+            .command(&["hook", "tool"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let output = fixture
+            .command(&["hook", "tool"])
+            .env("MAHI_HOOK_SOCKET", fixture.root.join("nothing.sock"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
     }
 
     #[test]

@@ -54,6 +54,8 @@ pub(crate) struct Started {
     pub(crate) worktree: PathBuf,
     pub(crate) snapshots: ThreadRef,
     pub(crate) first_snapshot: Option<Recorded>,
+    pub(crate) slot: AgentSlot,
+    pub(crate) key: Option<ThreadKey>,
     meta: ObjectId,
 }
 
@@ -100,10 +102,8 @@ pub(crate) fn start(
         ParticipantKey::from_public_key(signer.public_key())?,
         public.recipient().clone(),
     )?;
-    let snapshots = ThreadRef::new(
-        thread,
-        RefKind::Snapshots(AgentSlot::new(participant.clone(), agent.clone())),
-    );
+    let slot = AgentSlot::new(participant.clone(), agent.clone());
+    let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
     let title = format!("{} on {branch}", agent.as_str());
     let draft = MetaDraft::new(
         thread,
@@ -125,13 +125,16 @@ pub(crate) fn start(
         remove_worktree_or_report(store, &name);
         return Err(StoreError::Interrupted.into());
     }
-    match create_thread(store, &draft, &ThreadKey::generate(), signer) {
+    let key = ThreadKey::generate();
+    match create_thread(store, &draft, &key, signer) {
         Ok(meta) => {
             let mut started = Started {
                 thread,
                 worktree,
                 snapshots,
                 first_snapshot: None,
+                slot,
+                key: Some(key),
                 meta,
             };
             let recorded =

@@ -16,6 +16,7 @@ use std::{
     os::unix::{
         ffi::OsStrExt,
         fs::PermissionsExt,
+        net::UnixListener,
     },
     path::{
         Path,
@@ -36,7 +37,10 @@ use std::{
             RecvTimeoutError,
         },
     },
-    thread,
+    thread::{
+        self,
+        JoinHandle,
+    },
     time::{
         Duration,
         Instant,
@@ -69,6 +73,7 @@ use mahi_sandbox::{
 };
 use mahi_schedule::Schedule;
 use mahi_store::{
+    GlobalPatterns,
     Store,
     StoreError,
 };
@@ -88,7 +93,12 @@ use thiserror::Error;
 
 use crate::{
     cli::RunCommand,
-    environment::Environment,
+    environment::{
+        Environment,
+        HOOK_SOCKET,
+        MAHI_BIN,
+    },
+    hook,
     recorder::{
         RecordError,
         Recorder,
@@ -97,10 +107,16 @@ use crate::{
     session::{
         self,
         StartError,
+        Started,
     },
     terminal::{
         self,
         RawMode,
+    },
+    turns::{
+        self,
+        Summary,
+        Transcript,
     },
 };
 
@@ -114,6 +130,8 @@ const PROGRAM_HEADERS: [&[u8]; 5] = [
     b"\xfe\xed\xfa\xce",
     b"\xca\xfe\xba\xbe",
 ];
+const HOOK_SOCKET_NAME: &str = "mahi.sock";
+const HOOK_QUEUE: usize = 16;
 const HOME: &str = "home";
 const TMP: &str = "tmp";
 const PRIVATE_IN_HOME: [&str; 9] = [
@@ -240,6 +258,8 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     for directory in [HOME, TMP] {
         fs::create_dir(scratch_path.join(directory)).map_err(RunError::Scratch)?;
     }
+    let hook_socket = scratch_path.join(HOOK_SOCKET_NAME);
+    let hooks = UnixListener::bind(&hook_socket).map_err(RunError::Scratch)?;
     let sandbox = Sandbox::system()?;
     let globals = environment.git_patterns();
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
@@ -275,13 +295,24 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         worktree: &started.worktree,
         git_dir: &git_dir,
         scratch: &scratch_path,
+        hook_socket: &hook_socket,
         host: &host,
     };
     let (child, raw) = started.launch(&store, || launch.spawn(sandbox))?;
+    let (recorder, turns) = start_background(&mut started, &git_dir, globals, hooks);
+    finish_run(child, raw, termination, recorder, turns)
+}
+
+fn start_background(
+    started: &mut Started,
+    git_dir: &Path,
+    globals: GlobalPatterns,
+    hooks: UnixListener,
+) -> (Option<Recorder>, Option<TurnWorker>) {
     let recorder = started.first_snapshot.take().map(|first| {
         Recorder::start(
             Target {
-                git_dir: git_dir.clone(),
+                git_dir: git_dir.to_path_buf(),
                 worktree: started.thread.to_string(),
                 snapshots: started.snapshots.clone(),
                 globals,
@@ -290,7 +321,44 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
             Schedule::default(),
         )
     });
-    finish_run(child, raw, termination, recorder)
+    let turns = started.key.take().map(|key| {
+        let transcript = Transcript {
+            git_dir: git_dir.to_path_buf(),
+            key,
+            thread: started.thread,
+            slot: started.slot.clone(),
+        };
+        let poker = recorder.as_ref().map(Recorder::poker);
+        let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
+        let closing = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&closing);
+        thread::spawn(move || hook::serve(&hooks, &flag, &messages));
+        let worker = thread::spawn(move || turns::record(&transcript, &inputs, poker.as_ref()));
+        (closing, worker)
+    });
+    (recorder, turns)
+}
+
+type TurnWorker = (Arc<AtomicBool>, JoinHandle<Summary>);
+
+fn finish_turns(turns: Option<TurnWorker>) {
+    let Some((closing, worker)) = turns else {
+        return;
+    };
+    closing.store(true, Ordering::SeqCst);
+    let Ok(summary) = worker.join() else {
+        eprintln!("mahi: the transcript stopped unexpectedly");
+        return;
+    };
+    if summary.dropped > 0 {
+        eprintln!(
+            "mahi: {} agent events were left out of the transcript",
+            summary.dropped
+        );
+    }
+    if let Some(error) = summary.error {
+        crate::report(&error);
+    }
 }
 
 fn finish_run(
@@ -298,6 +366,7 @@ fn finish_run(
     raw: Option<RawMode>,
     termination: TerminationSignals,
     recorder: Option<Recorder>,
+    turns: Option<TurnWorker>,
 ) -> Result<Outcome, RunError> {
     let (code, received) = supervise(child, raw, termination);
     if matches!(code, Ok(Outcome::Stopped(_))) {
@@ -306,6 +375,7 @@ fn finish_run(
     let abandon = recorder.as_ref().map(Recorder::abandon_flag);
     let (caught, stopped) = mpsc::channel();
     thread::spawn(move || stop_on_signal(&received, abandon.as_deref(), &caught));
+    finish_turns(turns);
     match recorder.map(Recorder::finish) {
         Some(Ok(skipped)) if skipped > 0 => {
             eprintln!("mahi: the last snapshot left out {skipped} paths it could not record");
@@ -401,6 +471,7 @@ struct Launch<'a> {
     worktree: &'a Path,
     git_dir: &'a Path,
     scratch: &'a Path,
+    hook_socket: &'a Path,
     host: &'a Host,
 }
 
@@ -423,6 +494,13 @@ impl Launch<'_> {
                 Err(error) => return Err(error.into()),
             }
         }
+        if let Some(mahi) = &self.environment.mahi_exe {
+            match sandbox.bind(mahi, Access::ReadOnly) {
+                Ok(_) | Err(SandboxError::Overlaps(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        sandbox.allow_connect(self.hook_socket)?;
         let mut pty = PtyCommand::new(&self.agent.program, self.worktree, terminal::size());
         for argument in self.command.arguments() {
             pty = pty.arg(argument);
@@ -430,10 +508,14 @@ impl Launch<'_> {
         for (name, value) in &self.environment.passed_on {
             pty = pty.env(name, value);
         }
-        let pty = pty
+        let mut pty = pty
             .env("HOME", self.scratch.join(HOME))
             .env("TMPDIR", self.scratch.join(TMP))
-            .sandbox(sandbox);
+            .env(HOOK_SOCKET, self.hook_socket);
+        if let Some(mahi) = &self.environment.mahi_exe {
+            pty = pty.env(MAHI_BIN, mahi);
+        }
+        let pty = pty.sandbox(sandbox);
         let raw = RawMode::enable().map_err(RunError::Terminal)?;
         let child = pty.spawn()?;
         Ok((child, raw))

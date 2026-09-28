@@ -70,6 +70,11 @@ impl Recorder {
         }
     }
 
+    /// Returns a handle that asks for a snapshot soon, as when the agent used a tool.
+    pub(crate) fn poker(&self) -> Poker {
+        self.poker.clone()
+    }
+
     /// Returns a flag that, once set, stops the snapshot in progress, including the last one.
     pub(crate) fn abandon_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.abandon)
