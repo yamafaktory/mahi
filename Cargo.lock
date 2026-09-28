@@ -2061,6 +2061,7 @@ dependencies = [
  "mahi-store",
  "mahi-thread",
  "rustix",
+ "sha2 0.10.9",
  "signature",
  "ssh-key",
  "subtle",

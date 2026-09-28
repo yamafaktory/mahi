@@ -161,12 +161,13 @@ fn replace(directory: &OwnedFd, name: &str, contents: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Opens the agent's state directory `name` inside `parent`, creating it if it is missing,
+/// Opens the directory `name` inside `parent`, such as an agent's state directory, creating it
+/// if it is missing,
 /// without following a symbolic link, and makes sure it is a directory of the user's that only
 /// the user can use.
 ///
 /// Returns `Ok(None)` when `name` exists but is not such a directory.
-pub(crate) fn open_state(parent: &OwnedFd, name: &str) -> io::Result<Option<OwnedFd>> {
+pub(crate) fn open_private_dir(parent: &OwnedFd, name: &str) -> io::Result<Option<OwnedFd>> {
     match rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o700)) {
         Err(error) if error != Errno::EXIST => return Err(error.into()),
         _ => {}
@@ -216,14 +217,14 @@ mod tests {
     fn a_state_directory_is_created_private_and_a_planted_link_or_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let parent = open_dir(dir.path());
-        assert!(open_state(&parent, "agent").unwrap().is_some());
+        assert!(open_private_dir(&parent, "agent").unwrap().is_some());
         let mode = fs::metadata(dir.path().join("agent"))
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
         fs::set_permissions(dir.path().join("agent"), fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(open_state(&parent, "agent").unwrap().is_some());
+        assert!(open_private_dir(&parent, "agent").unwrap().is_some());
         let mode = fs::metadata(dir.path().join("agent"))
             .unwrap()
             .permissions()
@@ -232,9 +233,9 @@ mod tests {
         let outside = dir.path().join("outside");
         fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, dir.path().join("linked")).unwrap();
-        assert!(open_state(&parent, "linked").unwrap().is_none());
+        assert!(open_private_dir(&parent, "linked").unwrap().is_none());
         fs::write(dir.path().join("file"), "x").unwrap();
-        assert!(open_state(&parent, "file").unwrap().is_none());
+        assert!(open_private_dir(&parent, "file").unwrap().is_none());
     }
 
     #[test]

@@ -250,6 +250,20 @@ mod tests {
             command
         }
 
+        fn worktrees_root(&self) -> PathBuf {
+            self.home.join(".local/share/mahi/worktrees")
+        }
+
+        fn thread_worktrees(&self) -> Vec<PathBuf> {
+            let Ok(repositories) = fs::read_dir(self.worktrees_root()) else {
+                return Vec::new();
+            };
+            repositories
+                .flat_map(|repository| fs::read_dir(repository.unwrap().path()).unwrap())
+                .map(|worktree| worktree.unwrap().path())
+                .collect()
+        }
+
         fn mahi(&self, arguments: &[&str]) -> Output {
             self.command(arguments).output().unwrap()
         }
@@ -289,7 +303,11 @@ mod tests {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(3), "{stdout}{stderr}");
         let worktree = worktree_of(&stderr);
-        assert!(worktree.starts_with(fixture.repo.join(".git/mahi/worktrees")));
+        assert!(
+            worktree.starts_with(fixture.worktrees_root()),
+            "{worktree:?}"
+        );
+        assert!(!worktree.starts_with(fixture.repo.join(".git")));
         assert!(stdout.contains("agent-ran"), "{stdout}");
         assert!(stdout.contains(&worktree.display().to_string()), "{stdout}");
         assert!(stdout.contains("hello from the repository"), "{stdout}");
@@ -854,10 +872,9 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(fixture.threads().len(), 3);
         assert!(
             fixture
-                .repo
-                .join(".git/mahi/worktrees")
-                .join(&thread)
-                .exists()
+                .thread_worktrees()
+                .iter()
+                .any(|worktree| worktree.ends_with(&thread))
         );
     }
 
@@ -941,6 +958,61 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
     }
 
     #[test]
+    fn worktrees_go_to_the_data_directory_which_must_not_be_private() {
+        let fixture = fixture();
+        let run = fixture.mahi(&["run", "true"]);
+        let worktree = worktree_of(&String::from_utf8_lossy(&run.stderr));
+        let repository = worktree.parent().unwrap();
+        assert!(
+            repository
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("repo-")
+        );
+        assert_eq!(
+            fs::metadata(repository).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let data = fixture.root.join("data");
+        let run = fixture
+            .command(&["run", "true"])
+            .env("XDG_DATA_HOME", &data)
+            .output()
+            .unwrap();
+        let worktree = worktree_of(&String::from_utf8_lossy(&run.stderr));
+        assert!(
+            worktree.starts_with(data.join("mahi/worktrees")),
+            "{worktree:?}"
+        );
+
+        let threads = fixture.threads();
+        let linked = fixture.root.join("linked-data");
+        fs::create_dir_all(fixture.home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(fixture.home.join(".ssh"), &linked).unwrap();
+        let through_link = fixture
+            .command(&["run", "true"])
+            .env("XDG_DATA_HOME", &linked)
+            .output()
+            .unwrap();
+        assert_eq!(through_link.status.code(), Some(1));
+        assert!(!fixture.home.join(".ssh/mahi").exists());
+        fs::remove_dir(fixture.home.join(".ssh")).unwrap();
+        let private = fixture.home.join(".ssh");
+        let refused = fixture
+            .command(&["run", "true"])
+            .env("XDG_DATA_HOME", &private)
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("holds private files"));
+        assert!(!private.exists());
+        assert_eq!(fixture.threads(), threads);
+    }
+
+    #[test]
     fn the_agent_cannot_write_to_the_checkout_or_the_git_directory() {
         let fixture = fixture();
         let outside = fixture.root.join("outside");
@@ -997,7 +1069,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(output.status.code(), Some(1), "{stderr}");
         assert!(stderr.contains("is not a program"), "{stderr}");
         assert!(fixture.threads().is_empty());
-        assert!(!fixture.repo.join(".git/mahi/worktrees").exists());
+        assert!(fixture.thread_worktrees().is_empty());
     }
 
     #[test]
@@ -1027,13 +1099,11 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         });
         assert_eq!(status.unwrap().signal(), Some(libc::SIGTERM));
         assert!(fixture.threads().is_empty());
-        for directory in [".git/mahi/worktrees", ".git/worktrees"] {
-            assert_eq!(
-                fs::read_dir(fixture.repo.join(directory)).map_or(0, Iterator::count),
-                0,
-                "{directory}"
-            );
-        }
+        assert!(fixture.thread_worktrees().is_empty());
+        assert_eq!(
+            fs::read_dir(fixture.repo.join(".git/worktrees")).map_or(0, Iterator::count),
+            0
+        );
     }
 
     #[test]
@@ -1078,7 +1148,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("private directories"), "{stderr}");
         assert!(fixture.threads().is_empty());
-        assert!(!fixture.repo.join(".git/mahi/worktrees").exists());
+        assert!(fixture.thread_worktrees().is_empty());
         assert!(!fixture.repo.join(".git/worktrees").exists());
     }
 

@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeSet,
+    ffi::OsStr,
     fs,
     io,
+    os::unix::ffi::OsStrExt,
     path::{
         Path,
         PathBuf,
@@ -51,10 +53,14 @@ use mahi_thread::{
     load_meta,
     read_tip,
 };
+use sha2::{
+    Digest,
+    Sha256,
+};
 use thiserror::Error;
 
-const WORKTREES: [&str; 2] = ["mahi", "worktrees"];
 const STATE: [&str; 2] = ["mahi", "state"];
+const LONGEST_REPOSITORY_NAME: usize = 64;
 pub(crate) const SNAPSHOT_MESSAGE: &str = "snapshot";
 
 /// A thread `mahi run` started, the worktree its agent works in, and the worktree's first
@@ -97,15 +103,28 @@ pub(crate) enum StartError {
     Thread(#[from] ThreadError),
 }
 
+/// Who starts a new thread, for which agent, and where its worktree goes.
+pub(crate) struct NewThread<'a> {
+    pub(crate) public: &'a PublicIdentity,
+    pub(crate) signer: &'a dyn SshSigner,
+    pub(crate) participant: ParticipantName,
+    pub(crate) agent: &'a AgentName,
+    pub(crate) worktrees: &'a Path,
+}
+
 pub(crate) fn start(
     store: &Store,
-    public: &PublicIdentity,
-    signer: &dyn SshSigner,
-    participant: ParticipantName,
-    agent: &AgentName,
+    new: NewThread<'_>,
     globals: &GlobalPatterns,
     interrupt: &AtomicBool,
 ) -> Result<Started, StartError> {
+    let NewThread {
+        public,
+        signer,
+        participant,
+        agent,
+        worktrees,
+    } = new;
     let base = store.head_commit()?;
     let branch = store.head_branch()?.ok_or(StartError::NoBranch)?;
     let thread = ThreadId::random()?;
@@ -126,12 +145,7 @@ pub(crate) fn start(
         PrivateMeta::new(&title, &branch)?,
     )?;
     let name = thread.to_string();
-    let path = WORKTREES
-        .iter()
-        .fold(store.common_dir().to_path_buf(), |path, part| {
-            path.join(part)
-        })
-        .join(&name);
+    let path = worktrees.join(&name);
     let worktree = store.add_worktree(&name, &path, base, interrupt)?;
     if interrupt.load(Ordering::SeqCst) {
         remove_worktree_or_report(store, &name);
@@ -365,6 +379,9 @@ impl Started {
         };
         let thread = discard_thread(store, self.thread, created);
         let worktree = store.remove_worktree(&self.thread.to_string());
+        if let Some(repository) = self.worktree.parent() {
+            let _ = fs::remove_dir(repository);
+        }
         let state = match fs::remove_dir_all(self.state_root(store)) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
@@ -384,6 +401,29 @@ pub(crate) enum DiscardError {
     Thread(#[from] ThreadError),
     #[error("cannot remove the agent's state")]
     State(#[source] io::Error),
+}
+
+/// Returns the directory, under the user's worktree root, that holds the worktrees of the
+/// repository whose common git directory is `common_dir`: the repository's name made safe,
+/// and a short hash of the directory's path, so two repositories with one name never share it.
+pub(crate) fn repository_dir(common_dir: &Path) -> String {
+    let named = if common_dir.file_name() == Some(OsStr::new(".git")) {
+        common_dir.parent()
+    } else {
+        Some(common_dir)
+    };
+    let name = named
+        .and_then(Path::file_name)
+        .map(|name| {
+            let mut name = name_from(&name.to_string_lossy());
+            name.truncate(LONGEST_REPOSITORY_NAME);
+            name.trim_end_matches('-').to_owned()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "repository".to_owned());
+    let digest = Sha256::digest(common_dir.as_os_str().as_bytes());
+    let [a, b, c, d, ..]: [u8; 32] = digest.into();
+    format!("{name}-{:08x}", u32::from_be_bytes([a, b, c, d]))
 }
 
 /// Turns a login name or a program name into a mahi name: lowercase, with every other
@@ -499,12 +539,16 @@ pub(crate) mod tests {
         signer: &dyn SshSigner,
         interrupt: &AtomicBool,
     ) -> Result<Started, StartError> {
+        let public = PublicIdentity::from(&LocalIdentity::generate());
         start(
             store,
-            &PublicIdentity::from(&LocalIdentity::generate()),
-            signer,
-            ParticipantName::new("alice").unwrap(),
-            &agent_from(Path::new("claude")),
+            NewThread {
+                public: &public,
+                signer,
+                participant: ParticipantName::new("alice").unwrap(),
+                agent: &agent_from(Path::new("claude")),
+                worktrees: &worktrees(store),
+            },
             &GlobalPatterns::default(),
             interrupt,
         )
@@ -575,11 +619,15 @@ pub(crate) mod tests {
     }
 
     fn worktrees(store: &Store) -> PathBuf {
-        store.common_dir().join("mahi").join("worktrees")
+        store
+            .common_dir()
+            .parent()
+            .unwrap()
+            .join("thread-worktrees")
     }
 
     #[test]
-    fn a_started_thread_has_a_worktree_at_head_under_the_git_directory() {
+    fn a_started_thread_has_a_worktree_at_head_where_it_is_asked() {
         let (_dir, store) = repository_on_main();
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let started = start_with(&store, &signer).unwrap();
@@ -769,6 +817,19 @@ pub(crate) mod tests {
             pick_slot(&store, thread, &alice, Some(&AgentName::new("sh").unwrap())),
             Err(ResumeError::UnknownAgent(..))
         ));
+    }
+
+    #[test]
+    fn a_repositorys_worktree_directory_is_named_after_it_and_its_path() {
+        let one = repository_dir(Path::new("/home/alice/code/My Project/.git"));
+        assert!(one.starts_with("my-project-"), "{one}");
+        assert_eq!(one.len(), "my-project-".len() + 8);
+        let other = repository_dir(Path::new("/home/bob/code/My Project/.git"));
+        assert_ne!(one, other);
+        assert!(repository_dir(Path::new("/srv/bare.git")).starts_with("bare-git-"));
+        assert!(repository_dir(Path::new("/")).starts_with("repository-"));
+        let long = format!("/code/{}/.git", "a".repeat(300));
+        assert_eq!(repository_dir(Path::new(&long)).len(), 64 + 1 + 8);
     }
 
     #[test]

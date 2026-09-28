@@ -251,6 +251,8 @@ pub(crate) enum RunError {
     Resume(#[from] ResumeError),
     #[error("{} is not a private directory of yours, so it is not reused", .0.display())]
     StateNotPrivate(PathBuf),
+    #[error("cannot create the directory for the thread's worktree")]
+    Worktrees(#[source] io::Error),
     #[error("cannot prepare the agent's state directory")]
     State(#[source] io::Error),
     #[error("cannot start the thread")]
@@ -316,14 +318,18 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         },
     )?;
     let agent_name = session::agent_from(Path::new(command.agent()));
+    let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
     let (started, caught) = until_stopped(&termination, |interrupt| {
         session::start(
             &prepared.store,
-            &public,
-            &signer,
-            participant,
-            &agent_name,
+            session::NewThread {
+                public: &public,
+                signer: &signer,
+                participant,
+                agent: &agent_name,
+                worktrees: &worktrees,
+            },
             &prepared.globals,
             interrupt,
         )
@@ -334,9 +340,16 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
             Err(StartError::Store(StoreError::Interrupted)) => {}
             Err(error) => eprintln!("mahi: {error}"),
         }
+        let _ = fs::remove_dir(&worktrees);
         return Ok(Outcome::Stopped(signal));
     }
-    let started = started?;
+    let started = started.inspect_err(|_| {
+        let _ = fs::remove_dir(&worktrees);
+    })?;
+    if let Err(error) = keep_private(&worktrees) {
+        started.discard_or_report(&prepared.store);
+        return Err(error);
+    }
     let _lock = match ThreadLock::acquire(&config, started.thread) {
         Ok(lock) => lock,
         Err(error) => {
@@ -704,6 +717,69 @@ fn check_profile(
     }
 }
 
+/// Returns the directory that holds this repository's thread worktrees, under the user's
+/// worktree root, after checking that it is not a private place and making sure it is a
+/// directory of the user's that only the user can use.
+fn worktree_dir(
+    environment: &Environment,
+    host: &Host,
+    git_dir: &Path,
+) -> Result<PathBuf, RunError> {
+    let root = environment.worktree_root().ok_or(RunError::NoHome)?;
+    if host.is_private(&root) || host.is_private(&resolve_existing(&root)) {
+        return Err(RunError::PrivateDirectory(root));
+    }
+    profile::create_private_dir(&root).map_err(RunError::Worktrees)?;
+    let root = fs::canonicalize(&root).map_err(RunError::Worktrees)?;
+    if host.is_private(&root) {
+        return Err(RunError::PrivateDirectory(root));
+    }
+    let name = session::repository_dir(git_dir);
+    let root_dir = rustix::fs::open(
+        &root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| RunError::Worktrees(error.into()))?;
+    let path = root.join(&name);
+    profile::open_private_dir(&root_dir, &name)
+        .map_err(RunError::Worktrees)?
+        .ok_or_else(|| RunError::StateNotPrivate(path.clone()))?;
+    Ok(path)
+}
+
+/// Resolves the deepest part of `path` that exists and appends the rest unchanged, so a path
+/// that does not exist yet can be checked against canonical private directories.
+fn resolve_existing(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(resolved) = fs::canonicalize(ancestor) {
+            let rest = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
+            return resolved.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Checks again that the repository's worktree directory is a private directory of the user's,
+/// once the worktree is in it, since another mahi may have recreated it in between.
+fn keep_private(worktrees: &Path) -> Result<(), RunError> {
+    let not_private = || RunError::StateNotPrivate(worktrees.to_path_buf());
+    let (Some(root), Some(name)) = (worktrees.parent(), worktrees.file_name()) else {
+        return Err(not_private());
+    };
+    let root = rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| RunError::Worktrees(error.into()))?;
+    let name = name.to_str().ok_or_else(not_private)?;
+    profile::open_private_dir(&root, name)
+        .map_err(RunError::Worktrees)?
+        .ok_or_else(not_private)?;
+    Ok(())
+}
+
 fn require_passed(environment: &Environment) -> Result<(), RunError> {
     match environment
         .pass_env
@@ -791,7 +867,7 @@ impl Launch<'_> {
             Mode::empty(),
         )
         .map_err(|error| RunError::State(error.into()))?;
-        let directory = profile::open_state(&parent_dir, name)
+        let directory = profile::open_private_dir(&parent_dir, name)
             .map_err(RunError::State)?
             .ok_or_else(not_private)?;
         profile.install(&directory).map_err(RunError::State)?;

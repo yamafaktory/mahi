@@ -55,6 +55,7 @@ const RESERVED: [&str; 12] = [
 pub(crate) struct Environment {
     pub(crate) home: Option<PathBuf>,
     pub(crate) xdg_config_home: Option<PathBuf>,
+    pub(crate) xdg_data_home: Option<PathBuf>,
     pub(crate) xdg_runtime_dir: Option<PathBuf>,
     pub(crate) ssh_auth_sock: Option<PathBuf>,
     pub(crate) hook_socket: Option<PathBuf>,
@@ -79,6 +80,7 @@ impl fmt::Debug for Environment {
         f.debug_struct("Environment")
             .field("home", &self.home)
             .field("xdg_config_home", &self.xdg_config_home)
+            .field("xdg_data_home", &self.xdg_data_home)
             .field("xdg_runtime_dir", &self.xdg_runtime_dir)
             .field("ssh_auth_sock", &self.ssh_auth_sock)
             .field("hook_socket", &self.hook_socket)
@@ -150,6 +152,7 @@ impl Environment {
         Self {
             home: path("HOME"),
             xdg_config_home: path("XDG_CONFIG_HOME"),
+            xdg_data_home: path("XDG_DATA_HOME").filter(|path| path.is_absolute()),
             xdg_runtime_dir: path("XDG_RUNTIME_DIR"),
             ssh_auth_sock: path("SSH_AUTH_SOCK"),
             hook_socket: path(HOOK_SOCKET),
@@ -172,6 +175,20 @@ impl Environment {
                 })
                 .collect(),
         }
+    }
+
+    /// Returns where thread worktrees live: `$XDG_DATA_HOME/mahi/worktrees`, or
+    /// `~/.local/share/mahi/worktrees`, on macOS too, since mahi keeps agents out of
+    /// `~/Library`.
+    pub(crate) fn worktree_root(&self) -> Option<PathBuf> {
+        self.xdg_data_home
+            .clone()
+            .or_else(|| {
+                self.home
+                    .as_ref()
+                    .map(|home| home.join(".local").join("share"))
+            })
+            .map(|data| data.join("mahi").join("worktrees"))
     }
 
     /// Returns the user's git ignore and attributes files, where git looks for them.
@@ -236,6 +253,24 @@ mod tests {
         let shown = format!("{environment:?}");
         assert!(shown.contains("TOKEN"), "{shown}");
         assert!(!shown.contains("s3cret"), "{shown}");
+    }
+
+    #[test]
+    fn worktrees_live_in_the_user_data_directory() {
+        let mut environment = Environment {
+            home: Some(PathBuf::from("/home/alice")),
+            ..Environment::default()
+        };
+        assert_eq!(
+            environment.worktree_root(),
+            Some(PathBuf::from("/home/alice/.local/share/mahi/worktrees"))
+        );
+        environment.xdg_data_home = Some(PathBuf::from("/data"));
+        assert_eq!(
+            environment.worktree_root(),
+            Some(PathBuf::from("/data/mahi/worktrees"))
+        );
+        assert_eq!(Environment::default().worktree_root(), None);
     }
 
     #[test]
