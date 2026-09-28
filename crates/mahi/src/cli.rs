@@ -54,6 +54,8 @@ pub(crate) enum Command {
     /// Lists the threads of this repository, with their agents and whether their worktree is
     /// still there.
     Threads,
+    /// Prints your participant card: the line a thread's owner needs to invite you.
+    Id,
     /// Keeps the tokens agents sign in with, so no shell has to export them.
     #[command(subcommand)]
     Credential(CredentialCommand),

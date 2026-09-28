@@ -5,6 +5,7 @@ mod credentials;
 mod end;
 mod environment;
 mod hook;
+mod id;
 mod init;
 mod network;
 mod profile;
@@ -84,6 +85,13 @@ fn main() {
                 eprint!("{done}");
                 0
             }
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
+        Command::Id => match id::id(&environment) {
+            Ok(card) => print_out(&card),
             Err(error) => {
                 report(&error);
                 1

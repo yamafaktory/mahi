@@ -1,5 +1,6 @@
 //! Threads of mahi: their signed meta document, participants and transcripts.
 
+mod card;
 mod key;
 mod meta;
 mod node;
@@ -8,6 +9,10 @@ mod signer;
 mod thread;
 mod transcript;
 
+pub use card::{
+    CardError,
+    ParticipantCard,
+};
 pub use key::{
     KeyError,
     ParticipantKey,
