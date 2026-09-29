@@ -25,7 +25,9 @@ use std::{
 use mahi_core::{
     AgentSlot,
     ParticipantName,
+    RefKind,
     ThreadId,
+    ThreadRef,
 };
 use mahi_identity::{
     ConfigDir,
@@ -58,9 +60,12 @@ use mahi_store::{
 use mahi_thread::{
     MetaError,
     NodeId,
+    OwnerError,
     ThreadError,
     VerifiedMeta,
-    pin_meta,
+    record_meta,
+    remember_owner,
+    remembered_owner,
 };
 use thiserror::Error;
 
@@ -118,8 +123,12 @@ pub(crate) enum JoinError {
     Rollback,
     #[error("the thread's meta does not list this node or the host")]
     NotListed,
-    #[error("cannot pin the thread's meta")]
+    #[error("cannot record the thread's meta")]
     Pin(#[source] ThreadError),
+    #[error("cannot remember the thread's owner")]
+    Owner(#[source] OwnerError),
+    #[error("thread {0} was started in this repository, not joined; a ticket cannot claim it")]
+    NotInvited(ThreadId),
     #[error("cannot ask for your passphrase")]
     Terminal(#[source] io::Error),
     #[error("cannot unlock your mahi key")]
@@ -415,8 +424,21 @@ fn joined_meta(
     if !listed(&own) || !listed(ticket.host().node()) {
         return Err(JoinError::NotListed);
     }
-    pin_meta(store, &meta).map_err(JoinError::Pin)?;
+    check_joinable(store, thread)?;
+    record_meta(store, thread, &document, ticket.owner()).map_err(JoinError::Pin)?;
+    remember_owner(store, thread, ticket.owner()).map_err(JoinError::Owner)?;
     Ok(meta)
+}
+
+/// Refuses a thread this repository started: it has a `meta` ref but no remembered owner, so
+/// a ticket naming its id must not replace its owner or pin another document.
+fn check_joinable(store: &Store, thread: ThreadId) -> Result<(), JoinError> {
+    let known_owner = remembered_owner(store, thread).map_err(JoinError::Owner)?;
+    let meta_ref = ThreadRef::new(thread, RefKind::Meta);
+    if known_owner.is_none() && store.head(&meta_ref)?.is_some() {
+        return Err(JoinError::NotInvited(thread));
+    }
+    Ok(())
 }
 
 fn watch(
@@ -695,5 +717,52 @@ mod tests {
         );
         assert!(view.render().unwrap().starts_with(CLEAR));
         assert_eq!(view.screen.as_ref().unwrap().screen().size(), (10, 40));
+    }
+
+    #[test]
+    fn a_thread_started_here_cannot_be_claimed_by_a_ticket() {
+        use std::sync::atomic::AtomicBool;
+
+        use mahi_identity::PublicIdentity;
+        use mahi_store::GlobalPatterns;
+        use ssh_key::{
+            Algorithm,
+            PrivateKey,
+            rand_core::OsRng,
+        };
+
+        use crate::session::{
+            self,
+            NewThread,
+            agent_from,
+            tests::repository_on_main,
+        };
+
+        let (_repo, store) = repository_on_main();
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let worktrees = tempfile::TempDir::new().unwrap();
+        let started = session::start(
+            &store,
+            NewThread {
+                public: &PublicIdentity::from(&LocalIdentity::generate()),
+                node: NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
+                signer: &key,
+                participant: name("alice"),
+                agent: &agent_from(std::path::Path::new("claude")),
+                worktrees: worktrees.path(),
+            },
+            &GlobalPatterns::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches!(
+            check_joinable(&store, started.thread),
+            Err(JoinError::NotInvited(thread)) if thread == started.thread
+        ));
+        let unknown = ThreadId::random().unwrap();
+        check_joinable(&store, unknown).unwrap();
+        let owner = mahi_thread::ParticipantKey::from_public_key(key.public_key()).unwrap();
+        mahi_thread::remember_owner(&store, started.thread, &owner).unwrap();
+        check_joinable(&store, started.thread).unwrap();
     }
 }

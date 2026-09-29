@@ -4,6 +4,7 @@ mod card;
 mod key;
 mod meta;
 mod node;
+mod owners;
 mod pins;
 mod signer;
 mod thread;
@@ -31,6 +32,11 @@ pub use node::{
     NodeId,
     NodeIdError,
 };
+pub use owners::{
+    OwnerError,
+    remember_owner,
+    remembered_owner,
+};
 pub use pins::PinError;
 pub use signer::{
     SignError,
@@ -44,7 +50,7 @@ pub use thread::{
     discard_thread,
     load_meta,
     load_meta_document,
-    pin_meta,
+    record_meta,
 };
 pub use transcript::{
     Event,

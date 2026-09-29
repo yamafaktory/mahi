@@ -181,17 +181,47 @@ pub fn load_meta_document(
     Ok((verified, encoded))
 }
 
-/// Pins a meta document obtained without the repository's refs, as a joiner gets it from
-/// the host, so a rolled-back or conflicting document is refused later.
-///
-/// The caller has checked `meta` against the owner key it trusts.
+/// Records a meta document obtained from the thread's host in this repository: checks it
+/// against `trusted_owner`, pins it, and makes it the thread's `meta` ref, creating the ref or
+/// moving it forward to a newer generation. A joiner keeps it this way until thread refs are
+/// fetched.
 ///
 /// # Errors
 ///
-/// Returns [`ThreadError::Pin`] if `meta` is older than, or conflicts with, the pinned
-/// document, or the pin cannot be written.
-pub fn pin_meta(store: &Store, meta: &VerifiedMeta) -> Result<(), ThreadError> {
-    Ok(Pins::new(store).accept(meta)?)
+/// Returns [`ThreadError::Meta`] if the document is invalid or not signed by `trusted_owner`,
+/// [`ThreadError::Pin`] if it is older than, or conflicts with, the pinned document, or
+/// [`ThreadError::Store`] if writing fails, including with [`StoreError::Conflict`] when the
+/// ref moved meanwhile.
+pub fn record_meta(
+    store: &Store,
+    thread: ThreadId,
+    encoded: &[u8],
+    trusted_owner: &ParticipantKey,
+) -> Result<VerifiedMeta, ThreadError> {
+    let verified = VerifiedMeta::decode(encoded, thread, trusted_owner)?;
+    let meta_ref = ThreadRef::new(thread, RefKind::Meta);
+    let head = store.head(&meta_ref)?;
+    if let Some(commit) = head {
+        let current = store
+            .read_entry(commit, META_ENTRY, MAX_META_BYTES as u64)?
+            .ok_or(ThreadError::MissingMetaEntry(thread))?;
+        let current = VerifiedMeta::decode(&current, thread, trusted_owner)?;
+        if current.body_hash() == verified.body_hash() {
+            return Ok(verified);
+        }
+        if current.generation() >= verified.generation() {
+            return Err(PinError::Rollback {
+                pinned: current.generation(),
+                found: verified.generation(),
+            }
+            .into());
+        }
+    }
+    Pins::new(store).accept(&verified)?;
+    let blob = store.write_blob(encoded)?;
+    let tree = store.write_tree(&[(META_ENTRY, EntryKind::Blob, blob)])?;
+    store.append(&meta_ref, head, tree, META_MESSAGE)?;
+    Ok(verified)
 }
 
 /// Adds `participant` to `thread`, which `owner_key` owns: signs the next generation of its
@@ -861,42 +891,78 @@ mod tests {
     }
 
     #[test]
-    fn a_meta_pinned_without_refs_refuses_an_older_one_later() {
+    fn a_fetched_meta_is_recorded_once_and_moved_forward_only() {
         let setup = setup();
         let thread_key = ThreadKey::generate();
-        let first = VerifiedMeta::decode(
-            &draft(&setup, 0, "t")
-                .sign(&thread_key, &setup.owner)
-                .unwrap(),
-            setup.thread,
-            &setup.owner_key,
-        )
-        .unwrap();
-        let second = VerifiedMeta::decode(
-            &draft(&setup, 1, "t")
-                .sign(&thread_key, &setup.owner)
-                .unwrap(),
-            setup.thread,
-            &setup.owner_key,
-        )
-        .unwrap();
-        pin_meta(&setup.store, &second).unwrap();
-        pin_meta(&setup.store, &second).unwrap();
-        let other_second = VerifiedMeta::decode(
-            &draft(&setup, 1, "other")
-                .sign(&thread_key, &setup.owner)
-                .unwrap(),
-            setup.thread,
-            &setup.owner_key,
-        )
-        .unwrap();
+        let first = draft(&setup, 1, "t")
+            .sign(&thread_key, &setup.owner)
+            .unwrap();
+        let second = draft(&setup, 2, "t")
+            .sign(&thread_key, &setup.owner)
+            .unwrap();
+        record_meta(&setup.store, setup.thread, &first, &setup.owner_key).unwrap();
+        let meta_ref = ThreadRef::new(setup.thread, RefKind::Meta);
+        let head = setup.store.head(&meta_ref).unwrap();
+        record_meta(&setup.store, setup.thread, &first, &setup.owner_key).unwrap();
+        assert_eq!(setup.store.head(&meta_ref).unwrap(), head);
+        record_meta(&setup.store, setup.thread, &second, &setup.owner_key).unwrap();
+        assert_eq!(
+            load_meta(&setup.store, setup.thread, &setup.owner_key, 2)
+                .unwrap()
+                .generation(),
+            2
+        );
         assert!(matches!(
-            pin_meta(&setup.store, &other_second),
-            Err(ThreadError::Pin(PinError::Equivocation { .. }))
-        ));
-        assert!(matches!(
-            pin_meta(&setup.store, &first),
+            record_meta(&setup.store, setup.thread, &first, &setup.owner_key),
             Err(ThreadError::Pin(PinError::Rollback { .. }))
         ));
+        let mallory = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mallory_key = ParticipantKey::from_public_key(mallory.public_key()).unwrap();
+        assert!(matches!(
+            record_meta(&setup.store, setup.thread, &second, &mallory_key),
+            Err(ThreadError::Meta(_))
+        ));
+    }
+
+    #[test]
+    fn a_meta_from_another_owner_neither_replaces_nor_pins_over_the_local_one() {
+        let setup = setup();
+        let thread_key = ThreadKey::generate();
+        create_thread(
+            &setup.store,
+            &draft(&setup, 0, "t"),
+            &thread_key,
+            &setup.owner,
+        )
+        .unwrap();
+        let pinned = Pins::new(&setup.store).get(setup.thread).unwrap();
+        let mallory = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mallory_key = ParticipantKey::from_public_key(mallory.public_key()).unwrap();
+        let alice = ParticipantName::new("alice").unwrap();
+        let hostile = MetaDraft::new(
+            setup.thread,
+            u64::MAX,
+            ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
+            alice.clone(),
+            vec![
+                Participant::new(
+                    alice,
+                    mallory_key.clone(),
+                    setup.mahi.to_public(),
+                    crate::node::tests::random_node(),
+                )
+                .unwrap(),
+            ],
+            PrivateMeta::new("t", "main").unwrap(),
+        )
+        .unwrap()
+        .sign(&ThreadKey::generate(), &mallory)
+        .unwrap();
+        assert!(matches!(
+            record_meta(&setup.store, setup.thread, &hostile, &mallory_key),
+            Err(ThreadError::Meta(_))
+        ));
+        assert_eq!(Pins::new(&setup.store).get(setup.thread).unwrap(), pinned);
+        load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
     }
 }
