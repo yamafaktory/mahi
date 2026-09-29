@@ -1,0 +1,26 @@
+[package]
+authors.workspace = true
+description = "mahi's SSH transport: git remotes over SSH, with host keys from known_hosts and keys from ssh-agent."
+edition.workspace = true
+license.workspace = true
+name = "mahi-ssh"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+hmac = { workspace = true }
+russh = { workspace = true }
+sha1 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread"] }
+tokio-stream = { workspace = true }
+
+[lints]
+workspace = true
