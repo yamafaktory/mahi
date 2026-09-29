@@ -154,7 +154,22 @@ pub fn load_meta(
     trusted_owner: &ParticipantKey,
     min_generation: u64,
 ) -> Result<VerifiedMeta, ThreadError> {
-    let (_, verified) = read_meta(store, thread, trusted_owner)?;
+    load_meta_document(store, thread, trusted_owner, min_generation).map(|(verified, _)| verified)
+}
+
+/// Loads `thread`'s current meta document like [`load_meta`], and also returns it as encoded,
+/// signed bytes, as a host serves it to participants.
+///
+/// # Errors
+///
+/// Returns the errors of [`load_meta`].
+pub fn load_meta_document(
+    store: &Store,
+    thread: ThreadId,
+    trusted_owner: &ParticipantKey,
+    min_generation: u64,
+) -> Result<(VerifiedMeta, Vec<u8>), ThreadError> {
+    let (_, verified, encoded) = read_meta(store, thread, trusted_owner)?;
     if verified.generation() < min_generation {
         return Err(PinError::BelowMinimum {
             required: min_generation,
@@ -163,7 +178,7 @@ pub fn load_meta(
         .into());
     }
     Pins::new(store).accept(&verified)?;
-    Ok(verified)
+    Ok((verified, encoded))
 }
 
 /// Adds `participant` to `thread`, which `owner_key` owns: signs the next generation of its
@@ -187,7 +202,7 @@ pub fn add_participant(
     participant: Participant,
 ) -> Result<VerifiedMeta, ThreadError> {
     let owner = ParticipantKey::from_public_key(owner_key.public_key()).map_err(MetaError::from)?;
-    let (commit, current) = read_meta(store, thread, &owner)?;
+    let (commit, current, _) = read_meta(store, thread, &owner)?;
     let pins = Pins::new(store);
     pins.accept(&current)?;
     if !current.is_thread_key(thread_key) {
@@ -225,7 +240,7 @@ fn read_meta(
     store: &Store,
     thread: ThreadId,
     trusted_owner: &ParticipantKey,
-) -> Result<(ObjectId, VerifiedMeta), ThreadError> {
+) -> Result<(ObjectId, VerifiedMeta, Vec<u8>), ThreadError> {
     let meta_ref = ThreadRef::new(thread, RefKind::Meta);
     let commit = store
         .head(&meta_ref)?
@@ -234,7 +249,7 @@ fn read_meta(
         .read_entry(commit, META_ENTRY, MAX_META_BYTES as u64)?
         .ok_or(ThreadError::MissingMetaEntry(thread))?;
     let verified = VerifiedMeta::decode(&encoded, thread, trusted_owner)?;
-    Ok((commit, verified))
+    Ok((commit, verified, encoded))
 }
 
 #[cfg(test)]
@@ -324,6 +339,11 @@ mod tests {
 
         let meta = load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
         assert_eq!(meta.generation(), 0);
+        let (same, encoded) =
+            load_meta_document(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
+        assert_eq!(same.body_hash(), meta.body_hash());
+        let decoded = VerifiedMeta::decode(&encoded, setup.thread, &setup.owner_key).unwrap();
+        assert_eq!(decoded.body_hash(), meta.body_hash());
         let key = meta
             .thread_key(&ParticipantName::new("alice").unwrap(), &setup.mahi)
             .unwrap();

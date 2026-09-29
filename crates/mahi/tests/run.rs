@@ -251,7 +251,8 @@ mod tests {
                 .env("XDG_CONFIG_HOME", self.home.join(".config"))
                 .env("SSH_AUTH_SOCK", &self.socket)
                 .env("USER", "tester")
-                .env("MAHI_TEST_SECRET", "secret-value");
+                .env("MAHI_TEST_SECRET", "secret-value")
+                .env("MAHI_LIVE", "off");
             command
         }
 
@@ -702,7 +703,8 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             .env("HOME", &fixture.home)
             .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
             .env("SSH_AUTH_SOCK", &fixture.socket)
-            .env("USER", "tester");
+            .env("USER", "tester")
+            .env("MAHI_LIVE", "off");
         in_terminal_with(command, passphrase)
     }
 
@@ -856,7 +858,8 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         .env("HOME", &fixture.home)
         .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
         .env("SSH_AUTH_SOCK", &fixture.socket)
-        .env("USER", "tester");
+        .env("USER", "tester")
+        .env("MAHI_LIVE", "off");
         let (code, output) = in_terminal_with(command, Some(PASSPHRASE));
         assert_eq!(code, 0, "{output}");
         assert!(output.contains("args=--continue"), "{output}");
@@ -1377,6 +1380,194 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert!(!fixture.repo.join(".git/worktrees").exists());
     }
 
+    #[derive(Debug)]
+    struct AdmitsHost(mahi_thread::NodeId);
+
+    impl mahi_live::Peers for AdmitsHost {
+        fn admits(&self, node: &mahi_thread::NodeId) -> bool {
+            node == &self.0
+        }
+
+        fn meta_for(&self, _thread: ThreadId, _node: &mahi_thread::NodeId) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    fn running_thread(fixture: &Fixture) -> (ThreadId, mahi_crypto::ThreadKey) {
+        wait_until("the thread", || {
+            fixture.threads().iter().any(|name| name.ends_with("/meta"))
+        });
+        let thread: ThreadId = fixture
+            .threads()
+            .iter()
+            .find_map(|name| name.strip_suffix("/meta"))
+            .and_then(|name| name.strip_prefix("refs/threads/"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let store = Store::open(&fixture.repo).unwrap();
+        let tester = ParticipantName::new("tester").unwrap();
+        let key = load_meta(&store, thread, &fixture.owner, 0)
+            .unwrap()
+            .thread_key(&tester, fixture.identity.as_age())
+            .unwrap();
+        (thread, key)
+    }
+
+    fn invite_bob(fixture: &Fixture, thread: ThreadId, key: &mahi_crypto::ThreadKey) -> NodeKey {
+        let bob_node_key = NodeKey::generate().unwrap();
+        let bob_ssh = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let bob = mahi_thread::Participant::new(
+            ParticipantName::new("bob").unwrap(),
+            ParticipantKey::from_public_key(bob_ssh.public_key()).unwrap(),
+            age::x25519::Identity::generate().to_public(),
+            mahi_thread::NodeId::from_bytes(bob_node_key.public()).unwrap(),
+        )
+        .unwrap();
+        let owner_ssh = ssh_key::PublicKey::from_openssh(fixture.owner.to_openssh()).unwrap();
+        let signer = mahi_identity::AgentSigner::new(
+            mahi_identity::SshAgent::new(&fixture.socket),
+            owner_ssh,
+        )
+        .unwrap();
+        let store = Store::open(&fixture.repo).unwrap();
+        mahi_thread::add_participant(&store, thread, key, &signer, bob).unwrap();
+        bob_node_key
+    }
+
+    fn local_host_address(fixture: &Fixture) -> mahi_live::HostAddress {
+        let host_node = mahi_thread::NodeId::from_bytes(
+            NodeKey::load(&config_dir(&fixture.home).node_key_file())
+                .unwrap()
+                .public(),
+        )
+        .unwrap();
+        let port = mahi_live::stable_port(&host_node);
+        mahi_live::HostAddress::new(
+            host_node,
+            None,
+            vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_invited_participant_watches_the_agent_live_over_the_local_network() {
+        use mahi_live::{
+            Body,
+            FrameReceiver,
+            FrameSender,
+            LiveKeys,
+            LiveNode,
+            Relays,
+        };
+
+        let fixture = fixture();
+        let mut command = fixture.command(&[
+            "run",
+            "sh",
+            "-c",
+            "printf 'first screen'; sleep 12; printf ' then live output'; sleep 1",
+        ]);
+        let mahi = KillOnDrop(
+            command
+                .env("MAHI_LIVE", "local")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let (thread, key) = running_thread(&fixture);
+        let bob = invite_bob(&fixture, thread, &key);
+        let address = local_host_address(&fixture);
+        let viewer = LiveNode::bind_live(
+            bob.secret(),
+            Relays::Disabled,
+            Arc::new(AdmitsHost(*address.node())),
+        )
+        .unwrap();
+        let mut document = None;
+        wait_until("the host to serve meta to bob", || {
+            document = viewer.fetch_meta(&address, thread).ok();
+            if document.is_none() {
+                thread::sleep(Duration::from_millis(500));
+            }
+            document.is_some()
+        });
+        let meta =
+            mahi_thread::VerifiedMeta::decode(&document.unwrap(), thread, &fixture.owner).unwrap();
+        let keys = || LiveKeys::derive(&key, thread).unwrap();
+        let topic = viewer
+            .join(
+                keys().topic(),
+                std::slice::from_ref(&address),
+                Some(Duration::from_secs(10)),
+            )
+            .unwrap();
+        let mut receiver = FrameReceiver::new(
+            keys(),
+            meta.participants()
+                .map(|listed| (*listed.node(), listed.name().clone())),
+        );
+        let mut sender = FrameSender::new(keys(), bob.secret()).unwrap();
+        let (mut screen, mut output) = (Vec::new(), Vec::new());
+        let mut asked_at: Option<Instant> = None;
+        wait_until("the screen and the live output", || {
+            if screen.is_empty() && asked_at.is_none_or(|at| at.elapsed() > Duration::from_secs(1))
+            {
+                let request = receiver.request_screen().unwrap();
+                topic.broadcast(sender.seal(&request).unwrap()).unwrap();
+                asked_at = Some(Instant::now());
+            }
+            while let Some(frame) = topic.receive(Duration::from_millis(100)).unwrap() {
+                match receiver.open(&frame).map(|received| received.body) {
+                    Ok(Body::Screen { bytes, .. }) => screen.extend_from_slice(&bytes),
+                    Ok(Body::Output { bytes, .. }) => output.extend_from_slice(&bytes),
+                    _ => {}
+                }
+            }
+            String::from_utf8_lossy(&output).contains("then live output")
+        });
+        assert!(String::from_utf8_lossy(&screen).contains("first screen"));
+        viewer.close().unwrap();
+        let mut mahi = mahi;
+        let mut status = None;
+        wait_until("mahi to exit after its agent", || {
+            status = mahi.0.try_wait().unwrap();
+            status.is_some()
+        });
+        assert!(status.unwrap().success());
+    }
+
+    #[test]
+    fn mahi_ends_with_its_agent_when_teammates_can_watch_and_refuses_an_unknown_live_setting() {
+        let fixture = fixture();
+        let started = Instant::now();
+        let output = fixture
+            .command(&["run", "sh", "-c", "printf done"])
+            .env("MAHI_LIVE", "local")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(started.elapsed() < Duration::from_secs(15));
+        let refused = fixture
+            .command(&["run", "true"])
+            .env("MAHI_LIVE", "of")
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("MAHI_LIVE must be off, local or public")
+        );
+    }
+
     #[test]
     fn run_needs_mahi_init_a_repository_and_a_branch() {
         let fixture = fixture();
@@ -1525,6 +1716,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
         .env("SSH_AUTH_SOCK", &fixture.socket)
         .env("USER", "tester")
+        .env("MAHI_LIVE", "off")
         .spawn()
         .unwrap();
         let terminal = mahi.writer().unwrap();

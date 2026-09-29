@@ -66,6 +66,32 @@ pub(crate) struct Environment {
     pub(crate) temp_dir: PathBuf,
     pub(crate) passed_on: Vec<(&'static str, OsString)>,
     pub(crate) pass_env: Vec<Passed>,
+    pub(crate) live: LiveMode,
+}
+
+/// Whether `mahi run` and `mahi resume` let teammates watch, from `MAHI_LIVE`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum LiveMode {
+    /// `off`: no live layer at all.
+    Off,
+    /// `local`: the live layer without relays, reachable only at direct addresses.
+    Local,
+    /// `public`, or unset: the live layer with n0's public relays.
+    #[default]
+    Public,
+    /// Any other value, which `mahi run` refuses rather than guess.
+    Unknown,
+}
+
+impl LiveMode {
+    fn parse(value: Option<&OsString>) -> Self {
+        match value.map(|value| value.to_str()) {
+            None | Some(Some("public")) => Self::Public,
+            Some(Some("off")) => Self::Off,
+            Some(Some("local")) => Self::Local,
+            Some(_) => Self::Unknown,
+        }
+    }
 }
 
 /// A variable passed on to the agent: its value, if set, and whether a missing one is an error
@@ -88,6 +114,7 @@ impl fmt::Debug for Environment {
             .field("mahi_exe", &self.mahi_exe)
             .field("user", &self.user)
             .field("temp_dir", &self.temp_dir)
+            .field("live", &self.live)
             .field(
                 "pass_env",
                 &self
@@ -161,6 +188,7 @@ impl Environment {
             path: value("PATH"),
             user: value("USER").and_then(|user| user.into_string().ok()),
             temp_dir: env::temp_dir(),
+            live: LiveMode::parse(value("MAHI_LIVE").as_ref()),
             passed_on: PASSED_ON
                 .iter()
                 .filter_map(|&name| value(name).map(|value| (name, value)))
@@ -292,5 +320,17 @@ mod tests {
             Some(PathBuf::from("/xdg/git/attributes"))
         );
         assert_eq!(Environment::default().git_patterns().excludes, None);
+    }
+
+    #[test]
+    fn mahi_live_is_off_local_or_public_and_anything_else_is_refused() {
+        let parse = |value: Option<&str>| LiveMode::parse(value.map(OsString::from).as_ref());
+        assert_eq!(parse(None), LiveMode::Public);
+        assert_eq!(parse(Some("public")), LiveMode::Public);
+        assert_eq!(parse(Some("off")), LiveMode::Off);
+        assert_eq!(parse(Some("local")), LiveMode::Local);
+        for typo in ["of", "0", "false", "OFF", "Local"] {
+            assert_eq!(parse(Some(typo)), LiveMode::Unknown, "{typo}");
+        }
     }
 }

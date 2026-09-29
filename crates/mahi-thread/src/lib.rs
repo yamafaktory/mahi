@@ -43,6 +43,7 @@ pub use thread::{
     create_thread,
     discard_thread,
     load_meta,
+    load_meta_document,
 };
 pub use transcript::{
     Event,

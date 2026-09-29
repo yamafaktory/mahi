@@ -2,6 +2,7 @@ use std::{
     fmt,
     sync::{
         Arc,
+        Mutex,
         atomic::{
             AtomicU64,
             Ordering,
@@ -83,7 +84,7 @@ impl ProtocolHandler for GossipGate {
 /// A thread's live topic, joined: frames to broadcast and the frames other nodes sent.
 pub struct LiveTopic {
     sender: GossipSender,
-    received: Receiver<Vec<u8>>,
+    received: Mutex<Receiver<Vec<u8>>>,
     dropped: Arc<AtomicU64>,
     handle: Handle,
 }
@@ -101,7 +102,7 @@ impl LiveTopic {
         handle.spawn(forward(receiver, queue, Arc::clone(&dropped)));
         Self {
             sender,
-            received: frames,
+            received: Mutex::new(frames),
             dropped,
             handle,
         }
@@ -148,7 +149,8 @@ impl LiveTopic {
     ///
     /// Returns [`LiveError::Gossip`] if the topic is gone.
     pub fn receive(&self, wait: Duration) -> Result<Option<Vec<u8>>, LiveError> {
-        match self.received.recv_timeout(wait) {
+        let received = self.received.lock().map_err(|_| LiveError::TopicClosed)?;
+        match received.recv_timeout(wait) {
             Ok(frame) => Ok(Some(frame)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => Err(LiveError::TopicClosed),

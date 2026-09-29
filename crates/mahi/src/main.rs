@@ -8,6 +8,7 @@ mod hook;
 mod id;
 mod init;
 mod invite;
+mod live;
 mod network;
 mod profile;
 mod prompt;

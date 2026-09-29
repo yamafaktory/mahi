@@ -60,10 +60,12 @@ use mahi_identity::{
     CredentialName,
     IdentityError,
     LocalIdentity,
+    NodeKey,
     PublicIdentity,
     SigningKey,
     SshAgent,
 };
+use mahi_live::Relays;
 use mahi_proxy::HostName;
 use mahi_sandbox::{
     Access,
@@ -114,12 +116,18 @@ use crate::{
         EnvName,
         Environment,
         HOOK_SOCKET,
+        LiveMode,
         MAHI_BIN,
         PASSED_ON,
         PROXY_VARIABLES,
         Passed,
     },
     hook,
+    live::{
+        LiveHost,
+        LiveSetup,
+        OutputTap,
+    },
     network::{
         Network,
         NetworkError,
@@ -226,6 +234,8 @@ pub(crate) enum RunError {
     Config(#[from] ConfigError),
     #[error("mahi is not set up; run mahi init first")]
     NotInitialised(#[source] IdentityError),
+    #[error("MAHI_LIVE must be off, local or public")]
+    LiveSetting,
     #[error("SSH_AUTH_SOCK is not set; start ssh-agent and add your signing key (ssh-add)")]
     NoSshAgent,
     #[error("cannot sign with the SSH key")]
@@ -306,6 +316,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         PublicIdentity::load(&config.recipient_file()).map_err(RunError::NotInitialised)?;
     let signing = SigningKey::load(&config.signing_key_file()).map_err(RunError::NotInitialised)?;
     let node = session::own_node(&config).map_err(RunError::NotInitialised)?;
+    let live = live_setup(environment, &config, &signing)?;
     let socket = environment
         .ssh_auth_sock
         .as_deref()
@@ -317,7 +328,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let profile = command.profile();
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
     let credentials = gather_credentials(&config, &command.options, profile, environment)?;
-    let prepared = Prepared::new(
+    let mut prepared = Prepared::new(
         environment,
         host,
         &cwd,
@@ -330,6 +341,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         },
         credentials,
     )?;
+    prepared.live = live;
     let agent_name = session::agent_from(Path::new(command.agent()));
     let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
@@ -400,7 +412,7 @@ pub(crate) fn resume(
     let (program, arguments, profile) = resumed_command(command, &slot);
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
     let credentials = gather_credentials(&config, &command.options, profile, environment)?;
-    let prepared = Prepared::new(
+    let mut prepared = Prepared::new(
         environment,
         host,
         &cwd,
@@ -413,6 +425,7 @@ pub(crate) fn resume(
         },
         credentials,
     )?;
+    prepared.live = live_setup(environment, &config, &signing)?;
     load_meta(&prepared.store, command.thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
     let passphrase = TerminalPrompt::open()
@@ -437,6 +450,25 @@ pub(crate) fn resume(
         return Ok(Outcome::Stopped(signal));
     }
     prepared.launch(environment, started?, termination)
+}
+
+/// Returns what the live layer needs, unless `MAHI_LIVE` turns it off.
+fn live_setup(
+    environment: &Environment,
+    config: &ConfigDir,
+    signing: &SigningKey,
+) -> Result<Option<LiveSetup>, RunError> {
+    let relays = match environment.live {
+        LiveMode::Off => return Ok(None),
+        LiveMode::Local => Relays::Disabled,
+        LiveMode::Public => Relays::Public,
+        LiveMode::Unknown => return Err(RunError::LiveSetting),
+    };
+    Ok(Some(LiveSetup {
+        node_key: NodeKey::load(&config.node_key_file()).map_err(RunError::NotInitialised)?,
+        owner: ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)?,
+        relays,
+    }))
 }
 
 /// Returns what `mahi resume` runs: the command after `--`, or the program named after the
@@ -549,6 +581,7 @@ struct Prepared {
     network: Option<Network>,
     globals: GlobalPatterns,
     credentials: Vec<Handed>,
+    live: Option<LiveSetup>,
 }
 
 impl Prepared {
@@ -601,6 +634,7 @@ impl Prepared {
             network,
             globals: environment.git_patterns(),
             credentials,
+            live: None,
         })
     }
 
@@ -635,10 +669,35 @@ impl Prepared {
             credentials: &self.credentials,
         };
         let (sandbox, network) = (self.sandbox, self.network);
-        let (child, raw, proxy) = started.launch(&self.store, || launch.spawn(sandbox, network))?;
+        let live = self
+            .live
+            .as_ref()
+            .zip(started.key.as_ref())
+            .and_then(|(setup, key)| {
+                LiveHost::start(
+                    setup,
+                    &self.git_dir,
+                    started.thread,
+                    started.slot.clone(),
+                    key,
+                    terminal::size(),
+                )
+                .inspect_err(|error| eprintln!("mahi: teammates cannot watch this thread: {error}"))
+                .ok()
+            });
+        let launched = started.launch(&self.store, || launch.spawn(sandbox, network));
+        let (child, raw, proxy) = match launched {
+            Ok(launched) => launched,
+            Err(error) => {
+                if let Some(live) = live {
+                    live.stop();
+                }
+                return Err(error);
+            }
+        };
         let (recorder, turns) =
             start_background(&mut started, &self.git_dir, self.globals, self.hooks);
-        finish_run(child, raw, termination, recorder, turns, proxy)
+        finish_run(child, raw, termination, recorder, turns, proxy, live)
     }
 }
 
@@ -708,8 +767,12 @@ fn finish_run(
     recorder: Option<Recorder>,
     turns: Option<TurnWorker>,
     proxy: Option<Running>,
+    live: Option<LiveHost>,
 ) -> Result<Outcome, RunError> {
-    let (code, received) = supervise(child, raw, termination);
+    let (code, received) = supervise(child, raw, termination, live.as_ref().map(LiveHost::tap));
+    if let Some(live) = live {
+        live.stop();
+    }
     if matches!(code, Ok(Outcome::Stopped(_))) {
         while received.try_recv().is_ok() {}
     }
@@ -740,6 +803,7 @@ fn supervise(
     child: PtyChild,
     raw: Option<RawMode>,
     termination: TerminationSignals,
+    tap: Option<OutputTap>,
 ) -> (Result<Outcome, RunError>, Receiver<Event>) {
     let (events, received) = mpsc::channel();
     let stop_events = events.clone();
@@ -748,7 +812,7 @@ fn supervise(
             let _ = stop_events.send(Event::Stopped(signal));
         }
     });
-    let code = relay(child, raw.is_some(), events, &received);
+    let code = relay(child, raw.is_some(), events, &received, tap);
     drop(raw);
     (code, received)
 }
@@ -1082,17 +1146,23 @@ fn relay(
     interactive: bool,
     events: mpsc::Sender<Event>,
     received: &Receiver<Event>,
+    tap: Option<OutputTap>,
 ) -> Result<Outcome, RunError> {
     let writer = child.writer()?;
     thread::spawn(move || forward_input(writer, interactive));
     let resizer = child.resizer()?;
+    let resize_tap = tap.clone();
     thread::spawn(move || {
         let Ok(changes) = WindowChanges::listen() else {
             return;
         };
         while changes.wait().is_ok() {
-            if resizer.resize(terminal::size()).is_err() {
+            let size = terminal::size();
+            if resizer.resize(size).is_err() {
                 break;
+            }
+            if let Some(tap) = &resize_tap {
+                tap.resize(size);
             }
         }
     });
@@ -1101,7 +1171,7 @@ fn relay(
     let output_events = events.clone();
     let output_progress = Arc::clone(&progress);
     thread::spawn(move || {
-        let ended = copy_output(&mut reader, &output_progress);
+        let ended = copy_output(&mut reader, &output_progress, tap.as_ref());
         let _ = output_events.send(Event::OutputEnded(ended));
     });
     let child = Arc::new(Mutex::new(child));
@@ -1202,7 +1272,11 @@ fn output_failure(error: io::Error) -> Result<i32, RunError> {
     }
 }
 
-fn copy_output(reader: &mut impl Read, progress: &AtomicU64) -> io::Result<()> {
+fn copy_output(
+    reader: &mut impl Read,
+    progress: &AtomicU64,
+    tap: Option<&OutputTap>,
+) -> io::Result<()> {
     let mut output = io::stdout().lock();
     let mut buffer = [0_u8; 8192];
     loop {
@@ -1212,6 +1286,9 @@ fn copy_output(reader: &mut impl Read, progress: &AtomicU64) -> io::Result<()> {
         }
         output.write_all(&buffer[..read])?;
         output.flush()?;
+        if let Some(tap) = tap {
+            tap.output(&buffer[..read]);
+        }
         progress.fetch_add(1, Ordering::Relaxed);
     }
 }
