@@ -5,10 +5,15 @@ use std::{
         Read,
         Write,
     },
+    pin::pin,
     sync::{
         Arc,
         Mutex,
         PoisonError,
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
     },
     time::Duration,
 };
@@ -27,6 +32,7 @@ use tokio::{
 };
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const INTERRUPT_POLL: Duration = Duration::from_millis(100);
 const MAX_ERROR_OUTPUT: usize = 4 << 10;
 const QUEUED_CHUNKS: usize = 16;
 const STDERR: u32 = 1;
@@ -40,8 +46,14 @@ pub struct Exec {
     input: ExecInput,
 }
 
+/// The caller asked to stop, through the interrupt flag the connection was given.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("interrupted")]
+pub struct Interrupted;
+
 /// The command's standard output, read with [`Read`].
 pub struct ExecOutput {
+    interrupt: Option<Arc<AtomicBool>>,
     runtime: Handle,
     chunks: mpsc::Receiver<Bytes>,
     chunk: Bytes,
@@ -50,6 +62,7 @@ pub struct ExecOutput {
 
 /// The command's standard input, written with [`Write`].
 pub struct ExecInput {
+    interrupt: Option<Arc<AtomicBool>>,
     runtime: Handle,
     channel: Arc<ChannelWriteHalf<Msg>>,
 }
@@ -80,7 +93,12 @@ struct Ending {
 }
 
 impl Exec {
-    pub(crate) fn start(runtime: Handle, channel: russh::Channel<Msg>, early: Vec<u8>) -> Self {
+    pub(crate) fn start(
+        runtime: Handle,
+        channel: russh::Channel<Msg>,
+        early: Vec<u8>,
+        interrupt: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let (read, write) = channel.split();
         let write = Arc::new(write);
         let (sender, chunks) = mpsc::channel(QUEUED_CHUNKS);
@@ -94,12 +112,14 @@ impl Exec {
         ));
         Self {
             output: ExecOutput {
+                interrupt: interrupt.clone(),
                 runtime: runtime.clone(),
                 chunks,
                 chunk: Bytes::new(),
                 ending,
             },
             input: ExecInput {
+                interrupt,
                 runtime,
                 channel: write,
             },
@@ -125,8 +145,12 @@ impl ExecInput {
     /// Panics if called from async code.
     pub fn finish(&mut self) -> io::Result<()> {
         let channel = &self.channel;
+        let interrupt = self.interrupt.as_deref();
         self.runtime
-            .block_on(async { tokio::time::timeout(IDLE_TIMEOUT, channel.eof()).await })
+            .block_on(until_interrupted(interrupt, async {
+                tokio::time::timeout(IDLE_TIMEOUT, channel.eof()).await
+            }))
+            .ok_or_else(|| io::Error::other(Interrupted))?
             .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
             .map_err(io::Error::other)
     }
@@ -139,9 +163,13 @@ impl Read for ExecOutput {
         }
         while self.chunk.is_empty() {
             let chunks = &mut self.chunks;
+            let interrupt = self.interrupt.as_deref();
             let next = self
                 .runtime
-                .block_on(async { tokio::time::timeout(IDLE_TIMEOUT, chunks.recv()).await })
+                .block_on(until_interrupted(interrupt, async {
+                    tokio::time::timeout(IDLE_TIMEOUT, chunks.recv()).await
+                }))
+                .ok_or_else(|| io::Error::other(Interrupted))?
                 .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
             match next {
                 Some(chunk) => self.chunk = chunk,
@@ -180,9 +208,13 @@ impl ExecOutput {
 impl Write for ExecInput {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let channel = &self.channel;
+        let interrupt = self.interrupt.as_deref();
         let data = Bytes::copy_from_slice(buffer);
         self.runtime
-            .block_on(async { tokio::time::timeout(IDLE_TIMEOUT, channel.data_bytes(data)).await })
+            .block_on(until_interrupted(interrupt, async {
+                tokio::time::timeout(IDLE_TIMEOUT, channel.data_bytes(data)).await
+            }))
+            .ok_or_else(|| io::Error::other(Interrupted))?
             .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
             .map_err(io::Error::other)?;
         Ok(buffer.len())
@@ -190,6 +222,26 @@ impl Write for ExecInput {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Runs `work` until it finishes, or returns `None` once `interrupt` is set, checking it every
+/// 100 ms.
+pub(crate) async fn until_interrupted<F: Future>(
+    interrupt: Option<&AtomicBool>,
+    work: F,
+) -> Option<F::Output> {
+    let Some(interrupt) = interrupt else {
+        return Some(work.await);
+    };
+    let mut work = pin!(work);
+    loop {
+        if interrupt.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Ok(output) = tokio::time::timeout(INTERRUPT_POLL, &mut work).await {
+            return Some(output);
+        }
     }
 }
 

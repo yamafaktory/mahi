@@ -30,6 +30,10 @@ use mahi_core::{
     ThreadId,
     ThreadRef,
 };
+use mahi_sandbox::{
+    Termination,
+    TerminationSignals,
+};
 use mahi_ssh::{
     KnownHosts,
     KnownHostsError,
@@ -59,6 +63,7 @@ use crate::{
         RemoteName,
         Visibility,
     },
+    run::until_stopped,
 };
 
 const MAX_CAUSE_CHARS: usize = 300;
@@ -150,9 +155,9 @@ impl SyncSetup {
         pushed_refs(thread, slot, self.visibility, self.owns_meta)
     }
 
-    /// Connects to the remote over SSH.
-    pub(crate) fn connect(&self) -> Result<SshTransport, PushError> {
-        Ok(self.access.connect(&self.remote)?)
+    /// Connects to the remote over SSH, stopping once `interrupt` is set.
+    pub(crate) fn connect(&self, interrupt: &Arc<AtomicBool>) -> Result<SshTransport, PushError> {
+        Ok(self.access.connect(&self.remote, interrupt)?)
     }
 }
 
@@ -178,7 +183,11 @@ impl SshAccess {
         })
     }
 
-    fn connect(&self, remote: &SshRemote) -> Result<SshTransport, ConnectError> {
+    fn connect(
+        &self,
+        remote: &SshRemote,
+        interrupt: &Arc<AtomicBool>,
+    ) -> Result<SshTransport, ConnectError> {
         let paths: Vec<&Path> = self.known_hosts.iter().map(PathBuf::as_path).collect();
         let known_hosts = KnownHosts::read(&paths)?;
         Ok(SshTransport::connect(
@@ -186,6 +195,7 @@ impl SshAccess {
             &known_hosts,
             &self.agent,
             &self.user,
+            Some(Arc::clone(interrupt)),
         )?)
     }
 }
@@ -210,6 +220,8 @@ pub(crate) enum FetchError {
 
 /// Fetches `thread` from the clone's chosen remote, or else from `origin`, accepts what
 /// checks out for the participant `local` trusting `owner`, and tells the user what changed.
+/// Once `interrupt` is set, the fetch stops within 100 ms, and nothing is accepted unless
+/// accepting had already begun.
 /// A remote that is not chosen and not an SSH remote is skipped quietly, and a thread the
 /// remote does not have leaves everything as it was.
 pub(crate) fn fetch_thread(
@@ -218,6 +230,7 @@ pub(crate) fn fetch_thread(
     thread: ThreadId,
     owner: &ParticipantKey,
     local: &ParticipantName,
+    interrupt: &Arc<AtomicBool>,
 ) {
     let (name, url, chosen) = match fetch_source(store) {
         Ok(Some(source)) => source,
@@ -238,9 +251,9 @@ pub(crate) fn fetch_thread(
     };
     eprintln!("mahi: fetching the thread from {name}");
     let outcome = access
-        .connect(&url)
+        .connect(&url, interrupt)
         .map_err(FetchError::from)
-        .and_then(|transport| fetch_and_accept(store, transport, thread, owner, local));
+        .and_then(|transport| fetch_and_accept(store, transport, thread, owner, local, interrupt));
     if let Some(told) = fetch_report(&outcome, &name) {
         eprint!("{told}");
     }
@@ -261,14 +274,40 @@ fn fetch_source(store: &Store) -> Result<Option<(RemoteName, SshRemote, bool)>, 
         .map(|url| (origin, url, false)))
 }
 
+/// Fetches as [`fetch_thread`] does while listening for stop signals, and returns the one that
+/// stopped it, if any; the signals go back to their usual handling afterwards. When the
+/// signals cannot be listened to, the fetch runs without them.
+pub(crate) fn fetch_until_stopped(
+    store: &Store,
+    environment: &Environment,
+    thread: ThreadId,
+    owner: &ParticipantKey,
+    local: &ParticipantName,
+) -> Option<Termination> {
+    let Ok(termination) = TerminationSignals::listen() else {
+        let never = Arc::new(AtomicBool::new(false));
+        fetch_thread(store, environment, thread, owner, local, &never);
+        return None;
+    };
+    let ((), caught) = until_stopped(&termination, |interrupt| {
+        fetch_thread(store, environment, thread, owner, local, interrupt);
+    });
+    caught
+}
+
 fn fetch_and_accept<T: Transport>(
     store: &Store,
     transport: T,
     thread: ThreadId,
     owner: &ParticipantKey,
     local: &ParticipantName,
+    interrupt: &AtomicBool,
 ) -> Result<Option<Accepted>, FetchError> {
-    store.fetch_thread(transport, thread, &AtomicBool::new(false))?;
+    let fetched = store.fetch_thread(transport, thread, interrupt);
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(StoreError::Interrupted.into());
+    }
+    fetched?;
     match accept_fetched(store, thread, owner, local) {
         Ok(accepted) => Ok(Some(accepted)),
         Err(ThreadError::NotFound(_)) => Ok(None),
@@ -282,6 +321,12 @@ fn fetch_report(
 ) -> Option<String> {
     let mut text = String::new();
     match outcome {
+        Err(
+            FetchError::Fetch(StoreError::Interrupted)
+            | FetchError::Connect(ConnectError::Ssh(SshError::Interrupted)),
+        ) => {
+            let _ = writeln!(text, "mahi: stopped fetching the thread from {name}");
+        }
         Err(error) => {
             let mut message = format!("mahi: cannot fetch the thread from {name}: {error}");
             let mut cause = std::error::Error::source(error);
@@ -347,13 +392,14 @@ impl Pusher {
     pub(crate) fn start<T, C>(git_dir: PathBuf, refs: Vec<ThreadRef>, connect: C) -> Self
     where
         T: Transport,
-        C: Fn() -> Result<T, PushError> + Send + 'static,
+        C: Fn(&Arc<AtomicBool>) -> Result<T, PushError> + Send + 'static,
     {
         let (pokes, received) = mpsc::sync_channel(1);
         let interrupt = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&interrupt);
-        let worker =
-            thread::spawn(move || push_on_pokes(&git_dir, &refs, &connect, &received, &flag));
+        let worker = thread::spawn(move || {
+            push_on_pokes(&git_dir, &refs, &|| connect(&flag), &received, &flag)
+        });
         Self {
             pokes,
             worker,
@@ -421,11 +467,14 @@ fn push_once<T: Transport>(
     };
     interrupted()?;
     let store = Store::open(git_dir).map_err(PushError::Open)?;
-    let transport = connect()?;
+    let pushed = connect().and_then(|transport| {
+        interrupted()?;
+        store
+            .push_refs(transport, refs, interrupt)
+            .map_err(PushError::Push)
+    });
     interrupted()?;
-    store
-        .push_refs(transport, refs, interrupt)
-        .map_err(PushError::Push)
+    pushed
 }
 
 impl Pushes {
@@ -547,10 +596,12 @@ mod tests {
         .unwrap();
         assert!(!hostile.contains('\x1b'), "{hostile}");
         assert!(told.contains("refused"), "{told}");
-        let failed = fetch_report(&Err(FetchError::Fetch(StoreError::Interrupted)), &name).unwrap();
+        let failed = fetch_report(&Err(FetchError::Fetch(StoreError::NoCommit)), &name).unwrap();
+        assert!(failed.starts_with("mahi: cannot fetch the thread from origin: the fetch failed"));
+        let stopped = fetch_report(&Err(FetchError::Fetch(StoreError::Interrupted)), &name);
         assert_eq!(
-            failed,
-            "mahi: cannot fetch the thread from origin: the fetch failed: interrupted\n"
+            stopped.as_deref(),
+            Some("mahi: stopped fetching the thread from origin\n")
         );
     }
 
@@ -697,7 +748,7 @@ mod git_tests {
         };
         let first = append(None);
         let target = remote.clone();
-        let pusher = Pusher::start(local.clone(), vec![meta.clone()], move || {
+        let pusher = Pusher::start(local.clone(), vec![meta.clone()], move |_| {
             Ok(
                 file::connect(target.as_os_str().as_encoded_bytes(), Protocol::V1, false)
                     .unwrap_or_else(|never| match never {}),
@@ -713,15 +764,27 @@ mod git_tests {
             second.to_string()
         );
 
-        let unreachable = Pusher::start(local.clone(), vec![meta.clone()], || {
+        let unreachable = Pusher::start(local.clone(), vec![meta.clone()], |_| {
             Err::<file::SpawnProcessOnDemand, _>(PushError::Connect(ConnectError::Ssh(
                 SshError::Timeout("example.org".to_owned()),
             )))
         });
         let failed = unreachable.finish();
         assert!(matches!(failed.last, Some(Err(PushError::Connect(_)))));
+        let stopped_while_connecting = Pusher::start(local.clone(), vec![meta.clone()], |_| {
+            Err::<file::SpawnProcessOnDemand, _>(PushError::Connect(ConnectError::Ssh(
+                SshError::Timeout("example.org".to_owned()),
+            )))
+        });
+        stopped_while_connecting
+            .interrupt_flag()
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(
+            stopped_while_connecting.finish().last,
+            Some(Err(PushError::Push(StoreError::Interrupted)))
+        ));
         let target = remote.clone();
-        let stopped = Pusher::start(local.clone(), vec![meta.clone()], move || {
+        let stopped = Pusher::start(local.clone(), vec![meta.clone()], move |_| {
             Ok(
                 file::connect(target.as_os_str().as_encoded_bytes(), Protocol::V1, false)
                     .unwrap_or_else(|never| match never {}),
@@ -764,26 +827,67 @@ mod git_tests {
             .unwrap();
         let (_clone_dir, clone) = crate::session::tests::repository_on_main();
         let bob = ParticipantName::new("bob").unwrap();
-        let accepted = fetch_and_accept(&clone, connect(), started.thread, &owner, &bob)
-            .unwrap()
-            .unwrap();
+        let accepted = fetch_and_accept(
+            &clone,
+            connect(),
+            started.thread,
+            &owner,
+            &bob,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(accepted.updated, [meta.clone(), started.snapshots.clone()]);
         assert_eq!(clone.head(&meta).unwrap(), owner_store.head(&meta).unwrap());
-        let again = fetch_and_accept(&clone, connect(), started.thread, &owner, &bob)
-            .unwrap()
-            .unwrap();
+        let again = fetch_and_accept(
+            &clone,
+            connect(),
+            started.thread,
+            &owner,
+            &bob,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
         assert!(again.updated.is_empty());
         let elsewhere = ThreadId::random().unwrap();
         assert!(
-            fetch_and_accept(&clone, connect(), elsewhere, &owner, &bob)
-                .unwrap()
-                .is_none()
+            fetch_and_accept(
+                &clone,
+                connect(),
+                elsewhere,
+                &owner,
+                &bob,
+                &AtomicBool::new(false)
+            )
+            .unwrap()
+            .is_none()
         );
+        let (_stopped_dir, stopped) = crate::session::tests::repository_on_main();
+        assert!(matches!(
+            fetch_and_accept(
+                &stopped,
+                connect(),
+                started.thread,
+                &owner,
+                &bob,
+                &AtomicBool::new(true)
+            ),
+            Err(FetchError::Fetch(StoreError::Interrupted))
+        ));
+        assert_eq!(stopped.head(&meta).unwrap(), None);
         let impostor = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let wrong = ParticipantKey::from_public_key(impostor.public_key()).unwrap();
         let (_other_dir, other) = crate::session::tests::repository_on_main();
         assert!(matches!(
-            fetch_and_accept(&other, connect(), started.thread, &wrong, &bob),
+            fetch_and_accept(
+                &other,
+                connect(),
+                started.thread,
+                &wrong,
+                &bob,
+                &AtomicBool::new(false)
+            ),
             Err(FetchError::Accept(ThreadError::FetchedMetaRefused { .. }))
         ));
         assert_eq!(other.head(&meta).unwrap(), None);

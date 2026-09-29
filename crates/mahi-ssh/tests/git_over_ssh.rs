@@ -328,6 +328,7 @@ mod tests {
                 &self.known_hosts,
                 &self.agent,
                 "nobody",
+                None,
             )?;
             let remote = repository.remote_at(url.as_str())?.with_refspecs(
                 [
@@ -393,6 +394,7 @@ mod tests {
             &fixture.known_hosts,
             &fixture.agent,
             "nobody",
+            None,
         )
         .unwrap();
         let pushed = store

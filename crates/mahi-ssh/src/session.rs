@@ -1,7 +1,10 @@
 use std::{
     borrow::Cow,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::AtomicBool,
+    },
     time::Duration,
 };
 
@@ -26,7 +29,10 @@ use thiserror::Error;
 use tokio::runtime;
 
 use crate::{
-    exec::Exec,
+    exec::{
+        Exec,
+        until_interrupted,
+    },
     known_hosts::{
         HostKeyStatus,
         KnownHosts,
@@ -45,6 +51,7 @@ const MAX_AGENT_KEYS: usize = 6;
 pub struct SshSession {
     handle: Handle<HostCheck>,
     exec_timeout: Duration,
+    interrupt: Option<Arc<AtomicBool>>,
 }
 
 /// Why connecting to a remote, or running a command there, failed.
@@ -119,6 +126,9 @@ pub enum SshError {
     /// The async runtime the connection runs on cannot start.
     #[error("cannot start the ssh runtime")]
     Runtime(#[source] std::io::Error),
+    /// The caller asked to stop.
+    #[error("interrupted")]
+    Interrupted,
     /// The SSH connection failed.
     #[error("the ssh connection failed")]
     Ssh(#[from] russh::Error),
@@ -132,22 +142,30 @@ impl std::fmt::Debug for SshSession {
 
 impl SshSession {
     /// Connects to `remote`'s host, checks its key against `known_hosts`, and logs in as the
-    /// remote's user, or else `default_user`, with the keys of the ssh-agent at `agent`.
+    /// remote's user, or else `default_user`, with the keys of the ssh-agent at `agent`. Once
+    /// `interrupt` is set, connecting, and every command's reading and writing, stop within
+    /// 100 ms.
     ///
     /// # Errors
     ///
     /// Returns [`SshError`] if the host cannot be reached, its key is not trusted, no key is
-    /// accepted, or this takes longer than 20 s.
+    /// accepted, this takes longer than 20 s, or `interrupt` is set.
     pub async fn connect(
         remote: &SshRemote,
         known_hosts: &KnownHosts,
         agent: &Path,
         default_user: &str,
+        interrupt: Option<Arc<AtomicBool>>,
     ) -> Result<Self, SshError> {
         let user = remote.user().unwrap_or(default_user);
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, connect(remote, known_hosts, agent, user))
+        let connecting =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, connect(remote, known_hosts, agent, user));
+        let mut session = until_interrupted(interrupt.as_deref(), connecting)
             .await
-            .map_err(|_| SshError::Timeout(remote.host().to_owned()))?
+            .ok_or(SshError::Interrupted)?
+            .map_err(|_| SshError::Timeout(remote.host().to_owned()))??;
+        session.interrupt = interrupt;
+        Ok(session)
     }
 
     /// Sets how long [`SshSession::exec`] waits for the host to start a command; 20 s unless
@@ -167,8 +185,10 @@ impl SshSession {
         if runtime::Handle::current().runtime_flavor() == runtime::RuntimeFlavor::CurrentThread {
             return Err(SshError::CurrentThreadRuntime);
         }
-        tokio::time::timeout(self.exec_timeout, self.start(command, env))
+        let starting = tokio::time::timeout(self.exec_timeout, self.start(command, env));
+        until_interrupted(self.interrupt.as_deref(), starting)
             .await
+            .ok_or(SshError::Interrupted)?
             .map_err(|_| SshError::ExecTimeout(command.to_owned()))?
     }
 
@@ -194,7 +214,12 @@ impl SshSession {
                 Some(_) => {}
             }
         }
-        Ok(Exec::start(runtime::Handle::current(), channel, early))
+        Ok(Exec::start(
+            runtime::Handle::current(),
+            channel,
+            early,
+            self.interrupt.clone(),
+        ))
     }
 
     /// Closes the connection.
@@ -260,6 +285,7 @@ async fn connect(
                 return Ok(SshSession {
                     handle,
                     exec_timeout: DEFAULT_EXEC_TIMEOUT,
+                    interrupt: None,
                 });
             }
             Ok(_) | Err(russh::AgentAuthError::Key(_)) => {}

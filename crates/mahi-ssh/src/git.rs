@@ -3,6 +3,10 @@ use std::{
     borrow::Cow,
     fmt,
     path::Path,
+    sync::{
+        Arc,
+        atomic::AtomicBool,
+    },
 };
 
 use gix::protocol::transport::{
@@ -57,13 +61,14 @@ use crate::{
 pub struct SshTransport {
     connection: Option<Connection<ExecOutput, ExecInput>>,
     session: SshSession,
-    runtime: Runtime,
+    runtime: Option<Runtime>,
     remote: SshRemote,
     url: String,
 }
 
 impl SshTransport {
-    /// Connects to `remote` as [`SshSession::connect`] does.
+    /// Connects to `remote` as [`SshSession::connect`] does, stopping reads and writes once
+    /// `interrupt` is set.
     ///
     /// # Errors
     ///
@@ -77,23 +82,32 @@ impl SshTransport {
         known_hosts: &KnownHosts,
         agent: &Path,
         default_user: &str,
+        interrupt: Option<Arc<AtomicBool>>,
     ) -> Result<Self, SshError> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .map_err(SshError::Runtime)?;
-        let session = runtime.block_on(SshSession::connect(
+        let connected = runtime.block_on(SshSession::connect(
             &remote,
             known_hosts,
             agent,
             default_user,
-        ))?;
+            interrupt,
+        ));
+        let session = match connected {
+            Ok(session) => session,
+            Err(error) => {
+                runtime.shutdown_background();
+                return Err(error);
+            }
+        };
         let url = remote.to_string();
         Ok(Self {
             connection: None,
             session,
-            runtime,
+            runtime: Some(runtime),
             remote,
             url,
         })
@@ -129,8 +143,11 @@ impl Transport for SshTransport {
             Service::ReceivePack => (GitService::ReceivePack, Protocol::V1, &[]),
         };
         let command = self.remote.command(git_service);
-        let exec = self
+        let runtime = self
             .runtime
+            .as_ref()
+            .ok_or_else(|| client::Error::Io(std::io::Error::other(SshError::Interrupted)))?;
+        let exec = runtime
             .block_on(self.session.exec(&command, env))
             .map_err(|error| client::Error::Io(std::io::Error::other(error)))?;
         let (output, input) = exec.split();
@@ -156,6 +173,15 @@ impl Transport for SshTransport {
             .as_mut()
             .ok_or(client::Error::MissingHandshake)?
             .request(write_mode, on_into_read, trace)
+    }
+}
+
+impl Drop for SshTransport {
+    fn drop(&mut self) {
+        drop(self.connection.take());
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 

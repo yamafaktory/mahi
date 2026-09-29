@@ -17,6 +17,7 @@ mod tests {
         sync::{
             Arc,
             atomic::{
+                AtomicBool,
                 AtomicUsize,
                 Ordering,
             },
@@ -26,6 +27,7 @@ mod tests {
 
     use mahi_ssh::{
         Exec,
+        Interrupted,
         KnownHosts,
         RemoteFailure,
         SshError,
@@ -281,6 +283,7 @@ mod tests {
                 known_hosts,
                 agent,
                 "nobody",
+                None,
             ))
         }
     }
@@ -356,6 +359,39 @@ mod tests {
     }
 
     #[test]
+    fn setting_the_interrupt_flag_stops_connecting_and_a_blocked_read() {
+        let user = ed25519();
+        let fixture = fixture(user.public_key(), &user);
+        let known_hosts = fixture.known_hosts(&fixture.host_key);
+        let connect = |flag: &Arc<AtomicBool>| {
+            fixture.runtime.block_on(SshSession::connect(
+                &fixture.remote(),
+                &known_hosts,
+                &fixture.agent,
+                "nobody",
+                Some(Arc::clone(flag)),
+            ))
+        };
+        let stopped = Arc::new(AtomicBool::new(true));
+        assert!(matches!(connect(&stopped), Err(SshError::Interrupted)));
+        let flag = Arc::new(AtomicBool::new(false));
+        let session = connect(&flag).unwrap();
+        let command = fixture.remote().command(mahi_ssh::GitService::ReceivePack);
+        let (mut output, _input) = fixture.exec(&session, &command).unwrap().split();
+        let mut early = [0; 6];
+        output.read_exact(&mut early).unwrap();
+        let setter = Arc::clone(&flag);
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let error = output.read_to_end(&mut Vec::new()).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.into_inner().unwrap().is::<Interrupted>());
+    }
+
+    #[test]
     fn a_command_needs_a_multi_thread_runtime() {
         let user = ed25519();
         let fixture = fixture(user.public_key(), &user);
@@ -369,6 +405,7 @@ mod tests {
                 &fixture.known_hosts(&fixture.host_key),
                 &fixture.agent,
                 "nobody",
+                None,
             ))
             .unwrap();
         let refused = local.block_on(session.exec("git-upload-pack 'x'", &[]));

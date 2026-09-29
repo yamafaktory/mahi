@@ -456,13 +456,16 @@ pub(crate) fn resume(
     let current = load_meta(&prepared.store, command.thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
     if let Some(me) = current.participants().find(|listed| listed.key() == &own) {
-        sync::fetch_thread(
+        let stopped = sync::fetch_until_stopped(
             &prepared.store,
             environment,
             command.thread,
             &owner,
             me.name(),
         );
+        if let Some(signal) = stopped {
+            return Ok(Outcome::Stopped(signal));
+        }
         load_meta(
             &prepared.store,
             command.thread,
@@ -832,7 +835,7 @@ impl Prepared {
         let pusher = self.sync.map(|setup| {
             let refs = setup.refs(started.thread, &started.slot);
             let name = setup.name.clone();
-            let pusher = Pusher::start(self.git_dir.clone(), refs, move || setup.connect());
+            let pusher = Pusher::start(self.git_dir.clone(), refs, move |flag| setup.connect(flag));
             (pusher, name)
         });
         let (recorder, turns) = start_background(
@@ -1133,9 +1136,9 @@ fn stop_now(signal: Termination) -> ! {
 
 pub(crate) fn until_stopped<T>(
     termination: &TerminationSignals,
-    work: impl FnOnce(&AtomicBool) -> T,
+    work: impl FnOnce(&Arc<AtomicBool>) -> T,
 ) -> (T, Option<Termination>) {
-    let interrupt = AtomicBool::new(false);
+    let interrupt = Arc::new(AtomicBool::new(false));
     let finished = AtomicBool::new(false);
     thread::scope(|scope| {
         let watcher = scope.spawn(|| {

@@ -11,6 +11,7 @@ pub use exec::{
     Exec,
     ExecInput,
     ExecOutput,
+    Interrupted,
     RemoteFailure,
 };
 pub use git::SshTransport;

@@ -423,7 +423,16 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
             .map(|listed| listed.name().clone());
         let meta = match me {
             Some(me) => {
-                sync::fetch_thread(&store, environment, ticket.thread(), ticket.owner(), &me);
+                let stopped = sync::fetch_until_stopped(
+                    &store,
+                    environment,
+                    ticket.thread(),
+                    ticket.owner(),
+                    &me,
+                );
+                if let Some(signal) = stopped {
+                    return Ok(Outcome::Stopped(signal));
+                }
                 load_meta(&store, ticket.thread(), ticket.owner(), meta.generation())
                     .map_err(JoinError::Pin)?
             }
