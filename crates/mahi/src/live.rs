@@ -106,6 +106,7 @@ const SCREEN_EVERY: Duration = Duration::from_secs(1);
 const PENDING_SCREENS: usize = 8;
 const LISTEN_PAUSE: Duration = Duration::from_millis(200);
 const UNASKED: [u8; 16] = [0; 16];
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
 const PUBLISHED: &str = "live";
 const MAX_PUBLISHED_BYTES: u64 = 4096;
@@ -293,6 +294,7 @@ impl LiveHost {
             wanted: Arc::clone(&wanted),
             stop: Arc::clone(&stop),
             held_through: 0,
+            sent_at: Instant::now(),
         };
         let listener = Listener {
             topic,
@@ -370,12 +372,20 @@ struct Broadcaster {
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
     held_through: u64,
+    sent_at: Instant,
 }
 
 impl Broadcaster {
     fn run(mut self) {
         while !self.stopping() {
             self.send_screen_if_needed();
+            if self.sent_at.elapsed() >= HEARTBEAT_EVERY {
+                let beat = Body::Heartbeat {
+                    slot: self.slot.clone(),
+                };
+                self.send(&beat);
+                self.sent_at = Instant::now();
+            }
             let Ok(tapped) = self.tapped.recv_timeout(LISTEN_PAUSE) else {
                 continue;
             };
@@ -446,9 +456,14 @@ impl Broadcaster {
     }
 
     fn send(&mut self, body: &Body) -> bool {
-        self.sender
+        let sent = self
+            .sender
             .seal(body)
-            .is_ok_and(|frame| self.topic.broadcast(frame).is_ok())
+            .is_ok_and(|frame| self.topic.broadcast(frame).is_ok());
+        if sent {
+            self.sent_at = Instant::now();
+        }
+        sent
     }
 }
 

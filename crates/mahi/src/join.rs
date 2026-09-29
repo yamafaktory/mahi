@@ -42,6 +42,7 @@ use mahi_live::{
     LiveError,
     LiveKeys,
     LiveNode,
+    LiveTopic,
     Peers,
     Relays,
     Ticket,
@@ -88,6 +89,7 @@ const RESET: &[u8] =
     b"\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>";
 const STUCK_SCREEN: Duration = Duration::from_secs(3);
 const DRAIN: usize = 256;
+const HOST_SILENCE: Duration = Duration::from_secs(30);
 const QUIT_KEYS: [u8; 3] = [b'q', 0x03, 0x04];
 
 #[derive(Debug, Error)]
@@ -213,8 +215,13 @@ impl View {
                     self.changed = true;
                 }
             }
-            Body::ScreenRequest { .. } => {}
+            Body::ScreenRequest { .. } | Body::Heartbeat { .. } => {}
         }
+    }
+
+    /// Returns the participant whose agent the view follows.
+    pub(crate) fn follows(&self) -> &ParticipantName {
+        &self.follows
     }
 
     /// Returns what to write to the viewer's terminal to show the screen as it is now: all of
@@ -467,11 +474,39 @@ fn watch(
     let raw = RawMode::enable().map_err(JoinError::Terminal)?;
     let screen = AlternateScreen::enter();
     watch_leave_keys(&leave);
-    let mut view = View::new(follows);
+    let ended = show(&topic, &mut frames, &mut sender, View::new(follows), &leave);
+    drop(screen);
+    drop(raw);
+    match ended {
+        Ended::Left => {}
+        Ended::Closed => eprintln!("mahi: the thread's live topic closed"),
+        Ended::Silent => eprintln!(
+            "mahi: no live frame from the host for {} s; it may have stopped",
+            HOST_SILENCE.as_secs()
+        ),
+    }
+    eprintln!("mahi: left thread {thread}");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    Left,
+    Closed,
+    Silent,
+}
+
+fn show(
+    topic: &LiveTopic,
+    frames: &mut FrameReceiver,
+    sender: &mut FrameSender,
+    mut view: View,
+    leave: &AtomicBool,
+) -> Ended {
     let mut asked_at: Option<Instant> = None;
     let mut dropped = topic.dropped();
     let mut unanchored = false;
-    let mut closed = false;
+    let mut heard_at = Instant::now();
     while !leave.load(Ordering::SeqCst) {
         let lost = topic.dropped() != dropped;
         dropped = topic.dropped();
@@ -491,14 +526,16 @@ fn watch(
             let frame = match topic.receive(wait) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
-                Err(_) => {
-                    closed = true;
-                    break;
-                }
+                Err(_) => return Ended::Closed,
             };
             wait = Duration::ZERO;
             match frames.open(&frame) {
-                Ok(received) => view.apply(&received.participant, received.body),
+                Ok(received) => {
+                    if &received.participant == view.follows() {
+                        heard_at = Instant::now();
+                    }
+                    view.apply(&received.participant, received.body);
+                }
                 Err(FrameError::Unanchored) => unanchored = true,
                 Err(_) => {}
             }
@@ -508,17 +545,11 @@ fn watch(
             let _ = output.write_all(&drawn);
             let _ = output.flush();
         }
-        if closed {
-            break;
+        if heard_at.elapsed() > HOST_SILENCE {
+            return Ended::Silent;
         }
     }
-    drop(screen);
-    drop(raw);
-    if closed {
-        eprintln!("mahi: the thread's live topic closed");
-    }
-    eprintln!("mahi: left thread {thread}");
-    Ok(())
+    Ended::Left
 }
 
 fn watch_leave_keys(leave: &Arc<AtomicBool>) {

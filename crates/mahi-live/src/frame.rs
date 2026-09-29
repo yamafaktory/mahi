@@ -82,6 +82,11 @@ pub enum Body {
         /// Its width in columns.
         columns: u16,
     },
+    /// The agent's host is still there, sent when it has had nothing else to send for a while.
+    Heartbeat {
+        /// The agent whose host it is.
+        slot: AgentSlot,
+    },
     /// A viewer asks for the screens of the thread's agents.
     ScreenRequest {
         /// A random value the answer must carry.
@@ -191,6 +196,9 @@ enum WireBody<'a> {
         part: u16,
         parts: u16,
         bytes: &'a [u8],
+    },
+    Heartbeat {
+        slot: &'a str,
     },
 }
 
@@ -354,6 +362,10 @@ impl FrameSender {
             Body::ScreenRequest { challenge } => WireBody::ScreenRequest {
                 challenge: *challenge,
             },
+            Body::Heartbeat { slot: owner } => {
+                slot = owner.to_string();
+                WireBody::Heartbeat { slot: &slot }
+            }
             Body::Screen {
                 slot: owner,
                 rows,
@@ -617,9 +629,10 @@ fn check_parts(part: u16, parts: u16) -> Result<(), FrameError> {
 
 fn drawn_slot(body: &Body) -> Option<&AgentSlot> {
     match body {
-        Body::Output { slot, .. } | Body::Resize { slot, .. } | Body::Screen { slot, .. } => {
-            Some(slot)
-        }
+        Body::Output { slot, .. }
+        | Body::Resize { slot, .. }
+        | Body::Screen { slot, .. }
+        | Body::Heartbeat { slot } => Some(slot),
         Body::ScreenRequest { .. } => None,
     }
 }
@@ -647,6 +660,7 @@ fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
             columns,
         },
         WireBody::ScreenRequest { challenge } => Body::ScreenRequest { challenge },
+        WireBody::Heartbeat { slot: owner } => Body::Heartbeat { slot: slot(owner)? },
         WireBody::Screen {
             slot: owner,
             rows,
@@ -1048,5 +1062,31 @@ mod tests {
             Err(FrameError::Unanchored)
         );
         assert!(!format!("{:?}", thread.keys()).contains("seal"));
+    }
+
+    #[test]
+    fn a_heartbeat_follows_the_senders_run_and_only_its_owner_sends_it() {
+        let thread = Thread::new();
+        let mut viewer = thread.receiver();
+        let mut host = thread.sender(1);
+        let beat = Body::Heartbeat {
+            slot: slot("alice"),
+        };
+        assert_eq!(
+            viewer.open(&host.seal(&beat).unwrap()),
+            Err(FrameError::Unanchored)
+        );
+        let request = viewer.request_screen().unwrap();
+        viewer
+            .open(&host.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
+        let frame = host.seal(&beat).unwrap();
+        assert_eq!(viewer.open(&frame).unwrap().body, beat);
+        assert_eq!(viewer.open(&frame), Err(FrameError::Replayed));
+        let mut mallory = thread.sender(3);
+        assert_eq!(
+            viewer.open(&mallory.seal(&beat).unwrap()),
+            Err(FrameError::NotTheirSlot)
+        );
     }
 }

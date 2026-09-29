@@ -1453,6 +1453,19 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         .unwrap()
     }
 
+    fn wait_for_heartbeat(topic: &mahi_live::LiveTopic, receiver: &mut mahi_live::FrameReceiver) {
+        let mut heartbeat = false;
+        wait_until("a heartbeat from the quiet host", || {
+            while let Some(frame) = topic.receive(Duration::from_millis(100)).unwrap() {
+                heartbeat |= matches!(
+                    receiver.open(&frame).map(|received| received.body),
+                    Ok(mahi_live::Body::Heartbeat { .. })
+                );
+            }
+            heartbeat
+        });
+    }
+
     #[test]
     fn an_invited_participant_watches_the_agent_live_over_the_local_network() {
         use mahi_live::{
@@ -1469,7 +1482,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             "run",
             "sh",
             "-c",
-            "printf 'first screen'; sleep 12; printf ' then live output'; sleep 1",
+            "printf 'first screen'; sleep 12; printf ' then live output'; sleep 10",
         ]);
         let mahi = KillOnDrop(
             command
@@ -1539,6 +1552,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             String::from_utf8_lossy(&output).contains("then live output")
         });
         assert!(String::from_utf8_lossy(&screen).contains("first screen"));
+        wait_for_heartbeat(&topic, &mut receiver);
         viewer.close().unwrap();
         let mut mahi = mahi;
         let mut status = None;
