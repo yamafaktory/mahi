@@ -221,7 +221,6 @@ fn warn_if_not_in_agent(
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
         io::{
             Read,
             Write,
@@ -244,36 +243,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-
-    #[derive(Default)]
-    struct Script {
-        secrets: VecDeque<&'static str>,
-        answers: VecDeque<&'static str>,
-        said: Vec<String>,
-    }
-
-    impl Prompt for Script {
-        fn say(&mut self, line: &str) -> io::Result<()> {
-            self.said.push(line.to_owned());
-            Ok(())
-        }
-
-        fn secret(&mut self, _: &str) -> io::Result<SecretString> {
-            let secret = self
-                .secrets
-                .pop_front()
-                .expect("an unexpected passphrase question");
-            Ok(SecretString::from(secret.to_owned()))
-        }
-
-        fn answer(&mut self, _: &str) -> io::Result<String> {
-            Ok(self
-                .answers
-                .pop_front()
-                .expect("an unexpected question")
-                .to_owned())
-        }
-    }
+    use crate::prompt::tests::Script;
 
     struct Setup {
         _dir: TempDir,

@@ -1,6 +1,11 @@
 use std::{
     fmt,
     io,
+    net::{
+        Ipv4Addr,
+        Ipv6Addr,
+        SocketAddr,
+    },
     sync::Arc,
     time::Duration,
 };
@@ -11,7 +16,9 @@ use iroh::{
     SecretKey,
     endpoint::{
         BindError,
+        BindOpts,
         Builder,
+        InvalidSocketAddr,
     },
 };
 use mahi_thread::{
@@ -33,6 +40,8 @@ use crate::{
 };
 
 const WORKER_THREADS: usize = 2;
+const FIRST_STABLE_PORT: u16 = 49_152;
+const STABLE_PORTS: u16 = 16_384;
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// Which relays an endpoint uses to reach peers it cannot reach directly.
@@ -66,6 +75,9 @@ pub enum LiveError {
     /// The endpoint could not bind its sockets.
     #[error("cannot open the live layer's endpoint")]
     Bind(#[source] Box<BindError>),
+    /// iroh refused a socket address, which it never does for the unspecified addresses used.
+    #[error("cannot choose the live layer's sockets")]
+    SocketAddress(#[source] InvalidSocketAddr),
     /// iroh reports a node id that is not a usable key, which it never does.
     #[error("the endpoint's node id is not usable")]
     Node(#[from] NodeIdError),
@@ -86,6 +98,9 @@ impl fmt::Debug for LiveNode {
 impl LiveNode {
     /// Binds an endpoint with the node key whose secret is `secret`.
     ///
+    /// It listens on the node's [`stable_port`], so the direct addresses in a ticket still
+    /// reach a host started later, or on a random port when that one is taken.
+    ///
     /// # Errors
     ///
     /// Returns [`LiveError::InsideRuntime`] if called from inside an async runtime,
@@ -102,15 +117,16 @@ impl LiveNode {
             Relays::Public => RelayMode::Default,
             Relays::Disabled => RelayMode::Disabled,
         };
-        let endpoint = runtime
-            .block_on(
-                Builder::empty()
-                    .secret_key(SecretKey::from_bytes(secret))
-                    .crypto_provider(Arc::new(mahi_tls::provider()))
-                    .relay_mode(relay_mode)
-                    .bind(),
-            )
-            .map_err(|error| LiveError::Bind(Box::new(error)))?;
+        let secret_key = SecretKey::from_bytes(secret);
+        let port = NodeId::from_bytes(*secret_key.public().as_bytes())
+            .map_or(0, |node| stable_port(&node));
+        let stable = builder(&secret_key, relay_mode.clone(), port)?;
+        let endpoint = match runtime.block_on(stable.bind()) {
+            Ok(endpoint) => endpoint,
+            Err(_) => runtime
+                .block_on(builder(&secret_key, relay_mode, 0)?.bind())
+                .map_err(|error| LiveError::Bind(Box::new(error)))?,
+        };
         Ok(Self {
             endpoint,
             runtime,
@@ -172,6 +188,33 @@ impl LiveNode {
     }
 }
 
+/// Returns the UDP port a node listens on when it is free: one of the 16384 dynamic ports,
+/// chosen by the node id, so it stays the same from one run to the next.
+#[must_use]
+pub fn stable_port(node: &NodeId) -> u16 {
+    let [first, second, ..] = *node.as_bytes();
+    FIRST_STABLE_PORT + u16::from_le_bytes([first, second]) % STABLE_PORTS
+}
+
+fn builder(secret_key: &SecretKey, relay_mode: RelayMode, port: u16) -> Result<Builder, LiveError> {
+    Builder::empty()
+        .secret_key(secret_key.clone())
+        .crypto_provider(Arc::new(mahi_tls::provider()))
+        .relay_mode(relay_mode)
+        .clear_ip_transports()
+        .bind_addr_with_opts(
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            BindOpts::default(),
+        )
+        .and_then(|builder| {
+            builder.bind_addr_with_opts(
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+                BindOpts::default().set_is_required(false),
+            )
+        })
+        .map_err(LiveError::SocketAddress)
+}
+
 fn outside_runtime() -> Result<(), LiveError> {
     if Handle::try_current().is_ok() {
         return Err(LiveError::InsideRuntime);
@@ -198,6 +241,30 @@ mod tests {
         let hex = "09".repeat(secret.len());
         assert!(!format!("{node:?}").contains(&hex));
         node.close().unwrap();
+    }
+
+    #[test]
+    fn a_node_listens_on_its_stable_port_unless_it_is_taken() {
+        let secret = [5_u8; 32];
+        let first = LiveNode::bind(&secret, Relays::Disabled).unwrap();
+        let port = stable_port(&first.node().unwrap());
+        assert!((FIRST_STABLE_PORT..=u16::MAX).contains(&port));
+        let ports = |node: &LiveNode| -> Vec<u16> {
+            node.address(Duration::ZERO)
+                .unwrap()
+                .direct()
+                .iter()
+                .map(SocketAddr::port)
+                .collect()
+        };
+        assert!(ports(&first).iter().all(|&used| used == port));
+        let second = LiveNode::bind(&secret, Relays::Disabled).unwrap();
+        assert!(ports(&second).iter().all(|&used| used != port));
+        second.close().unwrap();
+        first.close().unwrap();
+        let again = LiveNode::bind(&secret, Relays::Disabled).unwrap();
+        assert!(ports(&again).iter().all(|&used| used == port));
+        again.close().unwrap();
     }
 
     #[test]

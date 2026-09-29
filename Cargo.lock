@@ -3046,6 +3046,7 @@ dependencies = [
  "mahi-core",
  "mahi-crypto",
  "mahi-identity",
+ "mahi-live",
  "mahi-proxy",
  "mahi-sandbox",
  "mahi-schedule",

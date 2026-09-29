@@ -10,6 +10,7 @@ pub use endpoint::{
     LiveError,
     LiveNode,
     Relays,
+    stable_port,
 };
 pub use ticket::{
     AddressError,

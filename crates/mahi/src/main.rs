@@ -7,6 +7,7 @@ mod environment;
 mod hook;
 mod id;
 mod init;
+mod invite;
 mod network;
 mod profile;
 mod prompt;
@@ -85,6 +86,13 @@ fn main() {
                 eprint!("{done}");
                 0
             }
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
+        Command::Invite(command) => match invite::invite(&command, &environment) {
+            Ok(ticket) => print_out(&ticket),
             Err(error) => {
                 report(&error);
                 1

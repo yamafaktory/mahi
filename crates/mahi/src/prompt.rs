@@ -193,8 +193,40 @@ impl Drop for EchoOff<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct Script {
+        pub(crate) secrets: VecDeque<&'static str>,
+        pub(crate) answers: VecDeque<&'static str>,
+        pub(crate) said: Vec<String>,
+    }
+
+    impl Prompt for Script {
+        fn say(&mut self, line: &str) -> io::Result<()> {
+            self.said.push(line.to_owned());
+            Ok(())
+        }
+
+        fn secret(&mut self, _: &str) -> io::Result<SecretString> {
+            let secret = self
+                .secrets
+                .pop_front()
+                .expect("an unexpected passphrase question");
+            Ok(SecretString::from(secret.to_owned()))
+        }
+
+        fn answer(&mut self, _: &str) -> io::Result<String> {
+            Ok(self
+                .answers
+                .pop_front()
+                .expect("an unexpected question")
+                .to_owned())
+        }
+    }
 
     #[test]
     fn a_line_is_read_without_its_ending() {

@@ -56,12 +56,31 @@ pub(crate) enum Command {
     Threads,
     /// Prints your participant card: the line a thread's owner needs to invite you.
     Id,
+    /// Adds a teammate to a thread you own, from their participant card, and prints the
+    /// ticket they join with.
+    Invite(InviteCommand),
     /// Keeps the tokens agents sign in with, so no shell has to export them.
     #[command(subcommand)]
     Credential(CredentialCommand),
     /// Reports an agent event, with its details on standard input, to the mahi run that
     /// started the agent. Agent hooks call it; it always exits with 0.
     Hook(HookCommand),
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct InviteCommand {
+    /// The thread to invite to, as `mahi threads` lists it.
+    pub(crate) thread: ThreadId,
+    /// The teammate's participant card, as `mahi id` printed it; quoting it is optional.
+    #[arg(required = true, num_args = 1.., value_name = "CARD")]
+    card: Vec<String>,
+}
+
+impl InviteCommand {
+    /// Returns the card, its words joined by spaces.
+    pub(crate) fn card(&self) -> String {
+        self.card.join(" ")
+    }
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -246,6 +265,24 @@ mod tests {
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn invite_takes_a_card_quoted_or_as_separate_words() {
+        let thread = "7f3a9c2e00010203040506070809abff";
+        let card = "mahi-participant bob age1x 00 ssh-ed25519 AAAA bob@laptop";
+        let words: Vec<&str> = card.split(' ').collect();
+        for arguments in [
+            vec!["invite", thread, card],
+            [vec!["invite", thread], words.clone()].concat(),
+        ] {
+            let Command::Invite(invite) = parse(&arguments).unwrap().command else {
+                panic!("not an invite");
+            };
+            assert_eq!(invite.thread.to_string(), thread);
+            assert_eq!(invite.card(), card);
+        }
+        assert!(parse(&["invite", thread]).is_err());
     }
 
     #[test]
