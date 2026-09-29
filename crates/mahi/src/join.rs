@@ -64,6 +64,7 @@ use mahi_thread::{
     OwnerError,
     ThreadError,
     VerifiedMeta,
+    load_meta,
     record_meta,
     remember_owner,
     remembered_owner,
@@ -90,6 +91,7 @@ use crate::{
         Outcome,
         RunError,
     },
+    sync,
     terminal::RawMode,
     thread_lock::{
         LockError,
@@ -415,6 +417,18 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     if command.agent().is_some() {
         let _ = node.close();
         let lock = ThreadLock::acquire(&config, ticket.thread()).map_err(JoinError::Busy)?;
+        let me = meta
+            .participants()
+            .find(|listed| listed.node() == &own)
+            .map(|listed| listed.name().clone());
+        let meta = match me {
+            Some(me) => {
+                sync::fetch_thread(&store, environment, ticket.thread(), ticket.owner(), &me);
+                load_meta(&store, ticket.thread(), ticket.owner(), meta.generation())
+                    .map_err(JoinError::Pin)?
+            }
+            None => meta,
+        };
         let (participant, key) = unlock(&meta, own, &config)?;
         let joined = Joined {
             thread: ticket.thread(),

@@ -25,6 +25,7 @@ use std::{
 
 use mahi_core::{
     AgentSlot,
+    ParticipantName,
     RefKind,
     ThreadId,
     ThreadRef,
@@ -42,17 +43,25 @@ use mahi_store::{
     StoreError,
     Transport,
 };
+use mahi_thread::{
+    Accepted,
+    ParticipantKey,
+    ThreadError,
+    accept_fetched,
+};
 use thiserror::Error;
 
 use crate::{
     environment::Environment,
     remote::{
         self,
+        RemoteError,
         RemoteName,
         Visibility,
     },
 };
 
+const MAX_CAUSE_CHARS: usize = 300;
 const SYSTEM_KNOWN_HOSTS: [&str; 2] = ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"];
 
 /// Where and how a run pushes its thread refs, gathered before the agent starts.
@@ -62,6 +71,12 @@ pub(crate) struct SyncSetup {
     remote: SshRemote,
     visibility: Visibility,
     owns_meta: bool,
+    access: SshAccess,
+}
+
+/// What reaching a remote over SSH needs from the environment.
+#[derive(Debug, Clone)]
+struct SshAccess {
     known_hosts: Vec<PathBuf>,
     agent: PathBuf,
     user: String,
@@ -73,10 +88,8 @@ pub(crate) enum PushError {
     Open(#[source] StoreError),
     #[error("the push failed")]
     Push(#[source] StoreError),
-    #[error("cannot read known_hosts")]
-    KnownHosts(#[from] KnownHostsError),
-    #[error("cannot reach the remote")]
-    Ssh(#[from] SshError),
+    #[error(transparent)]
+    Connect(#[from] ConnectError),
 }
 
 /// Pushes a run's refs on its own thread each time it is poked, a burst of pokes being one
@@ -120,30 +133,15 @@ impl SyncSetup {
             .inspect_err(|error| crate::report_with("threads are not pushed", error))
             .ok()??;
         let (chosen, remote) = chosen;
-        let Some(agent) = environment.ssh_auth_sock.clone() else {
-            eprintln!("mahi: threads are not pushed: ssh-agent is not running");
-            return None;
-        };
-        let Some(user) = environment.user.clone() else {
-            eprintln!("mahi: threads are not pushed: USER is not set");
-            return None;
-        };
-        let mut known_hosts: Vec<PathBuf> = environment
-            .home
-            .iter()
-            .flat_map(|home| {
-                ["known_hosts", "known_hosts2"].map(|name| home.join(".ssh").join(name))
-            })
-            .collect();
-        known_hosts.extend(SYSTEM_KNOWN_HOSTS.iter().map(PathBuf::from));
+        let access = SshAccess::gather(environment)
+            .inspect_err(|missing| eprintln!("mahi: threads are not pushed: {missing}"))
+            .ok()?;
         Some(Self {
             name: chosen.name,
             remote,
             visibility: chosen.visibility,
             owns_meta,
-            known_hosts,
-            agent,
-            user,
+            access,
         })
     }
 
@@ -154,15 +152,175 @@ impl SyncSetup {
 
     /// Connects to the remote over SSH.
     pub(crate) fn connect(&self) -> Result<SshTransport, PushError> {
+        Ok(self.access.connect(&self.remote)?)
+    }
+}
+
+impl SshAccess {
+    fn gather(environment: &Environment) -> Result<Self, &'static str> {
+        let agent = environment
+            .ssh_auth_sock
+            .clone()
+            .ok_or("ssh-agent is not running")?;
+        let user = environment.user.clone().ok_or("USER is not set")?;
+        let mut known_hosts: Vec<PathBuf> = environment
+            .home
+            .iter()
+            .flat_map(|home| {
+                ["known_hosts", "known_hosts2"].map(|name| home.join(".ssh").join(name))
+            })
+            .collect();
+        known_hosts.extend(SYSTEM_KNOWN_HOSTS.iter().map(PathBuf::from));
+        Ok(Self {
+            known_hosts,
+            agent,
+            user,
+        })
+    }
+
+    fn connect(&self, remote: &SshRemote) -> Result<SshTransport, ConnectError> {
         let paths: Vec<&Path> = self.known_hosts.iter().map(PathBuf::as_path).collect();
         let known_hosts = KnownHosts::read(&paths)?;
         Ok(SshTransport::connect(
-            self.remote.clone(),
+            remote.clone(),
             &known_hosts,
             &self.agent,
             &self.user,
         )?)
     }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ConnectError {
+    #[error("cannot read known_hosts")]
+    KnownHosts(#[from] KnownHostsError),
+    #[error("cannot reach the remote")]
+    Ssh(#[from] SshError),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum FetchError {
+    #[error(transparent)]
+    Connect(#[from] ConnectError),
+    #[error("the fetch failed")]
+    Fetch(#[from] StoreError),
+    #[error("the fetched thread was not accepted")]
+    Accept(#[from] ThreadError),
+}
+
+/// Fetches `thread` from the clone's chosen remote, or else from `origin`, accepts what
+/// checks out for the participant `local` trusting `owner`, and tells the user what changed.
+/// A remote that is not chosen and not an SSH remote is skipped quietly, and a thread the
+/// remote does not have leaves everything as it was.
+pub(crate) fn fetch_thread(
+    store: &Store,
+    environment: &Environment,
+    thread: ThreadId,
+    owner: &ParticipantKey,
+    local: &ParticipantName,
+) {
+    let (name, url, chosen) = match fetch_source(store) {
+        Ok(Some(source)) => source,
+        Ok(None) => return,
+        Err(error) => {
+            crate::report_with("the thread is not fetched", &error);
+            return;
+        }
+    };
+    let access = match SshAccess::gather(environment) {
+        Ok(access) => access,
+        Err(missing) => {
+            if chosen {
+                eprintln!("mahi: the thread is not fetched: {missing}");
+            }
+            return;
+        }
+    };
+    eprintln!("mahi: fetching the thread from {name}");
+    let outcome = access
+        .connect(&url)
+        .map_err(FetchError::from)
+        .and_then(|transport| fetch_and_accept(store, transport, thread, owner, local));
+    if let Some(told) = fetch_report(&outcome, &name) {
+        eprint!("{told}");
+    }
+}
+
+/// Returns the remote to fetch from and its URL, and whether it was chosen: the chosen remote
+/// at the URL it pushes to, where its threads are, or else `origin` when it fetches over SSH.
+fn fetch_source(store: &Store) -> Result<Option<(RemoteName, SshRemote, bool)>, RemoteError> {
+    if let Some(chosen) = remote::sync_remote(store)? {
+        let url = remote::ssh_push_url(store, &chosen.name)?;
+        return Ok(Some((chosen.name, url, true)));
+    }
+    let Ok(origin) = "origin".parse::<RemoteName>() else {
+        return Ok(None);
+    };
+    Ok(remote::ssh_fetch_url(store, &origin)
+        .ok()
+        .map(|url| (origin, url, false)))
+}
+
+fn fetch_and_accept<T: Transport>(
+    store: &Store,
+    transport: T,
+    thread: ThreadId,
+    owner: &ParticipantKey,
+    local: &ParticipantName,
+) -> Result<Option<Accepted>, FetchError> {
+    store.fetch_thread(transport, thread, &AtomicBool::new(false))?;
+    match accept_fetched(store, thread, owner, local) {
+        Ok(accepted) => Ok(Some(accepted)),
+        Err(ThreadError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn fetch_report(
+    outcome: &Result<Option<Accepted>, FetchError>,
+    name: &RemoteName,
+) -> Option<String> {
+    let mut text = String::new();
+    match outcome {
+        Err(error) => {
+            let mut message = format!("mahi: cannot fetch the thread from {name}: {error}");
+            let mut cause = std::error::Error::source(error);
+            while let Some(source) = cause {
+                let said: String = source
+                    .to_string()
+                    .chars()
+                    .take(MAX_CAUSE_CHARS)
+                    .flat_map(char::escape_debug)
+                    .collect();
+                let _ = write!(message, ": {said}");
+                cause = source.source();
+            }
+            let _ = writeln!(text, "{message}");
+        }
+        Ok(None) => return None,
+        Ok(Some(accepted)) => {
+            match accepted.updated.len() {
+                0 => {}
+                1 => {
+                    let _ = writeln!(text, "mahi: fetched 1 ref of the thread from {name}");
+                }
+                count => {
+                    let _ = writeln!(text, "mahi: fetched {count} refs of the thread from {name}");
+                }
+            }
+            for thread_ref in &accepted.diverged {
+                let _ = writeln!(
+                    text,
+                    "mahi: {thread_ref} on {name} has a history that went apart from the local \
+                     one; the local one is kept"
+                );
+            }
+            for (thread_ref, error) in &accepted.refused {
+                let _ = writeln!(text, "mahi: refused {thread_ref} from {name}: {error}");
+            }
+        }
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 fn pushed_refs(
@@ -362,6 +520,99 @@ mod tests {
     }
 
     #[test]
+    fn what_a_fetch_changed_is_told_and_a_thread_not_there_says_nothing() {
+        let name: RemoteName = "origin".parse().unwrap();
+        let thread = ThreadId::random().unwrap();
+        let meta = ThreadRef::new(thread, RefKind::Meta);
+        assert_eq!(fetch_report(&Ok(None), &name), None);
+        assert_eq!(fetch_report(&Ok(Some(Accepted::default())), &name), None);
+        let accepted = Accepted {
+            updated: vec![meta.clone()],
+            diverged: vec![meta.clone()],
+            refused: vec![(meta, StoreError::Interrupted)],
+            ..Accepted::default()
+        };
+        let told = fetch_report(&Ok(Some(accepted)), &name).unwrap();
+        assert!(
+            told.starts_with("mahi: fetched 1 ref of the thread from origin\n"),
+            "{told}"
+        );
+        assert!(told.contains("went apart"), "{told}");
+        let hostile = fetch_report(
+            &Err(FetchError::Fetch(StoreError::PushFailed(
+                "\x1b[2Jgone".to_owned(),
+            ))),
+            &name,
+        )
+        .unwrap();
+        assert!(!hostile.contains('\x1b'), "{hostile}");
+        assert!(told.contains("refused"), "{told}");
+        let failed = fetch_report(&Err(FetchError::Fetch(StoreError::Interrupted)), &name).unwrap();
+        assert_eq!(
+            failed,
+            "mahi: cannot fetch the thread from origin: the fetch failed: interrupted\n"
+        );
+    }
+
+    #[test]
+    fn the_chosen_remote_is_fetched_where_it_pushes_or_else_an_ssh_origin() {
+        let store_with = |remotes: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            gix::init(dir.path()).unwrap();
+            let config = dir.path().join(".git").join("config");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(remotes);
+            std::fs::write(&config, text).unwrap();
+            let store = Store::open(dir.path()).unwrap();
+            (dir, store)
+        };
+        let source = |store: &Store| {
+            fetch_source(store).map(|found| {
+                found.map(|(name, url, chosen)| (name.to_string(), url.to_string(), chosen))
+            })
+        };
+        let (_dir, store) = store_with(
+            "[remote \"origin\"]\n\turl = https://example.org/r.git\n\tpushurl = git@example.org:r.git\n",
+        );
+        assert!(matches!(source(&store), Ok(None)));
+        let (_dir, store) = store_with("[remote \"origin\"]\n\turl = git@example.org:r.git\n");
+        assert_eq!(
+            source(&store).unwrap(),
+            Some((
+                "origin".to_owned(),
+                "git@example.org:r.git".to_owned(),
+                false
+            ))
+        );
+        let (_dir, store) = store_with(
+            "[remote \"mirror\"]\n\turl = https://example.org/r.git\n\tpushurl = git@example.org:r.git\n",
+        );
+        assert!(matches!(source(&store), Ok(None)));
+        std::fs::create_dir_all(store.common_dir().join("mahi").join("sync")).unwrap();
+        std::fs::write(
+            store.common_dir().join("mahi").join("sync").join("remote"),
+            "private mirror\n",
+        )
+        .unwrap();
+        assert_eq!(
+            source(&store).unwrap(),
+            Some((
+                "mirror".to_owned(),
+                "git@example.org:r.git".to_owned(),
+                true
+            ))
+        );
+        let (_dir, store) = store_with("[remote \"web\"]\n\turl = https://example.org/r.git\n");
+        std::fs::create_dir_all(store.common_dir().join("mahi").join("sync")).unwrap();
+        std::fs::write(
+            store.common_dir().join("mahi").join("sync").join("remote"),
+            "public web\n",
+        )
+        .unwrap();
+        assert!(matches!(source(&store), Err(RemoteError::NotSsh { .. })));
+    }
+
+    #[test]
     fn what_the_last_push_did_is_told_briefly() {
         let name: RemoteName = "origin".parse().unwrap();
         let thread_ref = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
@@ -411,6 +662,11 @@ mod git_tests {
         client::blocking_io::file,
     };
     use mahi_store::EntryKind;
+    use ssh_key::{
+        Algorithm,
+        PrivateKey,
+        rand_core::OsRng,
+    };
 
     use super::*;
 
@@ -458,12 +714,12 @@ mod git_tests {
         );
 
         let unreachable = Pusher::start(local.clone(), vec![meta.clone()], || {
-            Err::<file::SpawnProcessOnDemand, _>(PushError::Ssh(SshError::Timeout(
-                "example.org".to_owned(),
+            Err::<file::SpawnProcessOnDemand, _>(PushError::Connect(ConnectError::Ssh(
+                SshError::Timeout("example.org".to_owned()),
             )))
         });
         let failed = unreachable.finish();
-        assert!(matches!(failed.last, Some(Err(PushError::Ssh(_)))));
+        assert!(matches!(failed.last, Some(Err(PushError::Connect(_)))));
         let target = remote.clone();
         let stopped = Pusher::start(local.clone(), vec![meta.clone()], move || {
             Ok(
@@ -482,5 +738,54 @@ mod git_tests {
             git(&remote, &["rev-parse", &meta.to_string()]),
             second.to_string()
         );
+    }
+
+    #[test]
+    fn a_thread_pushed_by_its_owner_is_fetched_and_accepted_in_another_clone() {
+        let (_owner_dir, owner_store) = crate::session::tests::repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let owner = ParticipantKey::from_public_key(signer.public_key()).unwrap();
+        let started = crate::session::tests::start_with(&owner_store, &signer).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]);
+        let connect = || {
+            file::connect(remote.as_os_str().as_encoded_bytes(), Protocol::V1, false)
+                .unwrap_or_else(|never| match never {})
+        };
+        let meta = ThreadRef::new(started.thread, RefKind::Meta);
+        owner_store
+            .push_refs(
+                connect(),
+                &[meta.clone(), started.snapshots.clone()],
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let (_clone_dir, clone) = crate::session::tests::repository_on_main();
+        let bob = ParticipantName::new("bob").unwrap();
+        let accepted = fetch_and_accept(&clone, connect(), started.thread, &owner, &bob)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.updated, [meta.clone(), started.snapshots.clone()]);
+        assert_eq!(clone.head(&meta).unwrap(), owner_store.head(&meta).unwrap());
+        let again = fetch_and_accept(&clone, connect(), started.thread, &owner, &bob)
+            .unwrap()
+            .unwrap();
+        assert!(again.updated.is_empty());
+        let elsewhere = ThreadId::random().unwrap();
+        assert!(
+            fetch_and_accept(&clone, connect(), elsewhere, &owner, &bob)
+                .unwrap()
+                .is_none()
+        );
+        let impostor = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let wrong = ParticipantKey::from_public_key(impostor.public_key()).unwrap();
+        let (_other_dir, other) = crate::session::tests::repository_on_main();
+        assert!(matches!(
+            fetch_and_accept(&other, connect(), started.thread, &wrong, &bob),
+            Err(FetchError::Accept(ThreadError::FetchedMetaRefused { .. }))
+        ));
+        assert_eq!(other.head(&meta).unwrap(), None);
     }
 }

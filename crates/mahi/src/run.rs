@@ -164,6 +164,7 @@ use crate::{
         Started,
     },
     sync::{
+        self,
         PushPoker,
         Pusher,
         SyncSetup,
@@ -452,8 +453,24 @@ pub(crate) fn resume(
     )?;
     prepared.live = live_setup(environment, &config, owner.clone(), bootstrap)?;
     prepared.sync = SyncSetup::gather(&prepared.store, environment, owns_meta);
-    load_meta(&prepared.store, command.thread, &owner, 0)
+    let current = load_meta(&prepared.store, command.thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
+    if let Some(me) = current.participants().find(|listed| listed.key() == &own) {
+        sync::fetch_thread(
+            &prepared.store,
+            environment,
+            command.thread,
+            &owner,
+            me.name(),
+        );
+        load_meta(
+            &prepared.store,
+            command.thread,
+            &owner,
+            current.generation(),
+        )
+        .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
+    }
     let passphrase = TerminalPrompt::open()
         .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
         .map_err(RunError::Terminal)?;

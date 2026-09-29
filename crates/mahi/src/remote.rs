@@ -65,7 +65,7 @@ pub(crate) enum RemoteError {
     Store(#[from] StoreError),
     #[error("this repository has no remote called {0}")]
     NoSuchRemote(RemoteName),
-    #[error("remote {name} does not push over ssh, and mahi pushes over ssh only")]
+    #[error("remote {name} is not an ssh remote, and mahi reaches remotes over ssh only")]
     NotSsh {
         name: RemoteName,
         #[source]
@@ -167,10 +167,17 @@ fn describe(setting: &SyncRemote, url: &SshRemote) -> String {
 
 /// Returns the SSH URL the remote `name` pushes to.
 pub(crate) fn ssh_push_url(store: &Store, name: &RemoteName) -> Result<SshRemote, RemoteError> {
-    let push = store
-        .remote_push_url(name.as_str())?
-        .ok_or_else(|| RemoteError::NoSuchRemote(name.clone()))?;
-    SshRemote::parse(&push).map_err(|source| RemoteError::NotSsh {
+    ssh_url(name, store.remote_url(name.as_str(), true)?)
+}
+
+/// Returns the SSH URL the remote `name` fetches from.
+pub(crate) fn ssh_fetch_url(store: &Store, name: &RemoteName) -> Result<SshRemote, RemoteError> {
+    ssh_url(name, store.remote_url(name.as_str(), false)?)
+}
+
+fn ssh_url(name: &RemoteName, url: Option<String>) -> Result<SshRemote, RemoteError> {
+    let url = url.ok_or_else(|| RemoteError::NoSuchRemote(name.clone()))?;
+    SshRemote::parse(&url).map_err(|source| RemoteError::NotSsh {
         name: name.clone(),
         source,
     })

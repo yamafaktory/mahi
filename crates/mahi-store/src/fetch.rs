@@ -45,7 +45,8 @@ pub const MAX_HISTORY_WALK: usize = 1 << 20;
 impl Store {
     /// Fetches `thread`'s refs from the remote `transport` reaches into
     /// `refs/mahi/fetched/<thread-id>/`, first removing what an earlier fetch left there, so the
-    /// fetched refs mirror the remote's. Thread refs themselves are not touched.
+    /// fetched refs mirror the remote's; a remote without the thread leaves none. Thread refs
+    /// themselves are not touched.
     ///
     /// # Errors
     ///
@@ -66,10 +67,14 @@ impl Store {
             .with_fetch_tags(Tags::None)
             .with_refspecs([spec.as_str()], Direction::Fetch)
             .map_err(gix::Error::from_error)?;
-        remote
+        let prepared = remote
             .to_connection_with_transport(transport)
             .prepare_fetch(gix::progress::Discard, ref_map::Options::default())
-            .map_err(gix::Error::from_error)?
+            .map_err(gix::Error::from_error)?;
+        if prepared.ref_map().mappings.is_empty() {
+            return Ok(());
+        }
+        prepared
             .receive(gix::progress::Discard, interrupt)
             .map_err(gix::Error::from_error)?;
         Ok(())

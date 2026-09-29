@@ -286,16 +286,17 @@ impl Store {
         Ok(refs)
     }
 
-    /// Returns the URL the git remote called `name` pushes to, after git's `insteadOf` and
-    /// `pushInsteadOf` rewriting: its push URL, or else its URL. Returns `None` if the
-    /// repository has no such remote, or it has no URL.
+    /// Returns the URL the git remote called `name` pushes to when `push` is set, or else
+    /// fetches from, after git's `insteadOf` and `pushInsteadOf` rewriting: for a push, its
+    /// push URL or else its URL. Returns `None` if the repository has no such remote, or it has
+    /// no such URL.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidRemoteName`] if `name` is not a plain remote name,
     /// [`StoreError::NonUtf8Url`] if the URL is not UTF-8, or [`StoreError::Git`] if the
     /// remote's configuration cannot be read.
-    pub fn remote_push_url(&self, name: &str) -> Result<Option<String>, StoreError> {
+    pub fn remote_url(&self, name: &str, push: bool) -> Result<Option<String>, StoreError> {
         let plain = !name.is_empty()
             && !name.starts_with(['-', '.'])
             && name
@@ -308,7 +309,12 @@ impl Store {
             return Ok(None);
         };
         let remote = remote.map_err(gix::Error::from_error)?;
-        let Some(url) = remote.url(gix::remote::Direction::Push) else {
+        let direction = if push {
+            gix::remote::Direction::Push
+        } else {
+            gix::remote::Direction::Fetch
+        };
+        let Some(url) = remote.url(direction) else {
             return Ok(None);
         };
         let bytes = url.to_bstring();
@@ -1054,7 +1060,12 @@ mod tests {
         );
         std::fs::write(&config, text).unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let url = |name| store.remote_push_url(name).unwrap();
+        let url = |name| store.remote_url(name, true).unwrap();
+        assert_eq!(
+            store.remote_url("split", false).unwrap().as_deref(),
+            Some("https://example.org/r.git")
+        );
+        assert_eq!(store.remote_url("pushonly", false).unwrap(), None);
         assert_eq!(
             url("origin").as_deref(),
             Some("git@github.com:org/repo.git")
@@ -1067,7 +1078,7 @@ mod tests {
         for name in ["", "-x", ".x", "git@host:repo", "a/b", "https://x"] {
             assert!(
                 matches!(
-                    store.remote_push_url(name),
+                    store.remote_url(name, true),
                     Err(StoreError::InvalidRemoteName(_))
                 ),
                 "{name}"

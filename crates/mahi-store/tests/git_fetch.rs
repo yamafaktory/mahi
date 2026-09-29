@@ -88,6 +88,9 @@ mod tests {
         source.remove(&snapshots, snapshot).unwrap();
         let next = commit(&source, &meta, Some(meta_commit), "meta 2");
         fetch(&target);
-        assert_eq!(target.fetched_refs(thread).unwrap(), [(meta, next)]);
+        assert_eq!(target.fetched_refs(thread).unwrap(), [(meta.clone(), next)]);
+        source.remove(&meta, next).unwrap();
+        fetch(&target);
+        assert!(target.fetched_refs(thread).unwrap().is_empty());
     }
 }
