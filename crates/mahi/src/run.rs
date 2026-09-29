@@ -156,11 +156,17 @@ use crate::{
         Recorder,
         Target,
     },
+    remote::RemoteName,
     session::{
         self,
         ResumeError,
         StartError,
         Started,
+    },
+    sync::{
+        PushPoker,
+        Pusher,
+        SyncSetup,
     },
     terminal::{
         self,
@@ -358,6 +364,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         credentials,
     )?;
     prepared.live = live;
+    prepared.sync = SyncSetup::gather(&prepared.store, environment, true);
     let agent_name = session::agent_from(Path::new(command.agent()));
     let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
@@ -419,8 +426,9 @@ pub(crate) fn resume(
     let participant = session::participant_from(environment.user.as_deref())
         .map_err(RunError::ParticipantName)?;
     let store = Store::discover(&cwd)?;
-    let owner = session::thread_owner(&store, command.thread, own)
+    let owner = session::thread_owner(&store, command.thread, own.clone())
         .map_err(|error| RunError::ThreadOwner(command.thread, error))?;
+    let owns_meta = owner == own;
     let bootstrap: Vec<HostAddress> = live::remembered_host(&store, command.thread)
         .into_iter()
         .collect();
@@ -443,6 +451,7 @@ pub(crate) fn resume(
         credentials,
     )?;
     prepared.live = live_setup(environment, &config, owner.clone(), bootstrap)?;
+    prepared.sync = SyncSetup::gather(&prepared.store, environment, owns_meta);
     load_meta(&prepared.store, command.thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
     let passphrase = TerminalPrompt::open()
@@ -549,6 +558,7 @@ pub(crate) fn join_run(
         joined.owner.clone(),
         vec![joined.host.clone()],
     )?;
+    prepared.sync = SyncSetup::gather(&prepared.store, environment, false);
     let agent_name = session::agent_from(Path::new(program));
     let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
     let _lock = joined.lock;
@@ -687,6 +697,7 @@ struct Prepared {
     globals: GlobalPatterns,
     credentials: Vec<Handed>,
     live: Option<LiveSetup>,
+    sync: Option<SyncSetup>,
 }
 
 impl Prepared {
@@ -740,6 +751,7 @@ impl Prepared {
             globals: environment.git_patterns(),
             credentials,
             live: None,
+            sync: None,
         })
     }
 
@@ -800,9 +812,31 @@ impl Prepared {
                 return Err(error);
             }
         };
-        let (recorder, turns) =
-            start_background(&mut started, &self.git_dir, self.globals, self.hooks);
-        finish_run(child, raw, termination, recorder, turns, proxy, live)
+        let pusher = self.sync.map(|setup| {
+            let refs = setup.refs(started.thread, &started.slot);
+            let name = setup.name.clone();
+            let pusher = Pusher::start(self.git_dir.clone(), refs, move || setup.connect());
+            (pusher, name)
+        });
+        let (recorder, turns) = start_background(
+            &mut started,
+            &self.git_dir,
+            self.globals,
+            self.hooks,
+            pusher.as_ref().map(|(pusher, _)| pusher.poker()),
+        );
+        finish_run(
+            child,
+            raw,
+            termination,
+            Background {
+                recorder,
+                turns,
+                pusher,
+            },
+            proxy,
+            live,
+        )
     }
 }
 
@@ -811,6 +845,7 @@ fn start_background(
     git_dir: &Path,
     globals: GlobalPatterns,
     hooks: UnixListener,
+    pushes: Option<PushPoker>,
 ) -> (Option<Recorder>, Option<TurnWorker>) {
     let recorder = started.first_snapshot.take().map(|first| {
         Recorder::start(
@@ -837,13 +872,23 @@ fn start_background(
         let closing = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&closing);
         thread::spawn(move || hook::serve(&hooks, &flag, &messages));
-        let worker = thread::spawn(move || turns::record(&transcript, &inputs, poker.as_ref()));
+        let worker = thread::spawn(move || {
+            turns::record(&transcript, &inputs, poker.as_ref(), pushes.as_ref())
+        });
         (closing, worker)
     });
     (recorder, turns)
 }
 
 type TurnWorker = (Arc<AtomicBool>, JoinHandle<Summary>);
+
+/// What runs beside the agent and is finished after it: the snapshot recorder, the transcript
+/// and the pusher.
+struct Background {
+    recorder: Option<Recorder>,
+    turns: Option<TurnWorker>,
+    pusher: Option<(Pusher, RemoteName)>,
+}
 
 fn finish_turns(turns: Option<TurnWorker>) {
     let Some((closing, worker)) = turns else {
@@ -869,11 +914,15 @@ fn finish_run(
     child: PtyChild,
     raw: Option<RawMode>,
     termination: TerminationSignals,
-    recorder: Option<Recorder>,
-    turns: Option<TurnWorker>,
+    background: Background,
     proxy: Option<Running>,
     live: Option<LiveHost>,
 ) -> Result<Outcome, RunError> {
+    let Background {
+        recorder,
+        turns,
+        pusher,
+    } = background;
     let (code, received) = supervise(child, raw, termination, live.as_ref().map(LiveHost::tap));
     if let Some(live) = live {
         live.stop();
@@ -881,9 +930,14 @@ fn finish_run(
     if matches!(code, Ok(Outcome::Stopped(_))) {
         while received.try_recv().is_ok() {}
     }
-    let abandon = recorder.as_ref().map(Recorder::abandon_flag);
+    let abandon: Vec<Arc<AtomicBool>> = recorder
+        .as_ref()
+        .map(Recorder::abandon_flag)
+        .into_iter()
+        .chain(pusher.as_ref().map(|(pusher, _)| pusher.interrupt_flag()))
+        .collect();
     let (caught, stopped) = mpsc::channel();
-    thread::spawn(move || stop_on_signal(&received, abandon.as_deref(), &caught));
+    thread::spawn(move || stop_on_signal(&received, &abandon, &caught));
     finish_turns(turns);
     for error in proxy.into_iter().flat_map(Running::stopped) {
         eprintln!("mahi: the proxy stopped serving the agent: {error}");
@@ -897,6 +951,11 @@ fn finish_run(
         }
         Some(Err(error)) => crate::report(&error),
         _ => {}
+    }
+    if let Some((pusher, name)) = pusher
+        && let Some(told) = pusher.finish().report(&name)
+    {
+        eprint!("{told}");
     }
     match stopped.try_recv() {
         Ok(signal) => Ok(Outcome::Stopped(signal)),
@@ -924,7 +983,7 @@ fn supervise(
 
 fn stop_on_signal(
     received: &Receiver<Event>,
-    abandon: Option<&AtomicBool>,
+    abandon: &[Arc<AtomicBool>],
     caught: &mpsc::Sender<Termination>,
 ) {
     let mut stopping = false;
@@ -932,11 +991,13 @@ fn stop_on_signal(
         let Event::Stopped(signal) = event else {
             continue;
         };
-        let Some(abandon) = abandon.filter(|_| !stopping) else {
+        if stopping || abandon.is_empty() {
             stop_now(signal);
-        };
+        }
         let _ = caught.send(signal);
-        abandon.store(true, Ordering::SeqCst);
+        for flag in abandon {
+            flag.store(true, Ordering::SeqCst);
+        }
         stopping = true;
     }
 }

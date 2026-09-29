@@ -17,6 +17,7 @@ pub use fetch::{
 pub use gix::{
     ObjectId,
     objs::tree::EntryKind,
+    protocol::transport::client::blocking_io::Transport,
 };
 pub use push::Pushed;
 pub use snapshot::{

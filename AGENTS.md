@@ -143,7 +143,8 @@ Performance and security are both critical. Neither is traded away for convenien
 - In tests, `unwrap()` and `expect()` are allowed.
 - A test that needs an external tool (bubblewrap, a git remote, network) must fail if the tool
   is missing. It must not pass by skipping. Put it behind a nextest filter or a separate
-  recipe.
+  recipe. Tests that run the `git` program go in a `tests/git_*.rs` file or a `git_tests`
+  module: `just test` leaves them out and `just test-git` runs them.
 
 ## Commits
 

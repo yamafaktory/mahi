@@ -25,10 +25,13 @@ use mahi_thread::{
 };
 use thiserror::Error;
 
-use crate::hook::{
-    Delivery,
-    HookKind,
-    HookMessage,
+use crate::{
+    hook::{
+        Delivery,
+        HookKind,
+        HookMessage,
+    },
+    sync::PushPoker,
 };
 
 const EVENT_OVERHEAD: usize = 64;
@@ -65,6 +68,7 @@ pub(crate) fn record(
     transcript: &Transcript,
     inputs: &Receiver<Delivery>,
     poker: Option<&Poker>,
+    pushes: Option<&PushPoker>,
 ) -> Summary {
     let store = match Store::open(&transcript.git_dir) {
         Ok(store) => store,
@@ -91,8 +95,8 @@ pub(crate) fn record(
         }
         let ends = message.kind == HookKind::TurnEnd;
         turns.push(&message);
-        if ends {
-            turns.seal_or_note(&store, transcript);
+        if ends && turns.seal_or_note(&store, transcript) {
+            pushes.inspect(|pushes| pushes.poke());
         }
     }
     turns.seal_or_note(&store, transcript);
@@ -142,15 +146,19 @@ impl Turns {
         }
     }
 
-    fn seal_or_note(&mut self, store: &Store, transcript: &Transcript) {
-        if let Err(error) = self.seal(store, transcript) {
-            self.summary.error.get_or_insert(error);
+    fn seal_or_note(&mut self, store: &Store, transcript: &Transcript) -> bool {
+        match self.seal(store, transcript) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                self.summary.error.get_or_insert(error);
+                false
+            }
         }
     }
 
-    fn seal(&mut self, store: &Store, transcript: &Transcript) -> Result<(), TurnError> {
+    fn seal(&mut self, store: &Store, transcript: &Transcript) -> Result<bool, TurnError> {
         if self.events.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         self.bytes = 0;
         let record = TurnRecord::new(self.next_turn, mem::take(&mut self.events))?;
@@ -165,7 +173,7 @@ impl Turns {
         self.tip = Some(tip);
         self.next_turn += 1;
         self.summary.turns += 1;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -232,7 +240,7 @@ mod tests {
         ] {
             sender.send(input).unwrap();
         }
-        let summary = record(&transcript, &inputs, None);
+        let summary = record(&transcript, &inputs, None, None);
         assert!(summary.error.is_none(), "{:?}", summary.error);
         assert_eq!((summary.turns, summary.dropped), (2, 1));
         let turns = read_turns(
@@ -269,13 +277,13 @@ mod tests {
         sender.send(hook(HookKind::Prompt, b"one")).unwrap();
         sender.send(hook(HookKind::TurnEnd, b"")).unwrap();
         sender.send(Delivery::End { dropped: 0 }).unwrap();
-        assert!(record(&first, &inputs, None).error.is_none());
+        assert!(record(&first, &inputs, None, None).error.is_none());
         let tip = read_tip(&store, &first.key, first.thread, &first.slot).unwrap();
         let resumed = Transcript { tip, ..first };
         let (sender, inputs) = mpsc::channel();
         sender.send(hook(HookKind::Prompt, b"two")).unwrap();
         sender.send(Delivery::End { dropped: 0 }).unwrap();
-        let summary = record(&resumed, &inputs, None);
+        let summary = record(&resumed, &inputs, None, None);
         assert!(summary.error.is_none(), "{:?}", summary.error);
         let turns = read_turns(&store, &resumed.key, resumed.thread, &resumed.slot, 10).unwrap();
         assert_eq!(turns.len(), 2);
@@ -308,7 +316,11 @@ mod tests {
         let (sender, inputs) = mpsc::channel();
         sender.send(hook(HookKind::Tool, b"")).unwrap();
         sender.send(Delivery::End { dropped: 0 }).unwrap();
-        assert!(record(&transcript, &inputs, Some(&poker)).error.is_none());
+        assert!(
+            record(&transcript, &inputs, Some(&poker), None)
+                .error
+                .is_none()
+        );
         assert_eq!(scheduler.wait(), Trigger::Poked);
     }
 

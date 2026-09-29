@@ -16,7 +16,7 @@ test *args:
     cargo nextest run --workspace --locked --no-tests=pass {{args}}
 
 test-git *args:
-    cargo nextest run --workspace --locked --ignore-default-filter -E 'binary(/^git_/)' {{args}}
+    cargo nextest run --workspace --locked --ignore-default-filter -E 'binary(/^git_/) | test(/(^|::)git_tests::/)' {{args}}
 
 deny:
     cargo deny --locked check

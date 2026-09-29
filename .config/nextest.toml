@@ -1,5 +1,5 @@
 [profile.default]
-default-filter = "not binary(/^git_/)"
+default-filter = "not (binary(/^git_/) | test(/(^|::)git_tests::/))"
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 [profile.ci]

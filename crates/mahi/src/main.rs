@@ -17,6 +17,7 @@ mod recorder;
 mod remote;
 mod run;
 mod session;
+mod sync;
 mod terminal;
 mod thread_lock;
 mod threads;
@@ -166,7 +167,15 @@ fn print_out(text: &str) -> i32 {
 }
 
 fn report(error: &dyn Error) {
-    let mut message = format!("mahi: {error}");
+    report_message(format!("mahi: {error}"), error);
+}
+
+/// Reports `error` and its causes after `context`.
+fn report_with(context: &str, error: &dyn Error) {
+    report_message(format!("mahi: {context}: {error}"), error);
+}
+
+fn report_message(mut message: String, error: &dyn Error) {
     let mut source = error.source();
     while let Some(cause) = source {
         let _ = write!(message, ": {cause}");
