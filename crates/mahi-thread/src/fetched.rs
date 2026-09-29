@@ -333,14 +333,23 @@ mod tests {
         let repo = gix::open(setup.store.common_dir()).unwrap();
         let root = commit(&setup, None, "f", b"root");
         let side = commit(&setup, None, "f", b"side");
+        let signature = gix::actor::Signature {
+            name: "test".into(),
+            email: "test@example.org".into(),
+            time: gix::date::Time::default(),
+        };
         let merged = repo
-            .new_commit(
-                "merge",
-                setup.store.commit_tree(root).unwrap(),
-                [root, side],
-            )
+            .write_object(&gix::objs::Commit {
+                tree: setup.store.commit_tree(root).unwrap(),
+                parents: [root, side].into_iter().collect(),
+                author: signature.clone(),
+                committer: signature,
+                encoding: None,
+                message: "merge".into(),
+                extra_headers: Vec::new(),
+            })
             .unwrap()
-            .id;
+            .detach();
         let child = commit(&setup, Some(merged), "f", b"child");
         set_ref(&setup, &merge.to_string(), root);
         stage(&setup, &merge, child);
