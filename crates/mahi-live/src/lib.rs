@@ -3,6 +3,7 @@
 
 mod endpoint;
 mod frame;
+mod gossip;
 mod meta;
 #[cfg(test)]
 mod testing;
@@ -25,9 +26,13 @@ pub use frame::{
     MAX_SCREEN_PARTS,
     Received,
 };
+pub use gossip::{
+    LiveTopic,
+    RECEIVED_FRAMES,
+};
 pub use meta::{
     META_ALPN,
-    MetaSource,
+    Peers,
 };
 pub use ticket::{
     AddressError,

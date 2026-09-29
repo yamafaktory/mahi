@@ -14,6 +14,7 @@ use iroh::{
     Endpoint,
     RelayMode,
     SecretKey,
+    address_lookup::memory::MemoryLookup,
     endpoint::{
         BindError,
         BindOpts,
@@ -22,6 +23,10 @@ use iroh::{
         InvalidSocketAddr,
     },
     protocol::Router,
+};
+use iroh_gossip::{
+    Gossip,
+    proto::TopicId,
 };
 use mahi_core::ThreadId;
 use mahi_thread::{
@@ -39,7 +44,12 @@ use crate::{
     AddressError,
     HostAddress,
     MAX_DIRECT_ADDRESSES,
-    MetaSource,
+    Peers,
+    gossip::{
+        GossipGate,
+        LiveTopic,
+        MAX_GOSSIP_MESSAGE_BYTES,
+    },
     is_reachable,
     meta::{
         self,
@@ -69,6 +79,8 @@ pub enum Relays {
 /// It blocks on its own runtime, so it is used, and dropped, outside any async runtime.
 pub struct LiveNode {
     router: Option<Router>,
+    gossip: Option<Gossip>,
+    addresses: MemoryLookup,
     endpoint: Endpoint,
     runtime: Option<Runtime>,
     relays: Relays,
@@ -121,6 +133,18 @@ pub enum LiveError {
     /// The host did not answer in time.
     #[error("the host did not answer in time")]
     TimedOut,
+    /// The live topic could not be joined or used.
+    #[error("the live topic failed")]
+    Gossip(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The live topic was closed.
+    #[error("the live topic is closed")]
+    TopicClosed,
+    /// A frame to broadcast is larger than a frame can be.
+    #[error("the frame is too large to broadcast")]
+    FrameTooLarge,
+    /// This node was bound without [`Peers`], so it cannot join a live topic.
+    #[error("this live node was not bound to join a live topic")]
+    NotLive,
 }
 
 impl fmt::Debug for LiveNode {
@@ -147,16 +171,16 @@ impl LiveNode {
         Self::bind_with(secret, relays, None)
     }
 
-    /// Binds an endpoint like [`LiveNode::bind`] that also hosts: it serves `meta` from
-    /// `source` to the nodes `source` accepts.
+    /// Binds an endpoint like [`LiveNode::bind`] that can join live topics, admitting the
+    /// nodes `peers` admits, and serves `meta` from `peers` to the nodes it accepts.
     ///
     /// # Errors
     ///
     /// Returns the errors of [`LiveNode::bind`].
-    pub fn bind_host(
+    pub fn bind_live(
         secret: &[u8; 32],
         relays: Relays,
-        source: Arc<dyn MetaSource>,
+        source: Arc<dyn Peers>,
     ) -> Result<Self, LiveError> {
         Self::bind_with(secret, relays, Some(source))
     }
@@ -164,7 +188,7 @@ impl LiveNode {
     fn bind_with(
         secret: &[u8; 32],
         relays: Relays,
-        source: Option<Arc<dyn MetaSource>>,
+        source: Option<Arc<dyn Peers>>,
     ) -> Result<Self, LiveError> {
         outside_runtime()?;
         let runtime = runtime::Builder::new_multi_thread()
@@ -179,23 +203,41 @@ impl LiveNode {
         let secret_key = SecretKey::from_bytes(secret);
         let port = NodeId::from_bytes(*secret_key.public().as_bytes())
             .map_or(0, |node| stable_port(&node));
-        let stable = builder(&secret_key, relay_mode.clone(), port)?;
+        let addresses = MemoryLookup::new();
+        let stable = builder(&secret_key, relay_mode.clone(), port, &addresses)?;
         let endpoint = match runtime.block_on(stable.bind()) {
             Ok(endpoint) => endpoint,
             Err(_) => runtime
-                .block_on(builder(&secret_key, relay_mode, 0)?.bind())
+                .block_on(builder(&secret_key, relay_mode, 0, &addresses)?.bind())
                 .map_err(|error| LiveError::Bind(Box::new(error)))?,
         };
-        let router = source.map(|source| {
-            let endpoint = endpoint.clone();
-            runtime.block_on(async move {
-                Router::builder(endpoint)
-                    .accept(META_ALPN, MetaHandler::new(source))
-                    .spawn()
-            })
-        });
+        let (router, gossip) = match source {
+            Some(peers) => {
+                let endpoint = endpoint.clone();
+                let (router, gossip) = runtime.block_on(async move {
+                    let gossip = Gossip::builder()
+                        .max_message_size(MAX_GOSSIP_MESSAGE_BYTES)
+                        .spawn(endpoint.clone());
+                    let router = Router::builder(endpoint)
+                        .accept(META_ALPN, MetaHandler::new(Arc::clone(&peers)))
+                        .accept(
+                            iroh_gossip::ALPN,
+                            GossipGate {
+                                gossip: gossip.clone(),
+                                peers,
+                            },
+                        )
+                        .spawn();
+                    (router, gossip)
+                });
+                (Some(router), Some(gossip))
+            }
+            None => (None, None),
+        };
         Ok(Self {
             router,
+            gossip,
+            addresses,
             endpoint,
             runtime: Some(runtime),
             relays,
@@ -239,6 +281,46 @@ impl LiveNode {
                 .copied()
                 .collect(),
         )?)
+    }
+
+    /// Joins the live topic `topic`, reaching the other nodes through `bootstrap`, whose
+    /// addresses it remembers. With `wait`, it waits that long for a first neighbour.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiveError::NotLive`] if the node was not bound with [`LiveNode::bind_live`],
+    /// [`LiveError::TimedOut`] if no neighbour came in time, or [`LiveError::Gossip`] if the
+    /// topic cannot be joined.
+    pub fn join(
+        &self,
+        topic: [u8; 32],
+        bootstrap: &[HostAddress],
+        wait: Option<Duration>,
+    ) -> Result<LiveTopic, LiveError> {
+        outside_runtime()?;
+        let gossip = self.gossip.as_ref().ok_or(LiveError::NotLive)?;
+        let mut ids = Vec::with_capacity(bootstrap.len());
+        for host in bootstrap {
+            let address = meta::endpoint_address(host)?;
+            ids.push(address.id);
+            self.addresses.set_endpoint_info(address);
+        }
+        let runtime = self.runtime()?;
+        let joined = runtime.block_on(async {
+            let mut subscription = gossip
+                .subscribe(TopicId::from_bytes(topic), ids)
+                .await
+                .map_err(|error| LiveError::Gossip(Box::new(error)))?;
+            if let Some(wait) = wait {
+                tokio::time::timeout(wait, subscription.joined())
+                    .await
+                    .map_err(|_| LiveError::TimedOut)?
+                    .map_err(|error| LiveError::Gossip(Box::new(error)))?;
+            }
+            Ok::<_, LiveError>(subscription)
+        })?;
+        let (sender, receiver) = joined.split();
+        Ok(LiveTopic::new(sender, receiver, runtime.handle().clone()))
     }
 
     /// Asks the host at `host` for `thread`'s signed `meta`, waiting up to 20 s.
@@ -286,6 +368,7 @@ impl LiveNode {
             return;
         }
         let router = self.router.take();
+        let _ = self.gossip.take();
         let endpoint = self.endpoint.clone();
         let _ = runtime.block_on(async move {
             tokio::time::timeout(CLOSE_WAIT, async move {
@@ -314,9 +397,15 @@ pub fn stable_port(node: &NodeId) -> u16 {
     FIRST_STABLE_PORT + u16::from_le_bytes([first, second]) % STABLE_PORTS
 }
 
-fn builder(secret_key: &SecretKey, relay_mode: RelayMode, port: u16) -> Result<Builder, LiveError> {
+fn builder(
+    secret_key: &SecretKey,
+    relay_mode: RelayMode,
+    port: u16,
+    addresses: &MemoryLookup,
+) -> Result<Builder, LiveError> {
     Builder::empty()
         .secret_key(secret_key.clone())
+        .address_lookup(addresses.clone())
         .crypto_provider(Arc::new(mahi_tls::provider()))
         .relay_mode(relay_mode)
         .clear_ip_transports()

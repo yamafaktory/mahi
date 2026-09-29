@@ -43,20 +43,27 @@ const REFUSED: u32 = 1;
 const UNAVAILABLE: u32 = 2;
 const READERS: usize = 2;
 
-/// Where a host finds the `meta` it serves.
+/// Who a live node deals with: the nodes it admits to the thread's live topic, and, on a
+/// host, the `meta` it serves them.
 ///
-/// Any node that knows the host's address can ask, with as many fresh node keys as it likes,
-/// so a source answers unknown nodes from what it already holds, rereading the repository at
-/// most every few seconds whoever asks. The handler also runs at most two reads at once.
-pub trait MetaSource: Send + Sync + fmt::Debug + 'static {
+/// Any node that knows the address can connect, with as many fresh node keys as it likes, so
+/// an implementation answers unknown nodes from what it already holds, rereading the
+/// repository at most every few seconds whoever asks. The `meta` handler also runs at most two
+/// reads at once.
+pub trait Peers: Send + Sync + fmt::Debug + 'static {
+    /// Says whether `node` may join the thread's live topic. It is called for every incoming
+    /// gossip connection, so it only looks at what is already in memory.
+    fn admits(&self, node: &NodeId) -> bool;
+
     /// Returns the current signed `meta` document of `thread` when `node` is one of its
-    /// participants, or `None` to refuse. It may block, as it reads the repository.
+    /// participants, or `None` to refuse, as a node that does not host always does. It may
+    /// block, as it reads the repository.
     fn meta_for(&self, thread: ThreadId, node: &NodeId) -> Option<Vec<u8>>;
 }
 
 #[derive(Debug)]
 pub(crate) struct MetaHandler {
-    source: Arc<dyn MetaSource>,
+    source: Arc<dyn Peers>,
     readers: Arc<Semaphore>,
 }
 
@@ -67,7 +74,7 @@ enum Failure {
 }
 
 impl MetaHandler {
-    pub(crate) fn new(source: Arc<dyn MetaSource>) -> Self {
+    pub(crate) fn new(source: Arc<dyn Peers>) -> Self {
         Self {
             source,
             readers: Arc::new(Semaphore::new(READERS)),
@@ -194,7 +201,11 @@ mod tests {
         meta: Vec<u8>,
     }
 
-    impl MetaSource for OneParticipant {
+    impl Peers for OneParticipant {
+        fn admits(&self, node: &NodeId) -> bool {
+            node == &self.node
+        }
+
         fn meta_for(&self, thread: ThreadId, node: &NodeId) -> Option<Vec<u8>> {
             (thread == self.thread && node == &self.node).then(|| self.meta.clone())
         }
@@ -218,7 +229,7 @@ mod tests {
             meta,
         };
         let host =
-            LiveNode::bind_host(&random_secret(), Relays::Disabled, Arc::new(source)).unwrap();
+            LiveNode::bind_live(&random_secret(), Relays::Disabled, Arc::new(source)).unwrap();
         let address = host.address(Duration::ZERO).unwrap();
         Pair {
             host,
@@ -335,7 +346,11 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
     }
 
-    impl MetaSource for Slow {
+    impl Peers for Slow {
+        fn admits(&self, _node: &NodeId) -> bool {
+            false
+        }
+
         fn meta_for(&self, _thread: ThreadId, _node: &NodeId) -> Option<Vec<u8>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::thread::sleep(self.pause);
@@ -349,8 +364,8 @@ mod tests {
             pause: Duration::from_millis(1500),
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let source: Arc<dyn MetaSource> = Arc::clone(&slow) as Arc<dyn MetaSource>;
-        let host = LiveNode::bind_host(&random_secret(), Relays::Disabled, source).unwrap();
+        let source: Arc<dyn Peers> = Arc::clone(&slow) as Arc<dyn Peers>;
+        let host = LiveNode::bind_live(&random_secret(), Relays::Disabled, source).unwrap();
         let address = host.address(Duration::ZERO).unwrap();
         let joiners: Vec<LiveNode> = (0..4)
             .map(|_| LiveNode::bind(&random_secret(), Relays::Disabled).unwrap())
@@ -387,10 +402,10 @@ mod tests {
             pause: Duration::from_secs(60),
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let host = LiveNode::bind_host(
+        let host = LiveNode::bind_live(
             &random_secret(),
             Relays::Disabled,
-            Arc::clone(&stuck) as Arc<dyn MetaSource>,
+            Arc::clone(&stuck) as Arc<dyn Peers>,
         )
         .unwrap();
         let address = host.address(Duration::ZERO).unwrap();
