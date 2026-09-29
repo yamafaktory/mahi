@@ -1481,6 +1481,13 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         let (thread, key) = running_thread(&fixture);
         let bob = invite_bob(&fixture, thread, &key);
         let address = local_host_address(&fixture);
+        let published = config_dir(&fixture.home)
+            .path()
+            .join("live")
+            .join(thread.to_string());
+        wait_until("the host to publish its address", || published.exists());
+        let host = mahi_live::HostAddress::from_bytes(&fs::read(&published).unwrap()).unwrap();
+        assert_eq!(host.node(), address.node());
         let viewer = LiveNode::bind_live(
             bob.secret(),
             Relays::Disabled,
@@ -1538,6 +1545,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             status.is_some()
         });
         assert!(status.unwrap().success());
+        assert!(!published.exists());
     }
 
     #[test]

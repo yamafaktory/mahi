@@ -465,6 +465,7 @@ fn live_setup(
         LiveMode::Unknown => return Err(RunError::LiveSetting),
     };
     Ok(Some(LiveSetup {
+        config: config.clone(),
         node_key: NodeKey::load(&config.node_key_file()).map_err(RunError::NotInitialised)?,
         owner: ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)?,
         relays,

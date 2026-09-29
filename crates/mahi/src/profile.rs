@@ -143,7 +143,9 @@ fn create_if_missing(directory: &OwnedFd, name: &str, contents: &[u8]) -> io::Re
     Ok(())
 }
 
-fn replace(directory: &OwnedFd, name: &str, contents: &[u8]) -> io::Result<()> {
+/// Replaces the file `name` in `directory` with `contents`, atomically and without following
+/// a symbolic link: it is written to a temporary name, synced, then renamed into place.
+pub(crate) fn replace(directory: &OwnedFd, name: &str, contents: &[u8]) -> io::Result<()> {
     let temporary = format!(".{name}.mahi");
     match rustix::fs::unlinkat(directory, temporary.as_str(), AtFlags::empty()) {
         Err(error) if error != Errno::NOENT => return Err(error.into()),

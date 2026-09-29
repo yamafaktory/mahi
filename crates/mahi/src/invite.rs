@@ -21,6 +21,7 @@ use mahi_identity::{
     SshAgent,
 };
 use mahi_live::{
+    HostAddress,
     LiveError,
     LiveNode,
     Relays,
@@ -53,9 +54,14 @@ use crate::{
         Environment,
         LiveMode,
     },
+    live,
     prompt::{
         Prompt,
         TerminalPrompt,
+    },
+    thread_lock::{
+        LockError,
+        ThreadLock,
     },
 };
 
@@ -99,6 +105,10 @@ pub(crate) enum InviteError {
     NodeMismatch,
     #[error("cannot write the ticket")]
     Ticket(#[from] TicketError),
+    #[error("the thread is running, but its host has not published its address yet; try again")]
+    NotPublished,
+    #[error("cannot check whether the thread is running")]
+    Lock(#[source] LockError),
     #[error(
         "an invitation needs the live layer: set MAHI_LIVE to local or public, or leave it unset"
     )]
@@ -185,15 +195,7 @@ pub(crate) fn invite_to<P: Prompt>(
     }) {
         return Err(InviteError::Clash(clash.name().clone()));
     }
-    let meta = if current.participants().any(|listed| listed == new) {
-        current
-    } else {
-        add(store, thread, &current, card, inviter, open_prompt)?
-    };
-    let node = LiveNode::bind(inviter.node_key.secret(), inviter.relays)?;
-    let address = node.address(RELAY_WAIT);
-    node.close()?;
-    let address = address?;
+    let address = host_address(thread, inviter)?;
     if inviter.relays == Relays::Public && address.relay().is_none() {
         return Err(InviteError::NoRelay);
     }
@@ -202,6 +204,11 @@ pub(crate) fn invite_to<P: Prompt>(
     if address.node() != &own {
         return Err(InviteError::NodeMismatch);
     }
+    let meta = if current.participants().any(|listed| listed == new) {
+        current
+    } else {
+        add(store, thread, &current, card, inviter, open_prompt)?
+    };
     Ok(Ticket::new(
         thread,
         address,
@@ -209,6 +216,25 @@ pub(crate) fn invite_to<P: Prompt>(
         meta.generation(),
         invitee_node,
     ))
+}
+
+/// Returns where the thread's host is: the address a running host published, since binding
+/// a second endpoint with the same node key would take its relay connection over, or else this
+/// machine's address, found by binding the endpoint while the thread's lock keeps a host from
+/// starting.
+fn host_address(thread: ThreadId, inviter: &Inviter<'_>) -> Result<HostAddress, InviteError> {
+    match ThreadLock::acquire(inviter.config, thread) {
+        Ok(_lock) => {
+            let node = LiveNode::bind(inviter.node_key.secret(), inviter.relays)?;
+            let address = node.address(RELAY_WAIT);
+            node.close()?;
+            Ok(address?)
+        }
+        Err(LockError::Busy(_)) => {
+            live::published_address(inviter.config, thread).ok_or(InviteError::NotPublished)
+        }
+        Err(error) => Err(InviteError::Lock(error)),
+    }
 }
 
 fn add<P: Prompt>(
@@ -493,5 +519,63 @@ mod tests {
             Err(InviteError::Thread(thread, error))
                 if thread == missing && matches!(*error, ThreadError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn a_running_threads_ticket_points_at_the_address_its_host_published() {
+        let (_repo, store) = repository_on_main();
+        let owner = owner_of_a_thread(&store);
+        let running = crate::thread_lock::ThreadLock::acquire(&owner.config, owner.thread).unwrap();
+        assert!(matches!(
+            invite_to(
+                &store,
+                owner.thread,
+                bob(),
+                &inviter(&owner, &owner.key),
+                &mut script(&[PASSPHRASE]),
+            ),
+            Err(InviteError::NotPublished)
+        ));
+        let owner_key = ParticipantKey::from_public_key(owner.key.public_key()).unwrap();
+        assert_eq!(
+            load_meta(&store, owner.thread, &owner_key, 0)
+                .unwrap()
+                .generation(),
+            0
+        );
+        let published = HostAddress::new(
+            NodeId::from_bytes(owner.node_key.public()).unwrap(),
+            None,
+            vec!["192.0.2.9:51000".parse().unwrap()],
+        )
+        .unwrap();
+        let someone_else = HostAddress::new(
+            NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
+            None,
+            vec!["192.0.2.9:51000".parse().unwrap()],
+        )
+        .unwrap();
+        crate::live::publish_address(&owner.config, owner.thread, &someone_else).unwrap();
+        assert!(matches!(
+            invite_to(
+                &store,
+                owner.thread,
+                bob(),
+                &inviter(&owner, &owner.key),
+                &mut script(&[]),
+            ),
+            Err(InviteError::NodeMismatch)
+        ));
+        crate::live::publish_address(&owner.config, owner.thread, &published).unwrap();
+        let ticket = invite_to(
+            &store,
+            owner.thread,
+            bob(),
+            &inviter(&owner, &owner.key),
+            &mut script(&[PASSPHRASE]),
+        )
+        .unwrap();
+        assert_eq!(ticket.host(), &published);
+        drop(running);
     }
 }

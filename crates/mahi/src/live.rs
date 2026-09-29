@@ -3,6 +3,12 @@ use std::{
         HashMap,
         VecDeque,
     },
+    fs::File,
+    io::{
+        self,
+        Read,
+    },
+    os::fd::OwnedFd,
     path::{
         Path,
         PathBuf,
@@ -36,12 +42,16 @@ use mahi_core::{
     ThreadId,
 };
 use mahi_crypto::ThreadKey;
-use mahi_identity::NodeKey;
+use mahi_identity::{
+    ConfigDir,
+    NodeKey,
+};
 use mahi_live::{
     Body,
     FrameError,
     FrameReceiver,
     FrameSender,
+    HostAddress,
     LiveError,
     LiveKeys,
     LiveNode,
@@ -62,7 +72,14 @@ use mahi_thread::{
     ThreadError,
     load_meta_document,
 };
+use rustix::fs::{
+    AtFlags,
+    Mode,
+    OFlags,
+};
 use thiserror::Error;
+
+use crate::profile;
 
 /// How often a host rereads its `meta` at most, whoever asks.
 pub(crate) const REREAD_EVERY: Duration = Duration::from_secs(5);
@@ -90,12 +107,68 @@ const PENDING_SCREENS: usize = 8;
 const LISTEN_PAUSE: Duration = Duration::from_millis(200);
 const UNASKED: [u8; 16] = [0; 16];
 
+const PUBLISHED: &str = "live";
+const MAX_PUBLISHED_BYTES: u64 = 4096;
+const PUBLISH_EVERY: Duration = Duration::from_secs(2);
+
 /// What a host needs to open the live layer, gathered before the agent starts.
 #[derive(Debug)]
 pub(crate) struct LiveSetup {
+    pub(crate) config: ConfigDir,
     pub(crate) node_key: NodeKey,
     pub(crate) owner: ParticipantKey,
     pub(crate) relays: Relays,
+}
+
+fn published_dir(config: &ConfigDir) -> io::Result<OwnedFd> {
+    profile::create_private_dir(config.path())?;
+    let parent = rustix::fs::open(
+        config.path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    profile::open_private_dir(&parent, PUBLISHED)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the live directory is not a private directory",
+        )
+    })
+}
+
+/// Publishes where the running host of `thread` can be reached, for `mahi invite`.
+pub(crate) fn publish_address(
+    config: &ConfigDir,
+    thread: ThreadId,
+    address: &HostAddress,
+) -> io::Result<()> {
+    let bytes = address
+        .to_bytes()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    profile::replace(&published_dir(config)?, &thread.to_string(), &bytes)
+}
+
+/// Returns where the running host of `thread` said it can be reached, if it did.
+pub(crate) fn published_address(config: &ConfigDir, thread: ThreadId) -> Option<HostAddress> {
+    let directory = published_dir(config).ok()?;
+    let file = rustix::fs::openat(
+        &directory,
+        thread.to_string().as_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let mut bytes = Vec::new();
+    File::from(file)
+        .take(MAX_PUBLISHED_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    HostAddress::from_bytes(&bytes).ok()
+}
+
+fn withdraw_address(config: &ConfigDir, thread: ThreadId) {
+    if let Ok(directory) = published_dir(config) {
+        let _ = rustix::fs::unlinkat(&directory, thread.to_string().as_str(), AtFlags::empty());
+    }
 }
 
 /// The host's copy of the agent's screen, and how many chunks of output and resizes it has
@@ -163,10 +236,12 @@ impl OutputTap {
 /// the threads that broadcast it and answer screen requests.
 #[derive(Debug)]
 pub(crate) struct LiveHost {
-    node: LiveNode,
+    node: Arc<LiveNode>,
     tap: OutputTap,
     stop: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
+    config: ConfigDir,
+    thread: ThreadId,
 }
 
 impl LiveHost {
@@ -180,17 +255,18 @@ impl LiveHost {
         thread_key: &ThreadKey,
         size: WindowSize,
     ) -> Result<Self, HostError> {
+        withdraw_address(&setup.config, thread);
         let peers = Arc::new(HostPeers::new(
             git_dir.to_path_buf(),
             thread,
             setup.owner.clone(),
             REREAD_EVERY,
         )?);
-        let node = LiveNode::bind_live(
+        let node = Arc::new(LiveNode::bind_live(
             setup.node_key.secret(),
             setup.relays,
             Arc::clone(&peers) as Arc<dyn Peers>,
-        )?;
+        )?);
         let topic =
             Arc::new(node.join(LiveKeys::derive(thread_key, thread)?.topic(), &[], None)?);
         let sender = FrameSender::new(
@@ -225,6 +301,10 @@ impl LiveHost {
             wanted,
             stop: Arc::clone(&stop),
         };
+        let publisher = {
+            let (node, stop, config) = (Arc::clone(&node), Arc::clone(&stop), setup.config.clone());
+            thread::spawn(move || publish(&node, &stop, &config, thread))
+        };
         Ok(Self {
             node,
             tap: OutputTap {
@@ -236,7 +316,10 @@ impl LiveHost {
             workers: vec![
                 thread::spawn(move || broadcaster.run()),
                 thread::spawn(move || listener.run()),
+                publisher,
             ],
+            config: setup.config.clone(),
+            thread,
         })
     }
 
@@ -251,7 +334,27 @@ impl LiveHost {
         for worker in self.workers {
             let _ = worker.join();
         }
-        let _ = self.node.close();
+        withdraw_address(&self.config, self.thread);
+        if let Ok(node) = Arc::try_unwrap(self.node) {
+            let _ = node.close();
+        }
+    }
+}
+
+/// Keeps the host's published address current: the relay it reaches, and its direct addresses.
+fn publish(node: &LiveNode, stop: &AtomicBool, config: &ConfigDir, thread: ThreadId) {
+    let mut published: Option<HostAddress> = None;
+    while !stop.load(Ordering::SeqCst) {
+        if let Ok(address) = node.address(Duration::ZERO)
+            && published.as_ref() != Some(&address)
+            && publish_address(config, thread, &address).is_ok()
+        {
+            published = Some(address);
+        }
+        let deadline = Instant::now() + PUBLISH_EVERY;
+        while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(LISTEN_PAUSE);
+        }
     }
 }
 
@@ -727,5 +830,64 @@ mod tests {
         assert!(matches!(tapped.try_recv(), Ok(Tapped::Output(1, bytes)) if bytes == b"hello"));
         assert!(matches!(tapped.try_recv(), Ok(Tapped::Resize(2, _))));
         assert!(tapped.try_recv().is_err());
+    }
+
+    fn private_config() -> (TempDir, ConfigDir) {
+        let dir = TempDir::new().unwrap();
+        let config = ConfigDir::resolve(Some(dir.path()), Some(dir.path())).unwrap();
+        (dir, config)
+    }
+
+    fn some_address() -> HostAddress {
+        HostAddress::new(
+            NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
+            None,
+            vec!["192.0.2.7:50000".parse().unwrap()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_published_address_reads_back_and_is_withdrawn() {
+        let (_dir, config) = private_config();
+        let thread = ThreadId::random().unwrap();
+        assert!(published_address(&config, thread).is_none());
+        let address = some_address();
+        publish_address(&config, thread, &address).unwrap();
+        assert_eq!(published_address(&config, thread), Some(address.clone()));
+        let newer = some_address();
+        publish_address(&config, thread, &newer).unwrap();
+        assert_eq!(published_address(&config, thread), Some(newer));
+        withdraw_address(&config, thread);
+        assert!(published_address(&config, thread).is_none());
+    }
+
+    #[test]
+    fn planted_links_are_not_followed_for_published_addresses() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, config) = private_config();
+        let thread = ThreadId::random().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(
+            elsewhere.join(thread.to_string()),
+            some_address().to_bytes().unwrap(),
+        )
+        .unwrap();
+        crate::profile::create_private_dir(config.path()).unwrap();
+        symlink(&elsewhere, config.path().join(PUBLISHED)).unwrap();
+        assert!(published_address(&config, thread).is_none());
+        assert!(publish_address(&config, thread, &some_address()).is_err());
+
+        std::fs::remove_file(config.path().join(PUBLISHED)).unwrap();
+        let live = config.path().join(PUBLISHED);
+        crate::profile::create_private_dir(&live).unwrap();
+        symlink(
+            elsewhere.join(thread.to_string()),
+            live.join(thread.to_string()),
+        )
+        .unwrap();
+        assert!(published_address(&config, thread).is_none());
     }
 }

@@ -112,6 +112,13 @@ struct WireTicket<'a> {
 }
 
 #[derive(Serialize, Deserialize)]
+struct WireHost<'a> {
+    node: [u8; 32],
+    relay: Option<&'a str>,
+    direct: Vec<WireAddress>,
+}
+
+#[derive(Serialize, Deserialize)]
 enum WireAddress {
     V4([u8; 4], u16),
     V6([u8; 16], u16),
@@ -163,6 +170,51 @@ impl HostAddress {
     #[must_use]
     pub fn direct(&self) -> &[SocketAddr] {
         &self.direct
+    }
+
+    /// Encodes the address, as a running host publishes it for `mahi invite`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TicketError::Encode`] if encoding fails.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, TicketError> {
+        postcard::to_allocvec(&WireHost {
+            node: *self.node.as_bytes(),
+            relay: self.relay.as_ref().map(|relay| relay.as_str()),
+            direct: self.direct.iter().map(WireAddress::from).collect(),
+        })
+        .map_err(|_| TicketError::Encode)
+    }
+
+    /// Decodes an address [`HostAddress::to_bytes`] encoded, with the checks of a ticket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TicketError`] if the bytes are not such an address or break its rules.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, TicketError> {
+        if bytes.len() > MAX_TICKET_CHARS {
+            return Err(TicketError::Malformed);
+        }
+        let (wire, rest): (WireHost<'_>, _) =
+            postcard::take_from_bytes(bytes).map_err(|_| TicketError::Malformed)?;
+        if !rest.is_empty() {
+            return Err(TicketError::Malformed);
+        }
+        Ok(Self::new(
+            NodeId::from_bytes(wire.node)?,
+            parse_relay(wire.relay)?,
+            wire.direct.into_iter().map(SocketAddr::from).collect(),
+        )?)
+    }
+}
+
+fn parse_relay(relay: Option<&str>) -> Result<Option<RelayUrl>, AddressError> {
+    match relay {
+        Some(url) if url.len() <= MAX_RELAY_URL_BYTES => Ok(Some(
+            url.parse::<RelayUrl>().map_err(|_| AddressError::Relay)?,
+        )),
+        Some(_) => Err(AddressError::Relay),
+        None => Ok(None),
     }
 }
 
@@ -271,13 +323,7 @@ impl FromStr for Ticket {
         if wire.owner.len() > MAX_OWNER_KEY_BYTES {
             return Err(TicketError::Malformed);
         }
-        let relay = match wire.relay {
-            Some(url) if url.len() <= MAX_RELAY_URL_BYTES => {
-                Some(url.parse::<RelayUrl>().map_err(|_| AddressError::Relay)?)
-            }
-            Some(_) => return Err(AddressError::Relay.into()),
-            None => None,
-        };
+        let relay = parse_relay(wire.relay)?;
         let host = HostAddress::new(
             NodeId::from_bytes(wire.host)?,
             relay,
@@ -390,6 +436,31 @@ mod tests {
         assert_eq!(format!(" {text}\n").parse::<Ticket>().unwrap(), ticket);
         assert_eq!(text.to_uppercase().parse::<Ticket>().unwrap(), ticket);
         assert_eq!(ticket.min_generation(), 7);
+    }
+
+    #[test]
+    fn a_host_address_round_trips_as_bytes_with_the_ticket_rules() {
+        let address = ticket(3).host().clone();
+        assert_eq!(
+            HostAddress::from_bytes(&address.to_bytes().unwrap()).unwrap(),
+            address
+        );
+        let mut trailing = address.to_bytes().unwrap();
+        trailing.push(0);
+        assert_eq!(
+            HostAddress::from_bytes(&trailing),
+            Err(TicketError::Malformed)
+        );
+        let local = postcard::to_allocvec(&WireHost {
+            node: *random_node().as_bytes(),
+            relay: Some("http://relay.example/"),
+            direct: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            HostAddress::from_bytes(&local),
+            Err(TicketError::Address(AddressError::Relay))
+        );
     }
 
     #[test]
