@@ -16,7 +16,7 @@ test *args:
     cargo nextest run --workspace --locked --no-tests=pass {{args}}
 
 test-git *args:
-    cargo nextest run --workspace --locked --ignore-default-filter -E 'binary_id(mahi-ssh::git_over_ssh)' {{args}}
+    cargo nextest run --workspace --locked --ignore-default-filter -E 'binary(/^git_/)' {{args}}
 
 deny:
     cargo deny --locked check

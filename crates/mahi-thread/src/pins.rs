@@ -90,6 +90,17 @@ impl Pins {
         self.accept_hash(meta.thread(), meta.generation(), meta.body_hash())
     }
 
+    /// Checks `meta` as [`Pins::accept`] does and runs `then` under the pin's lock, moving the
+    /// pin only once `then` succeeded, so a refused document or a failed `then` leaves the pin
+    /// where it was.
+    pub(crate) fn accept_then<E: From<PinError>>(
+        &self,
+        meta: &VerifiedMeta,
+        then: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.accept_hash_then(meta.thread(), meta.generation(), meta.body_hash(), then)
+    }
+
     /// Runs `remove_thread` and then removes `thread`'s pin, all under the pin's lock, but only
     /// while the pin is missing or still at generation 0.
     ///
@@ -152,6 +163,16 @@ impl Pins {
         generation: u64,
         hash: [u8; 32],
     ) -> Result<(), PinError> {
+        self.accept_hash_then(thread, generation, hash, || Ok::<(), PinError>(()))
+    }
+
+    fn accept_hash_then<E: From<PinError>>(
+        &self,
+        thread: ThreadId,
+        generation: u64,
+        hash: [u8; 32],
+        then: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
         let path = self.path(thread);
         let mut lock = self.lock(&path)?;
 
@@ -160,26 +181,35 @@ impl Pins {
                 return Err(PinError::Rollback {
                     pinned,
                     found: generation,
-                });
+                }
+                .into());
             }
             if generation == pinned {
                 return if hash == pinned_hash {
-                    Ok(())
+                    then()
                 } else {
-                    Err(PinError::Equivocation { generation })
+                    Err(PinError::Equivocation { generation }.into())
                 };
             }
         }
 
-        let mut pin = [0; PIN_BYTES];
-        pin[..8].copy_from_slice(&generation.to_le_bytes());
-        pin[8..].copy_from_slice(&hash);
-        lock.write_all(&pin)?;
-        lock.with_mut(|file| file.sync_all())?;
-        lock.commit().map_err(|error| error.error)?;
-        File::open(&self.dir)?.sync_all()?;
+        then()?;
+        write_pin(&mut lock, generation, hash)?;
+        lock.commit().map_err(|error| PinError::from(error.error))?;
+        File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(PinError::from)?;
         Ok(())
     }
+}
+
+fn write_pin(lock: &mut gix_lock::File, generation: u64, hash: [u8; 32]) -> Result<(), PinError> {
+    let mut pin = [0; PIN_BYTES];
+    pin[..8].copy_from_slice(&generation.to_le_bytes());
+    pin[8..].copy_from_slice(&hash);
+    lock.write_all(&pin)?;
+    lock.with_mut(|file| file.sync_all())?;
+    Ok(())
 }
 
 fn read_pin(path: &Path, thread: ThreadId) -> Result<Option<(u64, [u8; 32])>, PinError> {
@@ -217,6 +247,26 @@ mod tests {
 
     fn no_lock_left(pins: &Pins, thread: ThreadId) -> bool {
         !pins.path(thread).with_extension("lock").exists()
+    }
+
+    #[test]
+    fn a_pin_moves_only_after_what_it_guards_succeeded() {
+        let (_dir, pins) = pins();
+        let t = thread();
+        pins.accept_hash(t, 1, [1; 32]).unwrap();
+        let failed = pins.accept_hash_then(t, 2, [2; 32], || Err(PinError::Corrupt(t)));
+        assert!(matches!(failed, Err(PinError::Corrupt(_))));
+        assert_eq!(pins.get(t).unwrap(), Some((1, [1; 32])));
+        let mut ran = false;
+        let refused = pins.accept_hash_then(t, 0, [0; 32], || {
+            ran = true;
+            Ok::<(), PinError>(())
+        });
+        assert!(matches!(refused, Err(PinError::Rollback { .. })));
+        assert!(!ran);
+        pins.accept_hash_then(t, 2, [2; 32], || Ok::<(), PinError>(()))
+            .unwrap();
+        assert_eq!(pins.get(t).unwrap(), Some((2, [2; 32])));
     }
 
     #[test]

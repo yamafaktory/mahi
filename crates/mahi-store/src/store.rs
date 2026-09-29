@@ -143,6 +143,15 @@ pub enum StoreError {
     /// A file in the tree could not be written, or collides with another.
     #[error("cannot check out {0:?}")]
     CheckoutPath(String),
+    /// More refs were fetched than mahi accepts at once.
+    #[error("{0} refs were fetched, more than mahi accepts")]
+    TooManyRefs(usize),
+    /// A history is longer than mahi walks.
+    #[error("the history of {0} is longer than mahi walks")]
+    HistoryTooLong(ObjectId),
+    /// A thread ref would move to a commit that does not descend from where it is.
+    #[error("{0} would not move forward")]
+    NotFastForward(String),
     /// Two tree entries have the same name.
     #[error("duplicate tree entry name {0:?}")]
     DuplicateEntryName(String),

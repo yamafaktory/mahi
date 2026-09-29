@@ -3,10 +3,16 @@
 #[cfg(not(unix))]
 compile_error!("mahi supports Linux and macOS only");
 
+mod fetch;
 mod snapshot;
 mod store;
 mod worktree;
 
+pub use fetch::{
+    FETCHED_PREFIX,
+    MAX_FETCHED_REFS,
+    MAX_HISTORY_WALK,
+};
 pub use gix::{
     ObjectId,
     objs::tree::EntryKind,

@@ -47,6 +47,16 @@ pub enum ThreadError {
     /// The thread's `meta` commit has no meta document, which mahi never writes.
     #[error("thread {0}'s meta commit has no meta document")]
     MissingMetaEntry(ThreadId),
+    /// A fetched meta document is not this thread's, is invalid, or is not signed by the trusted
+    /// owner; nothing fetched is accepted.
+    #[error("refused the fetched meta document of thread {thread}")]
+    FetchedMetaRefused {
+        /// The thread.
+        thread: ThreadId,
+        /// Why the document was refused.
+        #[source]
+        source: Box<MetaError>,
+    },
     /// The thread was created, but its meta document could not be pinned.
     ///
     /// The thread exists and is valid: the next [`load_meta`] pins it.
@@ -296,7 +306,7 @@ fn read_meta(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use mahi_core::ParticipantName;
     use ssh_key::{
         Algorithm,
@@ -311,16 +321,16 @@ mod tests {
         PrivateMeta,
     };
 
-    struct Setup {
-        _dir: TempDir,
-        store: Store,
-        owner: PrivateKey,
-        owner_key: ParticipantKey,
-        mahi: age::x25519::Identity,
-        thread: ThreadId,
+    pub(crate) struct Setup {
+        pub(crate) _dir: TempDir,
+        pub(crate) store: Store,
+        pub(crate) owner: PrivateKey,
+        pub(crate) owner_key: ParticipantKey,
+        pub(crate) mahi: age::x25519::Identity,
+        pub(crate) thread: ThreadId,
     }
 
-    fn setup() -> Setup {
+    pub(crate) fn setup() -> Setup {
         let dir = TempDir::new().unwrap();
         gix::init(dir.path()).unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -336,7 +346,7 @@ mod tests {
         }
     }
 
-    fn draft(setup: &Setup, generation: u64, title: &str) -> MetaDraft {
+    pub(crate) fn draft(setup: &Setup, generation: u64, title: &str) -> MetaDraft {
         let alice = ParticipantName::new("alice").unwrap();
         MetaDraft::new(
             setup.thread,
