@@ -19,16 +19,30 @@ use age::{
     secrecy::ExposeSecret,
     x25519,
 };
+use bech32::{
+    Bech32,
+    primitives::decode::CheckedHrpstring,
+};
+use hkdf::Hkdf;
 use lz4_flex::block::{
     compress_into,
     decompress_into,
     get_maximum_output_size,
 };
+use sha2::Sha256;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 const LEN_PREFIX_BYTES: usize = 4;
 const MAX_WRAPPED_SECRET_BYTES: usize = 128;
+const SECRET_BYTES: usize = 32;
+/// The length of a key [`ThreadKey::derive`] returns.
+pub const DERIVED_KEY_BYTES: usize = 32;
+
+/// A key cannot be derived from the thread key, which never happens with a key age made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("cannot derive a key from the thread key")]
+pub struct DeriveError;
 
 /// A thread's own age identity, which every piece of encrypted thread content is sealed to.
 ///
@@ -191,6 +205,37 @@ impl ThreadKey {
         let mut writer = encryptor.wrap_output(Vec::new())?;
         writer.write_all(secret.expose_secret().as_bytes())?;
         Ok(writer.finish()?)
+    }
+
+    /// Derives a key for another use of the thread key, such as the live layer's: HKDF-SHA256
+    /// with the thread key's 32 secret bytes as input, `salt` as salt and `info` naming the use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeriveError`] if the secret cannot be read back, which never happens with a
+    /// key age made.
+    pub fn derive(
+        &self,
+        salt: &[u8],
+        info: &[u8],
+    ) -> Result<Zeroizing<[u8; DERIVED_KEY_BYTES]>, DeriveError> {
+        let text = self.0.to_string();
+        let checked =
+            CheckedHrpstring::new::<Bech32>(text.expose_secret()).map_err(|_| DeriveError)?;
+        let mut secret = Zeroizing::new([0_u8; SECRET_BYTES]);
+        let mut length = 0;
+        for byte in checked.byte_iter() {
+            *secret.get_mut(length).ok_or(DeriveError)? = byte;
+            length += 1;
+        }
+        if length != SECRET_BYTES {
+            return Err(DeriveError);
+        }
+        let mut derived = Zeroizing::new([0_u8; DERIVED_KEY_BYTES]);
+        Hkdf::<Sha256>::new(Some(salt), secret.as_slice())
+            .expand(info, derived.as_mut_slice())
+            .map_err(|_| DeriveError)?;
+        Ok(derived)
     }
 
     /// Recovers a thread key that [`ThreadKey::wrap`] encrypted for `identity`.
@@ -538,5 +583,36 @@ mod tests {
         fn opening_arbitrary_bytes_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2000)) {
             let _ = ThreadKey::generate().open(&bytes, LIMIT);
         }
+    }
+
+    #[test]
+    fn derived_keys_match_an_independent_hkdf_and_differ_by_salt_and_use() {
+        let key = ThreadKey(
+            "AGE-SECRET-KEY-1QQQSYQCYQ5RQWZQFPG9SCRGWPUGPZYSNZS23V9CCRYDPK8QARC0SWRYDWG"
+                .parse()
+                .unwrap(),
+        );
+        let salt = [7_u8; 16];
+        let seal = key.derive(&salt, b"mahi-live-seal-v1").unwrap();
+        let expected: Vec<u8> = (0..32)
+            .map(|index| {
+                u8::from_str_radix(
+                    &"179d224f36c1d026455eac3526d8523ee3da30451b238bef92a8af7c9ab69832"
+                        [index * 2..index * 2 + 2],
+                    16,
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(seal.as_slice(), expected);
+        assert_eq!(*key.derive(&salt, b"mahi-live-seal-v1").unwrap(), *seal);
+        assert_ne!(*key.derive(&salt, b"mahi-live-topic-v1").unwrap(), *seal);
+        assert_ne!(*key.derive(&[8; 16], b"mahi-live-seal-v1").unwrap(), *seal);
+        assert_ne!(
+            *ThreadKey::generate()
+                .derive(&salt, b"mahi-live-seal-v1")
+                .unwrap(),
+            *seal
+        );
     }
 }

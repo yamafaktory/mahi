@@ -11,7 +11,10 @@ version.workspace = true
 
 [dependencies]
 age = { workspace = true }
+bech32 = { workspace = true }
+hkdf = { workspace = true }
 lz4_flex = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 

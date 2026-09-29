@@ -2,6 +2,7 @@
 //! stream.
 
 mod endpoint;
+mod frame;
 mod meta;
 #[cfg(test)]
 mod testing;
@@ -12,6 +13,17 @@ pub use endpoint::{
     LiveNode,
     Relays,
     stable_port,
+};
+pub use frame::{
+    Body,
+    FrameError,
+    FrameReceiver,
+    FrameSender,
+    LiveKeys,
+    MAX_CHUNK_BYTES,
+    MAX_FRAME_BYTES,
+    MAX_SCREEN_PARTS,
+    Received,
 };
 pub use meta::{
     META_ALPN,

@@ -19,7 +19,7 @@ base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 blake3 = { version = "1.8.7", default-features = false, features = ["pure"] }
 bech32 = { version = "0.11.1", default-features = false, features = ["alloc"] }
 chacha20 = { version = "0.9.1", default-features = false, features = ["zeroize"] }
-chacha20poly1305 = { version = "0.10.1", default-features = false }
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
 clap = { version = "4.6.7", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize"] }
 getrandom = "0.4.3"
@@ -28,6 +28,7 @@ gix = { version = "0.88.0", default-features = false, features = ["attributes", 
 gix-hash = "0.27.0"
 gix-lock = "25.0.0"
 gix-validate = "0.12.0"
+hkdf = { version = "0.12.4", default-features = false }
 hmac = { version = "0.12.1", default-features = false }
 iroh = { version = "1.2.0", default-features = false }
 libc = { version = "0.2.189", default-features = false }

@@ -184,6 +184,7 @@ mod tests {
     use crate::{
         LiveNode,
         Relays,
+        testing::random_secret,
     };
 
     #[derive(Debug)]
@@ -208,15 +209,16 @@ mod tests {
     }
 
     fn pair(meta: Vec<u8>) -> Pair {
-        let joiner = LiveNode::bind(&[2; 32], Relays::Disabled).unwrap();
-        let stranger = LiveNode::bind(&[3; 32], Relays::Disabled).unwrap();
+        let joiner = LiveNode::bind(&random_secret(), Relays::Disabled).unwrap();
+        let stranger = LiveNode::bind(&random_secret(), Relays::Disabled).unwrap();
         let thread = ThreadId::random().unwrap();
         let source = OneParticipant {
             thread,
             node: joiner.node().unwrap(),
             meta,
         };
-        let host = LiveNode::bind_host(&[1; 32], Relays::Disabled, Arc::new(source)).unwrap();
+        let host =
+            LiveNode::bind_host(&random_secret(), Relays::Disabled, Arc::new(source)).unwrap();
         let address = host.address(Duration::ZERO).unwrap();
         Pair {
             host,
@@ -242,10 +244,8 @@ mod tests {
             pair.joiner.fetch_meta(&pair.address, pair.thread).unwrap(),
             b"signed meta"
         );
-        assert!(matches!(
-            pair.stranger.fetch_meta(&pair.address, pair.thread),
-            Err(LiveError::Refused)
-        ));
+        let stranger = pair.stranger.fetch_meta(&pair.address, pair.thread);
+        assert!(matches!(stranger, Err(LiveError::Refused)), "{stranger:?}");
         assert!(matches!(
             pair.joiner
                 .fetch_meta(&pair.address, ThreadId::random().unwrap()),
@@ -315,13 +315,13 @@ mod tests {
 
     #[test]
     fn a_host_that_sends_too_much_is_cut_off() {
-        let host = LiveNode::bind(&[7; 32], Relays::Disabled).unwrap();
+        let host = LiveNode::bind(&random_secret(), Relays::Disabled).unwrap();
         let _router = host.run(async {
             iroh::protocol::Router::builder(host.endpoint().clone())
                 .accept(META_ALPN, Hostile)
                 .spawn()
         });
-        let joiner = LiveNode::bind(&[8; 32], Relays::Disabled).unwrap();
+        let joiner = LiveNode::bind(&random_secret(), Relays::Disabled).unwrap();
         let address = host.address(Duration::ZERO).unwrap();
         assert!(matches!(
             joiner.fetch_meta(&address, ThreadId::random().unwrap()),
@@ -350,10 +350,10 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let source: Arc<dyn MetaSource> = Arc::clone(&slow) as Arc<dyn MetaSource>;
-        let host = LiveNode::bind_host(&[9; 32], Relays::Disabled, source).unwrap();
+        let host = LiveNode::bind_host(&random_secret(), Relays::Disabled, source).unwrap();
         let address = host.address(Duration::ZERO).unwrap();
-        let joiners: Vec<LiveNode> = (10..14)
-            .map(|seed| LiveNode::bind(&[seed; 32], Relays::Disabled).unwrap())
+        let joiners: Vec<LiveNode> = (0..4)
+            .map(|_| LiveNode::bind(&random_secret(), Relays::Disabled).unwrap())
             .collect();
         let results: Vec<Result<Vec<u8>, LiveError>> = std::thread::scope(|scope| {
             let handles: Vec<_> = joiners
@@ -388,13 +388,13 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let host = LiveNode::bind_host(
-            &[20; 32],
+            &random_secret(),
             Relays::Disabled,
             Arc::clone(&stuck) as Arc<dyn MetaSource>,
         )
         .unwrap();
         let address = host.address(Duration::ZERO).unwrap();
-        let joiner = LiveNode::bind(&[21; 32], Relays::Disabled).unwrap();
+        let joiner = LiveNode::bind(&random_secret(), Relays::Disabled).unwrap();
         std::thread::scope(|scope| {
             scope.spawn(|| joiner.fetch_meta(&address, ThreadId::random().unwrap()));
             while stuck.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {

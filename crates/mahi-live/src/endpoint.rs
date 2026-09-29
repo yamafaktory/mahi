@@ -356,6 +356,7 @@ fn outside_runtime() -> Result<(), LiveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::random_secret;
 
     #[test]
     fn a_node_speaks_as_its_key_and_is_reachable_directly_without_relays() {
@@ -376,7 +377,7 @@ mod tests {
 
     #[test]
     fn a_node_listens_on_its_stable_port_unless_it_is_taken() {
-        let secret = [5_u8; 32];
+        let secret = random_secret();
         let first = LiveNode::bind(&secret, Relays::Disabled).unwrap();
         let port = stable_port(&first.node().unwrap());
         assert!((FIRST_STABLE_PORT..=u16::MAX).contains(&port));
@@ -400,11 +401,11 @@ mod tests {
 
     #[test]
     fn a_node_refuses_to_block_inside_an_async_runtime() {
-        let node = LiveNode::bind(&[3; 32], Relays::Disabled).unwrap();
+        let node = LiveNode::bind(&random_secret(), Relays::Disabled).unwrap();
         let other = runtime::Builder::new_current_thread().build().unwrap();
         other.block_on(async {
             assert!(matches!(
-                LiveNode::bind(&[4; 32], Relays::Disabled),
+                LiveNode::bind(&random_secret(), Relays::Disabled),
                 Err(LiveError::InsideRuntime)
             ));
             assert!(matches!(

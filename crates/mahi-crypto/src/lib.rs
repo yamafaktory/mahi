@@ -6,6 +6,8 @@
 mod key;
 
 pub use key::{
+    DERIVED_KEY_BYTES,
+    DeriveError,
     OpenError,
     SealError,
     ThreadKey,
