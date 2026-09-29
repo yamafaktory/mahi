@@ -20,6 +20,7 @@ mahi-live = { workspace = true }
 mahi-proxy = { workspace = true }
 mahi-sandbox = { workspace = true }
 mahi-schedule = { workspace = true }
+mahi-ssh = { workspace = true }
 mahi-store = { workspace = true }
 mahi-thread = { workspace = true }
 rustix = { workspace = true }

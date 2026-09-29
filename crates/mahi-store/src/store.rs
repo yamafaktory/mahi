@@ -143,6 +143,12 @@ pub enum StoreError {
     /// A file in the tree could not be written, or collides with another.
     #[error("cannot check out {0:?}")]
     CheckoutPath(String),
+    /// A remote name holds characters git remote names do not, or starts with `-` or `.`.
+    #[error("invalid remote name {0:?}")]
+    InvalidRemoteName(String),
+    /// A remote's URL is not UTF-8.
+    #[error("the url of remote {0} is not UTF-8")]
+    NonUtf8Url(String),
     /// A push failed as a whole, for the reason given.
     #[error("push failed: {0}")]
     PushFailed(String),
@@ -278,6 +284,37 @@ impl Store {
         }
         refs.sort();
         Ok(refs)
+    }
+
+    /// Returns the URL the git remote called `name` pushes to, after git's `insteadOf` and
+    /// `pushInsteadOf` rewriting: its push URL, or else its URL. Returns `None` if the
+    /// repository has no such remote, or it has no URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidRemoteName`] if `name` is not a plain remote name,
+    /// [`StoreError::NonUtf8Url`] if the URL is not UTF-8, or [`StoreError::Git`] if the
+    /// remote's configuration cannot be read.
+    pub fn remote_push_url(&self, name: &str) -> Result<Option<String>, StoreError> {
+        let plain = !name.is_empty()
+            && !name.starts_with(['-', '.'])
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'));
+        if !plain {
+            return Err(StoreError::InvalidRemoteName(name.to_owned()));
+        }
+        let Some(remote) = self.repo.try_find_remote(name) else {
+            return Ok(None);
+        };
+        let remote = remote.map_err(gix::Error::from_error)?;
+        let Some(url) = remote.url(gix::remote::Direction::Push) else {
+            return Ok(None);
+        };
+        let bytes = url.to_bstring();
+        std::str::from_utf8(&bytes)
+            .map(|text| Some(text.to_owned()))
+            .map_err(|_| StoreError::NonUtf8Url(name.to_owned()))
     }
 
     /// Returns the repository's common git directory, shared by all its worktrees.
@@ -998,6 +1035,44 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_remotes_urls_are_read_from_the_configuration() {
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        let config = dir.path().join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(
+            "[remote \"origin\"]\n\turl = git@github.com:org/repo.git\n\
+             [remote \"split\"]\n\turl = https://example.org/r.git\n\tpushurl = ssh://git@example.org/r.git\n\
+             [remote \"pushonly\"]\n\tpushurl = me@host:repo\n\
+             [remote \"alias\"]\n\turl = gh:org/repo\n\
+             [remote \"web\"]\n\turl = https://github.com/org/repo\n\
+             [url \"git@github.com:\"]\n\tinsteadOf = gh:\n\
+             [url \"ssh://git@github.com/\"]\n\tpushInsteadOf = https://github.com/\n",
+        );
+        std::fs::write(&config, text).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let url = |name| store.remote_push_url(name).unwrap();
+        assert_eq!(
+            url("origin").as_deref(),
+            Some("git@github.com:org/repo.git")
+        );
+        assert_eq!(url("split").as_deref(), Some("ssh://git@example.org/r.git"));
+        assert_eq!(url("pushonly").as_deref(), Some("me@host:repo"));
+        assert_eq!(url("alias").as_deref(), Some("git@github.com:org/repo"));
+        assert_eq!(url("web").as_deref(), Some("ssh://git@github.com/org/repo"));
+        assert_eq!(url("missing"), None);
+        for name in ["", "-x", ".x", "git@host:repo", "a/b", "https://x"] {
+            assert!(
+                matches!(
+                    store.remote_push_url(name),
+                    Err(StoreError::InvalidRemoteName(_))
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]

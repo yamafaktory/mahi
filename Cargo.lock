@@ -3470,6 +3470,7 @@ dependencies = [
  "mahi-proxy",
  "mahi-sandbox",
  "mahi-schedule",
+ "mahi-ssh",
  "mahi-store",
  "mahi-thread",
  "rustix",

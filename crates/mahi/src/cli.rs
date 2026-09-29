@@ -4,6 +4,7 @@ use std::ffi::{
 };
 
 use clap::{
+    ArgGroup,
     Args,
     Parser,
     Subcommand,
@@ -27,6 +28,7 @@ use crate::{
     },
     hook::HookKind,
     profile::Profile,
+    remote::RemoteName,
 };
 
 const EXIT_CODES: &str = "\
@@ -63,6 +65,9 @@ pub(crate) enum Command {
     /// Watches a thread you were invited to, live, from the ticket its owner gave you. Run it
     /// in a clone of the project; press q to leave.
     Join(Box<JoinCommand>),
+    /// Shows or chooses the remote this clone pushes its threads to. Nothing is pushed until
+    /// one is chosen; on a public remote the agents' snapshots stay here.
+    Remote(RemoteCommand),
     /// Keeps the tokens agents sign in with, so no shell has to export them.
     #[command(subcommand)]
     Credential(CredentialCommand),
@@ -90,6 +95,24 @@ impl JoinCommand {
             .split_first()
             .map(|(program, arguments)| (program.as_os_str(), arguments))
     }
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+#[command(group(ArgGroup::new("visibility").args(["private", "public"])))]
+pub(crate) struct RemoteCommand {
+    /// The git remote to push threads to, such as origin; without one, the current choice is
+    /// shown.
+    #[arg(requires = "visibility")]
+    pub(crate) name: Option<RemoteName>,
+    /// The remote is private, so the agents' snapshots are pushed too.
+    #[arg(long, requires = "name")]
+    pub(crate) private: bool,
+    /// Anyone can read the remote, so the agents' snapshots, which are not encrypted, stay here.
+    #[arg(long, requires = "name")]
+    pub(crate) public: bool,
+    /// Stops pushing threads from this clone.
+    #[arg(long, conflicts_with_all = ["name", "private", "public"])]
+    pub(crate) off: bool,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -545,6 +568,39 @@ mod tests {
             parse(&["jump"]).unwrap_err().kind(),
             ErrorKind::InvalidSubcommand
         );
+    }
+
+    #[test]
+    fn a_remote_is_named_with_its_visibility_shown_or_turned_off() {
+        let remote = |arguments: &[&str]| match parse(arguments).map(|cli| cli.command) {
+            Ok(Command::Remote(command)) => Ok((
+                command.name.map(|name| name.to_string()),
+                command.private,
+                command.public,
+                command.off,
+            )),
+            Ok(other) => panic!("{other:?}"),
+            Err(error) => Err(error.kind()),
+        };
+        assert_eq!(remote(&["remote"]), Ok((None, false, false, false)));
+        assert_eq!(
+            remote(&["remote", "origin", "--private"]),
+            Ok((Some("origin".to_owned()), true, false, false))
+        );
+        assert_eq!(
+            remote(&["remote", "backup", "--public"]),
+            Ok((Some("backup".to_owned()), false, true, false))
+        );
+        assert_eq!(remote(&["remote", "--off"]), Ok((None, false, false, true)));
+        for wrong in [
+            &["remote", "origin"][..],
+            &["remote", "--private"],
+            &["remote", "origin", "--private", "--public"],
+            &["remote", "origin", "--private", "--off"],
+            &["remote", "-o", "--private"],
+        ] {
+            assert!(remote(wrong).is_err(), "{wrong:?}");
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ mod network;
 mod profile;
 mod prompt;
 mod recorder;
+mod remote;
 mod run;
 mod session;
 mod terminal;
@@ -107,6 +108,9 @@ fn main() {
         },
         Command::Invite(command) => {
             exit_code(invite::invite(&command, &environment).map(|ticket| print_out(&ticket)))
+        }
+        Command::Remote(command) => {
+            exit_code(remote::remote(&command).map(|done| print_out(&done)))
         }
         Command::Id => exit_code(id::id(&environment).map(|card| print_out(&card))),
         Command::Threads => exit_code(threads::threads().map(|listing| print_out(&listing))),
