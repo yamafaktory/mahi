@@ -62,7 +62,7 @@ pub(crate) enum Command {
     Invite(InviteCommand),
     /// Watches a thread you were invited to, live, from the ticket its owner gave you. Run it
     /// in a clone of the project; press q to leave.
-    Join(JoinCommand),
+    Join(Box<JoinCommand>),
     /// Keeps the tokens agents sign in with, so no shell has to export them.
     #[command(subcommand)]
     Credential(CredentialCommand),
@@ -75,6 +75,21 @@ pub(crate) enum Command {
 pub(crate) struct JoinCommand {
     /// The ticket `mahi invite` printed for you.
     pub(crate) ticket: Ticket,
+    #[command(flatten)]
+    pub(crate) options: LaunchOptions,
+    /// Your own agent to run in the thread, and its arguments, after `--`; without one, you
+    /// watch the host's agent.
+    #[arg(last = true, value_name = "AGENT")]
+    pub(crate) command: Vec<OsString>,
+}
+
+impl JoinCommand {
+    /// Returns the agent to run and its arguments, if one was given.
+    pub(crate) fn agent(&self) -> Option<(&OsStr, &[OsString])> {
+        self.command
+            .split_first()
+            .map(|(program, arguments)| (program.as_os_str(), arguments))
+    }
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
@@ -275,6 +290,62 @@ mod tests {
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    fn ticket() -> String {
+        use mahi_identity::NodeKey;
+        use mahi_thread::{
+            NodeId,
+            ParticipantKey,
+        };
+        use ssh_key::{
+            Algorithm,
+            PrivateKey,
+            rand_core::OsRng,
+        };
+
+        let node = || NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap();
+        let owner = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        mahi_live::Ticket::new(
+            ThreadId::random().unwrap(),
+            mahi_live::HostAddress::new(node(), None, vec!["192.0.2.1:50000".parse().unwrap()])
+                .unwrap(),
+            ParticipantKey::from_public_key(owner.public_key()).unwrap(),
+            1,
+            node(),
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn join_takes_agent_options_before_the_agent_after_two_dashes() {
+        let ticket = ticket();
+        let Command::Join(watch) = parse(&["join", &ticket]).unwrap().command else {
+            panic!("not a join");
+        };
+        assert!(watch.agent().is_none());
+        assert_eq!(watch.options, LaunchOptions::default());
+        let Command::Join(run) = parse(&[
+            "join",
+            &ticket,
+            "--allow-host",
+            "api.example.com",
+            "--",
+            "claude",
+            "--model",
+            "x",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("not a join");
+        };
+        let (program, arguments) = run.agent().unwrap();
+        assert_eq!(program, "claude");
+        assert_eq!(arguments, ["--model", "x"]);
+        assert_eq!(run.options.allow_hosts().len(), 1);
+        assert!(parse(&["join", &ticket, "claude"]).is_err());
+        assert!(parse(&["join", "mahi1qqqq"]).is_err());
     }
 
     #[test]

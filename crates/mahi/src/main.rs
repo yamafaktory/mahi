@@ -51,6 +51,7 @@ fn main() {
     let required = match &cli.command {
         Command::Run(command) => command.options.pass_env().to_vec(),
         Command::Resume(command) => command.options.pass_env().to_vec(),
+        Command::Join(command) if command.agent().is_some() => command.options.pass_env().to_vec(),
         _ => Vec::new(),
     };
     let optional: Vec<_> = Profile::optional_env_of_all()
@@ -93,7 +94,17 @@ fn main() {
                 1
             }
         },
-        Command::Join(command) => exit_code(join::join(&command, &environment).map(|()| 0)),
+        Command::Join(command) => match join::join(&command, &environment) {
+            Ok(Outcome::Exited(code)) => code,
+            Ok(Outcome::Stopped(signal)) => {
+                signal.reraise();
+                128 + signal.number()
+            }
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
         Command::Invite(command) => {
             exit_code(invite::invite(&command, &environment).map(|ticket| print_out(&ticket)))
         }

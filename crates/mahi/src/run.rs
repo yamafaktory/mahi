@@ -50,7 +50,10 @@ use std::{
 use mahi_core::{
     AgentSlot,
     NameError,
+    ParticipantName,
+    ThreadId,
 };
+use mahi_crypto::ThreadKey;
 use mahi_identity::{
     AgentError,
     AgentSigner,
@@ -65,7 +68,10 @@ use mahi_identity::{
     SigningKey,
     SshAgent,
 };
-use mahi_live::Relays;
+use mahi_live::{
+    HostAddress,
+    Relays,
+};
 use mahi_proxy::HostName;
 use mahi_sandbox::{
     Access,
@@ -83,6 +89,7 @@ use mahi_sandbox::{
 use mahi_schedule::Schedule;
 use mahi_store::{
     GlobalPatterns,
+    ObjectId,
     Store,
     StoreError,
 };
@@ -108,6 +115,7 @@ use thiserror::Error;
 
 use crate::{
     cli::{
+        JoinCommand,
         LaunchOptions,
         ResumeCommand,
         RunCommand,
@@ -236,6 +244,10 @@ pub(crate) enum RunError {
     NotInitialised(#[source] IdentityError),
     #[error("MAHI_LIVE must be off, local or public")]
     LiveSetting,
+    #[error("name the agent to run after --, as in mahi join <ticket> -- claude")]
+    NoAgent,
+    #[error("cannot run your agent in the thread")]
+    Enter(#[source] Box<session::EnterError>),
     #[error("SSH_AUTH_SOCK is not set; start ssh-agent and add your signing key (ssh-add)")]
     NoSshAgent,
     #[error("cannot sign with the SSH key")]
@@ -316,7 +328,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         PublicIdentity::load(&config.recipient_file()).map_err(RunError::NotInitialised)?;
     let signing = SigningKey::load(&config.signing_key_file()).map_err(RunError::NotInitialised)?;
     let node = session::own_node(&config).map_err(RunError::NotInitialised)?;
-    let live = live_setup(environment, &config, &signing)?;
+    let live = live_setup(environment, &config, own_key(&signing)?, Vec::new())?;
     let socket = environment
         .ssh_auth_sock
         .as_deref()
@@ -425,7 +437,7 @@ pub(crate) fn resume(
         },
         credentials,
     )?;
-    prepared.live = live_setup(environment, &config, &signing)?;
+    prepared.live = live_setup(environment, &config, owner.clone(), Vec::new())?;
     load_meta(&prepared.store, command.thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
     let passphrase = TerminalPrompt::open()
@@ -456,7 +468,8 @@ pub(crate) fn resume(
 fn live_setup(
     environment: &Environment,
     config: &ConfigDir,
-    signing: &SigningKey,
+    owner: ParticipantKey,
+    bootstrap: Vec<HostAddress>,
 ) -> Result<Option<LiveSetup>, RunError> {
     let relays = match environment.live {
         LiveMode::Off => return Ok(None),
@@ -467,9 +480,93 @@ fn live_setup(
     Ok(Some(LiveSetup {
         config: config.clone(),
         node_key: NodeKey::load(&config.node_key_file()).map_err(RunError::NotInitialised)?,
-        owner: ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)?,
+        owner,
         relays,
+        bootstrap,
     }))
+}
+
+fn own_key(signing: &SigningKey) -> Result<ParticipantKey, RunError> {
+    ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)
+}
+
+/// A thread someone else owns, joined from a ticket: what `mahi join` hands over to run the
+/// user's own agent in it.
+#[derive(Debug)]
+pub(crate) struct Joined {
+    pub(crate) thread: ThreadId,
+    pub(crate) base: ObjectId,
+    pub(crate) key: ThreadKey,
+    pub(crate) participant: ParticipantName,
+    pub(crate) owner: ParticipantKey,
+    pub(crate) host: HostAddress,
+    pub(crate) lock: ThreadLock,
+}
+
+/// Runs the user's own agent in a thread someone else owns, which `mahi join` checked and
+/// recorded, hosting it live on the thread's topic through the owner's host.
+pub(crate) fn join_run(
+    command: &JoinCommand,
+    environment: &Environment,
+    joined: Joined,
+) -> Result<Outcome, RunError> {
+    let (program, arguments) = command.agent().ok_or(RunError::NoAgent)?;
+    let cwd = env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(RunError::CurrentDirectory)?;
+    let host = Host::from_environment(environment)?;
+    let config = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )?;
+    let store = Store::discover(&cwd)?;
+    let profile = command.options.profile_for(program);
+    let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let credentials = gather_credentials(&config, &command.options, profile, environment)?;
+    let mut prepared = Prepared::new(
+        environment,
+        host,
+        &cwd,
+        store,
+        &AgentRequest {
+            program,
+            arguments,
+            profile,
+            hosts: &hosts,
+        },
+        credentials,
+    )?;
+    prepared.live = live_setup(
+        environment,
+        &config,
+        joined.owner.clone(),
+        vec![joined.host.clone()],
+    )?;
+    let agent_name = session::agent_from(Path::new(program));
+    let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
+    let _lock = joined.lock;
+    let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
+    let (started, caught) = until_stopped(&termination, |interrupt| {
+        session::enter(
+            &prepared.store,
+            session::Enter {
+                thread: joined.thread,
+                base: joined.base,
+                key: joined.key,
+                participant: joined.participant,
+                agent: &agent_name,
+                worktrees: &worktrees,
+            },
+            &prepared.globals,
+            interrupt,
+        )
+    });
+    if let Some(signal) = caught {
+        return Ok(Outcome::Stopped(signal));
+    }
+    let started = started.map_err(|error| RunError::Enter(Box::new(error)))?;
+    keep_private(&worktrees)?;
+    prepared.launch(environment, started, termination)
 }
 
 /// Returns what `mahi resume` runs: the command after `--`, or the program named after the

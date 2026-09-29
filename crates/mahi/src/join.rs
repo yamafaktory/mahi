@@ -29,6 +29,7 @@ use mahi_core::{
     ThreadId,
     ThreadRef,
 };
+use mahi_crypto::ThreadKey;
 use mahi_identity::{
     ConfigDir,
     ConfigError,
@@ -70,7 +71,10 @@ use mahi_thread::{
 use thiserror::Error;
 
 use crate::{
-    cli::JoinCommand,
+    cli::{
+        JoinCommand,
+        LaunchOptions,
+    },
     environment::{
         Environment,
         LiveMode,
@@ -79,7 +83,17 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
+    run::{
+        self,
+        Joined,
+        Outcome,
+        RunError,
+    },
     terminal::RawMode,
+    thread_lock::{
+        LockError,
+        ThreadLock,
+    },
 };
 
 const META_WAIT: Duration = Duration::from_secs(30);
@@ -139,6 +153,12 @@ pub(crate) enum JoinError {
     Frame(#[from] FrameError),
     #[error("cannot catch the signals that stop mahi")]
     Signals(#[source] SignalError),
+    #[error(transparent)]
+    Run(Box<RunError>),
+    #[error("--allow-host, --pass-env and the other agent options need an agent after --")]
+    OptionsNeedAgent,
+    #[error("cannot run your agent in the thread")]
+    Busy(#[source] LockError),
 }
 
 /// What a viewer shows: the screen of one agent of the participant it follows, rebuilt in its
@@ -349,13 +369,16 @@ impl Peers for JoinPeers {
 
 /// Joins the thread `command`'s ticket invites to and shows its host's agent until the user
 /// leaves with `q` or Ctrl-C, or mahi is stopped.
-pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<(), JoinError> {
+pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<Outcome, JoinError> {
     let relays = match environment.live {
         LiveMode::Public => Relays::Public,
         LiveMode::Local => Relays::Disabled,
         LiveMode::Off | LiveMode::Unknown => return Err(JoinError::LiveSetting),
     };
     let ticket = &command.ticket;
+    if command.agent().is_none() && command.options != LaunchOptions::default() {
+        return Err(JoinError::OptionsNeedAgent);
+    }
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(JoinError::CurrentDirectory)?;
@@ -386,12 +409,50 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<(
             return Err(error);
         }
     };
+    if command.agent().is_some() {
+        let _ = node.close();
+        let lock = ThreadLock::acquire(&config, ticket.thread()).map_err(JoinError::Busy)?;
+        let (participant, key) = unlock(&meta, own, &config)?;
+        let joined = Joined {
+            thread: ticket.thread(),
+            base: meta.base(),
+            key,
+            participant,
+            owner: ticket.owner().clone(),
+            host: ticket.host().clone(),
+            lock,
+        };
+        return run::join_run(command, environment, joined)
+            .map_err(|error| JoinError::Run(Box::new(error)));
+    }
     if let Ok(mut admitted) = peers.0.lock() {
         admitted.extend(meta.participants().map(|participant| *participant.node()));
     }
     let watched = watch(&node, ticket, &meta, &node_key, &config, own);
     let _ = node.close();
-    watched
+    watched.map(|()| Outcome::Exited(0))
+}
+
+/// Asks for the passphrase and recovers the thread key wrapped for this node's participant.
+fn unlock(
+    meta: &VerifiedMeta,
+    own: NodeId,
+    config: &ConfigDir,
+) -> Result<(ParticipantName, ThreadKey), JoinError> {
+    let me = meta
+        .participants()
+        .find(|participant| participant.node() == &own)
+        .ok_or(JoinError::NotListed)?;
+    let passphrase = TerminalPrompt::open()
+        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
+        .map_err(JoinError::Terminal)?;
+    let identity =
+        LocalIdentity::load(&config.identity_file(), &passphrase).map_err(JoinError::Unlock)?;
+    drop(passphrase);
+    let key = meta
+        .thread_key(me.name(), identity.as_age())
+        .map_err(JoinError::ThreadKey)?;
+    Ok((me.name().clone(), key))
 }
 
 fn joined_meta(
@@ -450,26 +511,13 @@ fn watch(
     own: NodeId,
 ) -> Result<(), JoinError> {
     let thread = ticket.thread();
-    let me = meta
-        .participants()
-        .find(|participant| participant.node() == &own)
-        .ok_or(JoinError::NotListed)?;
     let follows = meta
         .participants()
         .find(|participant| participant.node() == ticket.host().node())
         .ok_or(JoinError::NotListed)?
         .name()
         .clone();
-    let passphrase = TerminalPrompt::open()
-        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
-        .map_err(JoinError::Terminal)?;
-    let identity =
-        LocalIdentity::load(&config.identity_file(), &passphrase).map_err(JoinError::Unlock)?;
-    drop(passphrase);
-    let thread_key = meta
-        .thread_key(me.name(), identity.as_age())
-        .map_err(JoinError::ThreadKey)?;
-    drop(identity);
+    let (_, thread_key) = unlock(meta, own, config)?;
     let topic = node.join(
         LiveKeys::derive(&thread_key, thread)?.topic(),
         std::slice::from_ref(ticket.host()),

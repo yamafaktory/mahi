@@ -1687,44 +1687,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         );
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
-        let mut id = Command::new(env!("CARGO_BIN_EXE_mahi"));
-        id.arg("id");
-        teammate_env(&mut id, &bob, "bob");
-        let card = String::from_utf8(id.output().unwrap().stdout).unwrap();
-        assert!(card.starts_with("mahi-participant bob "));
-
-        let owner_env: Vec<(&str, &OsStr)> = vec![
-            ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
-            ("HOME", fixture.home.as_os_str()),
-            ("SSH_AUTH_SOCK", fixture.socket.as_os_str()),
-            ("USER", OsStr::new("tester")),
-            ("MAHI_LIVE", OsStr::new("local")),
-        ];
-        let config_home = fixture.home.join(".config");
-        let owner_env: Vec<(&str, &OsStr)> = owner_env
-            .into_iter()
-            .chain([("XDG_CONFIG_HOME", config_home.as_os_str())])
-            .collect();
-        let thread_text = thread.to_string();
-        let mut invite = mahi_in_terminal(
-            &fixture.repo,
-            &["invite", &thread_text, card.trim()],
-            &owner_env,
-        );
-        let invited = collect(&invite);
-        let mut answer = invite.writer().unwrap();
-        wait_until("the owner's passphrase question", || {
-            String::from_utf8_lossy(&invited.lock().unwrap()).contains("Passphrase")
-        });
-        answer
-            .write_all(format!("{PASSPHRASE}\n").as_bytes())
-            .unwrap();
-        assert_eq!(exit_of(&mut invite), 0);
-        let ticket = String::from_utf8_lossy(&invited.lock().unwrap())
-            .split_whitespace()
-            .find(|word| word.starts_with("mahi1"))
-            .unwrap()
-            .to_owned();
+        let ticket = invite_teammate(&fixture, thread, &bob);
 
         let bob_config = bob.home.join(".config");
         let bob_env: Vec<(&str, &OsStr)> = vec![
@@ -1766,6 +1729,117 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         keys.write_all(b"q").unwrap();
         assert_eq!(exit_of(&mut join), 0);
         assert!(String::from_utf8_lossy(&watched.lock().unwrap()).contains("left thread"));
+    }
+
+    fn invite_teammate(fixture: &Fixture, thread: ThreadId, teammate: &Teammate) -> String {
+        let mut id = Command::new(env!("CARGO_BIN_EXE_mahi"));
+        id.arg("id");
+        teammate_env(&mut id, teammate, "bob");
+        let card = String::from_utf8(id.output().unwrap().stdout).unwrap();
+        let config_home = fixture.home.join(".config");
+        let owner_env: Vec<(&str, &OsStr)> = vec![
+            ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+            ("HOME", fixture.home.as_os_str()),
+            ("XDG_CONFIG_HOME", config_home.as_os_str()),
+            ("SSH_AUTH_SOCK", fixture.socket.as_os_str()),
+            ("USER", OsStr::new("tester")),
+            ("MAHI_LIVE", OsStr::new("local")),
+        ];
+        let thread_text = thread.to_string();
+        let mut invite = mahi_in_terminal(
+            &fixture.repo,
+            &["invite", &thread_text, card.trim()],
+            &owner_env,
+        );
+        let invited = collect(&invite);
+        let mut answer = invite.writer().unwrap();
+        wait_until("the owner's passphrase question", || {
+            String::from_utf8_lossy(&invited.lock().unwrap()).contains("Passphrase")
+        });
+        answer
+            .write_all(format!("{PASSPHRASE}\n").as_bytes())
+            .unwrap();
+        assert_eq!(exit_of(&mut invite), 0);
+        String::from_utf8_lossy(&invited.lock().unwrap())
+            .split_whitespace()
+            .find(|word| word.starts_with("mahi1"))
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_teammate_runs_their_own_agent_in_the_owners_thread() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let mut host = fixture.command(&["run", "sh", "-c", "sleep 60"]);
+        let _host = KillOnDrop(
+            host.env("MAHI_LIVE", "local")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let (thread, _key) = running_thread(&fixture);
+        let bob = teammate(&fixture, "bob");
+        let ticket = invite_teammate(&fixture, thread, &bob);
+        assert_eq!(
+            Store::open(&bob.repo).unwrap().head_commit().unwrap(),
+            fixture.base,
+            "repository_on_main writes the same base commit in both clones"
+        );
+
+        let bob_config = bob.home.join(".config");
+        let bob_env: Vec<(&str, &OsStr)> = vec![
+            ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+            ("HOME", bob.home.as_os_str()),
+            ("XDG_CONFIG_HOME", bob_config.as_os_str()),
+            ("USER", OsStr::new("bob")),
+            ("MAHI_LIVE", OsStr::new("local")),
+        ];
+        let mut join = mahi_in_terminal(
+            &bob.repo,
+            &[
+                "join",
+                &ticket,
+                "--",
+                "sh",
+                "-c",
+                "printf 'bob agent in %s' \"$(basename \"$PWD\")\"; echo change > bob.txt",
+            ],
+            &bob_env,
+        );
+        let output = collect(&join);
+        let mut keys = join.writer().unwrap();
+        wait_until("bob's passphrase question", || {
+            String::from_utf8_lossy(&output.lock().unwrap()).contains("Passphrase")
+        });
+        keys.write_all(format!("{PASSPHRASE}\n").as_bytes())
+            .unwrap();
+        assert_eq!(
+            exit_of(&mut join),
+            0,
+            "{}",
+            String::from_utf8_lossy(&output.lock().unwrap())
+        );
+        let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
+        assert!(text.contains(&format!("bob agent in {thread}")), "{text}");
+
+        let store = Store::open(&bob.repo).unwrap();
+        let owner = mahi_thread::remembered_owner(&store, thread)
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner, fixture.owner);
+        load_meta(&store, thread, &owner, 1).unwrap();
+        let bob_git = gix::open(&bob.repo).unwrap();
+        let snapshots = bob_git
+            .find_reference(format!("refs/threads/{thread}/agents/bob.sh/snapshots").as_str())
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(snapshots.find_entry("bob.txt").is_some());
     }
 
     #[test]

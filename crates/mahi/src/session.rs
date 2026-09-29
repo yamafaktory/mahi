@@ -273,6 +273,91 @@ pub(crate) fn resume(
     })
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum EnterError {
+    #[error("cannot read the repository")]
+    Store(#[from] StoreError),
+    #[error("this clone does not have the thread's base commit {0}; fetch it first")]
+    BaseMissing(ObjectId, #[source] StoreError),
+    #[error("cannot read the thread's transcript")]
+    Transcript(#[source] Box<TranscriptError>),
+    #[error(
+        "your worktree of thread {0} is gone, and rebuilding it from your last snapshot is not \
+         supported yet"
+    )]
+    WorktreeGone(ThreadId),
+}
+
+/// What `mahi join` needs to run the user's own agent in a thread someone else owns.
+#[derive(Debug)]
+pub(crate) struct Enter<'a> {
+    pub(crate) thread: ThreadId,
+    pub(crate) base: ObjectId,
+    pub(crate) key: ThreadKey,
+    pub(crate) participant: ParticipantName,
+    pub(crate) agent: &'a AgentName,
+    pub(crate) worktrees: &'a Path,
+}
+
+/// Starts, or continues, the user's own agent in a thread whose `meta` is already here: a
+/// worktree at the thread's base, reused when it exists, the agent's snapshots continued from
+/// their newest commit or started with snapshot zero, and its transcript from its tip.
+pub(crate) fn enter(
+    store: &Store,
+    enter: Enter<'_>,
+    globals: &GlobalPatterns,
+    interrupt: &AtomicBool,
+) -> Result<Started, EnterError> {
+    let Enter {
+        thread,
+        base,
+        key,
+        participant,
+        agent,
+        worktrees,
+    } = enter;
+    store
+        .commit_tree(base)
+        .map_err(|error| EnterError::BaseMissing(base, error))?;
+    let name = thread.to_string();
+    let slot = AgentSlot::new(participant, agent.clone());
+    let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
+    let head = store.head(&snapshots)?;
+    let worktree = match store.worktree_dir(&name) {
+        Ok(worktree) => worktree,
+        Err(StoreError::NotAWorktree(_)) if head.is_some() => {
+            return Err(EnterError::WorktreeGone(thread));
+        }
+        Err(StoreError::NotAWorktree(_)) => {
+            store.add_worktree(&name, &worktrees.join(&name), base, interrupt)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(StoreError::Interrupted.into());
+    }
+    let first_snapshot = match head {
+        Some(commit) => Recorded {
+            commit,
+            tree: store.commit_tree(commit)?,
+            cache: SnapshotCache::default(),
+        },
+        None => take_first_snapshot(store, &name, &snapshots, globals, interrupt)?,
+    };
+    let tip = read_tip(store, &key, thread, &slot)
+        .map_err(|error| EnterError::Transcript(Box::new(error)))?;
+    Ok(Started {
+        thread,
+        worktree,
+        snapshots,
+        first_snapshot: Some(first_snapshot),
+        slot,
+        key: Some(key),
+        tip,
+        created: None,
+    })
+}
+
 /// Finds the user's agent in `thread`: the one named `agent`, or the only one.
 pub(crate) fn pick_slot(
     store: &Store,
@@ -861,6 +946,47 @@ pub(crate) mod tests {
         assert!(matches!(
             result,
             Err(StartError::Store(StoreError::NoCommit))
+        ));
+    }
+
+    #[test]
+    fn entering_a_joined_thread_checks_its_base_reuses_its_worktree_and_refuses_a_lost_one() {
+        let (_dir, store) = repository_on_main();
+        let base = store.head_commit().unwrap();
+        let thread = ThreadId::random().unwrap();
+        let agent = agent_from(Path::new("claude"));
+        let enter_with = |base| {
+            enter(
+                &store,
+                Enter {
+                    thread,
+                    base,
+                    key: ThreadKey::generate(),
+                    participant: ParticipantName::new("bob").unwrap(),
+                    agent: &agent,
+                    worktrees: &worktrees(&store),
+                },
+                &GlobalPatterns::default(),
+                &AtomicBool::new(false),
+            )
+        };
+        let missing = ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert!(matches!(
+            enter_with(missing),
+            Err(EnterError::BaseMissing(commit, _)) if commit == missing
+        ));
+        let first = enter_with(base).unwrap();
+        assert!(first.worktree.join("README").is_file());
+        assert_eq!(first.slot.to_string(), "bob.claude");
+        let snapshots = store.head(&first.snapshots).unwrap().unwrap();
+        assert_eq!(first.first_snapshot.as_ref().unwrap().commit, snapshots);
+        let again = enter_with(base).unwrap();
+        assert_eq!(again.worktree, first.worktree);
+        assert_eq!(again.first_snapshot.unwrap().commit, snapshots);
+        store.remove_worktree(&thread.to_string()).unwrap();
+        assert!(matches!(
+            enter_with(base),
+            Err(EnterError::WorktreeGone(gone)) if gone == thread
         ));
     }
 }

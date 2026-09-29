@@ -119,6 +119,7 @@ pub(crate) struct LiveSetup {
     pub(crate) node_key: NodeKey,
     pub(crate) owner: ParticipantKey,
     pub(crate) relays: Relays,
+    pub(crate) bootstrap: Vec<HostAddress>,
 }
 
 fn published_dir(config: &ConfigDir) -> io::Result<OwnedFd> {
@@ -268,8 +269,11 @@ impl LiveHost {
             setup.relays,
             Arc::clone(&peers) as Arc<dyn Peers>,
         )?);
-        let topic =
-            Arc::new(node.join(LiveKeys::derive(thread_key, thread)?.topic(), &[], None)?);
+        let topic = Arc::new(node.join(
+            LiveKeys::derive(thread_key, thread)?.topic(),
+            &setup.bootstrap,
+            None,
+        )?);
         let sender = FrameSender::new(
             LiveKeys::derive(thread_key, thread)?,
             setup.node_key.secret(),
