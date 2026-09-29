@@ -18,9 +18,12 @@ use iroh::{
         BindError,
         BindOpts,
         Builder,
+        ConnectError,
         InvalidSocketAddr,
     },
+    protocol::Router,
 };
+use mahi_core::ThreadId;
 use mahi_thread::{
     NodeId,
     NodeIdError,
@@ -36,13 +39,20 @@ use crate::{
     AddressError,
     HostAddress,
     MAX_DIRECT_ADDRESSES,
+    MetaSource,
     is_reachable,
+    meta::{
+        self,
+        META_ALPN,
+        MetaHandler,
+    },
 };
 
 const WORKER_THREADS: usize = 2;
 const FIRST_STABLE_PORT: u16 = 49_152;
 const STABLE_PORTS: u16 = 16_384;
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
+const FETCH_WAIT: Duration = Duration::from_secs(20);
 
 /// Which relays an endpoint uses to reach peers it cannot reach directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,8 +68,9 @@ pub enum Relays {
 ///
 /// It blocks on its own runtime, so it is used, and dropped, outside any async runtime.
 pub struct LiveNode {
+    router: Option<Router>,
     endpoint: Endpoint,
-    runtime: Runtime,
+    runtime: Option<Runtime>,
     relays: Relays,
 }
 
@@ -84,6 +95,32 @@ pub enum LiveError {
     /// The endpoint's address cannot go into a ticket.
     #[error("the endpoint's address cannot go into a ticket")]
     Address(#[from] AddressError),
+    /// The host could not be reached.
+    #[error("cannot reach the host")]
+    Connect(#[source] Box<ConnectError>),
+    /// The connection to the host broke.
+    #[error("the connection to the host broke")]
+    Stream(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The live node was already closed, which a caller holding it never sees.
+    #[error("the live node is closed")]
+    Closed,
+    /// The host's node id is not a usable key, which a checked host address never holds.
+    #[error("the host's node id is not a usable key")]
+    HostKey,
+    /// The host could not answer now: it is busy, or reading its `meta` failed or was slow.
+    #[error("the host cannot answer now; try again")]
+    Unavailable,
+    /// The host refused: the thread is unknown to it, or this node is not a participant.
+    #[error(
+        "the host refused: this node is not a participant of the thread, or the host does not have it"
+    )]
+    Refused,
+    /// The host sent more than a `meta` document can hold.
+    #[error("the host sent a meta document that is too large")]
+    TooLarge,
+    /// The host did not answer in time.
+    #[error("the host did not answer in time")]
+    TimedOut,
 }
 
 impl fmt::Debug for LiveNode {
@@ -107,6 +144,28 @@ impl LiveNode {
     /// [`LiveError::Runtime`] if the runtime cannot start, or [`LiveError::Bind`] if the
     /// endpoint cannot bind its sockets.
     pub fn bind(secret: &[u8; 32], relays: Relays) -> Result<Self, LiveError> {
+        Self::bind_with(secret, relays, None)
+    }
+
+    /// Binds an endpoint like [`LiveNode::bind`] that also hosts: it serves `meta` from
+    /// `source` to the nodes `source` accepts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`LiveNode::bind`].
+    pub fn bind_host(
+        secret: &[u8; 32],
+        relays: Relays,
+        source: Arc<dyn MetaSource>,
+    ) -> Result<Self, LiveError> {
+        Self::bind_with(secret, relays, Some(source))
+    }
+
+    fn bind_with(
+        secret: &[u8; 32],
+        relays: Relays,
+        source: Option<Arc<dyn MetaSource>>,
+    ) -> Result<Self, LiveError> {
         outside_runtime()?;
         let runtime = runtime::Builder::new_multi_thread()
             .worker_threads(WORKER_THREADS)
@@ -127,9 +186,18 @@ impl LiveNode {
                 .block_on(builder(&secret_key, relay_mode, 0)?.bind())
                 .map_err(|error| LiveError::Bind(Box::new(error)))?,
         };
+        let router = source.map(|source| {
+            let endpoint = endpoint.clone();
+            runtime.block_on(async move {
+                Router::builder(endpoint)
+                    .accept(META_ALPN, MetaHandler::new(source))
+                    .spawn()
+            })
+        });
         Ok(Self {
+            router,
             endpoint,
-            runtime,
+            runtime: Some(runtime),
             relays,
         })
     }
@@ -157,7 +225,7 @@ impl LiveNode {
         outside_runtime()?;
         if self.relays == Relays::Public {
             let _ = self
-                .runtime
+                .runtime()?
                 .block_on(async { tokio::time::timeout(wait, self.endpoint.online()).await });
         }
         let address = self.endpoint.addr();
@@ -173,18 +241,68 @@ impl LiveNode {
         )?)
     }
 
-    /// Closes the endpoint, telling connected peers for up to 5 s, and stops the runtime.
+    /// Asks the host at `host` for `thread`'s signed `meta`, waiting up to 20 s.
+    ///
+    /// The document is returned unchecked: the caller verifies it against the owner key it
+    /// trusts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiveError::Refused`] if the host refuses, [`LiveError::TimedOut`] if it does
+    /// not answer in time, [`LiveError::TooLarge`] if it sends too much, or another
+    /// [`LiveError`] if it cannot be reached.
+    pub fn fetch_meta(&self, host: &HostAddress, thread: ThreadId) -> Result<Vec<u8>, LiveError> {
+        outside_runtime()?;
+        self.runtime()?
+            .block_on(async {
+                tokio::time::timeout(FETCH_WAIT, meta::fetch(&self.endpoint, host, thread)).await
+            })
+            .map_err(|_| LiveError::TimedOut)?
+    }
+
+    /// Closes the endpoint, telling connected peers, and stops the runtime, in about 10 s at
+    /// most: work still running then, such as a slow `meta` read, is left behind.
     ///
     /// # Errors
     ///
     /// Returns [`LiveError::InsideRuntime`] if called from inside an async runtime, where the
     /// node is dropped without telling its peers.
-    pub fn close(self) -> Result<(), LiveError> {
+    pub fn close(mut self) -> Result<(), LiveError> {
         outside_runtime()?;
-        let _ = self
-            .runtime
-            .block_on(async { tokio::time::timeout(CLOSE_WAIT, self.endpoint.close()).await });
+        self.shut_down();
         Ok(())
+    }
+
+    fn runtime(&self) -> Result<&Runtime, LiveError> {
+        self.runtime.as_ref().ok_or(LiveError::Closed)
+    }
+
+    fn shut_down(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        if Handle::try_current().is_ok() {
+            runtime.shutdown_background();
+            return;
+        }
+        let router = self.router.take();
+        let endpoint = self.endpoint.clone();
+        let _ = runtime.block_on(async move {
+            tokio::time::timeout(CLOSE_WAIT, async move {
+                if let Some(router) = router {
+                    let _ = router.shutdown().await;
+                }
+                endpoint.close().await;
+            })
+            .await
+        });
+        runtime.shutdown_timeout(CLOSE_WAIT);
+    }
+}
+
+impl Drop for LiveNode {
+    fn drop(&mut self) {
+        self.shut_down();
     }
 }
 
@@ -213,6 +331,19 @@ fn builder(secret_key: &SecretKey, relay_mode: RelayMode, port: u16) -> Result<B
             )
         })
         .map_err(LiveError::SocketAddress)
+}
+
+#[cfg(test)]
+impl LiveNode {
+    pub(crate) fn run<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.runtime()
+            .expect("a node in a test is open")
+            .block_on(future)
+    }
+
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
 }
 
 fn outside_runtime() -> Result<(), LiveError> {

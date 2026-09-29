@@ -57,7 +57,7 @@ ssh-key = { version = "0.6.7", default-features = false, features = ["ed25519", 
 subtle = { version = "2.6.1", default-features = false }
 tempfile = "3.27.0"
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "time"] }
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "sync", "time"] }
 webpki-roots = "1.0.9"
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
 zeroize = "1.9.0"

@@ -2,6 +2,7 @@
 //! stream.
 
 mod endpoint;
+mod meta;
 #[cfg(test)]
 mod testing;
 mod ticket;
@@ -11,6 +12,10 @@ pub use endpoint::{
     LiveNode,
     Relays,
     stable_port,
+};
+pub use meta::{
+    META_ALPN,
+    MetaSource,
 };
 pub use ticket::{
     AddressError,
