@@ -8,6 +8,7 @@ mod hook;
 mod id;
 mod init;
 mod invite;
+mod join;
 mod live;
 mod network;
 mod profile;
@@ -92,27 +93,12 @@ fn main() {
                 1
             }
         },
-        Command::Invite(command) => match invite::invite(&command, &environment) {
-            Ok(ticket) => print_out(&ticket),
-            Err(error) => {
-                report(&error);
-                1
-            }
-        },
-        Command::Id => match id::id(&environment) {
-            Ok(card) => print_out(&card),
-            Err(error) => {
-                report(&error);
-                1
-            }
-        },
-        Command::Threads => match threads::threads() {
-            Ok(listing) => print_out(&listing),
-            Err(error) => {
-                report(&error);
-                1
-            }
-        },
+        Command::Join(command) => exit_code(join::join(&command, &environment).map(|()| 0)),
+        Command::Invite(command) => {
+            exit_code(invite::invite(&command, &environment).map(|ticket| print_out(&ticket)))
+        }
+        Command::Id => exit_code(id::id(&environment).map(|card| print_out(&card))),
+        Command::Threads => exit_code(threads::threads().map(|listing| print_out(&listing))),
         Command::Hook(hook) => {
             if let Some(socket) = &environment.hook_socket {
                 let _ = hook::send(socket, hook.kind, io::stdin().lock());
@@ -143,6 +129,14 @@ fn main() {
         },
     };
     process::exit(code);
+}
+
+/// Returns the exit code of a command's `result`, reporting its error.
+fn exit_code<E: Error>(result: Result<i32, E>) -> i32 {
+    result.unwrap_or_else(|error| {
+        report(&error);
+        1
+    })
 }
 
 /// Writes `text` to standard output, where a reader that stopped early is not an error.

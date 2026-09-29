@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsStr,
         fs,
         io::{
             Read,
@@ -70,6 +71,7 @@ mod tests {
         SigningKey,
     };
     use mahi_sandbox::{
+        PtyChild,
         PtyCommand,
         WindowSize,
         exit_code,
@@ -1574,6 +1576,182 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             String::from_utf8_lossy(&refused.stderr)
                 .contains("MAHI_LIVE must be off, local or public")
         );
+    }
+
+    struct Teammate {
+        home: PathBuf,
+        repo: PathBuf,
+    }
+
+    fn teammate(fixture: &Fixture, name: &str) -> Teammate {
+        let home = fixture.root.join(format!("{name}-home"));
+        let repo = fixture.root.join(format!("{name}-repo"));
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        repository_on_main(&repo);
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        initialise(&home, &key)
+            .save(
+                &config_dir(&home).identity_file(),
+                &SecretString::from(PASSPHRASE.to_owned()),
+            )
+            .unwrap();
+        Teammate { home, repo }
+    }
+
+    fn teammate_env(command: &mut Command, teammate: &Teammate, name: &str) {
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr")
+            .env("HOME", &teammate.home)
+            .env("XDG_CONFIG_HOME", teammate.home.join(".config"))
+            .env("USER", name)
+            .env("MAHI_LIVE", "local");
+    }
+
+    fn mahi_in_terminal(cwd: &Path, arguments: &[&str], env: &[(&str, &OsStr)]) -> PtyChild {
+        let mut command = PtyCommand::new(
+            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            cwd,
+            WindowSize {
+                rows: 24,
+                cols: 200,
+            },
+        );
+        for argument in arguments {
+            command = command.arg(argument);
+        }
+        for (key, value) in env {
+            command = command.env(key, value);
+        }
+        command.spawn().unwrap()
+    }
+
+    fn collect(child: &PtyChild) -> Arc<Mutex<Vec<u8>>> {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&output);
+        let mut reader = child.reader().unwrap();
+        thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                collected.lock().unwrap().extend_from_slice(&buffer[..read]);
+            }
+        });
+        output
+    }
+
+    fn exit_of(child: &mut PtyChild) -> i32 {
+        let mut status = None;
+        wait_until("mahi to finish", || {
+            status = child.try_wait().unwrap();
+            status.is_some()
+        });
+        exit_code(status.unwrap())
+    }
+
+    #[test]
+    fn a_teammate_invited_with_their_card_joins_and_watches_the_agent_then_leaves() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let mut host = fixture.command(&[
+            "run",
+            "sh",
+            "-c",
+            "printf 'first screen'; while [ ! -e go ]; do sleep 0.1; done; \
+             printf ' then live output'; sleep 30",
+        ]);
+        let _host = KillOnDrop(
+            host.env("MAHI_LIVE", "local")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let (thread, _key) = running_thread(&fixture);
+        let bob = teammate(&fixture, "bob");
+        let mut id = Command::new(env!("CARGO_BIN_EXE_mahi"));
+        id.arg("id");
+        teammate_env(&mut id, &bob, "bob");
+        let card = String::from_utf8(id.output().unwrap().stdout).unwrap();
+        assert!(card.starts_with("mahi-participant bob "));
+
+        let owner_env: Vec<(&str, &OsStr)> = vec![
+            ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+            ("HOME", fixture.home.as_os_str()),
+            ("SSH_AUTH_SOCK", fixture.socket.as_os_str()),
+            ("USER", OsStr::new("tester")),
+            ("MAHI_LIVE", OsStr::new("local")),
+        ];
+        let config_home = fixture.home.join(".config");
+        let owner_env: Vec<(&str, &OsStr)> = owner_env
+            .into_iter()
+            .chain([("XDG_CONFIG_HOME", config_home.as_os_str())])
+            .collect();
+        let thread_text = thread.to_string();
+        let mut invite = mahi_in_terminal(
+            &fixture.repo,
+            &["invite", &thread_text, card.trim()],
+            &owner_env,
+        );
+        let invited = collect(&invite);
+        let mut answer = invite.writer().unwrap();
+        wait_until("the owner's passphrase question", || {
+            String::from_utf8_lossy(&invited.lock().unwrap()).contains("Passphrase")
+        });
+        answer
+            .write_all(format!("{PASSPHRASE}\n").as_bytes())
+            .unwrap();
+        assert_eq!(exit_of(&mut invite), 0);
+        let ticket = String::from_utf8_lossy(&invited.lock().unwrap())
+            .split_whitespace()
+            .find(|word| word.starts_with("mahi1"))
+            .unwrap()
+            .to_owned();
+
+        let bob_config = bob.home.join(".config");
+        let bob_env: Vec<(&str, &OsStr)> = vec![
+            ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+            ("HOME", bob.home.as_os_str()),
+            ("XDG_CONFIG_HOME", bob_config.as_os_str()),
+            ("USER", OsStr::new("bob")),
+            ("MAHI_LIVE", OsStr::new("local")),
+        ];
+        let mut join = mahi_in_terminal(&bob.repo, &["join", &ticket], &bob_env);
+        let watched = collect(&join);
+        let mut keys = join.writer().unwrap();
+        wait_until("bob's passphrase question", || {
+            String::from_utf8_lossy(&watched.lock().unwrap()).contains("Passphrase")
+        });
+        keys.write_all(format!("{PASSPHRASE}\n").as_bytes())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while !String::from_utf8_lossy(&watched.lock().unwrap()).contains("first screen") {
+            assert!(
+                Instant::now() < deadline,
+                "{}",
+                String::from_utf8_lossy(&watched.lock().unwrap())
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!String::from_utf8_lossy(&watched.lock().unwrap()).contains("live output"));
+        let worktree = fixture.thread_worktrees().pop().unwrap();
+        fs::write(worktree.join("go"), "").unwrap();
+        while !String::from_utf8_lossy(&watched.lock().unwrap()).contains("live output") {
+            assert!(
+                Instant::now() < deadline,
+                "{}",
+                String::from_utf8_lossy(&watched.lock().unwrap())
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(String::from_utf8_lossy(&watched.lock().unwrap()).contains("first screen"));
+        keys.write_all(b"q").unwrap();
+        assert_eq!(exit_of(&mut join), 0);
+        assert!(String::from_utf8_lossy(&watched.lock().unwrap()).contains("left thread"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use mahi_identity::{
     CredentialName,
     CredentialNameError,
 };
+use mahi_live::Ticket;
 use mahi_proxy::HostName;
 
 use crate::{
@@ -59,12 +60,21 @@ pub(crate) enum Command {
     /// Adds a teammate to a thread you own, from their participant card, and prints the
     /// ticket they join with.
     Invite(InviteCommand),
+    /// Watches a thread you were invited to, live, from the ticket its owner gave you. Run it
+    /// in a clone of the project; press q to leave.
+    Join(JoinCommand),
     /// Keeps the tokens agents sign in with, so no shell has to export them.
     #[command(subcommand)]
     Credential(CredentialCommand),
     /// Reports an agent event, with its details on standard input, to the mahi run that
     /// started the agent. Agent hooks call it; it always exits with 0.
     Hook(HookCommand),
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct JoinCommand {
+    /// The ticket `mahi invite` printed for you.
+    pub(crate) ticket: Ticket,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
