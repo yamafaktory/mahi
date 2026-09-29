@@ -2086,6 +2086,7 @@ dependencies = [
  "clru",
  "crossbeam-deque",
  "gix-chunk",
+ "gix-diff",
  "gix-error",
  "gix-features",
  "gix-hash",
@@ -2093,6 +2094,7 @@ dependencies = [
  "gix-object",
  "gix-path",
  "gix-tempfile",
+ "gix-traverse",
  "gix-zlib",
  "memmap2",
  "parking_lot",
@@ -3581,6 +3583,8 @@ dependencies = [
  "bytes",
  "gix",
  "hmac 0.12.1",
+ "mahi-core",
+ "mahi-store",
  "russh",
  "sha1 0.10.7",
  "tempfile",
@@ -3594,6 +3598,7 @@ name = "mahi-store"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "gix-pack",
  "gix-validate",
  "mahi-core",
  "mahi-crypto",

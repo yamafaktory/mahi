@@ -120,22 +120,24 @@ impl Transport for SshTransport {
         service: Service,
         extra_parameters: &'a [(&'a str, Option<&'a str>)],
     ) -> Result<SetServiceResponse<'_>, client::Error> {
-        let command = self.remote.command(match service {
-            Service::UploadPack => GitService::UploadPack,
-            Service::ReceivePack => GitService::ReceivePack,
-        });
+        let (git_service, protocol, env): (_, _, &[(&str, &str)]) = match service {
+            Service::UploadPack => (
+                GitService::UploadPack,
+                Protocol::V2,
+                &[("GIT_PROTOCOL", "version=2")],
+            ),
+            Service::ReceivePack => (GitService::ReceivePack, Protocol::V1, &[]),
+        };
+        let command = self.remote.command(git_service);
         let exec = self
             .runtime
-            .block_on(
-                self.session
-                    .exec(&command, &[("GIT_PROTOCOL", "version=2")]),
-            )
+            .block_on(self.session.exec(&command, env))
             .map_err(|error| client::Error::Io(std::io::Error::other(error)))?;
         let (output, input) = exec.split();
         let connection = self.connection.insert(Connection::new(
             output,
             input,
-            Protocol::V2,
+            protocol,
             BString::from(self.remote.path()),
             None::<(&str, Option<u16>)>,
             ConnectMode::Process,

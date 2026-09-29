@@ -4,6 +4,7 @@
 compile_error!("mahi supports Linux and macOS only");
 
 mod fetch;
+mod push;
 mod snapshot;
 mod store;
 mod worktree;
@@ -17,6 +18,7 @@ pub use gix::{
     ObjectId,
     objs::tree::EntryKind,
 };
+pub use push::Pushed;
 pub use snapshot::{
     GlobalPatterns,
     MAX_SNAPSHOT_DEPTH,

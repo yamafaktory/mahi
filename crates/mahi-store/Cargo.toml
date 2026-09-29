@@ -12,6 +12,7 @@ version.workspace = true
 [dependencies]
 gix = { workspace = true }
 gix-validate = { workspace = true }
+gix-pack = { workspace = true }
 mahi-core = { workspace = true }
 mahi-crypto = { workspace = true }
 rustix = { workspace = true }

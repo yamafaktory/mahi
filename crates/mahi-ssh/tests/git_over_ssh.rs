@@ -366,6 +366,52 @@ mod tests {
     }
 
     #[test]
+    fn thread_refs_are_pushed_over_ssh_with_git_receive_pack() {
+        let fixture = fixture();
+        let remote = fixture.dir.path().join("remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]);
+        let local = fixture.dir.path().join("local");
+        gix::init(&local).unwrap();
+        let store = mahi_store::Store::open(&local).unwrap();
+        let meta = mahi_core::ThreadRef::new(
+            mahi_core::ThreadId::random().unwrap(),
+            mahi_core::RefKind::Meta,
+        );
+        let blob = store.write_blob(b"meta").unwrap();
+        let tree = store
+            .write_tree(&[("meta", mahi_store::EntryKind::Blob, blob)])
+            .unwrap();
+        let commit = store.append(&meta, None, tree, "meta").unwrap();
+        let url = format!(
+            "ssh://git@127.0.0.1:{}{}",
+            fixture.address.port(),
+            remote.display()
+        );
+        let transport = SshTransport::connect(
+            SshRemote::parse(&url).unwrap(),
+            &fixture.known_hosts,
+            &fixture.agent,
+            "nobody",
+        )
+        .unwrap();
+        let pushed = store
+            .push_refs(
+                transport,
+                std::slice::from_ref(&meta),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(pushed, [(meta.clone(), mahi_store::Pushed::Updated)]);
+        assert_eq!(
+            git(&remote, &["rev-parse", &meta.to_string()]),
+            commit.to_string()
+        );
+        git(&remote, &["fsck", "--strict", "--no-dangling"]);
+        assert_eq!(*fixture.protocols.lock().unwrap(), [""]);
+    }
+
+    #[test]
     fn a_missing_repository_reports_what_the_remote_said() {
         let fixture = fixture();
         let missing = fixture.dir.path().join("missing");

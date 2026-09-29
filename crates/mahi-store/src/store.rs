@@ -143,6 +143,9 @@ pub enum StoreError {
     /// A file in the tree could not be written, or collides with another.
     #[error("cannot check out {0:?}")]
     CheckoutPath(String),
+    /// A push failed as a whole, for the reason given.
+    #[error("push failed: {0}")]
+    PushFailed(String),
     /// More refs were fetched than mahi accepts at once.
     #[error("{0} refs were fetched, more than mahi accepts")]
     TooManyRefs(usize),
