@@ -109,6 +109,7 @@ const UNASKED: [u8; 16] = [0; 16];
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
 const PUBLISHED: &str = "live";
+const HOSTS: &str = "hosts";
 const MAX_PUBLISHED_BYTES: u64 = 4096;
 const PUBLISH_EVERY: Duration = Duration::from_secs(2);
 
@@ -152,13 +153,52 @@ pub(crate) fn publish_address(
 /// Returns where the running host of `thread` said it can be reached, if it did.
 pub(crate) fn published_address(config: &ConfigDir, thread: ThreadId) -> Option<HostAddress> {
     let directory = published_dir(config).ok()?;
+    read_address(&directory, thread)
+}
+
+fn hosts_dir(store: &Store) -> io::Result<OwnedFd> {
+    let parent = store.common_dir().join("mahi");
+    profile::create_private_dir(&parent)?;
+    let parent = rustix::fs::open(
+        &parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    profile::open_private_dir(&parent, HOSTS)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the hosts directory is not a private directory",
+        )
+    })
+}
+
+/// Keeps, in the repository's git directory, where the host of a joined thread was last
+/// reached, so resuming the user's own agent there rejoins the thread's topic through it.
+pub(crate) fn remember_host(store: &Store, thread: ThreadId, host: &HostAddress) -> io::Result<()> {
+    let bytes = host
+        .to_bytes()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    profile::replace(&hosts_dir(store)?, &thread.to_string(), &bytes)
+}
+
+/// Returns where the host of a joined thread was last reached, if it was joined here.
+pub(crate) fn remembered_host(store: &Store, thread: ThreadId) -> Option<HostAddress> {
+    let directory = hosts_dir(store).ok()?;
+    read_address(&directory, thread)
+}
+
+fn read_address(directory: &OwnedFd, thread: ThreadId) -> Option<HostAddress> {
     let file = rustix::fs::openat(
-        &directory,
+        directory,
         thread.to_string().as_str(),
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .ok()?;
+    let stat = rustix::fs::fstat(&file).ok()?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+        return None;
+    }
     let mut bytes = Vec::new();
     File::from(file)
         .take(MAX_PUBLISHED_BYTES)
@@ -908,5 +948,38 @@ mod tests {
         )
         .unwrap();
         assert!(published_address(&config, thread).is_none());
+    }
+
+    #[test]
+    fn a_joined_threads_host_is_remembered_in_the_git_directory() {
+        let (_repo, store) = crate::session::tests::repository_on_main();
+        let thread = ThreadId::random().unwrap();
+        assert!(remembered_host(&store, thread).is_none());
+        let host = some_address();
+        remember_host(&store, thread, &host).unwrap();
+        assert_eq!(remembered_host(&store, thread), Some(host));
+        let newer = some_address();
+        remember_host(&store, thread, &newer).unwrap();
+        assert_eq!(remembered_host(&store, thread), Some(newer));
+
+        let other = ThreadId::random().unwrap();
+        let hosts = store.common_dir().join("mahi").join(HOSTS);
+        let elsewhere = hosts.join("elsewhere");
+        std::fs::write(&elsewhere, some_address().to_bytes().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, hosts.join(other.to_string())).unwrap();
+        assert!(remembered_host(&store, other).is_none());
+        #[cfg(target_os = "linux")]
+        {
+            let fifo = ThreadId::random().unwrap();
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                hosts.join(fifo.to_string()),
+                rustix::fs::FileType::Fifo,
+                Mode::from_raw_mode(0o600),
+                0,
+            )
+            .unwrap();
+            assert!(remembered_host(&store, fifo).is_none());
+        }
     }
 }

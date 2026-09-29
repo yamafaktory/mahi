@@ -1767,6 +1767,29 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             .to_owned()
     }
 
+    fn teammate_in_terminal(teammate: &Teammate, name: &str, arguments: &[&str]) -> (i32, String) {
+        let config = teammate.home.join(".config");
+        let env: Vec<(&str, &OsStr)> = vec![
+            ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+            ("HOME", teammate.home.as_os_str()),
+            ("XDG_CONFIG_HOME", config.as_os_str()),
+            ("USER", OsStr::new(name)),
+            ("MAHI_LIVE", OsStr::new("local")),
+        ];
+        let mut mahi = mahi_in_terminal(&teammate.repo, arguments, &env);
+        let output = collect(&mahi);
+        let mut keys = mahi.writer().unwrap();
+        wait_until("the passphrase question", || {
+            String::from_utf8_lossy(&output.lock().unwrap()).contains("Passphrase")
+        });
+        keys.write_all(format!("{PASSPHRASE}\n").as_bytes())
+            .unwrap();
+        let code = exit_of(&mut mahi);
+        thread::sleep(Duration::from_millis(100));
+        let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
+        (code, text)
+    }
+
     #[test]
     fn a_teammate_runs_their_own_agent_in_the_owners_thread() {
         let fixture = fixture();
@@ -1789,16 +1812,9 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             "repository_on_main writes the same base commit in both clones"
         );
 
-        let bob_config = bob.home.join(".config");
-        let bob_env: Vec<(&str, &OsStr)> = vec![
-            ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
-            ("HOME", bob.home.as_os_str()),
-            ("XDG_CONFIG_HOME", bob_config.as_os_str()),
-            ("USER", OsStr::new("bob")),
-            ("MAHI_LIVE", OsStr::new("local")),
-        ];
-        let mut join = mahi_in_terminal(
-            &bob.repo,
+        let (code, text) = teammate_in_terminal(
+            &bob,
+            "bob",
             &[
                 "join",
                 &ticket,
@@ -1807,22 +1823,8 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
                 "-c",
                 "printf 'bob agent in %s' \"$(basename \"$PWD\")\"; echo change > bob.txt",
             ],
-            &bob_env,
         );
-        let output = collect(&join);
-        let mut keys = join.writer().unwrap();
-        wait_until("bob's passphrase question", || {
-            String::from_utf8_lossy(&output.lock().unwrap()).contains("Passphrase")
-        });
-        keys.write_all(format!("{PASSPHRASE}\n").as_bytes())
-            .unwrap();
-        assert_eq!(
-            exit_of(&mut join),
-            0,
-            "{}",
-            String::from_utf8_lossy(&output.lock().unwrap())
-        );
-        let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
+        assert_eq!(code, 0, "{text}");
         assert!(text.contains(&format!("bob agent in {thread}")), "{text}");
 
         let store = Store::open(&bob.repo).unwrap();
@@ -1840,6 +1842,52 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             .tree()
             .unwrap();
         assert!(snapshots.find_entry("bob.txt").is_some());
+
+        let thread_text = thread.to_string();
+        let (code, text) = teammate_in_terminal(
+            &bob,
+            "bob",
+            &[
+                "resume",
+                &thread_text,
+                "--",
+                "sh",
+                "-c",
+                "printf 'bob resumed'; echo more > more.txt",
+            ],
+        );
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("bob resumed"), "{text}");
+        let resumed_tree = bob_git
+            .find_reference(format!("refs/threads/{thread}/agents/bob.sh/snapshots").as_str())
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(resumed_tree.find_entry("bob.txt").is_some());
+        assert!(resumed_tree.find_entry("more.txt").is_some());
+
+        let mut end = Command::new(env!("CARGO_BIN_EXE_mahi"));
+        end.args(["end", &thread_text]).current_dir(&bob.repo);
+        teammate_env(&mut end, &bob, "bob");
+        let ended = end.output().unwrap();
+        assert_eq!(
+            ended.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&ended.stderr)
+        );
+        let bob_store = Store::open(&bob.repo).unwrap();
+        assert!(bob_store.worktree_dir(&thread_text).is_err());
+        assert!(
+            !bob_store
+                .common_dir()
+                .join("mahi/state")
+                .join(&thread_text)
+                .exists()
+        );
+        load_meta(&bob_store, thread, &fixture.owner, 1).unwrap();
     }
 
     #[test]

@@ -79,6 +79,7 @@ use crate::{
         Environment,
         LiveMode,
     },
+    live,
     prompt::{
         Prompt,
         TerminalPrompt,
@@ -141,6 +142,8 @@ pub(crate) enum JoinError {
     Pin(#[source] ThreadError),
     #[error("cannot remember the thread's owner")]
     Owner(#[source] OwnerError),
+    #[error("cannot remember the thread's host")]
+    Host(#[source] io::Error),
     #[error("thread {0} was started in this repository, not joined; a ticket cannot claim it")]
     NotInvited(ThreadId),
     #[error("cannot ask for your passphrase")]
@@ -488,6 +491,7 @@ fn joined_meta(
     check_joinable(store, thread)?;
     record_meta(store, thread, &document, ticket.owner()).map_err(JoinError::Pin)?;
     remember_owner(store, thread, ticket.owner()).map_err(JoinError::Owner)?;
+    live::remember_host(store, thread, ticket.host()).map_err(JoinError::Host)?;
     Ok(meta)
 }
 

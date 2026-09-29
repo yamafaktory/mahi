@@ -95,6 +95,7 @@ use mahi_store::{
 };
 use mahi_thread::{
     KeyError,
+    OwnerError,
     ParticipantKey,
     load_meta,
 };
@@ -132,6 +133,7 @@ use crate::{
     },
     hook,
     live::{
+        self,
         LiveHost,
         LiveSetup,
         OutputTap,
@@ -244,6 +246,8 @@ pub(crate) enum RunError {
     NotInitialised(#[source] IdentityError),
     #[error("MAHI_LIVE must be off, local or public")]
     LiveSetting,
+    #[error("cannot tell who owns thread {0}")]
+    ThreadOwner(ThreadId, #[source] OwnerError),
     #[error("name the agent to run after --, as in mahi join <ticket> -- claude")]
     NoAgent,
     #[error("cannot run your agent in the thread")]
@@ -411,11 +415,15 @@ pub(crate) fn resume(
         environment.xdg_config_home.as_deref(),
     )?;
     let signing = SigningKey::load(&config.signing_key_file()).map_err(RunError::NotInitialised)?;
-    let owner =
-        ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)?;
+    let own = ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)?;
     let participant = session::participant_from(environment.user.as_deref())
         .map_err(RunError::ParticipantName)?;
     let store = Store::discover(&cwd)?;
+    let owner = session::thread_owner(&store, command.thread, own)
+        .map_err(|error| RunError::ThreadOwner(command.thread, error))?;
+    let bootstrap: Vec<HostAddress> = live::remembered_host(&store, command.thread)
+        .into_iter()
+        .collect();
     let slot = session::pick_slot(&store, command.thread, &participant, command.agent.as_ref())?;
     store
         .worktree_dir(&command.thread.to_string())
@@ -437,7 +445,7 @@ pub(crate) fn resume(
         },
         credentials,
     )?;
-    prepared.live = live_setup(environment, &config, owner.clone(), Vec::new())?;
+    prepared.live = live_setup(environment, &config, owner.clone(), bootstrap)?;
     load_meta(&prepared.store, command.thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
     let passphrase = TerminalPrompt::open()

@@ -39,6 +39,7 @@ use mahi_store::{
 };
 use mahi_thread::{
     KeyError,
+    OwnerError,
     ParticipantKey,
     ThreadError,
     load_meta,
@@ -83,8 +84,10 @@ pub(crate) enum EndError {
     Lock(#[source] io::Error),
     #[error(transparent)]
     Agent(#[from] ResumeError),
-    #[error("cannot open thread {0}; only a thread you started can be ended")]
+    #[error("cannot open thread {0}; only a thread you started or joined can be ended")]
     NotOwner(ThreadId, #[source] Box<ThreadError>),
+    #[error("cannot tell who owns thread {0}")]
+    ThreadOwner(ThreadId, #[source] OwnerError),
     #[error("cannot take the last snapshot of the worktree")]
     Snapshot(#[source] StoreError),
     #[error(
@@ -119,11 +122,12 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
         environment.xdg_config_home.as_deref(),
     )?;
     let signing = SigningKey::load(&config.signing_key_file()).map_err(EndError::NotInitialised)?;
-    let owner =
-        ParticipantKey::from_public_key(signing.public_key()).map_err(EndError::OwnerKey)?;
+    let own = ParticipantKey::from_public_key(signing.public_key()).map_err(EndError::OwnerKey)?;
     let participant = session::participant_from(environment.user.as_deref())
         .map_err(EndError::ParticipantName)?;
     let store = Store::discover(&cwd)?;
+    let owner = session::thread_owner(&store, thread, own)
+        .map_err(|error| EndError::ThreadOwner(thread, error))?;
     let slot = session::pick_slot(&store, thread, &participant, command.agent.as_ref())?;
     let lock = match ThreadLock::acquire(&config, thread) {
         Ok(lock) => lock,

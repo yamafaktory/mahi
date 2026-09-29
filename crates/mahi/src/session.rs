@@ -45,6 +45,7 @@ use mahi_thread::{
     MetaDraft,
     MetaError,
     NodeId,
+    OwnerError,
     Participant,
     ParticipantKey,
     PrivateMeta,
@@ -56,6 +57,7 @@ use mahi_thread::{
     discard_thread,
     load_meta,
     read_tip,
+    remembered_owner,
 };
 use sha2::{
     Digest,
@@ -204,7 +206,7 @@ pub(crate) fn start(
 pub(crate) enum ResumeError {
     #[error("cannot read the repository")]
     Store(#[from] StoreError),
-    #[error("cannot open thread {0}; only a thread you started can be resumed for now")]
+    #[error("cannot open thread {0}; only a thread you started or joined can be resumed")]
     Meta(ThreadId, #[source] Box<ThreadError>),
     #[error("you are not a participant of thread {0}")]
     NotParticipant(ThreadId, #[source] Box<MetaError>),
@@ -538,6 +540,16 @@ pub(crate) fn name_from(text: &str) -> String {
         })
         .collect();
     mapped.trim_matches('-').to_owned()
+}
+
+/// Returns the key `thread`'s `meta` must be signed with: the owner remembered when the thread
+/// was joined from a ticket, or else the user's own key, for a thread started here. Never both.
+pub(crate) fn thread_owner(
+    store: &Store,
+    thread: ThreadId,
+    own: ParticipantKey,
+) -> Result<ParticipantKey, OwnerError> {
+    Ok(remembered_owner(store, thread)?.unwrap_or(own))
 }
 
 /// Returns the node id of the user's iroh node, from the node key `mahi init` wrote.
@@ -988,5 +1000,42 @@ pub(crate) mod tests {
             enter_with(base),
             Err(EnterError::WorktreeGone(gone)) if gone == thread
         ));
+    }
+
+    #[test]
+    fn a_thread_is_trusted_to_its_remembered_owner_or_else_the_user_never_both() {
+        let (_dir, store) = repository_on_main();
+        let own = ParticipantKey::from_public_key(
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+                .unwrap()
+                .public_key(),
+        )
+        .unwrap();
+        let other = ParticipantKey::from_public_key(
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+                .unwrap()
+                .public_key(),
+        )
+        .unwrap();
+        let started_here = ThreadId::random().unwrap();
+        assert_eq!(
+            thread_owner(&store, started_here, own.clone()).unwrap(),
+            own
+        );
+        let joined = ThreadId::random().unwrap();
+        mahi_thread::remember_owner(&store, joined, &other).unwrap();
+        assert_eq!(thread_owner(&store, joined, own.clone()).unwrap(), other);
+        let corrupt = ThreadId::random().unwrap();
+        mahi_thread::remember_owner(&store, corrupt, &other).unwrap();
+        std::fs::write(
+            store
+                .common_dir()
+                .join("mahi")
+                .join("owners")
+                .join(corrupt.to_string()),
+            "not a key",
+        )
+        .unwrap();
+        assert!(thread_owner(&store, corrupt, own).is_err());
     }
 }
