@@ -1,12 +1,23 @@
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+
 [advisories]
 ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable; it is a compile-time macro of iroh's netlink crates and none of it runs in mahi" },
     { id = "RUSTSEC-2023-0071", reason = "the Marvin timing attack recovers private keys; rsa is used only in mahi-tls, only to verify signatures with public keys, never to decrypt or sign" },
 ]
 
 [licenses]
 allow = [
     "Apache-2.0",
+    "BSD-2-Clause",
     "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "Unicode-3.0",

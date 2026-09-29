@@ -1,0 +1,30 @@
+[package]
+authors.workspace = true
+description = "mahi's live layer: iroh endpoints, invite tickets and the thread's live stream."
+edition.workspace = true
+license.workspace = true
+name = "mahi-live"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bech32 = { workspace = true }
+blake3 = { workspace = true }
+iroh = { workspace = true }
+mahi-core = { workspace = true }
+mahi-thread = { workspace = true }
+mahi-tls = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+ssh-key = { workspace = true, features = ["getrandom"] }
+
+[lints]
+workspace = true
