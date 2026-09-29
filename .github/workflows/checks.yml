@@ -53,6 +53,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: just test --profile ci
+      - run: just test-git --profile ci
 
   deny:
     runs-on: ubuntu-latest

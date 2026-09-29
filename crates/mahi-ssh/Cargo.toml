@@ -11,6 +11,8 @@ version.workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+bytes = { workspace = true }
+gix = { workspace = true }
 hmac = { workspace = true }
 russh = { workspace = true }
 sha1 = { workspace = true }
@@ -19,7 +21,7 @@ tokio = { workspace = true, features = ["io-util", "net"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt-multi-thread"] }
 tokio-stream = { workspace = true }
 
 [lints]

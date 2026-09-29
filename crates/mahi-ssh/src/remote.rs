@@ -90,6 +90,28 @@ impl SshRemote {
     }
 }
 
+impl fmt::Display for SshRemote {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let user = self
+            .user
+            .as_deref()
+            .map(|user| format!("{user}@"))
+            .unwrap_or_default();
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        if self.port == DEFAULT_PORT {
+            write!(formatter, "{user}{host}:{}", self.path)
+        } else if self.path.starts_with('/') {
+            write!(formatter, "ssh://{user}{host}:{}{}", self.port, self.path)
+        } else {
+            write!(formatter, "ssh://{user}{host}:{}/{}", self.port, self.path)
+        }
+    }
+}
+
 impl fmt::Display for GitService {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -135,25 +157,36 @@ fn parse_url(rest: &str) -> Result<SshRemote, RemoteError> {
 }
 
 fn parse_short(url: &str) -> Result<SshRemote, RemoteError> {
-    let (authority, path) = if let Some(bracketed) = url.strip_prefix('[') {
-        let (host, after) = bracketed.split_once(']').ok_or(RemoteError::NotSsh)?;
-        let path = after.strip_prefix(':').ok_or(RemoteError::NotSsh)?;
-        return Ok(SshRemote {
-            user: None,
-            host: check_ipv6(host)?,
-            port: DEFAULT_PORT,
-            path: check_path(path)?,
-        });
-    } else {
-        url.split_once(':').ok_or(RemoteError::NotSsh)?
-    };
-    if authority.contains('/') || authority.is_empty() || url.contains("://") {
+    if url.contains("://") {
         return Err(RemoteError::NotSsh);
     }
-    let (user, host) = split_user(authority)?;
+    let bracketed = match url.split_once('@') {
+        Some((user, rest)) if rest.starts_with('[') && !user.contains(':') => {
+            Some((Some(user), rest))
+        }
+        _ => url.starts_with('[').then_some((None, url)),
+    };
+    let (user, host, path) = if let Some((user, rest)) = bracketed {
+        let (host, after) = rest
+            .strip_prefix('[')
+            .and_then(|inside| inside.split_once(']'))
+            .ok_or(RemoteError::NotSsh)?;
+        let path = after.strip_prefix(':').ok_or(RemoteError::NotSsh)?;
+        if host.contains('/') || user.is_some_and(|user| user.contains('/')) {
+            return Err(RemoteError::NotSsh);
+        }
+        (user.map(check_user).transpose()?, check_ipv6(host)?, path)
+    } else {
+        let (authority, path) = url.split_once(':').ok_or(RemoteError::NotSsh)?;
+        if authority.contains('/') || authority.is_empty() {
+            return Err(RemoteError::NotSsh);
+        }
+        let (user, host) = split_user(authority)?;
+        (user, check_host(host)?, path)
+    };
     Ok(SshRemote {
         user,
-        host: check_host(host)?,
+        host,
         port: DEFAULT_PORT,
         path: check_path(path)?,
     })
@@ -268,6 +301,9 @@ mod tests {
                 remote(Some("me"), "::1", 22, "/repo"),
             ),
             ("[::1]:repo", remote(None, "::1", 22, "repo")),
+            ("me@[::1]:repo", remote(Some("me"), "::1", 22, "repo")),
+            ("host:foo@[x]", remote(None, "host", 22, "foo@[x]")),
+            ("host:dir@[1]:x", remote(None, "host", 22, "dir@[1]:x")),
             ("ssh://host:/repo", remote(None, "host", 22, "/repo")),
         ];
         for (url, expected) in cases {
@@ -281,6 +317,8 @@ mod tests {
             "https://github.com/org/repo.git",
             "/srv/repo.git",
             "./repo:with-colon",
+            "[a/b]:c",
+            "a/b@[::1]:c",
             "file:///srv/repo",
             "repo",
         ] {
@@ -308,6 +346,27 @@ mod tests {
         for (url, expected) in cases {
             assert_eq!(SshRemote::parse(url), Err(expected), "{url:?}");
         }
+    }
+
+    #[test]
+    fn a_remote_is_written_back_as_a_url_that_parses_to_it() {
+        for url in [
+            "git@github.com:org/repo.git",
+            "ssh://git@example.org:2222/srv/repo.git",
+            "ssh://example.org/~alice/repo",
+            "ssh://example.org:2200/~alice/repo",
+            "host:/~foo",
+            "host:foo@[x]",
+            "me@[::1]:repo",
+            "ssh://me@[::1]:22/repo",
+        ] {
+            let remote = SshRemote::parse(url).unwrap();
+            assert_eq!(SshRemote::parse(&remote.to_string()), Ok(remote), "{url}");
+        }
+        assert_eq!(
+            SshRemote::parse("ssh://host/srv/r").unwrap().to_string(),
+            "host:/srv/r"
+        );
     }
 
     #[test]

@@ -4,6 +4,11 @@
 mod tests {
     use std::{
         future::ready,
+        io::{
+            ErrorKind,
+            Read,
+            Write,
+        },
         net::SocketAddr,
         path::{
             Path,
@@ -20,7 +25,9 @@ mod tests {
     };
 
     use mahi_ssh::{
+        Exec,
         KnownHosts,
+        RemoteFailure,
         SshError,
         SshRemote,
         SshSession,
@@ -28,6 +35,7 @@ mod tests {
     use russh::{
         Channel,
         ChannelId,
+        Sig,
         keys::{
             Algorithm,
             PrivateKey,
@@ -50,10 +58,6 @@ mod tests {
         },
     };
     use tokio::{
-        io::{
-            AsyncReadExt,
-            AsyncWriteExt,
-        },
         net::{
             TcpListener,
             UnixListener,
@@ -89,6 +93,33 @@ mod tests {
                 session.channel_success(channel)
             } else if command == b"hang" {
                 Ok(())
+            } else if command == b"fail" {
+                session.channel_success(channel)?;
+                session.extended_data(
+                    channel,
+                    1,
+                    b"fatal: no such\x1b[2J repository\n".to_vec(),
+                )?;
+                session.exit_status_request(channel, 128)?;
+                Self::close(channel, session)
+            } else if command == b"signal" {
+                session.channel_success(channel)?;
+                session.exit_signal_request(
+                    channel,
+                    Sig::KILL,
+                    false,
+                    "out of \u{202e}memory",
+                    "",
+                )?;
+                Self::close(channel, session)
+            } else if command == b"cut" {
+                session.channel_success(channel)?;
+                session.data(channel, b"partial".to_vec())?;
+                session.disconnect(russh::Disconnect::ByApplication, "", "")
+            } else if command == b"exit 3" {
+                session.channel_success(channel)?;
+                session.exit_status_request(channel, 3)?;
+                Self::close(channel, session)
             } else {
                 session.channel_failure(channel)
             }
@@ -96,6 +127,10 @@ mod tests {
 
         fn finish(channel: ChannelId, session: &mut Session) -> Result<(), russh::Error> {
             session.exit_status_request(channel, 0)?;
+            Self::close(channel, session)
+        }
+
+        fn close(channel: ChannelId, session: &mut Session) -> Result<(), russh::Error> {
             session.eof(channel)?;
             session.close(channel)
         }
@@ -236,6 +271,10 @@ mod tests {
             ))
         }
 
+        fn exec(&self, session: &SshSession, command: &str) -> Result<Exec, SshError> {
+            self.runtime.block_on(session.exec(command, &[]))
+        }
+
         fn connect(&self, known_hosts: &KnownHosts, agent: &Path) -> Result<SshSession, SshError> {
             self.runtime.block_on(SshSession::connect(
                 &self.remote(),
@@ -254,16 +293,13 @@ mod tests {
             .connect(&fixture.known_hosts(&fixture.host_key), &fixture.agent)
             .unwrap();
         let command = fixture.remote().command(mahi_ssh::GitService::UploadPack);
-        let output = fixture.runtime.block_on(async {
-            let mut exec = session.exec(&command).await.unwrap();
-            exec.write_all(b"want\n").await.unwrap();
-            exec.shutdown().await.unwrap();
-            let mut output = String::new();
-            exec.read_to_string(&mut output).await.unwrap();
-            output
-        });
-        assert_eq!(output, "ran git-upload-pack '/repo'\nwant\n");
-        let refused = fixture.runtime.block_on(session.exec("rm -rf /"));
+        let (mut output, mut input) = fixture.exec(&session, &command).unwrap().split();
+        input.write_all(b"want\n").unwrap();
+        input.finish().unwrap();
+        let mut said = String::new();
+        output.read_to_string(&mut said).unwrap();
+        assert_eq!(said, "ran git-upload-pack '/repo'\nwant\n");
+        let refused = fixture.exec(&session, "rm -rf /");
         assert!(matches!(refused, Err(SshError::ExecRefused(command)) if command == "rm -rf /"));
         fixture.runtime.block_on(session.close()).unwrap();
     }
@@ -276,20 +312,70 @@ mod tests {
             .connect(&fixture.known_hosts(&fixture.host_key), &fixture.agent)
             .unwrap();
         let command = fixture.remote().command(mahi_ssh::GitService::ReceivePack);
-        let early = fixture.runtime.block_on(async {
-            let mut exec = session.exec(&command).await.unwrap();
-            let mut early = [0; 6];
-            exec.read_exact(&mut early).await.unwrap();
-            exec.write_all(b"then\n").await.unwrap();
-            exec.shutdown().await.unwrap();
-            let mut rest = String::new();
-            exec.read_to_string(&mut rest).await.unwrap();
-            (early, rest)
-        });
-        assert_eq!(early, (*b"early\n", "then\n".to_owned()));
+        let (mut output, mut input) = fixture.exec(&session, &command).unwrap().split();
+        let mut early = [0; 6];
+        output.read_exact(&mut early).unwrap();
+        input.write_all(b"then\n").unwrap();
+        input.finish().unwrap();
+        let mut rest = String::new();
+        output.read_to_string(&mut rest).unwrap();
+        assert_eq!((early, rest), (*b"early\n", "then\n".to_owned()));
         session.set_exec_timeout(Duration::from_millis(200));
-        let silent = fixture.runtime.block_on(session.exec("hang"));
+        let silent = fixture.exec(&session, "hang");
         assert!(matches!(silent, Err(SshError::ExecTimeout(command)) if command == "hang"));
+    }
+
+    #[test]
+    fn a_failed_command_reports_what_it_said_its_status_its_signal_or_a_cut_connection() {
+        let user = ed25519();
+        let fixture = fixture(user.public_key(), &user);
+        let session = fixture
+            .connect(&fixture.known_hosts(&fixture.host_key), &fixture.agent)
+            .unwrap();
+        let failure = |command| {
+            let (mut output, _input) = fixture.exec(&session, command).unwrap().split();
+            let error = output.read_to_end(&mut Vec::new()).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Other);
+            error
+                .into_inner()
+                .unwrap()
+                .downcast::<RemoteFailure>()
+                .map(|failure| *failure)
+                .unwrap()
+        };
+        assert_eq!(
+            failure("fail"),
+            RemoteFailure::Said("fatal: no such?[2J repository".to_owned())
+        );
+        assert_eq!(failure("exit 3"), RemoteFailure::Status(3));
+        assert_eq!(
+            failure("signal"),
+            RemoteFailure::Signal("KILL out of ?memory".to_owned())
+        );
+        assert_eq!(failure("cut"), RemoteFailure::Cut);
+    }
+
+    #[test]
+    fn a_command_needs_a_multi_thread_runtime() {
+        let user = ed25519();
+        let fixture = fixture(user.public_key(), &user);
+        let local = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let session = local
+            .block_on(SshSession::connect(
+                &fixture.remote(),
+                &fixture.known_hosts(&fixture.host_key),
+                &fixture.agent,
+                "nobody",
+            ))
+            .unwrap();
+        let refused = local.block_on(session.exec("git-upload-pack 'x'", &[]));
+        assert!(
+            matches!(refused, Err(SshError::CurrentThreadRuntime)),
+            "{refused:?}"
+        );
     }
 
     #[test]

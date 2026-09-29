@@ -1,4 +1,5 @@
 [profile.default]
+default-filter = "not binary_id(mahi-ssh::git_over_ssh)"
 slow-timeout = { period = "30s", terminate-after = 4 }
 
 [profile.ci]

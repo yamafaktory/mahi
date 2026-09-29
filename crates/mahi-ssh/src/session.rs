@@ -1,24 +1,16 @@
 use std::{
     borrow::Cow,
-    io,
     path::Path,
-    pin::Pin,
     sync::Arc,
-    task::{
-        Context,
-        Poll,
-    },
     time::Duration,
 };
 
 use russh::{
     ChannelMsg,
-    ChannelStream,
     Preferred,
     client::{
         self,
         Handle,
-        Msg,
     },
     keys::{
         Algorithm,
@@ -31,13 +23,10 @@ use russh::{
     },
 };
 use thiserror::Error;
-use tokio::io::{
-    AsyncRead,
-    AsyncWrite,
-    ReadBuf,
-};
+use tokio::runtime;
 
 use crate::{
+    exec::Exec,
     known_hosts::{
         HostKeyStatus,
         KnownHosts,
@@ -56,13 +45,6 @@ const MAX_AGENT_KEYS: usize = 6;
 pub struct SshSession {
     handle: Handle<HostCheck>,
     exec_timeout: Duration,
-}
-
-/// A command running on the remote host, with its standard input and output as a stream.
-pub struct Exec {
-    early: Vec<u8>,
-    read: usize,
-    stream: ChannelStream<Msg>,
 }
 
 /// Why connecting to a remote, or running a command there, failed.
@@ -131,6 +113,12 @@ pub enum SshError {
     /// The host sent more than 64 KiB before saying it runs the command.
     #[error("the host sent too much before starting {0}")]
     EarlyOutput(String),
+    /// Commands need a multi-thread runtime, since their output and input block on it.
+    #[error("ssh commands need a multi-thread runtime")]
+    CurrentThreadRuntime,
+    /// The async runtime the connection runs on cannot start.
+    #[error("cannot start the ssh runtime")]
+    Runtime(#[source] std::io::Error),
     /// The SSH connection failed.
     #[error("the ssh connection failed")]
     Ssh(#[from] russh::Error),
@@ -139,12 +127,6 @@ pub enum SshError {
 impl std::fmt::Debug for SshSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("SshSession").finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for Exec {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("Exec").finish_non_exhaustive()
     }
 }
 
@@ -174,20 +156,27 @@ impl SshSession {
         self.exec_timeout = timeout;
     }
 
-    /// Runs `command` on the host.
+    /// Runs `command` on the host, asking it to set the environment variables `env` first; a
+    /// host may ignore them.
     ///
     /// # Errors
     ///
-    /// Returns [`SshError`] if the channel cannot be opened, the host refuses the command, or it
-    /// does not start it within the exec timeout.
-    pub async fn exec(&self, command: &str) -> Result<Exec, SshError> {
-        tokio::time::timeout(self.exec_timeout, self.start(command))
+    /// Returns [`SshError`] if the runtime is a current-thread one, the channel cannot be
+    /// opened, the host refuses the command, or it does not start it within the exec timeout.
+    pub async fn exec(&self, command: &str, env: &[(&str, &str)]) -> Result<Exec, SshError> {
+        if runtime::Handle::current().runtime_flavor() == runtime::RuntimeFlavor::CurrentThread {
+            return Err(SshError::CurrentThreadRuntime);
+        }
+        tokio::time::timeout(self.exec_timeout, self.start(command, env))
             .await
             .map_err(|_| SshError::ExecTimeout(command.to_owned()))?
     }
 
-    async fn start(&self, command: &str) -> Result<Exec, SshError> {
+    async fn start(&self, command: &str, env: &[(&str, &str)]) -> Result<Exec, SshError> {
         let mut channel = self.handle.channel_open_session().await?;
+        for (name, value) in env {
+            channel.set_env(false, *name, *value).await?;
+        }
         channel.exec(true, command).await?;
         let mut early = Vec::new();
         loop {
@@ -205,11 +194,7 @@ impl SshSession {
                 Some(_) => {}
             }
         }
-        Ok(Exec {
-            early,
-            read: 0,
-            stream: channel.into_stream(),
-        })
+        Ok(Exec::start(runtime::Handle::current(), channel, early))
     }
 
     /// Closes the connection.
@@ -360,41 +345,6 @@ impl client::Handler for HostCheck {
         presented: &PublicKeyOrCertificate,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
         std::future::ready(self.verdict(presented))
-    }
-}
-
-impl AsyncRead for Exec {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = &mut *self;
-        if let Some(early) = this.early.get(this.read..).filter(|rest| !rest.is_empty()) {
-            let count = early.len().min(buffer.remaining());
-            buffer.put_slice(early.get(..count).unwrap_or_default());
-            this.read += count;
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut this.stream).poll_read(context, buffer)
-    }
-}
-
-impl AsyncWrite for Exec {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.stream).poll_write(context, buffer)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_flush(context)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.stream).poll_shutdown(context)
     }
 }
 

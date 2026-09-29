@@ -30,13 +30,15 @@ just clippy     # clippy on all targets, warnings are errors
 just test       # cargo nextest run; extra args pass through, e.g. just test -p mahi
 just build
 just run -- …   # run the mahi binary
+just test-git   # the tests that run the git program (not part of just test)
 just deny       # cargo-deny: advisories, licenses, banned crates, unknown sources
 just check      # fmt-check + clippy + test + deny
 ```
 
 CI (`.github/workflows/checks.yml`) runs `just fmt-check`, `just clippy`,
-`just test --profile ci` and `just deny` as separate jobs. Change a check in the `justfile`, not in the
-workflow, so that CI and local runs stay the same.
+`just test --profile ci` with `just test-git --profile ci`, and `just deny` as separate
+jobs. Change a check in the `justfile`, not in the workflow, so that CI and local runs stay
+the same.
 
 After every change, run `just fmt && just check`. A change is not done until `just check`
 passes. Do not silence a failure: fix the cause.
