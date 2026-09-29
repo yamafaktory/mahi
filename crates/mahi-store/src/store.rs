@@ -121,6 +121,10 @@ pub enum StoreError {
     /// where the worktree now is.
     #[error("{0:?} is not a worktree of this repository")]
     NotAWorktree(String),
+    /// A directory is where a lost worktree would be rebuilt, but it is not linked to this
+    /// repository; it has to be moved or removed by hand.
+    #[error("{} is not linked to this repository; move or remove it", .0.display())]
+    WorktreeUnlinked(std::path::PathBuf),
     /// A path changed while it was being read; snapshot again.
     #[error("{0} changed while it was read")]
     ChangedDuringSnapshot(gix::bstr::BString),

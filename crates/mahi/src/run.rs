@@ -425,9 +425,6 @@ pub(crate) fn resume(
         .into_iter()
         .collect();
     let slot = session::pick_slot(&store, command.thread, &participant, command.agent.as_ref())?;
-    store
-        .worktree_dir(&command.thread.to_string())
-        .map_err(|error| ResumeError::NoWorktree(command.thread, error))?;
     let _lock = ThreadLock::acquire(&config, command.thread)?;
     let (program, arguments, profile) = resumed_command(command, &slot);
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
@@ -454,12 +451,14 @@ pub(crate) fn resume(
     let identity =
         LocalIdentity::load(&config.identity_file(), &passphrase).map_err(RunError::Unlock)?;
     drop(passphrase);
+    let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
     let reopen = session::Reopen {
         thread: command.thread,
         owner: &owner,
         identity: &identity,
         participant: &participant,
         agent: Some(slot.agent()),
+        worktrees: &worktrees,
     };
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
     let (started, caught) = until_stopped(&termination, |interrupt| {

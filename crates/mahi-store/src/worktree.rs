@@ -57,6 +57,37 @@ impl Store {
         commit: ObjectId,
         interrupt: &AtomicBool,
     ) -> Result<PathBuf, StoreError> {
+        self.make_worktree(name, path, commit, None, interrupt)
+    }
+
+    /// Rebuilds a linked worktree like [`Store::add_worktree`], with a detached `HEAD` and an
+    /// index at `commit`, but with the files of `contents`, a tree such as an agent's latest
+    /// snapshot, so the work recorded there shows as changes on top of `commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Store::add_worktree`], and [`StoreError::WrongObject`] if
+    /// `contents` is not a tree.
+    pub fn restore_worktree(
+        &self,
+        name: &str,
+        path: &Path,
+        commit: ObjectId,
+        contents: ObjectId,
+        interrupt: &AtomicBool,
+    ) -> Result<PathBuf, StoreError> {
+        self.require_kind(contents, Kind::Tree)?;
+        self.make_worktree(name, path, commit, Some(contents), interrupt)
+    }
+
+    fn make_worktree(
+        &self,
+        name: &str,
+        path: &Path,
+        commit: ObjectId,
+        contents: Option<ObjectId>,
+        interrupt: &AtomicBool,
+    ) -> Result<PathBuf, StoreError> {
         validate_name(name)?;
         self.require_kind(commit, Kind::Commit)?;
         let path = path::absolute(path)?;
@@ -91,7 +122,7 @@ impl Store {
             .map_err(StoreError::from)
             .and_then(|canonical| {
                 refuse_newline(&canonical)?;
-                self.populate_worktree(&admin, &canonical, commit, interrupt)?;
+                self.populate_worktree(&admin, &canonical, commit, contents, interrupt)?;
                 Ok(canonical)
             });
         if populated.is_err() {
@@ -181,6 +212,7 @@ impl Store {
         admin: &Path,
         path: &Path,
         commit: ObjectId,
+        contents: Option<ObjectId>,
         interrupt: &AtomicBool,
     ) -> Result<(), StoreError> {
         let tree = self
@@ -190,15 +222,18 @@ impl Store {
             .map_err(gix::Error::from)?
             .detach();
         let objects = self.repo.objects.clone();
-        let mut index = gix::index::State::from_tree(
-            &tree,
-            objects.clone(),
-            gix_validate::path::component::Options {
-                protect_windows: false,
-                ..gix_validate::path::component::Options::default()
-            },
-        )
-        .map_err(|error| StoreError::Checkout(error.into()))?;
+        let index_of = |tree: &ObjectId| {
+            gix::index::State::from_tree(
+                tree,
+                objects.clone(),
+                gix_validate::path::component::Options {
+                    protect_windows: false,
+                    ..gix_validate::path::component::Options::default()
+                },
+            )
+            .map_err(|error| StoreError::Checkout(error.into()))
+        };
+        let mut index = index_of(&contents.unwrap_or(tree))?;
         let options = checkout::Options {
             fs: gix::fs::Capabilities::probe_dir(path),
             destination_is_initially_empty: true,
@@ -209,7 +244,13 @@ impl Store {
             ..checkout::Options::default()
         };
         let outcome = checkout(
-            &mut index, path, objects, &Discard, &Discard, interrupt, options,
+            &mut index,
+            path,
+            objects.clone(),
+            &Discard,
+            &Discard,
+            interrupt,
+            options,
         );
         if interrupt.load(Ordering::Relaxed) {
             return Err(StoreError::Interrupted);
@@ -222,6 +263,9 @@ impl Store {
             return Err(StoreError::CheckoutPath(collision.path.to_string()));
         }
 
+        if contents.is_some_and(|contents| contents != tree) {
+            index = index_of(&tree)?;
+        }
         let mut file = gix::index::File::from_state(index, admin.join("index"));
         file.write(gix::index::write::Options::default())
             .map_err(gix::Error::from)?;
@@ -318,6 +362,68 @@ mod tests {
             ])
             .unwrap();
         commit(store, root)
+    }
+
+    #[test]
+    fn a_restored_worktree_has_the_snapshots_files_on_top_of_its_base() {
+        let (dir, store) = store();
+        let base = sample_commit(&store);
+        let changed = store.write_blob(b"changed by the agent\n").unwrap();
+        let added = store.write_blob(b"new\n").unwrap();
+        let script = store.write_blob(b"#!/bin/sh\necho hi\n").unwrap();
+        let bin = store
+            .write_tree(&[("run", EntryKind::BlobExecutable, script)])
+            .unwrap();
+        let snapshot = store
+            .write_tree(&[
+                ("README.md", EntryKind::Blob, changed),
+                ("bin", EntryKind::Tree, bin),
+                ("notes.txt", EntryKind::Blob, added),
+            ])
+            .unwrap();
+        let path = store
+            .restore_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                base,
+                snapshot,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(path.join("README.md")).unwrap(),
+            b"changed by the agent\n"
+        );
+        assert_eq!(fs::read(path.join("notes.txt")).unwrap(), b"new\n");
+        assert!(fs::symlink_metadata(path.join("link")).is_err());
+        let repo = gix::open(&path).unwrap();
+        assert_eq!(repo.head_id().unwrap().detach(), base);
+        let index = repo.index().unwrap();
+        let paths: Vec<String> = index
+            .entries()
+            .iter()
+            .map(|entry| entry.path(&index).to_string())
+            .collect();
+        assert_eq!(paths, ["README.md", "bin/run", "link"]);
+        let recorded = store
+            .snapshot(
+                "agent",
+                &crate::GlobalPatterns::default(),
+                &mut crate::SnapshotCache::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(recorded.tree, snapshot);
+        assert!(matches!(
+            store.restore_worktree(
+                "other",
+                &dir.path().join("wt2"),
+                base,
+                base,
+                &AtomicBool::new(false)
+            ),
+            Err(StoreError::WrongObject { .. })
+        ));
     }
 
     #[test]

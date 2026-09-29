@@ -216,8 +216,6 @@ pub(crate) enum ResumeError {
     SeveralAgents { thread: ThreadId, agents: String },
     #[error("thread {0} has no agent of yours called {1}")]
     UnknownAgent(ThreadId, AgentName),
-    #[error("the worktree of thread {0} is gone, and rebuilding it is not supported yet")]
-    NoWorktree(ThreadId, #[source] StoreError),
     #[error("cannot read the thread's transcript")]
     Transcript(#[source] Box<TranscriptError>),
 }
@@ -230,6 +228,7 @@ pub(crate) struct Reopen<'a> {
     pub(crate) identity: &'a LocalIdentity,
     pub(crate) participant: &'a ParticipantName,
     pub(crate) agent: Option<&'a AgentName>,
+    pub(crate) worktrees: &'a Path,
 }
 
 /// Reopens a thread the user started: checks its `meta` against the user's own signing key,
@@ -249,11 +248,11 @@ pub(crate) fn resume(
         .map_err(|error| ResumeError::NotParticipant(thread, Box::new(error)))?;
     let slot = pick_slot(store, thread, reopen.participant, reopen.agent)?;
     let name = thread.to_string();
-    let worktree = store
-        .worktree_dir(&name)
-        .map_err(|error| ResumeError::NoWorktree(thread, error))?;
     let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
-    let first_snapshot = match store.head(&snapshots)? {
+    let head = store.head(&snapshots)?;
+    let worktree =
+        worktree_or_restore(store, &name, reopen.worktrees, meta.base(), head, interrupt)?;
+    let first_snapshot = match head {
         Some(commit) => Recorded {
             commit,
             tree: store.commit_tree(commit)?,
@@ -283,11 +282,37 @@ pub(crate) enum EnterError {
     BaseMissing(ObjectId, #[source] StoreError),
     #[error("cannot read the thread's transcript")]
     Transcript(#[source] Box<TranscriptError>),
-    #[error(
-        "your worktree of thread {0} is gone, and rebuilding it from your last snapshot is not \
-         supported yet"
-    )]
-    WorktreeGone(ThreadId),
+}
+
+/// Returns the worktree `name`, rebuilding it when it is gone: with the files of the agent's
+/// latest snapshot on top of `base`, or a fresh checkout of `base` when the agent has none. A
+/// worktree whose directory is still there but no longer links back is left alone.
+fn worktree_or_restore(
+    store: &Store,
+    name: &str,
+    worktrees: &Path,
+    base: ObjectId,
+    snapshot: Option<ObjectId>,
+    interrupt: &AtomicBool,
+) -> Result<PathBuf, StoreError> {
+    match store.worktree_dir(name) {
+        Err(StoreError::NotAWorktree(_)) => {
+            store.prune_worktree(name)?;
+            let path = worktrees.join(name);
+            let rebuilt = match snapshot {
+                Some(commit) => {
+                    let tree = store.commit_tree(commit)?;
+                    store.restore_worktree(name, &path, base, tree, interrupt)
+                }
+                None => store.add_worktree(name, &path, base, interrupt),
+            };
+            rebuilt.map_err(|error| match error {
+                StoreError::WorktreeExists(_) => StoreError::WorktreeUnlinked(path),
+                other => other,
+            })
+        }
+        found => found,
+    }
 }
 
 /// What `mahi join` needs to run the user's own agent in a thread someone else owns.
@@ -325,16 +350,7 @@ pub(crate) fn enter(
     let slot = AgentSlot::new(participant, agent.clone());
     let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
     let head = store.head(&snapshots)?;
-    let worktree = match store.worktree_dir(&name) {
-        Ok(worktree) => worktree,
-        Err(StoreError::NotAWorktree(_)) if head.is_some() => {
-            return Err(EnterError::WorktreeGone(thread));
-        }
-        Err(StoreError::NotAWorktree(_)) => {
-            store.add_worktree(&name, &worktrees.join(&name), base, interrupt)?
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let worktree = worktree_or_restore(store, &name, worktrees, base, head, interrupt)?;
     if interrupt.load(Ordering::SeqCst) {
         return Err(StoreError::Interrupted.into());
     }
@@ -962,7 +978,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn entering_a_joined_thread_checks_its_base_reuses_its_worktree_and_refuses_a_lost_one() {
+    fn entering_a_joined_thread_checks_its_base_reuses_its_worktree_and_rebuilds_a_lost_one() {
         let (_dir, store) = repository_on_main();
         let base = store.head_commit().unwrap();
         let thread = ThreadId::random().unwrap();
@@ -995,11 +1011,20 @@ pub(crate) mod tests {
         let again = enter_with(base).unwrap();
         assert_eq!(again.worktree, first.worktree);
         assert_eq!(again.first_snapshot.unwrap().commit, snapshots);
+        std::fs::write(first.worktree.join("agent.txt"), "work\n").unwrap();
         store.remove_worktree(&thread.to_string()).unwrap();
+        let recorded = enter_with(base).unwrap();
+        assert!(recorded.worktree.join("README").is_file());
+        assert!(!recorded.worktree.join("agent.txt").exists());
+        assert_eq!(recorded.first_snapshot.unwrap().commit, snapshots);
+        store.remove_worktree(&thread.to_string()).unwrap();
+        std::fs::create_dir_all(&recorded.worktree).unwrap();
+        std::fs::write(recorded.worktree.join("own.txt"), "kept\n").unwrap();
         assert!(matches!(
             enter_with(base),
-            Err(EnterError::WorktreeGone(gone)) if gone == thread
+            Err(EnterError::Store(StoreError::WorktreeUnlinked(path))) if path == recorded.worktree
         ));
+        assert!(recorded.worktree.join("own.txt").is_file());
     }
 
     #[test]

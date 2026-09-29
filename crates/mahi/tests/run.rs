@@ -1066,14 +1066,14 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
     }
 
     #[test]
-    fn resume_refuses_unknown_threads_wrong_passphrases_and_missing_worktrees() {
+    fn resume_refuses_unknown_threads_and_wrong_passphrases_and_rebuilds_a_lost_worktree() {
         let fixture = fixture();
         save_identity(&fixture);
         let unknown = fixture.mahi(&["resume", "0123456789abcdef0123456789abcdef"]);
         assert_eq!(unknown.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&unknown.stderr).contains("no agent of yours"));
 
-        let first = fixture.mahi(&["run", "true"]);
+        let first = fixture.mahi(&["run", "sh", "-c", "echo recorded work > work.txt"]);
         let worktree = worktree_of(&String::from_utf8_lossy(&first.stderr));
         let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
         let (code, output) = in_terminal(
@@ -1084,12 +1084,26 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(code, 1, "{output}");
         assert!(output.contains("cannot unlock your mahi key"), "{output}");
 
+        let recorded = gix::open(&fixture.repo)
+            .unwrap()
+            .find_reference(format!("refs/threads/{thread}/agents/tester.sh/snapshots").as_str())
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap()
+            .find_entry("work.txt")
+            .is_some();
+        assert!(recorded, "{}", String::from_utf8_lossy(&first.stderr));
         fs::remove_dir_all(&worktree).unwrap();
-        let gone = fixture.mahi(&["resume", &thread]);
-        assert_eq!(gone.status.code(), Some(1));
-        assert!(
-            String::from_utf8_lossy(&gone.stderr).contains("rebuilding it is not supported yet")
+        let (code, output) = in_terminal(
+            &fixture,
+            &["resume", &thread, "--", "cat", "work.txt"],
+            Some(PASSPHRASE),
         );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("recorded work"), "{output}");
+        assert!(worktree.join("README").is_file());
     }
 
     #[test]
