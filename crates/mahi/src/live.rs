@@ -316,13 +316,17 @@ impl Broadcaster {
         if challenges.is_empty() {
             return;
         }
-        let (state, taken) = match self.screen.lock() {
-            Ok(screen) => (screen.parser.screen().state_formatted(), screen.taken),
+        let (state, size, taken) = match self.screen.lock() {
+            Ok(screen) => (
+                screen.parser.screen().state_formatted(),
+                screen.parser.screen().size(),
+                screen.taken,
+            ),
             Err(_) => return,
         };
         let mut screens = Vec::with_capacity(challenges.len());
         for challenge in challenges {
-            let Ok(parts) = screen_parts(&self.slot, challenge, &state) else {
+            let Ok(parts) = screen_parts(&self.slot, challenge, size, &state) else {
                 return;
             };
             screens.push(parts);
@@ -496,6 +500,7 @@ fn read(git_dir: &Path, thread: ThreadId, owner: &ParticipantKey) -> Result<Cach
 pub(crate) fn screen_parts(
     slot: &AgentSlot,
     challenge: [u8; 16],
+    (rows, columns): (u16, u16),
     screen: &[u8],
 ) -> Result<Vec<Body>, HostError> {
     let chunks: Vec<&[u8]> = if screen.is_empty() {
@@ -511,6 +516,8 @@ pub(crate) fn screen_parts(
         .zip(chunks)
         .map(|(part, bytes)| Body::Screen {
             slot: slot.clone(),
+            rows,
+            columns,
             challenge,
             part,
             parts,
@@ -663,7 +670,7 @@ mod tests {
             AgentName::new("claude").unwrap(),
         );
         let screen = vec![b'x'; MAX_CHUNK_BYTES * 2 + 10];
-        let parts = screen_parts(&slot, [3; 16], &screen).unwrap();
+        let parts = screen_parts(&slot, [3; 16], (24, 80), &screen).unwrap();
         assert_eq!(parts.len(), 3);
         let mut joined = Vec::new();
         for (index, body) in (0_u16..).zip(&parts) {
@@ -682,10 +689,13 @@ mod tests {
             joined.extend_from_slice(bytes);
         }
         assert_eq!(joined, screen);
-        assert_eq!(screen_parts(&slot, [0; 16], b"").unwrap().len(), 1);
+        assert_eq!(
+            screen_parts(&slot, [0; 16], (24, 80), b"").unwrap().len(),
+            1
+        );
         let huge = vec![0; MAX_CHUNK_BYTES * usize::from(MAX_SCREEN_PARTS) + 1];
         assert!(matches!(
-            screen_parts(&slot, [0; 16], &huge),
+            screen_parts(&slot, [0; 16], (24, 80), &huge),
             Err(HostError::ScreenTooLarge)
         ));
     }

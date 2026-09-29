@@ -22,7 +22,9 @@ pub use frame::{
     FrameSender,
     LiveKeys,
     MAX_CHUNK_BYTES,
+    MAX_COLUMNS,
     MAX_FRAME_BYTES,
+    MAX_ROWS,
     MAX_SCREEN_PARTS,
     Received,
 };

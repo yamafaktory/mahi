@@ -49,7 +49,10 @@ use thiserror::Error;
 
 use crate::{
     cli::InviteCommand,
-    environment::Environment,
+    environment::{
+        Environment,
+        LiveMode,
+    },
     prompt::{
         Prompt,
         TerminalPrompt,
@@ -96,6 +99,10 @@ pub(crate) enum InviteError {
     NodeMismatch,
     #[error("cannot write the ticket")]
     Ticket(#[from] TicketError),
+    #[error(
+        "an invitation needs the live layer: set MAHI_LIVE to local or public, or leave it unset"
+    )]
+    LiveSetting,
 }
 
 /// Who invites, with which keys, and how the ticket finds this machine.
@@ -112,6 +119,7 @@ pub(crate) fn invite(
     command: &InviteCommand,
     environment: &Environment,
 ) -> Result<String, InviteError> {
+    let relays = relays_for(environment.live)?;
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(InviteError::CurrentDirectory)?;
@@ -132,13 +140,22 @@ pub(crate) fn invite(
         config: &config,
         signer: &signer,
         node_key: &node_key,
-        relays: Relays::Public,
+        relays,
     };
     let card: ParticipantCard = command.card().parse()?;
     let ticket = invite_to(&store, command.thread, card, &inviter, &mut || {
         TerminalPrompt::open()
     })?;
     Ok(format!("{ticket}\n"))
+}
+
+/// Returns the relays the invite's host address uses, as `MAHI_LIVE` says.
+fn relays_for(live: LiveMode) -> Result<Relays, InviteError> {
+    match live {
+        LiveMode::Public => Ok(Relays::Public),
+        LiveMode::Local => Ok(Relays::Disabled),
+        LiveMode::Off | LiveMode::Unknown => Err(InviteError::LiveSetting),
+    }
 }
 
 /// Adds `card`'s participant to `thread` unless they are already in it, exactly as the card
@@ -444,6 +461,20 @@ mod tests {
                 Err(InviteError::Clash(name)) if name.as_str() == "alice"
             ));
         }
+    }
+
+    #[test]
+    fn an_invitation_needs_the_live_layer_and_local_means_no_relays() {
+        assert_eq!(relays_for(LiveMode::Public).unwrap(), Relays::Public);
+        assert_eq!(relays_for(LiveMode::Local).unwrap(), Relays::Disabled);
+        assert!(matches!(
+            relays_for(LiveMode::Off),
+            Err(InviteError::LiveSetting)
+        ));
+        assert!(matches!(
+            relays_for(LiveMode::Unknown),
+            Err(InviteError::LiveSetting)
+        ));
     }
 
     #[test]

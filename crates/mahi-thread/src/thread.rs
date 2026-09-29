@@ -181,6 +181,19 @@ pub fn load_meta_document(
     Ok((verified, encoded))
 }
 
+/// Pins a meta document obtained without the repository's refs, as a joiner gets it from
+/// the host, so a rolled-back or conflicting document is refused later.
+///
+/// The caller has checked `meta` against the owner key it trusts.
+///
+/// # Errors
+///
+/// Returns [`ThreadError::Pin`] if `meta` is older than, or conflicts with, the pinned
+/// document, or the pin cannot be written.
+pub fn pin_meta(store: &Store, meta: &VerifiedMeta) -> Result<(), ThreadError> {
+    Ok(Pins::new(store).accept(meta)?)
+}
+
 /// Adds `participant` to `thread`, which `owner_key` owns: signs the next generation of its
 /// meta document, with the thread key also wrapped to the new participant, commits it on top of
 /// the current `meta` commit, and pins it.
@@ -844,6 +857,46 @@ mod tests {
         assert!(matches!(
             add_participant(&setup.store, setup.thread, &thread_key, &setup.owner, bob),
             Err(ThreadError::NoNextGeneration(thread)) if thread == setup.thread
+        ));
+    }
+
+    #[test]
+    fn a_meta_pinned_without_refs_refuses_an_older_one_later() {
+        let setup = setup();
+        let thread_key = ThreadKey::generate();
+        let first = VerifiedMeta::decode(
+            &draft(&setup, 0, "t")
+                .sign(&thread_key, &setup.owner)
+                .unwrap(),
+            setup.thread,
+            &setup.owner_key,
+        )
+        .unwrap();
+        let second = VerifiedMeta::decode(
+            &draft(&setup, 1, "t")
+                .sign(&thread_key, &setup.owner)
+                .unwrap(),
+            setup.thread,
+            &setup.owner_key,
+        )
+        .unwrap();
+        pin_meta(&setup.store, &second).unwrap();
+        pin_meta(&setup.store, &second).unwrap();
+        let other_second = VerifiedMeta::decode(
+            &draft(&setup, 1, "other")
+                .sign(&thread_key, &setup.owner)
+                .unwrap(),
+            setup.thread,
+            &setup.owner_key,
+        )
+        .unwrap();
+        assert!(matches!(
+            pin_meta(&setup.store, &other_second),
+            Err(ThreadError::Pin(PinError::Equivocation { .. }))
+        ));
+        assert!(matches!(
+            pin_meta(&setup.store, &first),
+            Err(ThreadError::Pin(PinError::Rollback { .. }))
         ));
     }
 }

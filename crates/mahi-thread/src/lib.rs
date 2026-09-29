@@ -44,6 +44,7 @@ pub use thread::{
     discard_thread,
     load_meta,
     load_meta_document,
+    pin_meta,
 };
 pub use transcript::{
     Event,

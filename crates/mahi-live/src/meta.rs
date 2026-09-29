@@ -13,6 +13,8 @@ use iroh::{
         ConnectionError,
         ReadError,
         ReadToEndError,
+        RecvStream,
+        SendStream,
         VarInt,
     },
     protocol::{
@@ -73,6 +75,15 @@ enum Failure {
     Unavailable,
 }
 
+impl Failure {
+    fn code(self) -> u32 {
+        match self {
+            Self::Refused => REFUSED,
+            Self::Unavailable => UNAVAILABLE,
+        }
+    }
+}
+
 impl MetaHandler {
     pub(crate) fn new(source: Arc<dyn Peers>) -> Self {
         Self {
@@ -88,6 +99,19 @@ impl MetaHandler {
             .accept_bi()
             .await
             .map_err(|_| Failure::Unavailable)?;
+        let answered = self.serve(node, &mut send, &mut receive).await;
+        if let Err(failure) = answered {
+            let _ = send.reset(VarInt::from_u32(failure.code()));
+        }
+        answered
+    }
+
+    async fn serve(
+        &self,
+        node: NodeId,
+        send: &mut SendStream,
+        receive: &mut RecvStream,
+    ) -> Result<(), Failure> {
         let request = receive
             .read_to_end(THREAD_ID_BYTES)
             .await
@@ -161,7 +185,16 @@ async fn request(connection: &Connection, thread: ThreadId) -> Result<Vec<u8>, L
     send.finish()
         .map_err(|error| LiveError::Stream(Box::new(error)))?;
     match receive.read_to_end(MAX_META_BYTES).await {
+        Ok(meta) if meta.is_empty() => Err(LiveError::Refused),
         Ok(meta) => Ok(meta),
+        Err(ReadToEndError::Read(ReadError::Reset(code))) if code == VarInt::from_u32(REFUSED) => {
+            Err(LiveError::Refused)
+        }
+        Err(ReadToEndError::Read(ReadError::Reset(code)))
+            if code == VarInt::from_u32(UNAVAILABLE) =>
+        {
+            Err(LiveError::Unavailable)
+        }
         Err(ReadToEndError::Read(ReadError::ConnectionLost(
             ConnectionError::ApplicationClosed(close),
         ))) if close.error_code == VarInt::from_u32(REFUSED) => Err(LiveError::Refused),
@@ -439,12 +472,15 @@ mod tests {
                 let (mut send, mut receive) = connection.open_bi().await.unwrap();
                 send.write_all(&request).await.unwrap();
                 send.finish().unwrap();
-                matches!(
-                    receive.read_to_end(MAX_META_BYTES).await,
+                match receive.read_to_end(MAX_META_BYTES).await {
+                    Err(ReadToEndError::Read(ReadError::Reset(code))) => {
+                        code == VarInt::from_u32(REFUSED)
+                    }
                     Err(ReadToEndError::Read(ReadError::ConnectionLost(
-                        ConnectionError::ApplicationClosed(close)
-                    ))) if close.error_code == VarInt::from_u32(REFUSED)
-                )
+                        ConnectionError::ApplicationClosed(close),
+                    ))) => close.error_code == VarInt::from_u32(REFUSED),
+                    _ => false,
+                }
             });
             assert!(refused, "{} bytes", request.len());
         }

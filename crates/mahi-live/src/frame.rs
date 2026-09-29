@@ -42,6 +42,10 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_CHUNK_BYTES: usize = 60 * 1024;
 /// The most frames one screen is split into.
 pub const MAX_SCREEN_PARTS: u16 = 64;
+/// The most rows a screen or a resize may have, so a viewer never allocates a huge screen.
+pub const MAX_ROWS: u16 = 1000;
+/// The most columns a screen or a resize may have.
+pub const MAX_COLUMNS: u16 = 1000;
 
 const SIGNED_LABEL: &[u8] = b"mahi-live-v1";
 const TOPIC_INFO: &[u8] = b"mahi-live-topic-v1";
@@ -87,6 +91,10 @@ pub enum Body {
     Screen {
         /// The agent whose screen it is.
         slot: AgentSlot,
+        /// The screen's height in rows.
+        rows: u16,
+        /// The screen's width in columns.
+        columns: u16,
         /// The challenge of the request this answers.
         challenge: [u8; CHALLENGE_BYTES],
         /// Which part this is, from 0.
@@ -177,6 +185,8 @@ enum WireBody<'a> {
     },
     Screen {
         slot: &'a str,
+        rows: u16,
+        columns: u16,
         challenge: [u8; CHALLENGE_BYTES],
         part: u16,
         parts: u16,
@@ -346,6 +356,8 @@ impl FrameSender {
             },
             Body::Screen {
                 slot: owner,
+                rows,
+                columns,
                 challenge,
                 part,
                 parts,
@@ -353,9 +365,12 @@ impl FrameSender {
             } => {
                 check_chunk(bytes)?;
                 check_parts(*part, *parts)?;
+                check_size(*rows, *columns)?;
                 slot = owner.to_string();
                 WireBody::Screen {
                     slot: &slot,
+                    rows: *rows,
+                    columns: *columns,
                     challenge: *challenge,
                     part: *part,
                     parts: *parts,
@@ -580,7 +595,7 @@ impl FrameReceiver {
 }
 
 fn check_size(rows: u16, columns: u16) -> Result<(), FrameError> {
-    if rows == 0 || columns == 0 {
+    if rows == 0 || columns == 0 || rows > MAX_ROWS || columns > MAX_COLUMNS {
         return Err(FrameError::Malformed);
     }
     Ok(())
@@ -634,6 +649,8 @@ fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
         WireBody::ScreenRequest { challenge } => Body::ScreenRequest { challenge },
         WireBody::Screen {
             slot: owner,
+            rows,
+            columns,
             challenge,
             part,
             parts,
@@ -641,8 +658,11 @@ fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
         } => {
             check_chunk(bytes)?;
             check_parts(part, parts)?;
+            check_size(rows, columns)?;
             Body::Screen {
                 slot: slot(owner)?,
+                rows,
+                columns,
                 challenge,
                 part,
                 parts,
@@ -725,6 +745,8 @@ mod tests {
         };
         Body::Screen {
             slot: slot(participant),
+            rows: 24,
+            columns: 80,
             challenge: *challenge,
             part: 0,
             parts: 1,
@@ -863,6 +885,8 @@ mod tests {
         for (part, parts) in [(0, 0), (1, 1), (0, MAX_SCREEN_PARTS + 1)] {
             let bad = Body::Screen {
                 slot: slot("alice"),
+                rows: 24,
+                columns: 80,
                 challenge: [0; 16],
                 part,
                 parts,
@@ -870,6 +894,34 @@ mod tests {
             };
             assert_eq!(host.seal(&bad), Err(FrameError::Malformed));
         }
+        let flat = Body::Screen {
+            slot: slot("alice"),
+            rows: 0,
+            columns: 80,
+            challenge: [0; 16],
+            part: 0,
+            parts: 1,
+            bytes: Vec::new(),
+        };
+        assert_eq!(host.seal(&flat), Err(FrameError::Malformed));
+        let huge = Body::Resize {
+            slot: slot("alice"),
+            rows: MAX_ROWS + 1,
+            columns: 80,
+        };
+        assert_eq!(host.seal(&huge), Err(FrameError::Malformed));
+        let flat_screen = host
+            .seal_wire(WireBody::Screen {
+                slot: "alice.claude",
+                rows: 24,
+                columns: MAX_COLUMNS + 1,
+                challenge: [0; 16],
+                part: 0,
+                parts: 1,
+                bytes: b"",
+            })
+            .unwrap();
+        assert_eq!(viewer.open(&flat_screen), Err(FrameError::Malformed));
         assert_eq!(
             viewer.open(&vec![0; MAX_FRAME_BYTES + 1]),
             Err(FrameError::TooLarge)
@@ -914,6 +966,8 @@ mod tests {
         let mut host = thread.sender(1);
         let second_part = Body::Screen {
             slot: slot("alice"),
+            rows: 24,
+            columns: 80,
             challenge,
             part: 1,
             parts: 2,
