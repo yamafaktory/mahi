@@ -1022,7 +1022,8 @@ pub(crate) mod tests {
         std::fs::write(recorded.worktree.join("own.txt"), "kept\n").unwrap();
         assert!(matches!(
             enter_with(base),
-            Err(EnterError::Store(StoreError::WorktreeUnlinked(path))) if path == recorded.worktree
+            Err(EnterError::Store(StoreError::WorktreeUnlinked(path)))
+                if path.canonicalize().unwrap() == recorded.worktree.canonicalize().unwrap()
         ));
         assert!(recorded.worktree.join("own.txt").is_file());
     }
