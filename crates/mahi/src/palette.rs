@@ -664,6 +664,7 @@ mod tests {
         assert!(shortened.contains("› fi") && !shortened.contains("› fix"));
         screen.typed(b"\x1b[200~\x1b\r\x1b[201~").unwrap();
         assert!(screen.is_open());
+        written(&screen);
         assert_eq!(screen.typed(b"\x1b[27uhello").unwrap(), 5);
         assert!(!screen.is_open());
         assert_eq!(screen.typed(b"hello").unwrap(), 0);

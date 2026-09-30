@@ -1,6 +1,7 @@
 //! The `mahi` binary.
 
 mod cli;
+mod compose;
 mod credentials;
 mod end;
 mod environment;

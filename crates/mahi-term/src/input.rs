@@ -12,7 +12,8 @@ const PRIVATE_USE: std::ops::RangeInclusive<char> = '\u{e000}'..='\u{f8ff}';
 /// A key typed while the palette is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteInput {
-    /// A character for the filter line, typed or pasted.
+    /// A character for the filter line, typed or pasted; only a paste gives a newline or a
+    /// tab.
     Text(char),
     /// Backspace.
     Backspace,
@@ -30,7 +31,7 @@ pub enum PaletteInput {
     PageUp,
     /// Page Down.
     PageDown,
-    /// Escape, which closes the palette.
+    /// Escape, or `Ctrl-C`, which closes the palette.
     Escape,
 }
 
@@ -83,6 +84,11 @@ impl PaletteKeys {
             self.paste_end_matched = 0;
             return (0, None);
         }
+        match byte {
+            b'\r' | b'\n' => return (1, Some(PaletteInput::Text('\n'))),
+            b'\t' => return (1, Some(PaletteInput::Text('\t'))),
+            _ => {}
+        }
         let (used, character) = character(rest);
         (
             used,
@@ -117,6 +123,7 @@ impl PaletteKeys {
             b'\t' => (1, Some(PaletteInput::Tab)),
             0x7f | 0x08 => (1, Some(PaletteInput::Backspace)),
             0x18 => (1, Some(PaletteInput::Reject)),
+            0x03 => (1, Some(PaletteInput::Escape)),
             0x00..=0x1f => (1, None),
             _ => {
                 let (used, character) = character(rest);
@@ -219,7 +226,7 @@ fn kitty(params: &[u8]) -> Option<PaletteInput> {
         return None;
     }
     match (code, modifiers) {
-        (27, 0) => Some(PaletteInput::Escape),
+        (27, 0) | (99, CTRL) => Some(PaletteInput::Escape),
         (13, 0) => Some(PaletteInput::Enter),
         (9, 0) => Some(PaletteInput::Tab),
         (127 | 8, 0) => Some(PaletteInput::Backspace),
@@ -328,12 +335,16 @@ mod tests {
     }
 
     #[test]
-    fn a_paste_gives_only_shown_text_even_across_reads() {
+    fn a_paste_gives_only_text_with_its_lines_even_across_reads() {
         assert_eq!(
             inputs(&[b"\x1b[200~fix\r\n\x18\x1b\tit\xe2\x80\x8b", b"!\x1b[201~\r"]),
-            [text("fixit!"), vec![PaletteInput::Enter]].concat()
+            [text("fix\n\n\tit!"), vec![PaletteInput::Enter]].concat()
         );
-        assert_eq!(inputs(&[b"\x1b[200~a", b"\r\x1b"]), text("a"));
+        assert_eq!(inputs(&[b"\x1b[200~a", b"\r\x1b"]), text("a\n"));
+        assert_eq!(
+            inputs(&[b"\x03\x1b[99;5u"]),
+            [PaletteInput::Escape, PaletteInput::Escape]
+        );
     }
 
     #[test]

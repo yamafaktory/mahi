@@ -14,6 +14,10 @@ use std::{
             AtomicBool,
             Ordering,
         },
+        mpsc::{
+            self,
+            Receiver,
+        },
     },
     thread,
     time::{
@@ -47,13 +51,17 @@ use mahi_live::{
     LiveKeys,
     LiveNode,
     LiveTopic,
+    PROMPT_ID_BYTES,
     Peers,
+    PromptText,
     Relays,
     Ticket,
+    prompt_id,
 };
 use mahi_sandbox::{
     SignalError,
     TerminationSignals,
+    WindowChanges,
 };
 use mahi_store::{
     Store,
@@ -79,6 +87,7 @@ use crate::{
         JoinCommand,
         LaunchOptions,
     },
+    compose::Composer,
     environment::{
         Environment,
         LiveMode,
@@ -95,8 +104,15 @@ use crate::{
         RunError,
     },
     session::CommitKey,
+    settings::{
+        Settings,
+        SettingsError,
+    },
     sync,
-    terminal::RawMode,
+    terminal::{
+        self,
+        RawMode,
+    },
     thread_lock::{
         LockError,
         ThreadLock,
@@ -116,10 +132,13 @@ const RESET: &[u8] =
 const STUCK_SCREEN: Duration = Duration::from_secs(3);
 const DRAIN: usize = 256;
 const HOST_SILENCE: Duration = Duration::from_secs(30);
-const QUIT_KEYS: [u8; 3] = [b'q', 0x03, 0x04];
+const KEY_QUEUE: usize = 64;
+const TYPING_PAUSE: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub(crate) enum JoinError {
+    #[error(transparent)]
+    Settings(#[from] SettingsError),
     #[error("joining needs the live layer: set MAHI_LIVE to local or public, or leave it unset")]
     LiveSetting,
     #[error("cannot find the current directory")]
@@ -269,6 +288,17 @@ impl View {
     /// Returns the participant whose agent the view follows.
     pub(crate) fn follows(&self) -> &ParticipantName {
         &self.follows
+    }
+
+    /// Returns the agent the view shows, once a screen of it arrived.
+    pub(crate) fn slot(&self) -> Option<&AgentSlot> {
+        self.slot.as_ref()
+    }
+
+    /// Makes the next render draw the whole screen again, as after the palette closed.
+    pub(crate) fn redraw_all(&mut self) {
+        self.shown = None;
+        self.changed = self.screen.is_some();
     }
 
     /// Returns what to write to the viewer's terminal to show the screen as it is now: all of
@@ -588,7 +618,9 @@ fn watch(
     );
     let mut sender = FrameSender::new(LiveKeys::derive(&thread_key, thread)?, node_key.secret())?;
     drop(thread_key);
-    eprintln!("mahi: watching {follows}'s agent; press q to leave");
+    let key = Settings::load(config)?.palette_key;
+    eprintln!("mahi: watching {follows}'s agent; press q to leave, {key} to write it a prompt");
+    let composer = Composer::new(key, follows.as_str());
     let leave = Arc::new(AtomicBool::new(false));
     let signals = TerminationSignals::listen().map_err(JoinError::Signals)?;
     {
@@ -601,8 +633,12 @@ fn watch(
     }
     let raw = RawMode::enable().map_err(JoinError::Terminal)?;
     let screen = AlternateScreen::enter();
-    watch_leave_keys(&leave);
-    let ended = show(&topic, &mut frames, &mut sender, View::new(follows), &leave);
+    let keys = read_keys(&leave);
+    let ended = show(
+        (&topic, &mut frames, &mut sender),
+        (View::new(follows), composer),
+        (&keys, &leave),
+    );
     drop(screen);
     drop(raw);
     match ended {
@@ -625,16 +661,16 @@ enum Ended {
 }
 
 fn show(
-    topic: &LiveTopic,
-    frames: &mut FrameReceiver,
-    sender: &mut FrameSender,
-    mut view: View,
-    leave: &AtomicBool,
+    (topic, frames, sender): (&LiveTopic, &mut FrameReceiver, &mut FrameSender),
+    (mut view, mut composer): (View, Composer),
+    (keys, leave): (&Receiver<Vec<u8>>, &AtomicBool),
 ) -> Ended {
     let mut asked_at: Option<Instant> = None;
     let mut dropped = topic.dropped();
     let mut unanchored = false;
     let mut heard_at = Instant::now();
+    let mut showing_from: Option<NodeId> = None;
+    let resized = watch_resizes();
     while !leave.load(Ordering::SeqCst) {
         let lost = topic.dropped() != dropped;
         dropped = topic.dropped();
@@ -649,7 +685,16 @@ fn show(
             asked_at = Some(Instant::now());
             unanchored = false;
         }
-        let mut wait = RECEIVE_PAUSE;
+        let mut palette_changed = false;
+        if resized.swap(false, Ordering::SeqCst) {
+            view.redraw_all();
+            palette_changed = true;
+        }
+        let mut wait = if composer.is_open() {
+            TYPING_PAUSE
+        } else {
+            RECEIVE_PAUSE
+        };
         for _ in 0..DRAIN {
             let frame = match topic.receive(wait) {
                 Ok(Some(frame)) => frame,
@@ -659,20 +704,56 @@ fn show(
             wait = Duration::ZERO;
             match frames.open(&frame) {
                 Ok(received) => {
-                    if &received.participant == view.follows() {
-                        heard_at = Instant::now();
+                    if &received.participant != view.follows() {
+                        continue;
                     }
-                    view.apply(&received.participant, received.body);
+                    heard_at = Instant::now();
+                    match received.body {
+                        Body::PromptAnswer { slot, id, outcome } => {
+                            let from_shown =
+                                showing_from == Some(received.sender) && view.slot() == Some(&slot);
+                            palette_changed |= from_shown && composer.answered(id, outcome);
+                        }
+                        body => {
+                            let screen = matches!(body, Body::Screen { .. });
+                            view.apply(&received.participant, body);
+                            if screen && view.is_showing() {
+                                showing_from = Some(received.sender);
+                            }
+                        }
+                    }
                 }
                 Err(FrameError::Unanchored) => unanchored = true,
                 Err(_) => {}
             }
         }
-        if let Some(drawn) = view.render() {
-            let mut output = io::stdout().lock();
-            let _ = output.write_all(&drawn);
-            let _ = output.flush();
+        while let Ok(chunk) = keys.try_recv() {
+            let was_open = composer.is_open();
+            let typed = composer.typed(&chunk);
+            if typed.quit {
+                return Ended::Left;
+            }
+            palette_changed |= typed.changed;
+            if let Some(text) = typed.send {
+                let id = showing_from
+                    .and_then(|host| send_prompt(&text, &view, frames, sender, (topic, host)));
+                composer.sent(id, &text);
+            }
+            if was_open && !composer.is_open() {
+                view.redraw_all();
+            }
         }
+        let drawn = view.render();
+        let mut output = io::stdout().lock();
+        if let Some(drawn) = &drawn {
+            let _ = output.write_all(drawn);
+        }
+        if composer.is_open() && (drawn.is_some() || palette_changed) {
+            let size = terminal::size();
+            let _ = composer.draw(size.rows, size.cols, &mut output);
+        }
+        let _ = output.flush();
+        drop(output);
         if heard_at.elapsed() > HOST_SILENCE {
             return Ended::Silent;
         }
@@ -680,18 +761,71 @@ fn show(
     Ended::Left
 }
 
-fn watch_leave_keys(leave: &Arc<AtomicBool>) {
+/// Sends `text` as a prompt to the agent the view shows, in the run of its host the viewer
+/// follows, and returns its id; `None` when no screen of the agent arrived yet or it could not
+/// be sent.
+fn send_prompt(
+    text: &str,
+    view: &View,
+    frames: &FrameReceiver,
+    sender: &mut FrameSender,
+    (topic, host): (&LiveTopic, NodeId),
+) -> Option<[u8; PROMPT_ID_BYTES]> {
+    let slot = view.slot()?.clone();
+    let run = frames.run_of(&host)?;
+    let text = PromptText::new(text.to_owned()).ok()?;
+    let id = prompt_id().ok()?;
+    let frame = sender
+        .seal(&Body::Prompt {
+            slot,
+            run,
+            id,
+            text,
+        })
+        .ok()?;
+    topic.broadcast(frame).ok()?;
+    Some(id)
+}
+
+/// Notes when the viewer's terminal changes size, so the view and the palette are drawn again.
+fn watch_resizes() -> Arc<AtomicBool> {
+    let resized = Arc::new(AtomicBool::new(false));
+    let noted = Arc::clone(&resized);
+    thread::spawn(move || {
+        let Ok(changes) = WindowChanges::listen() else {
+            return;
+        };
+        while changes.wait().is_ok() {
+            noted.store(true, Ordering::SeqCst);
+        }
+    });
+    resized
+}
+
+/// Reads the viewer's keys on a thread of its own and passes them on; the end of the input
+/// leaves the thread.
+fn read_keys(leave: &Arc<AtomicBool>) -> Receiver<Vec<u8>> {
+    let (keys, received) = mpsc::sync_channel(KEY_QUEUE);
     let leave = Arc::clone(leave);
     thread::spawn(move || {
         let mut input = io::stdin().lock();
-        let mut byte = [0_u8; 1];
-        while let Ok(read) = input.read(&mut byte) {
-            if read == 0 || QUIT_KEYS.contains(&byte[0]) {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = match input.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => 0,
+            };
+            let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
                 leave.store(true, Ordering::SeqCst);
+                return;
+            };
+            if keys.send(chunk.to_vec()).is_err() {
                 return;
             }
         }
     });
+    received
 }
 
 #[cfg(test)]

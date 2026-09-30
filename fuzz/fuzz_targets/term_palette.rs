@@ -19,7 +19,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     for chunk in [first, second] {
         let used = keys.read(chunk, |key| {
             if let PaletteInput::Text(c) = key {
-                assert!(!c.is_control());
+                assert!(!c.is_control() || c == '\n' || c == '\t');
                 filter.push(c);
             }
             true

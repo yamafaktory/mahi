@@ -770,6 +770,10 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
 
     impl Session {
         fn start(fixture: &Fixture, arguments: &[&str]) -> Self {
+            Self::start_with(fixture, arguments, "off")
+        }
+
+        fn start_with(fixture: &Fixture, arguments: &[&str], live: &str) -> Self {
             let mut command = PtyCommand::new(
                 Path::new(env!("CARGO_BIN_EXE_mahi")),
                 &fixture.repo,
@@ -784,7 +788,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
                 .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
                 .env("SSH_AUTH_SOCK", &fixture.socket)
                 .env("USER", "tester")
-                .env("MAHI_LIVE", "off")
+                .env("MAHI_LIVE", live)
                 .spawn()
                 .unwrap();
             let terminal = mahi.writer().unwrap();
@@ -2330,6 +2334,59 @@ cat parser.rs
         keys.write_all(b"q").unwrap();
         assert_eq!(exit_of(&mut join), 0);
         assert!(String::from_utf8_lossy(&watched.lock().unwrap()).contains("left thread"));
+    }
+
+    #[test]
+    fn a_teammate_sends_a_prompt_the_host_reads_and_accepts_into_the_agent() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let mut host = Session::start_with(
+            &fixture,
+            &[
+                "run",
+                "sh",
+                "-c",
+                "printf 'ready\\n'; read line; echo \"got:$line\"; read end",
+            ],
+            "local",
+        );
+        host.wait_for("ready");
+        let (thread, _key) = running_thread(&fixture);
+        let bob = teammate(&fixture, "bob");
+        let ticket = invite_teammate(&fixture, thread, &bob);
+        let bob_config = bob.home.join(".config");
+        let bob_env: Vec<(&str, &OsStr)> = vec![
+            ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+            ("HOME", bob.home.as_os_str()),
+            ("XDG_CONFIG_HOME", bob_config.as_os_str()),
+            ("USER", OsStr::new("bob")),
+            ("MAHI_LIVE", OsStr::new("local")),
+        ];
+        let mut join = mahi_in_terminal(&bob.repo, &["join", &ticket], &bob_env);
+        let watched = collect(&join);
+        let seen = |text: &str| String::from_utf8_lossy(&watched.lock().unwrap()).contains(text);
+        let mut keys = join.writer().unwrap();
+        wait_until("bob's passphrase question", || seen("Passphrase"));
+        keys.write_all(format!("{PASSPHRASE}\n").as_bytes())
+            .unwrap();
+        wait_until("bob to see the agent", || seen("ready"));
+        keys.write_all(b"\0").unwrap();
+        wait_until("bob's palette", || seen("Enter sends"));
+        keys.write_all(b"run the tests\r").unwrap();
+        wait_until("the host to queue bob's prompt", || seen("waiting"));
+
+        host.type_keys(b"\0");
+        host.wait_for_screen("run the tests");
+        host.type_keys(b"\r");
+        host.wait_for("got:run the tests");
+        wait_until("bob to learn it was accepted", || seen("accepted"));
+        keys.write_all(b"\x1b").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        keys.write_all(b"q").unwrap();
+        assert_eq!(exit_of(&mut join), 0);
+        host.type_keys(b"end\r");
+        let (code, text) = host.finish();
+        assert_eq!(code, 0, "{text}");
     }
 
     fn all_signed_by(store: &Store, thread_ref: &ThreadRef, key: &ParticipantKey) {
