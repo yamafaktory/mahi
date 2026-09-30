@@ -201,7 +201,14 @@ fn walk(
         );
         let fd = match opened {
             Ok(fd) => fd,
-            Err(Errno::LOOP | Errno::NOENT | Errno::NXIO | Errno::ACCESS | Errno::NAMETOOLONG) => {
+            Err(
+                Errno::LOOP
+                | Errno::NOENT
+                | Errno::NXIO
+                | Errno::OPNOTSUPP
+                | Errno::ACCESS
+                | Errno::NAMETOOLONG,
+            ) => {
                 continue;
             }
             Err(error) => return Err(SyncError::Read(error.into())),
