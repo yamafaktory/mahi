@@ -20,6 +20,7 @@ mahi-live = { path = "../crates/mahi-live" }
 mahi-proxy = { path = "../crates/mahi-proxy" }
 mahi-ssh = { path = "../crates/mahi-ssh" }
 mahi-store = { path = "../crates/mahi-store" }
+mahi-term = { path = "../crates/mahi-term" }
 mahi-thread = { path = "../crates/mahi-thread" }
 
 [workspace]
@@ -149,3 +150,10 @@ bench = false
 
 [patch.crates-io]
 russh = { git = "https://github.com/ToyOSOrg/russh", rev = "15eb197d28f12a4c6ac573850458545457f7bf55" }
+
+[[bin]]
+name = "term-scan"
+path = "fuzz_targets/term_scan.rs"
+test = false
+doc = false
+bench = false

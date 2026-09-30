@@ -51,6 +51,7 @@ mahi-sandbox = { path = "crates/mahi-sandbox" }
 mahi-schedule = { path = "crates/mahi-schedule" }
 mahi-ssh = { path = "crates/mahi-ssh" }
 mahi-store = { path = "crates/mahi-store" }
+mahi-term = { path = "crates/mahi-term" }
 mahi-thread = { path = "crates/mahi-thread" }
 mahi-tls = { path = "crates/mahi-tls" }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
