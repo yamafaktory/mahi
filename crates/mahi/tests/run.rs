@@ -834,6 +834,197 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(turns[1].events()[0].payload(), b"prompt\nsecond");
     }
 
+    const WORKING_CLAUDE: &str = r#"#!/bin/sh
+printf '{"prompt":"build the parser"}' | "$MAHI_BIN" hook prompt
+printf '{"tool_name":"Write","tool_input":{"file_path":"parser.rs"}}' | "$MAHI_BIN" hook tool
+echo 'fn parse() {}' > parser.rs
+"$MAHI_BIN" hook turn-end < /dev/null
+"#;
+
+    const TAKER: &str = r#"#!/bin/sh
+echo "args=$*"
+echo "notes=$MAHI_HANDOFF"
+ls -l "$MAHI_HANDOFF" | cut -c1-10
+tr '\n' '|' < "$MAHI_HANDOFF"
+echo
+cat parser.rs
+"#;
+
+    fn script(fixture: &Fixture, directory: &str, name: &str, text: &str) -> PathBuf {
+        let tools = fixture.root.join(directory);
+        fs::create_dir_all(&tools).unwrap();
+        let path = tools.join(name);
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn worked_thread(fixture: &Fixture) -> (String, PathBuf) {
+        save_identity(fixture);
+        let claude = script(fixture, "working", "claude", WORKING_CLAUDE);
+        let first = fixture
+            .command(&["run", claude.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert_eq!(first.status.code(), Some(0), "{stderr}");
+        let thread = worktree_of(&stderr)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        (thread, claude)
+    }
+
+    #[test]
+    fn a_handoff_needs_no_worktree_a_new_agent_and_a_listed_source_with_work() {
+        let fixture = fixture();
+        let (thread, claude) = worked_thread(&fixture);
+        let taker = script(&fixture, "taking", "codex", TAKER);
+        let taker = taker.to_str().unwrap();
+
+        let (code, output) = in_terminal(
+            &fixture,
+            &["handoff", &thread, "--from", "tester.claude", "--", taker],
+            None,
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains("record and remove it with mahi end"),
+            "{output}"
+        );
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+        let (code, output) = in_terminal(
+            &fixture,
+            &[
+                "handoff",
+                &thread,
+                "--from",
+                "tester.claude",
+                "--",
+                claude.to_str().unwrap(),
+            ],
+            None,
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains("already have an agent called claude"),
+            "{output}"
+        );
+        let (code, output) = in_terminal(
+            &fixture,
+            &["handoff", &thread, "--from", "mallory.claude", "--", taker],
+            None,
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains("does not list a participant called mallory"),
+            "{output}"
+        );
+        let (code, output) = in_terminal(
+            &fixture,
+            &["handoff", &thread, "--from", "tester.nothing", "--", taker],
+            None,
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains("tester.nothing has no snapshot here"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn another_agent_takes_over_with_the_work_and_a_briefing_of_it() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+        let taker = script(&fixture, "taking", "codex", TAKER);
+        let taker = taker.to_str().unwrap();
+
+        let (code, output) = in_terminal(
+            &fixture,
+            &["handoff", &thread, "--from", "tester.claude", "--", taker],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("handing tester.claude's work over to codex"),
+            "{output}"
+        );
+        assert!(
+            output.contains("tell the agent: Read the handoff notes at"),
+            "{output}"
+        );
+        assert!(output.contains("mahi-handoff.md"), "{output}");
+        for expected in [
+            "> build the parser",
+            "- ` Write parser.rs `",
+            "- added ` parser.rs `",
+            "- Previous agent: ` tester.claude `",
+            "fn parse() {}",
+            "-rw-------",
+        ] {
+            assert!(output.contains(expected), "{expected}: {output}");
+        }
+        let store = Store::open(&fixture.repo).unwrap();
+        let handed = ThreadRef::new(
+            thread.parse().unwrap(),
+            RefKind::Snapshots(AgentSlot::new(
+                ParticipantName::new("tester").unwrap(),
+                AgentName::new("codex").unwrap(),
+            )),
+        );
+        all_signed_by(&store, &handed, &fixture.owner);
+        let repository = gix::open(&fixture.repo).unwrap();
+        let tree = repository
+            .find_reference(handed.to_string().as_str())
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(tree.find_entry("parser.rs").is_some());
+    }
+
+    #[test]
+    fn claude_taking_over_starts_with_the_prompt_to_read_the_notes() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let first = fixture
+            .command(&["run", "sh", "-c", "echo work > work.txt"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert_eq!(first.status.code(), Some(0), "{stderr}");
+        let thread = worktree_of(&stderr)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+        let claude = fake_claude(&fixture);
+        let (code, output) = in_terminal(
+            &fixture,
+            &[
+                "handoff",
+                &thread,
+                "--from",
+                "tester.sh",
+                "--",
+                claude.to_str().unwrap(),
+            ],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("args=-- Read the handoff notes at "),
+            "{output}"
+        );
+        assert!(!output.contains("tell the agent"), "{output}");
+    }
+
     #[test]
     fn claudes_session_is_recorded_and_restored_once_its_state_is_gone() {
         let fixture = fixture();

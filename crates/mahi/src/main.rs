@@ -4,6 +4,7 @@ mod cli;
 mod credentials;
 mod end;
 mod environment;
+mod handoff;
 mod hook;
 mod id;
 mod init;
@@ -54,6 +55,7 @@ fn main() {
     let required = match &cli.command {
         Command::Run(command) => command.options.pass_env().to_vec(),
         Command::Resume(command) => command.options.pass_env().to_vec(),
+        Command::Handoff(command) => command.options.pass_env().to_vec(),
         Command::Join(command) if command.agent().is_some() => command.options.pass_env().to_vec(),
         _ => Vec::new(),
     };
@@ -97,17 +99,7 @@ fn main() {
                 1
             }
         },
-        Command::Join(command) => match join::join(&command, &environment) {
-            Ok(Outcome::Exited(code)) => code,
-            Ok(Outcome::Stopped(signal)) => {
-                signal.reraise();
-                128 + signal.number()
-            }
-            Err(error) => {
-                report(&error);
-                1
-            }
-        },
+        Command::Join(command) => outcome_code(join::join(&command, &environment)),
         Command::Invite(command) => {
             exit_code(invite::invite(&command, &environment).map(|ticket| print_out(&ticket)))
         }
@@ -122,30 +114,27 @@ fn main() {
             }
             0
         }
-        Command::Resume(command) => match run::resume(&command, &environment) {
-            Ok(Outcome::Exited(code)) => code,
-            Ok(Outcome::Stopped(signal)) => {
-                signal.reraise();
-                128 + signal.number()
-            }
-            Err(error) => {
-                report(&error);
-                1
-            }
-        },
-        Command::Run(command) => match run::run(&command, &environment) {
-            Ok(Outcome::Exited(code)) => code,
-            Ok(Outcome::Stopped(signal)) => {
-                signal.reraise();
-                128 + signal.number()
-            }
-            Err(error) => {
-                report(&error);
-                1
-            }
-        },
+        Command::Handoff(command) => outcome_code(run::handoff(&command, &environment)),
+        Command::Resume(command) => outcome_code(run::resume(&command, &environment)),
+        Command::Run(command) => outcome_code(run::run(&command, &environment)),
     };
     process::exit(code);
+}
+
+/// Returns the exit code of a command that ran an agent: the agent's, or 128 plus the signal
+/// that stopped it, reraised; or 1, reporting the error.
+fn outcome_code<E: Error>(result: Result<Outcome, E>) -> i32 {
+    match result {
+        Ok(Outcome::Exited(code)) => code,
+        Ok(Outcome::Stopped(signal)) => {
+            signal.reraise();
+            128 + signal.number()
+        }
+        Err(error) => {
+            report(&error);
+            1
+        }
+    }
 }
 
 /// Returns the exit code of a command's `result`, reporting its error.

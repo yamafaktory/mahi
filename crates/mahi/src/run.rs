@@ -15,7 +15,10 @@ use std::{
     },
     os::unix::{
         ffi::OsStrExt,
-        fs::PermissionsExt,
+        fs::{
+            OpenOptionsExt,
+            PermissionsExt,
+        },
         net::UnixListener,
     },
     path::{
@@ -48,10 +51,13 @@ use std::{
 };
 
 use mahi_core::{
+    AgentName,
     AgentSlot,
     NameError,
     ParticipantName,
+    RefKind,
     ThreadId,
+    ThreadRef,
 };
 use mahi_crypto::ThreadKey;
 use mahi_identity::{
@@ -97,6 +103,7 @@ use mahi_thread::{
     KeyError,
     OwnerError,
     ParticipantKey,
+    VerifiedMeta,
     load_meta,
 };
 use rustix::{
@@ -116,6 +123,7 @@ use thiserror::Error;
 
 use crate::{
     cli::{
+        HandoffCommand,
         JoinCommand,
         LaunchOptions,
         ResumeCommand,
@@ -130,6 +138,10 @@ use crate::{
         PASSED_ON,
         PROXY_VARIABLES,
         Passed,
+    },
+    handoff::{
+        self,
+        HandoffError,
     },
     hook,
     live::{
@@ -201,6 +213,8 @@ const PROGRAM_HEADERS: [&[u8]; 5] = [
     b"\xca\xfe\xba\xbe",
 ];
 const HOOK_SOCKET_NAME: &str = "mahi.sock";
+const HANDOFF_NOTES: &str = "mahi-handoff.md";
+const HANDOFF_ENV: &str = "MAHI_HANDOFF";
 const HOOK_QUEUE: usize = 16;
 const HOME: &str = "home";
 const TMP: &str = "tmp";
@@ -314,6 +328,24 @@ pub(crate) enum RunError {
         "this clone has a worktree for thread {0}, whose files would hide what is taken from the remote; record and remove it with mahi end, or resume without --take-remote"
     )]
     WorktreeHere(ThreadId),
+    #[error(
+        "this clone has a worktree for thread {0}; record and remove it with mahi end before handing its work over"
+    )]
+    HandoffWorktreeHere(ThreadId),
+    #[error(
+        "you already have an agent called {1} in thread {0}; resume it with mahi resume --agent {1}"
+    )]
+    AgentThere(ThreadId, AgentName),
+    #[error("thread {0} does not list a participant called {1}")]
+    SourceNotListed(ThreadId, ParticipantName),
+    #[error(
+        "{0} has no snapshot here; fetch the thread first, or check the name with mahi threads"
+    )]
+    NoSourceSnapshot(AgentSlot),
+    #[error("cannot read the previous agent's work")]
+    Handoff(#[from] HandoffError),
+    #[error("cannot write the handoff notes")]
+    HandoffNotes(#[source] io::Error),
 }
 
 #[derive(Debug)]
@@ -482,7 +514,7 @@ pub(crate) fn resume(
     let commits = match listed_and_fetched(
         &prepared.store,
         environment,
-        command,
+        (command.thread, !command.take_remote),
         &owner,
         (&own, &participant),
         &signing,
@@ -519,39 +551,183 @@ pub(crate) fn resume(
 }
 
 /// Checks that the thread's `meta` lists the user's key `own` under the name `participant`,
-/// fetches the thread as that participant unless `--take-remote` already fetched it, and
+/// fetches the thread as that participant when `fetch` is set, and
 /// returns the key that signs the user's commits: `signer`, or one made from `signing`. The
 /// inner `Err` is the signal that stopped the fetch.
 fn listed_and_fetched(
     store: &Store,
     environment: &Environment,
-    command: &ResumeCommand,
+    (thread, fetch): (ThreadId, bool),
     owner: &ParticipantKey,
     (own, participant): (&ParticipantKey, &ParticipantName),
     signing: &SigningKey,
     signer: Option<AgentSigner>,
 ) -> Result<Result<CommitKey, Termination>, RunError> {
-    let current = load_meta(store, command.thread, owner, 0)
-        .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
+    let current = load_meta(store, thread, owner, 0)
+        .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
     let me = current
         .participants()
         .find(|listed| listed.key() == own)
         .filter(|listed| listed.name() == participant)
-        .ok_or_else(|| RunError::NotListed(command.thread, participant.clone()))?;
+        .ok_or_else(|| RunError::NotListed(thread, participant.clone()))?;
     let signer = match signer {
         Some(signer) => signer,
         None => agent_signer(environment, signing)?,
     };
-    if !command.take_remote {
-        let stopped =
-            sync::fetch_until_stopped(store, environment, command.thread, owner, Some(me.name()));
+    if fetch {
+        let stopped = sync::fetch_until_stopped(store, environment, thread, owner, Some(me.name()));
         if let Some(signal) = stopped {
             return Ok(Err(signal));
         }
-        load_meta(store, command.thread, owner, current.generation())
-            .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
+        load_meta(store, thread, owner, current.generation())
+            .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
     }
     Ok(Ok(CommitKey::new(signer).map_err(RunError::OwnerKey)?))
+}
+
+/// Starts the user's new agent on the work of `command.from` in `command.thread`: in a
+/// worktree holding that agent's latest snapshot, with a briefing of what it was asked and did.
+pub(crate) fn handoff(
+    command: &HandoffCommand,
+    environment: &Environment,
+) -> Result<Outcome, RunError> {
+    let (program, arguments) = command.command.split_first().ok_or(RunError::NoAgent)?;
+    let thread = command.thread;
+    let cwd = env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(RunError::CurrentDirectory)?;
+    let host = Host::from_environment(environment)?;
+    let config = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )?;
+    let signing = SigningKey::load(&config.signing_key_file()).map_err(RunError::NotInitialised)?;
+    let own = ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)?;
+    let participant = session::participant_from(environment.user.as_deref())
+        .map_err(RunError::ParticipantName)?;
+    let store = Store::discover(&cwd)?;
+    let owner = session::thread_owner(&store, thread, own.clone())
+        .map_err(|error| RunError::ThreadOwner(thread, error))?;
+    let bootstrap: Vec<HostAddress> = live::remembered_host(&store, thread).into_iter().collect();
+    let _lock = ThreadLock::acquire(&config, thread)?;
+    if store.worktree_dir(&thread.to_string()).is_ok() {
+        return Err(RunError::HandoffWorktreeHere(thread));
+    }
+    let agent_name = session::agent_from(Path::new(program));
+    let slot = AgentSlot::new(participant.clone(), agent_name.clone());
+    if store
+        .head(&ThreadRef::new(thread, RefKind::Snapshots(slot.clone())))?
+        .is_some()
+    {
+        return Err(RunError::AgentThere(thread, agent_name));
+    }
+    let profile = command.options.profile_for(program);
+    let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let credentials = gather_credentials(&config, &command.options, profile, environment)?;
+    let mut prepared = Prepared::new(
+        environment,
+        host,
+        &cwd,
+        store,
+        &AgentRequest {
+            program,
+            arguments,
+            profile,
+            hosts: &hosts,
+        },
+        credentials,
+    )?;
+    prepared.live = live_setup(environment, &config, owner.clone(), bootstrap)?;
+    prepared.sync = SyncSetup::gather(&prepared.store, environment, owner == own);
+    let commits = match listed_and_fetched(
+        &prepared.store,
+        environment,
+        (thread, true),
+        &owner,
+        (&own, &participant),
+        &signing,
+        None,
+    )? {
+        Ok(commits) => commits,
+        Err(signal) => return Ok(Outcome::Stopped(signal)),
+    };
+    let meta = load_meta(&prepared.store, thread, &owner, 0)
+        .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
+    let from = &command.from;
+    let (key, contents) = brief(&mut prepared, &meta, from, &participant, &config)?;
+    eprintln!("mahi: handing {from}'s work over to {agent_name}");
+    let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
+    let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
+    let (started, caught) = until_stopped(&termination, |interrupt| {
+        session::hand_over(
+            &prepared.store,
+            session::HandOver {
+                thread,
+                base: meta.base(),
+                key,
+                slot,
+                contents,
+                worktrees: &worktrees,
+                commits: &commits,
+            },
+            &prepared.globals,
+            interrupt,
+        )
+    });
+    if let Some(signal) = caught {
+        return Ok(Outcome::Stopped(signal));
+    }
+    let started = started
+        .inspect_err(|_| {
+            let _ = fs::remove_dir(&worktrees);
+        })
+        .map_err(|error| RunError::Enter(Box::new(error)))?;
+    if let Err(error) = keep_private(&worktrees) {
+        started.discard_or_report(&prepared.store);
+        return Err(error);
+    }
+    prepared.launch(environment, started, termination)
+}
+
+/// Checks that `meta` lists `from`'s participant and that `from` has a snapshot, then asks for
+/// the passphrase and writes the briefing of `from`'s work for the agent. Returns the thread
+/// key and the tree of `from`'s latest snapshot.
+fn brief(
+    prepared: &mut Prepared,
+    meta: &VerifiedMeta,
+    from: &AgentSlot,
+    participant: &ParticipantName,
+    config: &ConfigDir,
+) -> Result<(ThreadKey, ObjectId), RunError> {
+    let thread = meta.thread();
+    if !meta
+        .participants()
+        .any(|listed| listed.name() == from.participant())
+    {
+        return Err(RunError::SourceNotListed(
+            thread,
+            from.participant().clone(),
+        ));
+    }
+    let source = prepared
+        .store
+        .head(&ThreadRef::new(thread, RefKind::Snapshots(from.clone())))?
+        .ok_or_else(|| RunError::NoSourceSnapshot(from.clone()))?;
+    let contents = prepared.store.commit_tree(source)?;
+    let passphrase = TerminalPrompt::open()
+        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
+        .map_err(RunError::Terminal)?;
+    let identity =
+        LocalIdentity::load(&config.identity_file(), &passphrase).map_err(RunError::Unlock)?;
+    drop(passphrase);
+    let key = meta
+        .thread_key(participant, identity.as_age())
+        .map_err(|error| ResumeError::NotParticipant(thread, Box::new(error)))?;
+    drop(identity);
+    let notes =
+        handoff::briefing(&prepared.store, &key, meta, from, (meta.base(), contents))?.render();
+    prepared.write_handoff(&notes)?;
+    Ok((key, contents))
 }
 
 /// Returns what the live layer needs, unless `MAHI_LIVE` turns it off.
@@ -789,9 +965,26 @@ struct Prepared {
     credentials: Vec<Handed>,
     live: Option<LiveSetup>,
     sync: Option<SyncSetup>,
+    handoff: Option<PathBuf>,
 }
 
 impl Prepared {
+    /// Writes the handoff notes into the agent's private temporary directory, readable by the
+    /// user only, and hands them to the agent when it starts.
+    fn write_handoff(&mut self, notes: &str) -> Result<(), RunError> {
+        let path = self.scratch.join(TMP).join(HANDOFF_NOTES);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(RunError::HandoffNotes)?;
+        file.write_all(notes.as_bytes())
+            .map_err(RunError::HandoffNotes)?;
+        self.handoff = Some(path);
+        Ok(())
+    }
+
     fn new(
         environment: &Environment,
         host: Host,
@@ -843,6 +1036,7 @@ impl Prepared {
             credentials,
             live: None,
             sync: None,
+            handoff: None,
         })
     }
 
@@ -895,6 +1089,7 @@ impl Prepared {
             });
         let launch = Launch {
             restore,
+            handoff: self.handoff.as_deref(),
             arguments: &self.arguments,
             environment,
             agent: &self.agent,
@@ -1284,6 +1479,7 @@ struct Restore<'a> {
 
 struct Launch<'a> {
     restore: Option<Restore<'a>>,
+    handoff: Option<&'a Path>,
     credentials: &'a [Handed],
     profile: Option<&'static Profile>,
     state: Option<PathBuf>,
@@ -1379,6 +1575,15 @@ impl Launch<'_> {
         for argument in self.arguments {
             pty = pty.arg(argument);
         }
+        if let Some(notes) = self.handoff {
+            let prompt = handoff::first_prompt(&notes.display().to_string());
+            let takes_prompt = self.profile.is_some_and(|profile| profile.takes_prompt);
+            if takes_prompt && notes.to_str().is_some() {
+                pty = pty.arg("--").arg(&prompt);
+            } else {
+                eprintln!("mahi: tell the agent: {prompt}");
+            }
+        }
         for (name, value) in &self.environment.passed_on {
             pty = pty.env(name, value);
         }
@@ -1388,6 +1593,9 @@ impl Launch<'_> {
             .env(HOOK_SOCKET, self.hook_socket);
         if let Some(mahi) = &self.environment.mahi_exe {
             pty = pty.env(MAHI_BIN, mahi);
+        }
+        if let Some(notes) = self.handoff {
+            pty = pty.env(HANDOFF_ENV, notes);
         }
         let handed = |name: &str| {
             self.credentials

@@ -23,7 +23,8 @@ const MAX_TOOL_CHARS: usize = 300;
 const MAX_REPLY_CHARS: usize = 4000;
 const MAX_REPLY_LINES: usize = 80;
 const MAX_LINE_CHARS: usize = 200;
-const RECENT_PROMPTS: usize = 30;
+/// How many of the latest prompts a briefing shows, after the first one.
+pub const BRIEFED_PROMPTS: usize = 30;
 const RECENT_TOOLS: usize = 20;
 const RECENT_REPLIES: usize = 3;
 const CUT_MARK: &str = "\n\n(the rest of these notes was cut)\n";
@@ -41,8 +42,15 @@ pub struct Briefing {
     pub branch: String,
     /// Who did the work, such as `alice.claude`.
     pub from: String,
-    /// The prompts the previous agent was given, oldest first.
+    /// The prompts the previous agent was given, oldest first: the first one, then the latest
+    /// ones, with [`Briefing::omitted_prompts`] between them not given.
     pub prompts: Vec<String>,
+    /// How many prompts came between the first one and the rest of
+    /// [`Briefing::prompts`] but are not in it.
+    pub omitted_prompts: usize,
+    /// Whether the transcript could not be read back to its start, so the first prompt given
+    /// is only the earliest one read.
+    pub transcript_cut: bool,
     /// The files its latest snapshot changed from the thread's base.
     pub changes: Changes,
     /// Short descriptions of its tool calls, oldest first.
@@ -131,16 +139,22 @@ impl Briefing {
         let first_block = block(1, first);
         let mut budget = PROMPTS_BYTES.saturating_sub(section.len() + first_block.len());
         let mut kept = Vec::new();
-        for (index, prompt) in rest.iter().enumerate().rev().take(RECENT_PROMPTS) {
-            let next = block(index + 2, prompt);
+        for (index, prompt) in rest.iter().enumerate().rev().take(BRIEFED_PROMPTS) {
+            let next = block(index + 2 + self.omitted_prompts, prompt);
             if next.len() > budget {
                 break;
             }
             budget -= next.len();
             kept.push(next);
         }
+        if self.transcript_cut {
+            section.push_str(
+                "(the transcript could not be read back to its start, so this is the earliest \
+                 prompt read, not necessarily the first)\n\n",
+            );
+        }
         section.push_str(&first_block);
-        let left_out = rest.len() - kept.len();
+        let left_out = rest.len() - kept.len() + self.omitted_prompts;
         if left_out > 0 {
             let _ = writeln!(
                 section,
@@ -307,6 +321,8 @@ mod tests {
                 "Add a login page".to_owned(),
                 "no, keep the old API\nand add tests".to_owned(),
             ],
+            omitted_prompts: 0,
+            transcript_cut: false,
             changes: Changes {
                 paths: vec![
                     ("src/login.rs".to_owned(), Change::Added),
@@ -376,6 +392,19 @@ mod tests {
         }
         .render();
         assert!(one_more.contains("(1 earlier prompt left out)"));
+        let gathered = Briefing {
+            prompts: vec!["goal".to_owned(), "latest".to_owned()],
+            omitted_prompts: 40,
+            ..briefing()
+        }
+        .render();
+        assert!(gathered.contains("(40 earlier prompts left out)\n\n42.\n> latest"));
+        let cut_short = Briefing {
+            transcript_cut: true,
+            ..briefing()
+        }
+        .render();
+        assert!(cut_short.contains("not necessarily the first)\n\n1.\n> Add a login page"));
         let empty = Briefing::default().render();
         assert!(empty.contains("No prompt was recorded."));
         assert!(empty.contains("None yet."));

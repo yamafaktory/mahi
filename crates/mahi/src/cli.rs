@@ -11,6 +11,7 @@ use clap::{
 };
 use mahi_core::{
     AgentName,
+    AgentSlot,
     NameError,
     ThreadId,
 };
@@ -51,6 +52,10 @@ pub(crate) enum Command {
     Run(RunCommand),
     /// Resumes a thread you started, in its worktree, with the same agent.
     Resume(ResumeCommand),
+    /// Starts your agent on another agent's work in a thread you are in: its worktree holds
+    /// that agent's latest snapshot, and it gets a briefing of what the user asked and what
+    /// was done.
+    Handoff(HandoffCommand),
     /// Ends a thread you started that is not running: records its worktree in a last
     /// snapshot, then removes the worktree and the agent's state. Its history stays.
     End(EndCommand),
@@ -270,6 +275,20 @@ pub(crate) struct ResumeCommand {
     /// A command to run instead of the thread's agent and its profile's resume arguments,
     /// after `--`.
     #[arg(last = true, value_name = "COMMAND")]
+    pub(crate) command: Vec<OsString>,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct HandoffCommand {
+    /// The thread, as `mahi threads` lists it.
+    pub(crate) thread: ThreadId,
+    /// The agent whose work to take over, as `<participant>.<agent>`, such as `alice.claude`.
+    #[arg(long, value_name = "PARTICIPANT.AGENT")]
+    pub(crate) from: AgentSlot,
+    #[command(flatten)]
+    pub(crate) options: LaunchOptions,
+    /// The agent to start, and its arguments, after `--`.
+    #[arg(last = true, required = true, value_name = "COMMAND")]
     pub(crate) command: Vec<OsString>,
 }
 

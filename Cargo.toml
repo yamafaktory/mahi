@@ -59,6 +59,7 @@ russh = { version = "0.63.3", default-features = false, features = ["rustcrypto"
 rustls = { version = "0.23.45", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive"] }
 sha1 = { version = "0.10.6", default-features = false }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 sha2 = { version = "0.10.9", default-features = false, features = ["oid"] }
 signature = "2.2.0"
 ssh-key = { version = "0.6.7", default-features = false, features = ["ed25519", "std"] }

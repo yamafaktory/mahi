@@ -86,7 +86,7 @@ impl HookKind {
         }
     }
 
-    fn parse(name: &[u8]) -> Option<Self> {
+    pub(crate) fn parse(name: &[u8]) -> Option<Self> {
         [Self::Prompt, Self::Tool, Self::TurnEnd]
             .into_iter()
             .find(|kind| kind.as_str().as_bytes() == name)

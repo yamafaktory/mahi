@@ -37,6 +37,7 @@ pub(crate) struct Profile {
     pub(crate) resume_args: &'static [&'static str],
     pub(crate) credential: Option<(&'static str, &'static str)>,
     pub(crate) session_dir: Option<fn(&Path) -> Option<String>>,
+    pub(crate) takes_prompt: bool,
     install: fn(&OwnedFd) -> io::Result<()>,
 }
 
@@ -54,6 +55,7 @@ const CLAUDE_CODE: Profile = Profile {
     resume_args: &["--continue"],
     credential: Some(("claude", "CLAUDE_CODE_OAUTH_TOKEN")),
     session_dir: Some(claude_code_session_dir),
+    takes_prompt: true,
     install: install_claude_code,
 };
 
