@@ -10,6 +10,7 @@ use mahi_store::{
     Store,
     StoreError,
 };
+use thiserror::Error;
 
 use crate::{
     MAX_META_BYTES,
@@ -17,9 +18,21 @@ use crate::{
     PinError,
     ThreadError,
     VerifiedMeta,
+    commits::signed_by,
     pins::Pins,
     thread::META_ENTRY,
 };
+
+/// Why a fetched agent ref was refused.
+#[derive(Debug, Error)]
+pub enum Refusal {
+    /// Its history could not be read or checked, or the ref could not be moved.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// A commit it adds is not signed by the key `meta` lists for the ref's participant.
+    #[error("commit {0} is not signed by the participant's key")]
+    NotSigned(ObjectId),
+}
 
 /// What accepting a thread's fetched refs changed.
 #[derive(Debug, Default)]
@@ -32,8 +45,9 @@ pub struct Accepted {
     /// The fetched refs left alone: the local participant's own, those of a participant the
     /// signed `meta` does not list, and `state`, whose writers are not settled yet.
     pub skipped: Vec<ThreadRef>,
-    /// The fetched refs that could not be checked or moved, with why.
-    pub refused: Vec<(ThreadRef, StoreError)>,
+    /// The fetched refs that could not be checked or moved, or that add a commit their
+    /// participant did not sign, with why.
+    pub refused: Vec<(ThreadRef, Refusal)>,
 }
 
 enum Advance {
@@ -51,9 +65,11 @@ enum Advance {
 /// already seen. An older fetched document leaves the local one in place. Then each agent ref
 /// of a participant the resulting `meta` lists, other than `local`, only moves forward: behind
 /// moves to the fetched commit, ahead stays, and a history that went apart stays and is
-/// reported. A ref that fails its checks is refused on its own, and the others go on. All the
-/// history walks together go through at most [`MAX_HISTORY_WALK`] commits; once that is spent,
-/// the remaining refs that need a walk are refused.
+/// reported. Moving forward also needs every commit the ref gains to be signed by the key that
+/// `meta` lists for the participant, so that no one else can write in their name. A ref that
+/// fails its checks is refused on its own, and the others go on. All the history walks
+/// together go through at most [`MAX_HISTORY_WALK`] commits; once that is spent, the remaining
+/// refs that need a walk are refused.
 ///
 /// # Errors
 ///
@@ -90,15 +106,18 @@ pub fn accept_fetched(
                 Some(slot)
             }
         };
-        let writable = slot.is_some_and(|slot| {
-            let writer = slot.participant();
-            writer != local && current.participants().any(|listed| listed.name() == writer)
-        });
-        if !writable {
+        let writer = slot
+            .filter(|slot| slot.participant() != local)
+            .and_then(|slot| {
+                current
+                    .participants()
+                    .find(|listed| listed.name() == slot.participant())
+            });
+        let Some(writer) = writer else {
             accepted.skipped.push(thread_ref);
             continue;
-        }
-        match advance(store, &thread_ref, commit, &mut budget) {
+        };
+        match advance(store, &thread_ref, commit, writer.key(), &mut budget) {
             Ok(Advance::Moved) => accepted.updated.push(thread_ref),
             Ok(Advance::Diverged) => accepted.diverged.push(thread_ref),
             Ok(Advance::Kept) => {}
@@ -165,8 +184,9 @@ fn advance(
     store: &Store,
     thread_ref: &ThreadRef,
     commit: ObjectId,
+    writer: &ParticipantKey,
     budget: &mut usize,
-) -> Result<Advance, StoreError> {
+) -> Result<Advance, Refusal> {
     let local = store.head(thread_ref)?;
     let forward = match local {
         None => true,
@@ -174,6 +194,7 @@ fn advance(
         Some(local) => store.descends_within(commit, local, budget)?,
     };
     if forward {
+        require_signed(store, commit, local, writer, budget)?;
         store.set_head(thread_ref, local, commit)?;
         return Ok(Advance::Moved);
     }
@@ -181,6 +202,26 @@ fn advance(
         Some(local) if store.descends_within(local, commit, budget)? => Ok(Advance::Kept),
         _ => Ok(Advance::Diverged),
     }
+}
+
+fn require_signed(
+    store: &Store,
+    tip: ObjectId,
+    until: Option<ObjectId>,
+    writer: &ParticipantKey,
+    budget: &mut usize,
+) -> Result<(), Refusal> {
+    let mut next = Some(tip);
+    while let Some(commit) = next.filter(|commit| Some(*commit) != until) {
+        *budget = budget
+            .checked_sub(1)
+            .ok_or(StoreError::HistoryTooLong(tip))?;
+        if !signed_by(store, commit, writer)? {
+            return Err(Refusal::NotSigned(commit));
+        }
+        next = store.parent(commit)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -195,9 +236,15 @@ mod tests {
         EntryKind,
         FETCHED_PREFIX,
     };
+    use ssh_key::{
+        Algorithm,
+        PrivateKey,
+        rand_core::OsRng,
+    };
 
     use super::*;
     use crate::{
+        GitSigner,
         PinError,
         create_thread,
         load_meta,
@@ -224,6 +271,16 @@ mod tests {
     }
 
     fn commit(setup: &Setup, parent: Option<ObjectId>, entry: &str, content: &[u8]) -> ObjectId {
+        commit_by(setup, &setup.owner, parent, entry, content)
+    }
+
+    fn commit_by(
+        setup: &Setup,
+        signer: &PrivateKey,
+        parent: Option<ObjectId>,
+        entry: &str,
+        content: &[u8],
+    ) -> ObjectId {
         let scratch = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
         if let Some(parent) = parent {
             set_ref(setup, &scratch.to_string(), parent);
@@ -232,6 +289,22 @@ mod tests {
         let tree = setup
             .store
             .write_tree(&[(entry, EntryKind::Blob, blob)])
+            .unwrap();
+        setup
+            .store
+            .append_signed(&scratch, parent, tree, "m", &GitSigner(signer.clone()))
+            .unwrap()
+    }
+
+    fn unsigned(setup: &Setup, parent: Option<ObjectId>, content: &[u8]) -> ObjectId {
+        let scratch = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
+        if let Some(parent) = parent {
+            set_ref(setup, &scratch.to_string(), parent);
+        }
+        let blob = setup.store.write_blob(content).unwrap();
+        let tree = setup
+            .store
+            .write_tree(&[("f", EntryKind::Blob, blob)])
             .unwrap();
         setup.store.append(&scratch, parent, tree, "m").unwrap()
     }
@@ -366,14 +439,70 @@ mod tests {
         assert!(matches!(
             accepted.refused.as_slice(),
             [
-                (first, StoreError::WrongObject { .. }),
-                (second, StoreError::NotLinear(_)),
+                (first, Refusal::Store(StoreError::WrongObject { .. })),
+                (second, Refusal::Store(StoreError::NotLinear(_))),
             ] if *first == broken && *second == merge
         ));
         for thread_ref in [&own, &stranger, &state, &broken] {
             assert_eq!(setup.store.head(thread_ref).unwrap(), None);
         }
         assert_eq!(setup.store.head(&merge).unwrap(), Some(root));
+    }
+
+    #[test]
+    fn only_commits_the_participant_signed_move_their_refs() {
+        let setup = setup();
+        let (_key, first) = created(&setup);
+        stage(&setup, &ThreadRef::new(setup.thread, RefKind::Meta), first);
+        let stranger = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let (plain, forged, hidden, old_plain, middle) = (
+            snapshots(&setup, "alice", "plain"),
+            snapshots(&setup, "alice", "forged"),
+            snapshots(&setup, "alice", "hidden"),
+            snapshots(&setup, "alice", "old"),
+            snapshots(&setup, "alice", "middle"),
+        );
+        let unsigned_root = unsigned(&setup, None, b"unsigned");
+        stage(&setup, &plain, unsigned_root);
+        stage(
+            &setup,
+            &forged,
+            commit_by(&setup, &stranger, None, "f", b"forged"),
+        );
+        let signed_over_unsigned = commit(&setup, Some(unsigned_root), "f", b"on top");
+        stage(&setup, &hidden, signed_over_unsigned);
+        set_ref(&setup, &old_plain.to_string(), unsigned_root);
+        stage(&setup, &old_plain, signed_over_unsigned);
+        let base = commit(&setup, None, "f", b"base");
+        let slipped_in = unsigned(&setup, Some(base), b"slipped in");
+        let signed_tip = commit(&setup, Some(slipped_in), "f", b"tip");
+        set_ref(&setup, &middle.to_string(), base);
+        stage(&setup, &middle, signed_tip);
+
+        let accepted = accept(&setup).unwrap();
+
+        assert_eq!(accepted.updated, std::slice::from_ref(&old_plain));
+        let refused: Vec<_> = accepted
+            .refused
+            .iter()
+            .map(|(thread_ref, refusal)| match refusal {
+                Refusal::NotSigned(commit) => (thread_ref.clone(), *commit),
+                Refusal::Store(error) => panic!("{thread_ref}: {error}"),
+            })
+            .collect();
+        assert_eq!(refused.len(), 4);
+        assert!(refused.contains(&(middle.clone(), slipped_in)));
+        assert_eq!(setup.store.head(&middle).unwrap(), Some(base));
+        assert!(refused.contains(&(plain.clone(), unsigned_root)));
+        assert!(refused.contains(&(hidden.clone(), unsigned_root)));
+        assert!(refused.iter().any(|(thread_ref, _)| *thread_ref == forged));
+        for thread_ref in [&plain, &forged, &hidden] {
+            assert_eq!(setup.store.head(thread_ref).unwrap(), None);
+        }
+        assert_eq!(
+            setup.store.head(&old_plain).unwrap(),
+            Some(signed_over_unsigned)
+        );
     }
 
     #[test]

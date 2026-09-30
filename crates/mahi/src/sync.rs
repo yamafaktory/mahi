@@ -578,7 +578,7 @@ mod tests {
         let accepted = Accepted {
             updated: vec![meta.clone()],
             diverged: vec![meta.clone()],
-            refused: vec![(meta, StoreError::Interrupted)],
+            refused: vec![(meta, mahi_thread::Refusal::Store(StoreError::Interrupted))],
             ..Accepted::default()
         };
         let told = fetch_report(&Ok(Some(accepted)), &name).unwrap();

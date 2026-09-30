@@ -23,6 +23,7 @@ pub use commits::{
 };
 pub use fetched::{
     Accepted,
+    Refusal,
     accept_fetched,
 };
 pub use key::{
