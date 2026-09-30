@@ -36,6 +36,7 @@ use mahi_identity::{
     IdentityError,
     LocalIdentity,
     NodeKey,
+    SigningKey,
 };
 use mahi_live::{
     Body,
@@ -62,6 +63,7 @@ use mahi_thread::{
     MetaError,
     NodeId,
     OwnerError,
+    ParticipantKey,
     ThreadError,
     VerifiedMeta,
     load_meta,
@@ -91,6 +93,7 @@ use crate::{
         Outcome,
         RunError,
     },
+    session::CommitKey,
     sync,
     terminal::RawMode,
     thread_lock::{
@@ -164,6 +167,10 @@ pub(crate) enum JoinError {
     OptionsNeedAgent,
     #[error("cannot run your agent in the thread")]
     Busy(#[source] LockError),
+    #[error(
+        "the thread lists another signing key for you than the one mahi init set up; ask the owner to invite your current card (mahi id)"
+    )]
+    KeyChanged,
 }
 
 /// What a viewer shows: the screen of one agent of the participant it follows, rebuilt in its
@@ -397,6 +404,17 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     if ticket.invitee() != &own {
         return Err(JoinError::NotForThisNode(own));
     }
+    let signer = match command.agent() {
+        Some(_) => {
+            let signing =
+                SigningKey::load(&config.signing_key_file()).map_err(JoinError::NotInitialised)?;
+            Some(
+                run::agent_signer(environment, &signing)
+                    .map_err(|error| JoinError::Run(Box::new(error)))?,
+            )
+        }
+        None => None,
+    };
     let store = Store::discover(&cwd)?;
     let peers = Arc::new(JoinPeers(Mutex::new(HashSet::from([*ticket
         .host()
@@ -414,7 +432,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
             return Err(error);
         }
     };
-    if command.agent().is_some() {
+    if let Some(signer) = signer {
         let _ = node.close();
         let lock = ThreadLock::acquire(&config, ticket.thread()).map_err(JoinError::Busy)?;
         let me = meta
@@ -438,7 +456,9 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
             }
             None => meta,
         };
-        let (participant, key) = unlock(&meta, own, &config)?;
+        let signing_key = ParticipantKey::from_public_key(signer.public_key())
+            .map_err(|_| JoinError::KeyChanged)?;
+        let (participant, key) = unlock(&meta, own, Some(&signing_key), &config)?;
         let joined = Joined {
             thread: ticket.thread(),
             base: meta.base(),
@@ -447,6 +467,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
             owner: ticket.owner().clone(),
             host: ticket.host().clone(),
             lock,
+            commits: CommitKey::new(signer),
         };
         return run::join_run(command, environment, joined)
             .map_err(|error| JoinError::Run(Box::new(error)));
@@ -459,16 +480,21 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     watched.map(|()| Outcome::Exited(0))
 }
 
-/// Asks for the passphrase and recovers the thread key wrapped for this node's participant.
+/// Checks that this node's participant is listed with `signing_key`, when the user's agent will
+/// sign, then asks for the passphrase and recovers the thread key wrapped for them.
 fn unlock(
     meta: &VerifiedMeta,
     own: NodeId,
+    signing_key: Option<&ParticipantKey>,
     config: &ConfigDir,
 ) -> Result<(ParticipantName, ThreadKey), JoinError> {
     let me = meta
         .participants()
         .find(|participant| participant.node() == &own)
         .ok_or(JoinError::NotListed)?;
+    if signing_key.is_some_and(|key| me.key() != key) {
+        return Err(JoinError::KeyChanged);
+    }
     let passphrase = TerminalPrompt::open()
         .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
         .map_err(JoinError::Terminal)?;
@@ -544,7 +570,7 @@ fn watch(
         .ok_or(JoinError::NotListed)?
         .name()
         .clone();
-    let (_, thread_key) = unlock(meta, own, config)?;
+    let (_, thread_key) = unlock(meta, own, None, config)?;
     let topic = node.join(
         LiveKeys::derive(&thread_key, thread)?.topic(),
         std::slice::from_ref(ticket.host()),
@@ -808,6 +834,7 @@ mod tests {
 
         use crate::session::{
             self,
+            CommitKey,
             NewThread,
             agent_from,
             tests::repository_on_main,
@@ -822,6 +849,7 @@ mod tests {
                 public: &PublicIdentity::from(&LocalIdentity::generate()),
                 node: NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
                 signer: &key,
+                commits: &CommitKey::new(key.clone()),
                 participant: name("alice"),
                 agent: &agent_from(std::path::Path::new("claude")),
                 worktrees: worktrees.path(),

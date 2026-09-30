@@ -714,6 +714,7 @@ mod tests {
     use super::*;
     use crate::session::{
         self,
+        CommitKey,
         NewThread,
         agent_from,
         tests::repository_on_main,
@@ -741,6 +742,7 @@ mod tests {
                 public: &PublicIdentity::from(&identity),
                 node: owner_node,
                 signer: &owner_key,
+                commits: &CommitKey::new(owner_key.clone()),
                 participant: ParticipantName::new("alice").unwrap(),
                 agent: &agent_from(std::path::Path::new("claude")),
                 worktrees: worktrees.path(),

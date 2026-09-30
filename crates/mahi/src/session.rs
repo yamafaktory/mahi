@@ -8,9 +8,12 @@ use std::{
         Path,
         PathBuf,
     },
-    sync::atomic::{
-        AtomicBool,
-        Ordering,
+    sync::{
+        Arc,
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
     },
 };
 
@@ -33,6 +36,7 @@ use mahi_identity::{
     PublicIdentity,
 };
 use mahi_store::{
+    CommitSigner,
     GlobalPatterns,
     ObjectId,
     SnapshotCache,
@@ -40,6 +44,7 @@ use mahi_store::{
     StoreError,
 };
 use mahi_thread::{
+    GitSigner,
     InvalidMeta,
     KeyError,
     MetaDraft,
@@ -69,6 +74,26 @@ const STATE: [&str; 2] = ["mahi", "state"];
 const LONGEST_REPOSITORY_NAME: usize = 64;
 pub(crate) const SNAPSHOT_MESSAGE: &str = "snapshot";
 
+/// What signs the user's agent commits: their snapshots and transcript turns.
+#[derive(Clone)]
+pub(crate) struct CommitKey(Arc<dyn CommitSigner + Send + Sync>);
+
+impl CommitKey {
+    pub(crate) fn new<S: SshSigner + Send + Sync + 'static>(signer: S) -> Self {
+        Self(Arc::new(GitSigner(signer)))
+    }
+
+    pub(crate) fn signer(&self) -> &dyn CommitSigner {
+        &*self.0
+    }
+}
+
+impl std::fmt::Debug for CommitKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CommitKey")
+    }
+}
+
 /// A thread `mahi run` started, the worktree its agent works in, and the worktree's first
 /// snapshot.
 #[derive(Debug)]
@@ -80,6 +105,7 @@ pub(crate) struct Started {
     pub(crate) slot: AgentSlot,
     pub(crate) key: Option<ThreadKey>,
     pub(crate) tip: Option<TranscriptTip>,
+    pub(crate) commits: CommitKey,
     created: Option<ObjectId>,
 }
 
@@ -114,6 +140,7 @@ pub(crate) struct NewThread<'a> {
     pub(crate) public: &'a PublicIdentity,
     pub(crate) node: NodeId,
     pub(crate) signer: &'a dyn SshSigner,
+    pub(crate) commits: &'a CommitKey,
     pub(crate) participant: ParticipantName,
     pub(crate) agent: &'a AgentName,
     pub(crate) worktrees: &'a Path,
@@ -129,6 +156,7 @@ pub(crate) fn start(
         public,
         node,
         signer,
+        commits,
         participant,
         agent,
         worktrees,
@@ -171,10 +199,17 @@ pub(crate) fn start(
                 slot,
                 key: Some(key),
                 tip: None,
+                commits: commits.clone(),
                 created: Some(meta),
             };
-            let recorded =
-                take_first_snapshot(store, &name, &started.snapshots, globals, interrupt);
+            let recorded = take_first_snapshot(
+                store,
+                &name,
+                &started.snapshots,
+                globals,
+                commits,
+                interrupt,
+            );
             match recorded {
                 Ok(recorded) if !interrupt.load(Ordering::SeqCst) => {
                     started.first_snapshot = Some(recorded);
@@ -229,6 +264,7 @@ pub(crate) struct Reopen<'a> {
     pub(crate) participant: &'a ParticipantName,
     pub(crate) agent: Option<&'a AgentName>,
     pub(crate) worktrees: &'a Path,
+    pub(crate) commits: &'a CommitKey,
 }
 
 /// Reopens a thread the user started: checks its `meta` against the user's own signing key,
@@ -258,7 +294,7 @@ pub(crate) fn resume(
             tree: store.commit_tree(commit)?,
             cache: SnapshotCache::default(),
         },
-        None => take_first_snapshot(store, &name, &snapshots, globals, interrupt)?,
+        None => take_first_snapshot(store, &name, &snapshots, globals, reopen.commits, interrupt)?,
     };
     let tip = read_tip(store, &key, thread, &slot)
         .map_err(|error| ResumeError::Transcript(Box::new(error)))?;
@@ -270,6 +306,7 @@ pub(crate) fn resume(
         slot,
         key: Some(key),
         tip,
+        commits: reopen.commits.clone(),
         created: None,
     })
 }
@@ -324,6 +361,7 @@ pub(crate) struct Enter<'a> {
     pub(crate) participant: ParticipantName,
     pub(crate) agent: &'a AgentName,
     pub(crate) worktrees: &'a Path,
+    pub(crate) commits: &'a CommitKey,
 }
 
 /// Starts, or continues, the user's own agent in a thread whose `meta` is already here: a
@@ -342,6 +380,7 @@ pub(crate) fn enter(
         participant,
         agent,
         worktrees,
+        commits,
     } = enter;
     store
         .commit_tree(base)
@@ -360,7 +399,7 @@ pub(crate) fn enter(
             tree: store.commit_tree(commit)?,
             cache: SnapshotCache::default(),
         },
-        None => take_first_snapshot(store, &name, &snapshots, globals, interrupt)?,
+        None => take_first_snapshot(store, &name, &snapshots, globals, commits, interrupt)?,
     };
     let tip = read_tip(store, &key, thread, &slot)
         .map_err(|error| EnterError::Transcript(Box::new(error)))?;
@@ -372,6 +411,7 @@ pub(crate) fn enter(
         slot,
         key: Some(key),
         tip,
+        commits: commits.clone(),
         created: None,
     })
 }
@@ -424,11 +464,12 @@ fn take_first_snapshot(
     name: &str,
     snapshots: &ThreadRef,
     globals: &GlobalPatterns,
+    commits: &CommitKey,
     interrupt: &AtomicBool,
 ) -> Result<Recorded, StoreError> {
     let mut cache = SnapshotCache::default();
     let tree = store.snapshot(name, globals, &mut cache, interrupt)?.tree;
-    let commit = store.append(snapshots, None, tree, SNAPSHOT_MESSAGE)?;
+    let commit = store.append_signed(snapshots, None, tree, SNAPSHOT_MESSAGE, commits.signer())?;
     Ok(Recorded {
         commit,
         tree,
@@ -661,13 +702,19 @@ pub(crate) mod tests {
         (dir, store)
     }
 
-    pub(crate) fn start_with(store: &Store, signer: &dyn SshSigner) -> Result<Started, StartError> {
-        start_until(store, signer, &AtomicBool::new(false))
+    pub(crate) fn start_with(store: &Store, signer: &PrivateKey) -> Result<Started, StartError> {
+        start_until(
+            store,
+            signer,
+            &CommitKey::new(signer.clone()),
+            &AtomicBool::new(false),
+        )
     }
 
     fn start_until(
         store: &Store,
         signer: &dyn SshSigner,
+        commits: &CommitKey,
         interrupt: &AtomicBool,
     ) -> Result<Started, StartError> {
         let public = PublicIdentity::from(&LocalIdentity::generate());
@@ -677,6 +724,7 @@ pub(crate) mod tests {
                 public: &public,
                 node: NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
                 signer,
+                commits,
                 participant: ParticipantName::new("alice").unwrap(),
                 agent: &agent_from(Path::new("claude")),
                 worktrees: &worktrees(store),
@@ -729,7 +777,12 @@ pub(crate) mod tests {
         let (_dir, store) = repository_on_main();
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         assert!(matches!(
-            start_until(&store, &signer, &AtomicBool::new(true)),
+            start_until(
+                &store,
+                &signer,
+                &CommitKey::new(signer.clone()),
+                &AtomicBool::new(true)
+            ),
             Err(StartError::Store(StoreError::Interrupted))
         ));
         no_thread_or_worktree(&store);
@@ -739,12 +792,11 @@ pub(crate) mod tests {
     fn an_interrupt_while_the_thread_is_signed_discards_it() {
         let (_dir, store) = repository_on_main();
         let interrupt = AtomicBool::new(false);
-        let signer = InterruptedWhileSigning(
-            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
-            &interrupt,
-        );
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let commits = CommitKey::new(key.clone());
+        let signer = InterruptedWhileSigning(key, &interrupt);
         assert!(matches!(
-            start_until(&store, &signer, &interrupt),
+            start_until(&store, &signer, &commits, &interrupt),
             Err(StartError::Store(StoreError::Interrupted))
         ));
         no_thread_or_worktree(&store);
@@ -866,9 +918,11 @@ pub(crate) mod tests {
     #[test]
     fn a_thread_that_cannot_be_signed_leaves_no_worktree() {
         let (_dir, store) = repository_on_main();
-        let signer = RefusingSigner(PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap());
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let commits = CommitKey::new(key.clone());
+        let signer = RefusingSigner(key);
         assert!(matches!(
-            start_with(&store, &signer),
+            start_until(&store, &signer, &commits, &AtomicBool::new(false)),
             Err(StartError::Thread(_))
         ));
         assert_eq!(std::fs::read_dir(worktrees(&store)).unwrap().count(), 0);
@@ -993,6 +1047,9 @@ pub(crate) mod tests {
                     participant: ParticipantName::new("bob").unwrap(),
                     agent: &agent,
                     worktrees: &worktrees(&store),
+                    commits: &CommitKey::new(
+                        PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+                    ),
                 },
                 &GlobalPatterns::default(),
                 &AtomicBool::new(false),

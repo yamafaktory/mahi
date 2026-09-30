@@ -31,6 +31,7 @@ use crate::{
         HookKind,
         HookMessage,
     },
+    session::CommitKey,
     sync::PushPoker,
 };
 
@@ -44,6 +45,7 @@ pub(crate) struct Transcript {
     pub(crate) thread: ThreadId,
     pub(crate) slot: AgentSlot,
     pub(crate) tip: Option<TranscriptTip>,
+    pub(crate) commits: CommitKey,
 }
 
 /// How recording the transcript went, and the first error it met.
@@ -147,9 +149,11 @@ impl Turns {
     }
 
     fn seal_or_note(&mut self, store: &Store, transcript: &Transcript) -> bool {
+        let pending = u64::try_from(self.events.len()).unwrap_or(u64::MAX);
         match self.seal(store, transcript) {
             Ok(sealed) => sealed,
             Err(error) => {
+                self.summary.dropped = self.summary.dropped.saturating_add(pending);
                 self.summary.error.get_or_insert(error);
                 false
             }
@@ -169,6 +173,7 @@ impl Turns {
             &transcript.slot,
             self.tip.as_ref(),
             &record,
+            transcript.commits.signer(),
         )?;
         self.tip = Some(tip);
         self.next_turn += 1;
@@ -228,6 +233,7 @@ mod tests {
             thread: started.thread,
             slot: started.slot.clone(),
             tip: None,
+            commits: started.commits.clone(),
         };
         let (sender, inputs) = mpsc::channel();
         for input in [
@@ -272,6 +278,7 @@ mod tests {
             thread: started.thread,
             slot: started.slot.clone(),
             tip: None,
+            commits: started.commits.clone(),
         };
         let (sender, inputs) = mpsc::channel();
         sender.send(hook(HookKind::Prompt, b"one")).unwrap();
@@ -303,6 +310,7 @@ mod tests {
             thread: started.thread,
             slot: started.slot.clone(),
             tip: None,
+            commits: started.commits.clone(),
         };
         let (mut scheduler, poker) = Scheduler::new(
             Schedule::new(

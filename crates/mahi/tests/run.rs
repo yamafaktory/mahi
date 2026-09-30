@@ -61,7 +61,9 @@ mod tests {
         AgentName,
         AgentSlot,
         ParticipantName,
+        RefKind,
         ThreadId,
+        ThreadRef,
     };
     use mahi_identity::{
         ConfigDir,
@@ -94,6 +96,8 @@ mod tests {
 
     const SIGN_REQUEST: u8 = 13;
     const SIGN_RESPONSE: u8 = 14;
+    const IDENTITIES_REQUEST: u8 = 11;
+    const IDENTITIES_ANSWER: u8 = 12;
 
     struct Fixture {
         _dir: TempDir,
@@ -220,6 +224,15 @@ mod tests {
                 }
                 let mut request = vec![0_u8; usize::try_from(u32::from_be_bytes(length)).unwrap()];
                 if stream.read_exact(&mut request).is_err() {
+                    continue;
+                }
+                if request == [IDENTITIES_REQUEST] {
+                    let mut body = vec![IDENTITIES_ANSWER, 0, 0, 0, 1];
+                    put_string(&mut body, &key.public_key().to_bytes().unwrap());
+                    put_string(&mut body, b"test");
+                    let mut frame = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+                    frame.extend_from_slice(&body);
+                    let _ = stream.write_all(&frame);
                     continue;
                 }
                 let Some((&SIGN_REQUEST, rest)) = request.split_first() else {
@@ -938,6 +951,18 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             .object()
             .unwrap();
         assert_eq!(late.data, b"written after the agent\n");
+        let snapshots = ThreadRef::new(
+            thread.parse().unwrap(),
+            RefKind::Snapshots(AgentSlot::new(
+                ParticipantName::new("tester").unwrap(),
+                AgentName::new("claude").unwrap(),
+            )),
+        );
+        all_signed_by(
+            &Store::open(&fixture.repo).unwrap(),
+            &snapshots,
+            &fixture.owner,
+        );
         assert_eq!(fixture.threads().len(), 3);
         let listed = fixture.mahi(&["threads"]);
         assert!(String::from_utf8_lossy(&listed.stdout).contains("no worktree"));
@@ -1027,6 +1052,77 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(ending.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&ending.stderr).contains("only a thread you started"));
         assert!(worktree.exists());
+    }
+
+    #[test]
+    fn resume_and_end_need_the_signing_key_in_ssh_agent() {
+        let fixture = fixture();
+        let first = fixture.mahi(&["run", "true"]);
+        let worktree = worktree_of(&String::from_utf8_lossy(&first.stderr));
+        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let elsewhere = fixture.root.join("other-agent.sock");
+        serve_signatures(
+            &elsewhere,
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+            None,
+        );
+        for arguments in [
+            &["resume", &thread, "--", "sh", "-c", "echo ran > ran.txt"][..],
+            &["end", &thread],
+        ] {
+            let refused = fixture
+                .command(arguments)
+                .env("SSH_AUTH_SOCK", &elsewhere)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert_eq!(refused.status.code(), Some(1), "{stderr}");
+            assert!(
+                stderr.contains("does not hold your signing key"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("Passphrase"), "{stderr}");
+        }
+        assert!(!worktree.join("ran.txt").exists());
+        assert!(worktree.exists());
+        let threads = fixture.threads().len();
+        let run = fixture
+            .command(&["run", "true"])
+            .env("SSH_AUTH_SOCK", &elsewhere)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("does not hold your signing key"),
+            "{stderr}"
+        );
+        assert_eq!(fixture.threads().len(), threads);
+        let repository = gix::open(&fixture.repo).unwrap();
+        let tester = repository
+            .find_reference(format!("refs/threads/{thread}/agents/tester.true/snapshots").as_str())
+            .unwrap()
+            .id()
+            .detach();
+        repository
+            .reference(
+                format!("refs/threads/{thread}/agents/mallory.true/snapshots").as_str(),
+                tester,
+                gix::refs::transaction::PreviousValue::MustNotExist,
+                "test",
+            )
+            .unwrap();
+        let someone_else = fixture
+            .command(&["resume", &thread, "--", "true"])
+            .env("USER", "mallory")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&someone_else.stderr);
+        assert_eq!(someone_else.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("does not list your signing key for mallory"),
+            "{stderr}"
+        );
     }
 
     #[test]
@@ -1609,6 +1705,8 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
     struct Teammate {
         home: PathBuf,
         repo: PathBuf,
+        socket: PathBuf,
+        key: ParticipantKey,
     }
 
     fn teammate(fixture: &Fixture, name: &str) -> Teammate {
@@ -1624,7 +1722,15 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
                 &SecretString::from(PASSPHRASE.to_owned()),
             )
             .unwrap();
-        Teammate { home, repo }
+        let socket = fixture.root.join(format!("{name}-agent.sock"));
+        let participant = ParticipantKey::from_public_key(key.public_key()).unwrap();
+        serve_signatures(&socket, key, None);
+        Teammate {
+            home,
+            repo,
+            socket,
+            key: participant,
+        }
     }
 
     fn teammate_env(command: &mut Command, teammate: &Teammate, name: &str) {
@@ -1633,6 +1739,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             .env("PATH", "/usr/bin:/bin:/usr")
             .env("HOME", &teammate.home)
             .env("XDG_CONFIG_HOME", teammate.home.join(".config"))
+            .env("SSH_AUTH_SOCK", &teammate.socket)
             .env("USER", name)
             .env("MAHI_LIVE", "local");
     }
@@ -1745,6 +1852,18 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert!(String::from_utf8_lossy(&watched.lock().unwrap()).contains("left thread"));
     }
 
+    fn all_signed_by(store: &Store, thread_ref: &ThreadRef, key: &ParticipantKey) {
+        let mut next = store.head(thread_ref).unwrap();
+        assert!(next.is_some(), "{thread_ref} is missing");
+        while let Some(commit) = next {
+            assert!(
+                mahi_thread::signed_by(store, commit, key).unwrap(),
+                "{thread_ref} {commit}"
+            );
+            next = store.parent(commit).unwrap();
+        }
+    }
+
     fn invite_teammate(fixture: &Fixture, thread: ThreadId, teammate: &Teammate) -> String {
         let mut id = Command::new(env!("CARGO_BIN_EXE_mahi"));
         id.arg("id");
@@ -1787,6 +1906,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
             ("HOME", teammate.home.as_os_str()),
             ("XDG_CONFIG_HOME", config.as_os_str()),
+            ("SSH_AUTH_SOCK", teammate.socket.as_os_str()),
             ("USER", OsStr::new(name)),
             ("MAHI_LIVE", OsStr::new("local")),
         ];
@@ -1802,6 +1922,68 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         thread::sleep(Duration::from_millis(100));
         let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
         (code, text)
+    }
+
+    #[test]
+    fn a_teammate_joins_with_their_agent_only_with_the_key_meta_lists() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let mut host = fixture.command(&["run", "sh", "-c", "sleep 60"]);
+        let _host = KillOnDrop(
+            host.env("MAHI_LIVE", "local")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let (thread, _key) = running_thread(&fixture);
+        let bob = teammate(&fixture, "bob");
+        let ticket = invite_teammate(&fixture, thread, &bob);
+        let join = |socket: &Path| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_mahi"));
+            command
+                .args(["join", &ticket, "--", "true"])
+                .current_dir(&bob.repo);
+            teammate_env(&mut command, &bob, "bob");
+            let output = command
+                .env("SSH_AUTH_SOCK", socket)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+        let rotated = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let elsewhere = fixture.root.join("rotated-agent.sock");
+        serve_signatures(&elsewhere, rotated.clone(), None);
+
+        let (code, stderr) = join(&elsewhere);
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains("does not hold your signing key"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("waiting for the thread's host"),
+            "{stderr}"
+        );
+
+        let config = config_dir(&bob.home);
+        fs::remove_file(config.signing_key_file()).unwrap();
+        SigningKey::try_from(rotated.public_key().clone())
+            .unwrap()
+            .save(&config.signing_key_file())
+            .unwrap();
+        let (code, stderr) = join(&elsewhere);
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(
+            stderr.contains("lists another signing key for you"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Passphrase"), "{stderr}");
     }
 
     #[test]
@@ -1881,6 +2063,14 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             .unwrap();
         assert!(resumed_tree.find_entry("bob.txt").is_some());
         assert!(resumed_tree.find_entry("more.txt").is_some());
+        let snapshots = ThreadRef::new(
+            thread,
+            RefKind::Snapshots(AgentSlot::new(
+                ParticipantName::new("bob").unwrap(),
+                AgentName::new("sh").unwrap(),
+            )),
+        );
+        all_signed_by(&store, &snapshots, &bob.key);
 
         let mut end = Command::new(env!("CARGO_BIN_EXE_mahi"));
         end.args(["end", &thread_text]).current_dir(&bob.repo);

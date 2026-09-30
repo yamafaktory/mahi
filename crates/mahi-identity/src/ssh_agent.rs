@@ -73,6 +73,9 @@ pub enum AgentError {
     /// The agent's answer is not a valid ed25519 signature response.
     #[error("ssh-agent sent a malformed response")]
     Malformed,
+    /// The agent is reachable but does not hold the key.
+    #[error("ssh-agent does not hold your signing key; add it with ssh-add")]
+    NotLoaded,
     /// The agent signed, but not with the requested key.
     #[error("ssh-agent signed with a different key")]
     WrongKey,
@@ -200,6 +203,21 @@ impl AgentSigner {
     #[must_use]
     pub fn public_key(&self) -> &PublicKey {
         &self.key
+    }
+
+    /// Checks that the agent holds the key, without signing anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::NotLoaded`] if the agent does not list the key, or the errors of
+    /// [`SshAgent::ed25519_keys`].
+    pub fn require_loaded(&self) -> Result<(), AgentError> {
+        let held = self.agent.ed25519_keys()?;
+        if held.iter().any(|key| key.key_data() == self.key.key_data()) {
+            Ok(())
+        } else {
+            Err(AgentError::NotLoaded)
+        }
     }
 
     /// Makes an SSHSIG signature over `message` in `namespace`, and checks it before returning.
@@ -384,6 +402,23 @@ mod tests {
         let request = agent.handle.join().unwrap();
         assert_eq!(request, [IDENTITIES_REQUEST]);
         result
+    }
+
+    #[test]
+    fn a_signer_needs_its_key_listed_by_the_agent() {
+        let (held, other) = (ed25519(), ed25519());
+        let check = |key: &PrivateKey| {
+            let entries: Vec<(Vec<u8>, &[u8])> =
+                vec![(held.public_key().to_bytes().unwrap(), b"held")];
+            let agent = fake_agent(move |_| identities(&entries, 1, &[]));
+            let signer =
+                AgentSigner::new(SshAgent::new(&agent.socket), key.public_key().clone()).unwrap();
+            let result = signer.require_loaded();
+            assert_eq!(agent.handle.join().unwrap(), [IDENTITIES_REQUEST]);
+            result
+        };
+        assert!(check(&held).is_ok());
+        assert!(matches!(check(&other), Err(AgentError::NotLoaded)));
     }
 
     #[test]

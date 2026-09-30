@@ -15,6 +15,7 @@ use mahi_crypto::{
     ThreadKey,
 };
 use mahi_store::{
+    CommitSigner,
     EntryKind,
     ObjectId,
     Store,
@@ -321,7 +322,8 @@ fn decode(bytes: &[u8], commit: ObjectId) -> Result<Decoded, TranscriptError> {
     })
 }
 
-/// Seals `record` to `thread_key` and commits it on top of `slot`'s transcript in `thread`.
+/// Seals `record` to `thread_key` and commits it on top of `slot`'s transcript in `thread`,
+/// signed by `signer`, the participant's key.
 ///
 /// `tip` is the transcript's newest turn, from the previous [`append_turn`] or [`read_tip`], or
 /// `None` for the first turn. The turn must be numbered one more than `tip`'s, or 0 for the
@@ -341,6 +343,7 @@ pub fn append_turn(
     slot: &AgentSlot,
     tip: Option<&TranscriptTip>,
     record: &TurnRecord,
+    signer: &dyn CommitSigner,
 ) -> Result<TranscriptTip, TranscriptError> {
     let follows = match tip {
         Some(tip) => tip.turn.checked_add(1) == Some(record.turn),
@@ -359,7 +362,13 @@ pub fn append_turn(
     let blob = store.write_sealed(thread_key, &record.encode(last_seq)?)?;
     let tree = store.write_tree(&[(TURN_ENTRY, EntryKind::Blob, blob)])?;
     let transcript = ThreadRef::new(thread, RefKind::Transcript(slot.clone()));
-    let commit = store.append(&transcript, tip.map(|tip| tip.commit), tree, TURN_MESSAGE)?;
+    let commit = store.append_signed(
+        &transcript,
+        tip.map(|tip| tip.commit),
+        tree,
+        TURN_MESSAGE,
+        signer,
+    )?;
     Ok(TranscriptTip {
         commit,
         turn: record.turn,
@@ -514,9 +523,19 @@ mod tests {
         AgentName,
         ParticipantName,
     };
+    use ssh_key::{
+        Algorithm,
+        PrivateKey,
+        rand_core::OsRng,
+    };
     use tempfile::TempDir;
 
     use super::*;
+    use crate::{
+        GitSigner,
+        ParticipantKey,
+        signed_by,
+    };
 
     struct Setup {
         dir: TempDir,
@@ -524,6 +543,7 @@ mod tests {
         key: ThreadKey,
         thread: ThreadId,
         slot: AgentSlot,
+        signer: GitSigner<PrivateKey>,
     }
 
     fn setup() -> Setup {
@@ -538,6 +558,7 @@ mod tests {
                 ParticipantName::new("alice").unwrap(),
                 AgentName::new("claude-code").unwrap(),
             ),
+            signer: GitSigner(PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap()),
         }
     }
 
@@ -561,6 +582,7 @@ mod tests {
             &setup.slot,
             tip,
             record,
+            &setup.signer,
         )
     }
 
@@ -599,6 +621,17 @@ mod tests {
         assert_eq!(read(&setup, 10).unwrap(), turns);
         assert_eq!(read(&setup, 2).unwrap(), turns[1..]);
         assert!(read(&setup, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_turn_is_signed_by_the_participant() {
+        let setup = setup();
+        let key = ParticipantKey::from_public_key(setup.signer.0.public_key()).unwrap();
+        let first = append(&setup, None, &turn(0, &[1]));
+        let second = append(&setup, Some(&first), &turn(1, &[2]));
+        for tip in [first, second] {
+            assert!(signed_by(&setup.store, tip.commit, &key).unwrap());
+        }
     }
 
     #[test]

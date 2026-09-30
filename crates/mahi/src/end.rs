@@ -20,10 +20,13 @@ use mahi_core::{
     ThreadRef,
 };
 use mahi_identity::{
+    AgentError,
+    AgentSigner,
     ConfigDir,
     ConfigError,
     IdentityError,
     SigningKey,
+    SshAgent,
 };
 use mahi_sandbox::{
     SignalError,
@@ -52,6 +55,7 @@ use crate::{
     run::until_stopped,
     session::{
         self,
+        CommitKey,
         ResumeError,
         SNAPSHOT_MESSAGE,
     },
@@ -74,6 +78,10 @@ pub(crate) enum EndError {
     NotInitialised(#[source] IdentityError),
     #[error("the signing key cannot identify thread owners")]
     OwnerKey(#[source] KeyError),
+    #[error("SSH_AUTH_SOCK is not set; start ssh-agent and add your signing key (ssh-add)")]
+    NoSshAgent,
+    #[error("cannot sign with the SSH key")]
+    Signer(#[from] AgentError),
     #[error("cannot make a participant name from USER")]
     ParticipantName(#[source] NameError),
     #[error("cannot open the git repository")]
@@ -136,6 +144,13 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
     };
     load_meta(&store, thread, &owner, 0)
         .map_err(|error| EndError::NotOwner(thread, Box::new(error)))?;
+    let socket = environment
+        .ssh_auth_sock
+        .as_deref()
+        .ok_or(EndError::NoSshAgent)?;
+    let signer = AgentSigner::new(SshAgent::new(socket), signing.public_key().clone())?;
+    signer.require_loaded()?;
+    let commits = CommitKey::new(signer);
     let termination = TerminationSignals::listen().map_err(EndError::Signals)?;
     let (recorded, caught) = until_stopped(&termination, |interrupt| {
         record_last(
@@ -143,6 +158,7 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
             thread,
             slot,
             &environment.git_patterns(),
+            &commits,
             command.force,
             interrupt,
         )
@@ -185,6 +201,7 @@ fn record_last(
     thread: ThreadId,
     slot: AgentSlot,
     globals: &GlobalPatterns,
+    commits: &CommitKey,
     force: bool,
     interrupt: &AtomicBool,
 ) -> Result<Recorded, EndError> {
@@ -226,7 +243,13 @@ fn record_last(
         .is_some_and(|tree| tree == taken.tree);
     if !unchanged {
         store
-            .append(&snapshots, head, taken.tree, SNAPSHOT_MESSAGE)
+            .append_signed(
+                &snapshots,
+                head,
+                taken.tree,
+                SNAPSHOT_MESSAGE,
+                commits.signer(),
+            )
             .map_err(EndError::Snapshot)?;
         report.push_str("recorded the worktree's last changes\n");
     }

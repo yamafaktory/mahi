@@ -25,6 +25,7 @@ use mahi_store::{
 use thiserror::Error;
 
 use crate::session::{
+    CommitKey,
     Recorded,
     SNAPSHOT_MESSAGE,
 };
@@ -46,6 +47,7 @@ pub(crate) struct Target {
     pub(crate) worktree: String,
     pub(crate) snapshots: ThreadRef,
     pub(crate) globals: GlobalPatterns,
+    pub(crate) commits: CommitKey,
 }
 
 #[derive(Debug, Error)]
@@ -143,11 +145,12 @@ fn snapshot(
     if taken.tree == last.tree {
         return Ok((false, skipped));
     }
-    last.commit = store.append(
+    last.commit = store.append_signed(
         &target.snapshots,
         Some(last.commit),
         taken.tree,
         SNAPSHOT_MESSAGE,
+        target.commits.signer(),
     )?;
     last.tree = taken.tree;
     Ok((true, skipped))
@@ -163,6 +166,10 @@ mod tests {
         },
     };
 
+    use mahi_thread::{
+        ParticipantKey,
+        signed_by,
+    };
     use ssh_key::{
         Algorithm,
         PrivateKey,
@@ -224,6 +231,7 @@ mod tests {
                 worktree: started.thread.to_string(),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
+                commits: CommitKey::new(signer.clone()),
             },
             started.first_snapshot.take().unwrap(),
             fast(),
@@ -251,6 +259,12 @@ mod tests {
         );
         assert_eq!(file_in_tree(&store, trees[1], "last"), None);
         assert_eq!(file_in_tree(&store, trees[2], "first"), None);
+        let key = ParticipantKey::from_public_key(signer.public_key()).unwrap();
+        let mut next = store.head(&started.snapshots).unwrap();
+        while let Some(commit) = next {
+            assert!(signed_by(&store, commit, &key).unwrap(), "{commit}");
+            next = store.parent(commit).unwrap();
+        }
     }
 
     #[test]
@@ -279,6 +293,7 @@ mod tests {
                 worktree: started.thread.to_string(),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
+                commits: CommitKey::new(signer.clone()),
             },
             started.first_snapshot.take().unwrap(),
             fast(),
@@ -300,6 +315,7 @@ mod tests {
                 worktree: started.thread.to_string(),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
+                commits: CommitKey::new(signer.clone()),
             },
             started.first_snapshot.take().unwrap(),
             Schedule::new(
@@ -331,6 +347,7 @@ mod tests {
                 worktree: "not-a-worktree".to_owned(),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
+                commits: CommitKey::new(signer.clone()),
             },
             started.first_snapshot.take().unwrap(),
             fast(),

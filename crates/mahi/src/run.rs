@@ -159,6 +159,7 @@ use crate::{
     remote::RemoteName,
     session::{
         self,
+        CommitKey,
         ResumeError,
         StartError,
         Started,
@@ -300,6 +301,10 @@ pub(crate) enum RunError {
     State(#[source] io::Error),
     #[error("cannot start the thread")]
     Start(#[from] StartError),
+    #[error(
+        "thread {0} does not list your signing key for {1}; resume as the user who started or joined it"
+    )]
+    NotListed(ThreadId, ParticipantName),
 }
 
 #[derive(Debug)]
@@ -340,11 +345,8 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let signing = SigningKey::load(&config.signing_key_file()).map_err(RunError::NotInitialised)?;
     let node = session::own_node(&config).map_err(RunError::NotInitialised)?;
     let live = live_setup(environment, &config, own_key(&signing)?, Vec::new())?;
-    let socket = environment
-        .ssh_auth_sock
-        .as_deref()
-        .ok_or(RunError::NoSshAgent)?;
-    let signer = AgentSigner::new(SshAgent::new(socket), signing.public_key().clone())?;
+    let signer = agent_signer(environment, &signing)?;
+    let commits = CommitKey::new(signer.clone());
     let participant = session::participant_from(environment.user.as_deref())
         .map_err(RunError::ParticipantName)?;
     let store = Store::discover(&cwd)?;
@@ -376,6 +378,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
                 public: &public,
                 node,
                 signer: &signer,
+                commits: &commits,
                 participant,
                 agent: &agent_name,
                 worktrees: &worktrees,
@@ -455,7 +458,13 @@ pub(crate) fn resume(
     prepared.sync = SyncSetup::gather(&prepared.store, environment, owns_meta);
     let current = load_meta(&prepared.store, command.thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
-    if let Some(me) = current.participants().find(|listed| listed.key() == &own) {
+    let me = current
+        .participants()
+        .find(|listed| listed.key() == &own)
+        .filter(|listed| listed.name() == &participant)
+        .ok_or_else(|| RunError::NotListed(command.thread, participant.clone()))?;
+    let commits = CommitKey::new(agent_signer(environment, &signing)?);
+    {
         let stopped = sync::fetch_until_stopped(
             &prepared.store,
             environment,
@@ -488,6 +497,7 @@ pub(crate) fn resume(
         participant: &participant,
         agent: Some(slot.agent()),
         worktrees: &worktrees,
+        commits: &commits,
     };
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
     let (started, caught) = until_stopped(&termination, |interrupt| {
@@ -522,6 +532,21 @@ fn live_setup(
     }))
 }
 
+/// Returns the signer for the user's signing key through ssh-agent, once the agent is found to
+/// hold that key.
+pub(crate) fn agent_signer(
+    environment: &Environment,
+    signing: &SigningKey,
+) -> Result<AgentSigner, RunError> {
+    let socket = environment
+        .ssh_auth_sock
+        .as_deref()
+        .ok_or(RunError::NoSshAgent)?;
+    let signer = AgentSigner::new(SshAgent::new(socket), signing.public_key().clone())?;
+    signer.require_loaded()?;
+    Ok(signer)
+}
+
 fn own_key(signing: &SigningKey) -> Result<ParticipantKey, RunError> {
     ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)
 }
@@ -537,6 +562,7 @@ pub(crate) struct Joined {
     pub(crate) owner: ParticipantKey,
     pub(crate) host: HostAddress,
     pub(crate) lock: ThreadLock,
+    pub(crate) commits: CommitKey,
 }
 
 /// Runs the user's own agent in a thread someone else owns, which `mahi join` checked and
@@ -593,6 +619,7 @@ pub(crate) fn join_run(
                 participant: joined.participant,
                 agent: &agent_name,
                 worktrees: &worktrees,
+                commits: &joined.commits,
             },
             &prepared.globals,
             interrupt,
@@ -874,6 +901,7 @@ fn start_background(
                 worktree: started.thread.to_string(),
                 snapshots: started.snapshots.clone(),
                 globals,
+                commits: started.commits.clone(),
             },
             first,
             Schedule::default(),
@@ -886,6 +914,7 @@ fn start_background(
             thread: started.thread,
             slot: started.slot.clone(),
             tip: started.tip,
+            commits: started.commits.clone(),
         };
         let poker = recorder.as_ref().map(Recorder::poker);
         let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
