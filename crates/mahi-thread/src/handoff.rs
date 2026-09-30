@@ -26,7 +26,8 @@ const MAX_LINE_CHARS: usize = 200;
 /// How many of the latest prompts a briefing shows, after the first one.
 pub const BRIEFED_PROMPTS: usize = 30;
 const RECENT_TOOLS: usize = 20;
-const RECENT_REPLIES: usize = 3;
+/// How many of the latest replies a briefing shows.
+pub const BRIEFED_REPLIES: usize = 3;
 const CUT_MARK: &str = "\n\n(the rest of these notes was cut)\n";
 
 /// What a new agent is told when it takes over another agent's work: the thread, what the user
@@ -117,7 +118,7 @@ impl Briefing {
         text.push_str(&newest_that_fit(
             "The previous agent's latest replies",
             &self.replies,
-            RECENT_REPLIES,
+            BRIEFED_REPLIES,
             REPLIES_BYTES,
             |reply| quote(reply, MAX_REPLY_CHARS, MAX_REPLY_LINES) + "\n",
         ));

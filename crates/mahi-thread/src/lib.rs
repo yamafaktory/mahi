@@ -30,6 +30,7 @@ pub use fetched::{
 };
 pub use handoff::{
     BRIEFED_PROMPTS,
+    BRIEFED_REPLIES,
     Briefing,
     MAX_BRIEFING_BYTES,
 };

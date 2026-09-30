@@ -838,6 +838,9 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
 printf '{"prompt":"build the parser"}' | "$MAHI_BIN" hook prompt
 printf '{"tool_name":"Write","tool_input":{"file_path":"parser.rs"}}' | "$MAHI_BIN" hook tool
 echo 'fn parse() {}' > parser.rs
+project="$CLAUDE_CONFIG_DIR/projects/$(pwd -P | sed 's/[^a-zA-Z0-9]/-/g')"
+mkdir -p "$project"
+printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":{"content":[{"type":"text","text":"Parser done; tests pass."}]}}' > "$project/s.jsonl"
 "$MAHI_BIN" hook turn-end < /dev/null
 "#;
 
@@ -964,6 +967,7 @@ cat parser.rs
             "- Previous agent: ` tester.claude `",
             "fn parse() {}",
             "-rw-------",
+            "> Parser done; tests pass.",
         ] {
             assert!(output.contains(expected), "{expected}: {output}");
         }
