@@ -27,7 +27,10 @@ getrandom = "0.4.3"
 ghash = { version = "0.5.1", default-features = false, features = ["zeroize"] }
 gix = { version = "0.88.0", default-features = false, features = ["attributes", "blocking-network-client", "excludes", "index", "pack-cache-lru-dynamic", "parallel", "sha1", "worktree-mutation"] }
 gix-hash = "0.27.0"
+gix-error = "0.4.0"
+gix-features = { version = "0.50.0", default-features = false, features = ["io-pipe"] }
 gix-pack = { version = "0.75.0", default-features = false, features = ["generate"] }
+gix-transport = { version = "0.60.0", default-features = false, features = ["http-client"] }
 gix-lock = "25.0.0"
 gix-validate = "0.12.0"
 hkdf = { version = "0.12.4", default-features = false }
@@ -38,6 +41,7 @@ libc = { version = "0.2.189", default-features = false }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode", "std"] }
 n0-future = { version = "0.3.2", default-features = false }
 mahi-core = { path = "crates/mahi-core" }
+mahi-http = { path = "crates/mahi-http" }
 mahi-crypto = { path = "crates/mahi-crypto" }
 mahi-identity = { path = "crates/mahi-identity" }
 mahi-live = { path = "crates/mahi-live" }
@@ -68,6 +72,7 @@ tempfile = "3.27.0"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "sync", "time"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["net"] }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 vt100 = "0.16.2"
 webpki-roots = "1.0.9"
 x25519-dalek = { version = "2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }

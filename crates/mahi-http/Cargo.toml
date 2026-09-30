@@ -1,0 +1,28 @@
+[package]
+authors.workspace = true
+description = "mahi's HTTPS transport: git remotes over HTTPS, through the proxy the environment names."
+edition.workspace = true
+license.workspace = true
+name = "mahi-http"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+gix = { workspace = true }
+gix-error = { workspace = true }
+gix-features = { workspace = true }
+gix-transport = { workspace = true }
+mahi-tls = { workspace = true }
+thiserror = { workspace = true }
+ureq = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+rustls = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -2320,8 +2320,10 @@ version = "0.60.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d2beb7b0387bbf4d7c13763c6e168f9957319aa811f09349dc59601be3b2951"
 dependencies = [
+ "base64 0.22.1",
  "bstr",
  "gix-command",
+ "gix-credentials",
  "gix-error",
  "gix-features",
  "gix-packetline",
@@ -2329,6 +2331,7 @@ dependencies = [
  "gix-quote",
  "gix-sec",
  "gix-url",
+ "parking_lot",
 ]
 
 [[package]]
@@ -3507,6 +3510,23 @@ dependencies = [
  "proptest",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "mahi-http"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "gix",
+ "gix-error",
+ "gix-features",
+ "gix-transport",
+ "mahi-tls",
+ "rustls",
+ "tempfile",
+ "thiserror 2.0.21",
+ "ureq",
  "zeroize",
 ]
 
@@ -6441,6 +6461,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "3.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a7ac20be9b7726e0bbdbf974c059676d9acb1cd414961f570a4e8231cacd7fc"
+dependencies = [
+ "base64 0.23.1",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86fd172ccca569e458f61b6bdd6220965a9ef36e672a6852953b51a0e1583be"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6452,6 +6500,12 @@ dependencies = [
  "serde",
  "serde_derive",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"
