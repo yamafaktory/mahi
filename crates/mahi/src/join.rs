@@ -259,7 +259,10 @@ impl View {
                     self.changed = true;
                 }
             }
-            Body::ScreenRequest { .. } | Body::Heartbeat { .. } => {}
+            Body::ScreenRequest { .. }
+            | Body::Heartbeat { .. }
+            | Body::Prompt { .. }
+            | Body::PromptAnswer { .. } => {}
         }
     }
 

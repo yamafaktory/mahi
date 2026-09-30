@@ -26,9 +26,16 @@ pub use frame::{
     MAX_CHUNK_BYTES,
     MAX_COLUMNS,
     MAX_FRAME_BYTES,
+    MAX_PROMPT_BYTES,
+    MAX_PROMPTS_PER_RUN,
     MAX_ROWS,
     MAX_SCREEN_PARTS,
+    PROMPT_ID_BYTES,
+    PromptOutcome,
+    PromptText,
+    RUN_BYTES,
     Received,
+    prompt_id,
 };
 pub use gossip::{
     LiveTopic,
