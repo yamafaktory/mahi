@@ -522,7 +522,16 @@ impl VerifiedMeta {
             return Err(MetaError::BadSignature);
         }
 
-        let body: WireBody<'_> = decode_exact(envelope.body)?;
+        Self::decode_body(envelope.body, thread, trusted_owner)
+    }
+
+    /// Decodes and checks a signed document's body, whose signature was already checked.
+    pub(crate) fn decode_body(
+        encoded: &[u8],
+        thread: ThreadId,
+        trusted_owner: &ParticipantKey,
+    ) -> Result<Self, MetaError> {
+        let body: WireBody<'_> = decode_exact(encoded)?;
         if ThreadId::from_bytes(body.thread) != thread {
             return Err(MetaError::ThreadMismatch);
         }
@@ -558,7 +567,7 @@ impl VerifiedMeta {
         Ok(Self {
             thread,
             generation: body.generation,
-            body_hash: Sha256::digest(envelope.body).into(),
+            body_hash: Sha256::digest(encoded).into(),
             base,
             owner,
             recipient,

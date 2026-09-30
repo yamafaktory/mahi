@@ -312,8 +312,15 @@ impl FromStr for Ticket {
             return Err(TicketError::Malformed);
         }
         let bytes: Vec<u8> = checked.byte_iter().collect();
+        Self::from_payload(&bytes)
+    }
+}
+
+impl Ticket {
+    /// Decodes a ticket's payload, once its bech32m text checked out.
+    pub(crate) fn from_payload(bytes: &[u8]) -> Result<Self, TicketError> {
         let (wire, rest): (WireTicket<'_>, _) =
-            postcard::take_from_bytes(&bytes).map_err(|_| TicketError::Malformed)?;
+            postcard::take_from_bytes(bytes).map_err(|_| TicketError::Malformed)?;
         if !rest.is_empty() {
             return Err(TicketError::Malformed);
         }

@@ -28,3 +28,16 @@ run *args:
     cargo run --locked -p mahi -- {{args}}
 
 check: fmt-check clippy test deny
+
+fuzz target seconds="60":
+    cd fuzz && cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}} -timeout=10
+
+fuzz-all seconds="30":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd fuzz
+    targets=$(cargo +nightly fuzz list)
+    test -n "$targets"
+    for target in $targets; do
+        cargo +nightly fuzz run "$target" -- -max_total_time={{seconds}} -timeout=10
+    done

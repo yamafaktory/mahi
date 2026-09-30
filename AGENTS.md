@@ -33,6 +33,8 @@ just run -- …   # run the mahi binary
 just test-git   # the tests that run the git program (not part of just test)
 just deny       # cargo-deny: advisories, licenses, banned crates, unknown sources
 just check      # fmt-check + clippy + test + deny
+just fuzz <t> [s] # run one fuzz target (nightly, cargo-fuzz) for s seconds
+just fuzz-all [s]  # run every fuzz target in turn
 ```
 
 CI (`.github/workflows/checks.yml`) runs `just fmt-check`, `just clippy`,
@@ -146,6 +148,8 @@ Performance and security are both critical. Neither is traded away for convenien
 - A test name says the behaviour, for example `resume_restores_latest_snapshot`, not
   `test_resume`.
 - In tests, `unwrap()` and `expect()` are allowed.
+- A parser or decoder of untrusted input gets a fuzz target in `fuzz/` (`just fuzz <target>`),
+  and a crash it finds becomes a regression test in its crate.
 - A test that needs an external tool (bubblewrap, a git remote, network) must fail if the tool
   is missing. It must not pass by skipping. Put it behind a nextest filter or a separate
   recipe. Tests that run the `git` program go in a `tests/git_*.rs` file or a `git_tests`

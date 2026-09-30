@@ -637,6 +637,14 @@ fn drawn_slot(body: &Body) -> Option<&AgentSlot> {
     }
 }
 
+/// Decodes `data` as a frame's plaintext and parses its body, for the fuzz targets.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_plaintext(data: &[u8]) {
+    if let Ok(plain) = decode_exact::<WirePlain<'_>>(data) {
+        let _ = parse_body(&plain.body);
+    }
+}
+
 fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
     let slot = |text: &str| text.parse::<AgentSlot>().map_err(|_| FrameError::Malformed);
     Ok(match *wire {

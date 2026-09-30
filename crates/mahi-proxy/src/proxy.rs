@@ -347,13 +347,13 @@ fn read_head(client: &mut TcpStream, limit: Duration) -> Option<(Zeroizing<Vec<u
     }
 }
 
-struct Request<'a> {
+pub(crate) struct Request<'a> {
     host: &'a str,
     port: u16,
     authorization: Option<&'a [u8]>,
 }
 
-fn parse(head: &[u8]) -> Option<Request<'_>> {
+pub(crate) fn parse(head: &[u8]) -> Option<Request<'_>> {
     let mut lines = head
         .split(|&byte| byte == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line));

@@ -227,7 +227,7 @@ impl TurnRecord {
         self.events.first().map(Event::seq)
     }
 
-    fn encode(&self, last_seq: Option<u64>) -> Result<Vec<u8>, TranscriptError> {
+    pub(crate) fn encode(&self, last_seq: Option<u64>) -> Result<Vec<u8>, TranscriptError> {
         let body = WireBody {
             turn: self.turn,
             last_seq,
@@ -287,12 +287,12 @@ impl TranscriptTip {
     }
 }
 
-struct Decoded {
-    record: TurnRecord,
-    last_seq: Option<u64>,
+pub(crate) struct Decoded {
+    pub(crate) record: TurnRecord,
+    pub(crate) last_seq: Option<u64>,
 }
 
-fn decode(bytes: &[u8], commit: ObjectId) -> Result<Decoded, TranscriptError> {
+pub(crate) fn decode(bytes: &[u8], commit: ObjectId) -> Result<Decoded, TranscriptError> {
     let malformed = || TranscriptError::Malformed(commit);
     let (version, rest): (u16, &[u8]) =
         postcard::take_from_bytes(bytes).map_err(|_| malformed())?;

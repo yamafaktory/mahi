@@ -3,6 +3,8 @@
 mod card;
 mod commits;
 mod fetched;
+#[cfg(fuzzing)]
+pub mod fuzzing;
 mod handoff;
 mod key;
 mod meta;

@@ -1,0 +1,121 @@
+[package]
+name = "mahi-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+age = { version = "0.11.5", default-features = false }
+libfuzzer-sys = "0.4.13"
+mahi-core = { path = "../crates/mahi-core" }
+mahi-crypto = { path = "../crates/mahi-crypto" }
+mahi-http = { path = "../crates/mahi-http" }
+mahi-identity = { path = "../crates/mahi-identity" }
+mahi-live = { path = "../crates/mahi-live" }
+mahi-proxy = { path = "../crates/mahi-proxy" }
+mahi-ssh = { path = "../crates/mahi-ssh" }
+mahi-thread = { path = "../crates/mahi-thread" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "briefing"
+path = "fuzz_targets/briefing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core-names"
+path = "fuzz_targets/core_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto-open"
+path = "fuzz_targets/crypto_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "https-text"
+path = "fuzz_targets/https_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "live-frame"
+path = "fuzz_targets/live_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "live-ticket"
+path = "fuzz_targets/live_ticket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session-manifest"
+path = "fuzz_targets/session_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh-text"
+path = "fuzz_targets/ssh_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thread-card"
+path = "fuzz_targets/thread_card.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thread-meta"
+path = "fuzz_targets/thread_meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thread-meta-body"
+path = "fuzz_targets/thread_meta_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transcript-turn"
+path = "fuzz_targets/transcript_turn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy-request"
+path = "fuzz_targets/proxy_request.rs"
+test = false
+doc = false
+bench = false
+
+[patch.crates-io]
+russh = { git = "https://github.com/ToyOSOrg/russh", rev = "15eb197d28f12a4c6ac573850458545457f7bf55" }

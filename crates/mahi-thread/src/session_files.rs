@@ -190,7 +190,7 @@ pub enum SessionError {
 type Tag = [u8; 32];
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
-struct Manifest {
+pub(crate) struct Manifest {
     version: u16,
     #[serde(deserialize_with = "bounded_files")]
     files: Vec<ManifestFile>,
@@ -480,8 +480,13 @@ fn read_manifest(
 ) -> Result<Manifest, SessionError> {
     let sealed = store.read_blob(blob, MAX_SEALED_MANIFEST_BYTES)?;
     let encoded = key.open(&sealed, MAX_MANIFEST_BYTES)?;
+    decode_manifest(&encoded, commit)
+}
+
+/// Decodes a manifest's plaintext, refusing trailing bytes and other versions.
+pub(crate) fn decode_manifest(encoded: &[u8], commit: ObjectId) -> Result<Manifest, SessionError> {
     let (manifest, rest): (Manifest, &[u8]) =
-        postcard::take_from_bytes(&encoded).map_err(|_| SessionError::Malformed(commit))?;
+        postcard::take_from_bytes(encoded).map_err(|_| SessionError::Malformed(commit))?;
     if !rest.is_empty() {
         return Err(SessionError::Malformed(commit));
     }

@@ -3,6 +3,8 @@
 
 mod endpoint;
 mod frame;
+#[cfg(fuzzing)]
+pub mod fuzzing;
 mod gossip;
 mod meta;
 #[cfg(test)]
