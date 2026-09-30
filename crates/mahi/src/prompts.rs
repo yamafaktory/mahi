@@ -1,5 +1,8 @@
 use std::{
-    collections::VecDeque,
+    collections::{
+        HashSet,
+        VecDeque,
+    },
     sync::Mutex,
     time::Instant,
 };
@@ -14,6 +17,7 @@ use mahi_live::{
 const MAX_WAITING: usize = 32;
 const MAX_WAITING_FROM_ONE: usize = 8;
 const MAX_ANSWERS: usize = 256;
+const MAX_ACCEPTED: usize = 32;
 
 /// The prompts teammates sent the host's agent, waiting for the host user, and the answers
 /// their senders are owed.
@@ -25,8 +29,28 @@ pub(crate) struct Prompts {
 #[derive(Debug, Default)]
 struct State {
     waiting: VecDeque<Waiting>,
+    accepted: VecDeque<Accepted>,
+    trusted: HashSet<ParticipantName>,
     answers: VecDeque<Answer>,
     closed: bool,
+}
+
+/// A prompt the host user accepted, waiting for the agent to be idle.
+#[derive(Debug)]
+pub(crate) struct Accepted {
+    pub(crate) id: [u8; PROMPT_ID_BYTES],
+    pub(crate) text: PromptText,
+}
+
+/// What the host user does with a waiting prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Decision {
+    /// Give it to the agent.
+    Accept,
+    /// Give it to the agent, and every prompt from the same teammate for the rest of the run.
+    AlwaysAccept,
+    /// Do not give it to the agent.
+    Reject,
 }
 
 /// A prompt waiting for the host user.
@@ -47,7 +71,8 @@ pub(crate) struct Answer {
 
 impl Prompts {
     /// Takes a prompt `from` a teammate: it waits, unless too many do, in all or from that
-    /// teammate, or the run is ending; either way its sender is answered.
+    /// teammate, or the run is ending, or is accepted at once when the host user always
+    /// accepts that teammate; either way its sender is answered.
     pub(crate) fn offer(
         &self,
         from: ParticipantName,
@@ -57,6 +82,11 @@ impl Prompts {
         let Ok(mut state) = self.state.lock() else {
             return PromptOutcome::Dropped;
         };
+        if !state.closed && state.trusted.contains(&from) {
+            let outcome = state.accept(id, text);
+            state.answer(id, outcome);
+            return outcome;
+        }
         let from_them = state
             .waiting
             .iter()
@@ -80,6 +110,51 @@ impl Prompts {
         outcome
     }
 
+    /// Applies the host user's `decision` to the waiting prompt `id`, and returns whether it
+    /// was still waiting.
+    pub(crate) fn decide(&self, id: [u8; PROMPT_ID_BYTES], decision: Decision) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(position) = state.waiting.iter().position(|waiting| waiting.id == id) else {
+            return false;
+        };
+        let Some(waiting) = state.waiting.remove(position) else {
+            return false;
+        };
+        let outcome = match decision {
+            Decision::Reject => PromptOutcome::Rejected,
+            Decision::Accept => state.accept(waiting.id, waiting.text),
+            Decision::AlwaysAccept => {
+                let outcome = state.accept(waiting.id, waiting.text);
+                let from = waiting.from;
+                while let Some(position) = state.waiting.iter().position(|other| other.from == from)
+                {
+                    if let Some(other) = state.waiting.remove(position) {
+                        let outcome = state.accept(other.id, other.text);
+                        state.answer(other.id, outcome);
+                    }
+                }
+                state.trusted.insert(from);
+                outcome
+            }
+        };
+        state.answer(id, outcome);
+        true
+    }
+
+    /// Returns the text of the waiting prompt `id`.
+    pub(crate) fn text_of(&self, id: [u8; PROMPT_ID_BYTES]) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        let waiting = state.waiting.iter().find(|waiting| waiting.id == id)?;
+        Some(waiting.text.as_str().to_owned())
+    }
+
+    /// Takes the oldest accepted prompt, for the agent.
+    pub(crate) fn next_accepted(&self) -> Option<Accepted> {
+        self.state.lock().ok()?.accepted.pop_front()
+    }
+
     /// Moves the answers owed into `into`, oldest first.
     pub(crate) fn take_answers(&self, into: &mut Vec<Answer>) {
         if let Ok(mut state) = self.state.lock() {
@@ -96,6 +171,9 @@ impl Prompts {
         while let Some(waiting) = state.waiting.pop_front() {
             state.answer(waiting.id, PromptOutcome::Dropped);
         }
+        while let Some(accepted) = state.accepted.pop_front() {
+            state.answer(accepted.id, PromptOutcome::Dropped);
+        }
     }
 
     /// Calls `visit` with each waiting prompt, oldest first.
@@ -107,6 +185,14 @@ impl Prompts {
 }
 
 impl State {
+    fn accept(&mut self, id: [u8; PROMPT_ID_BYTES], text: PromptText) -> PromptOutcome {
+        if self.accepted.len() >= MAX_ACCEPTED {
+            return PromptOutcome::Dropped;
+        }
+        self.accepted.push_back(Accepted { id, text });
+        PromptOutcome::Accepted
+    }
+
     fn answer(&mut self, id: [u8; PROMPT_ID_BYTES], outcome: PromptOutcome) {
         if self.answers.len() == MAX_ANSWERS {
             self.answers.pop_front();
@@ -218,5 +304,75 @@ mod tests {
         let owed = answers(&prompts);
         assert_eq!(owed.len(), MAX_ANSWERS);
         assert_eq!(owed[0].id[..2], [1, 0]);
+    }
+
+    #[test]
+    fn accepted_prompts_go_to_the_agent_in_order_and_rejected_ones_never() {
+        let prompts = Prompts::default();
+        prompts.offer(name("bob"), [1; 16], text());
+        prompts.offer(name("carol"), [2; 16], text());
+        prompts.offer(name("bob"), [3; 16], text());
+        answers(&prompts);
+        assert!(prompts.decide([3; 16], Decision::Accept));
+        assert!(prompts.decide([2; 16], Decision::Reject));
+        assert!(!prompts.decide([2; 16], Decision::Accept));
+        assert!(prompts.decide([1; 16], Decision::Accept));
+        let outcome = |id, outcome| Answer { id, outcome };
+        assert_eq!(
+            answers(&prompts),
+            [
+                outcome([3; 16], PromptOutcome::Accepted),
+                outcome([2; 16], PromptOutcome::Rejected),
+                outcome([1; 16], PromptOutcome::Accepted),
+            ]
+        );
+        assert_eq!(prompts.next_accepted().unwrap().id, [3; 16]);
+        assert_eq!(prompts.next_accepted().unwrap().id, [1; 16]);
+        assert!(prompts.next_accepted().is_none());
+        assert_eq!(waiting(&prompts), 0);
+    }
+
+    #[test]
+    fn always_accepting_a_teammate_takes_their_waiting_and_later_prompts() {
+        let prompts = Prompts::default();
+        prompts.offer(name("bob"), [1; 16], text());
+        prompts.offer(name("carol"), [2; 16], text());
+        prompts.offer(name("bob"), [3; 16], text());
+        assert!(prompts.decide([1; 16], Decision::AlwaysAccept));
+        assert_eq!(waiting(&prompts), 1);
+        assert_eq!(
+            prompts.offer(name("bob"), [4; 16], text()),
+            PromptOutcome::Accepted
+        );
+        assert_eq!(
+            prompts.offer(name("carol"), [5; 16], text()),
+            PromptOutcome::Queued
+        );
+        let ids: Vec<[u8; 16]> = std::iter::from_fn(|| prompts.next_accepted())
+            .map(|accepted| accepted.id)
+            .collect();
+        assert_eq!(ids, [[1; 16], [3; 16], [4; 16]]);
+    }
+
+    #[test]
+    fn accepted_prompts_not_yet_given_are_dropped_when_the_run_ends() {
+        let prompts = Prompts::default();
+        prompts.offer(name("bob"), [1; 16], text());
+        prompts.decide([1; 16], Decision::Accept);
+        answers(&prompts);
+        prompts.close();
+        assert_eq!(
+            answers(&prompts),
+            [Answer {
+                id: [1; 16],
+                outcome: PromptOutcome::Dropped,
+            }]
+        );
+        assert!(prompts.next_accepted().is_none());
+        prompts.decide([1; 16], Decision::AlwaysAccept);
+        assert_eq!(
+            prompts.offer(name("bob"), [2; 16], text()),
+            PromptOutcome::Dropped
+        );
     }
 }

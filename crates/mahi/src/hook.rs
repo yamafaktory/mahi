@@ -43,6 +43,8 @@ use rustix::event::{
     Timespec,
 };
 
+use crate::inject::Activity;
+
 const DEADLINE: Duration = Duration::from_secs(2);
 const DRAIN_LIMIT: Duration = Duration::from_secs(5);
 const ERROR_PAUSE: Duration = Duration::from_millis(50);
@@ -86,6 +88,7 @@ pub(crate) fn serve(
     listener: &UnixListener,
     closing: &AtomicBool,
     messages: &SyncSender<Delivery>,
+    activity: &Activity,
 ) {
     let mut drain_until = None;
     let connections = iter::from_fn(|| {
@@ -113,7 +116,7 @@ pub(crate) fn serve(
         }
     });
     let dropped = match listener.set_nonblocking(true) {
-        Ok(()) => serve_connections(connections, messages),
+        Ok(()) => serve_connections(connections, messages, activity),
         Err(_) => 0,
     };
     let _ = messages.send(Delivery::End { dropped });
@@ -145,6 +148,7 @@ fn wait_for_connection(listener: &UnixListener) {
 fn serve_connections(
     connections: impl Iterator<Item = io::Result<UnixStream>>,
     messages: &SyncSender<Delivery>,
+    activity: &Activity,
 ) -> u64 {
     let mut dropped = 0;
     for stream in connections {
@@ -156,6 +160,7 @@ fn serve_connections(
             dropped += 1;
             continue;
         };
+        activity.saw(message.kind);
         match messages.try_send(Delivery::Message(message)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => dropped += 1,
@@ -212,7 +217,7 @@ mod tests {
         let closing = Arc::new(AtomicBool::new(false));
         let (sender, deliveries) = mpsc::sync_channel(4);
         let flag = Arc::clone(&closing);
-        thread::spawn(move || serve(&listener, &flag, &sender));
+        thread::spawn(move || serve(&listener, &flag, &sender, &Activity::default()));
         Server {
             _dir: dir,
             socket,
@@ -302,7 +307,12 @@ mod tests {
         send(&socket, HookKind::TurnEnd, io::empty()).unwrap();
         send(&socket, HookKind::Prompt, &b"last"[..]).unwrap();
         let (sender, deliveries) = mpsc::sync_channel(4);
-        serve(&listener, &AtomicBool::new(true), &sender);
+        serve(
+            &listener,
+            &AtomicBool::new(true),
+            &sender,
+            &Activity::default(),
+        );
         assert_eq!(
             deliveries.try_recv().unwrap(),
             message(HookKind::TurnEnd, b"")
@@ -321,7 +331,10 @@ mod tests {
         drop(client);
         let connections = vec![Err(io::Error::from(io::ErrorKind::OutOfMemory)), Ok(server)];
         let (sender, deliveries) = mpsc::sync_channel(4);
-        assert_eq!(serve_connections(connections.into_iter(), &sender), 1);
+        assert_eq!(
+            serve_connections(connections.into_iter(), &sender, &Activity::default()),
+            1
+        );
         assert_eq!(
             deliveries.try_recv().unwrap(),
             message(HookKind::Prompt, b"ok")
@@ -338,7 +351,10 @@ mod tests {
             })
             .collect();
         let (sender, deliveries) = mpsc::sync_channel(1);
-        assert_eq!(serve_connections(connections.into_iter(), &sender), 2);
+        assert_eq!(
+            serve_connections(connections.into_iter(), &sender, &Activity::default()),
+            2
+        );
         assert_eq!(deliveries.try_recv().unwrap(), message(HookKind::Tool, b""));
     }
 }

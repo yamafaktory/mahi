@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthChar;
 const WIDEST: u16 = 72;
 const NARROWEST: u16 = 24;
 const MOST_ITEMS: usize = 12;
+const MOST_ITEMS_WITH_PREVIEW: usize = 5;
 const SAVE: &[u8] = b"\x1b7";
 const RESTORE: &[u8] = b"\x1b8";
 const RESET: &[u8] = b"\x1b[0m";
@@ -42,6 +43,35 @@ pub struct PaletteView<'a> {
     pub empty: &'a str,
     /// The hint in the bottom border.
     pub hint: &'a str,
+    /// The whole text of the selected item, shown below the list from line `scroll` on.
+    pub preview: Option<Preview<'a>>,
+}
+
+/// The whole text of the selected item, wrapped to the box, from a line on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Preview<'a> {
+    /// The text.
+    pub text: &'a str,
+    /// The first wrapped line shown.
+    pub scroll: usize,
+}
+
+/// How the preview fit: how many of its wrapped lines the box shows at once, and how many it
+/// has, so the caller can tell whether its end was shown and how far a page scrolls.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Drawn {
+    /// The rows the box gave the preview.
+    pub page: usize,
+    /// The preview's wrapped lines.
+    pub lines: usize,
+}
+
+impl Drawn {
+    /// Returns whether the preview, from line `scroll`, showed its last line.
+    #[must_use]
+    pub fn shows_end(&self, scroll: usize) -> bool {
+        scroll.saturating_add(self.page) >= self.lines
+    }
 }
 
 struct Frame {
@@ -52,20 +82,34 @@ struct Frame {
 
 impl PaletteView<'_> {
     /// Writes the escape sequences that draw the palette on a screen of `rows` by `columns`,
-    /// keeping the cursor and attributes the agent had; a screen too small for it gets
-    /// nothing.
+    /// keeping the cursor and attributes the agent had, and returns how the preview fit; a
+    /// screen too small for the palette gets nothing.
     ///
     /// # Errors
     ///
     /// Returns the error `out` gives.
-    pub fn draw(&self, rows: u16, columns: u16, out: &mut impl Write) -> io::Result<()> {
+    pub fn draw(&self, rows: u16, columns: u16, out: &mut impl Write) -> io::Result<Drawn> {
         let width = columns.saturating_sub(4).min(WIDEST);
         let room = usize::from(rows.saturating_sub(6));
+        let lines = self
+            .preview
+            .map(|preview| wrapped(preview.text, usize::from(width).saturating_sub(4)))
+            .unwrap_or_default();
         if width < NARROWEST || room == 0 {
-            return Ok(());
+            return Ok(Drawn {
+                page: 0,
+                lines: lines.len(),
+            });
         }
-        let shown = self.items.len().clamp(1, MOST_ITEMS.min(room));
-        let height = u16::try_from(shown + 4).unwrap_or(rows);
+        let most = if self.preview.is_some() {
+            MOST_ITEMS_WITH_PREVIEW
+        } else {
+            MOST_ITEMS
+        };
+        let shown = self.items.len().clamp(1, most.min(room));
+        let page = lines.len().min(room.saturating_sub(shown + 1));
+        let preview_rows = if page > 0 { page + 1 } else { 0 };
+        let height = u16::try_from(shown + 4 + preview_rows).unwrap_or(rows);
         let frame = Frame {
             top: (rows - height) / 2 + 1,
             left: (columns - width) / 2 + 1,
@@ -80,7 +124,14 @@ impl PaletteView<'_> {
         repeat("─", frame.width - 2, out)?;
         out.write_all("┤".as_bytes())?;
         self.draw_items(&frame, shown, out)?;
-        frame.line(u16::try_from(shown + 3).unwrap_or(0), out)?;
+        if page > 0 {
+            let scroll = self
+                .preview
+                .map_or(0, |preview| preview.scroll)
+                .min(lines.len() - page);
+            draw_preview(&frame, shown + 3, lines.get(scroll..scroll + page), out)?;
+        }
+        frame.line(u16::try_from(shown + 3 + preview_rows).unwrap_or(0), out)?;
         out.write_all(BORDER)?;
         out.write_all("╰─ ".as_bytes())?;
         let used = fit(self.hint, frame.width - 6, false, out)?;
@@ -88,7 +139,11 @@ impl PaletteView<'_> {
         repeat("─", frame.width - 5 - used, out)?;
         out.write_all("╯".as_bytes())?;
         out.write_all(RESET)?;
-        out.write_all(RESTORE)
+        out.write_all(RESTORE)?;
+        Ok(Drawn {
+            page,
+            lines: lines.len(),
+        })
     }
 
     fn draw_top(&self, frame: &Frame, out: &mut impl Write) -> io::Result<()> {
@@ -155,6 +210,59 @@ impl PaletteView<'_> {
         }
         Ok(())
     }
+}
+
+fn draw_preview(
+    frame: &Frame,
+    at: usize,
+    lines: Option<&[String]>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    frame.line(u16::try_from(at).unwrap_or(0), out)?;
+    out.write_all(BORDER)?;
+    out.write_all("├".as_bytes())?;
+    repeat("─", frame.width - 2, out)?;
+    out.write_all("┤".as_bytes())?;
+    let room = frame.width - 4;
+    for (row, line) in lines.unwrap_or_default().iter().enumerate() {
+        frame.line(u16::try_from(at + 1 + row).unwrap_or(0), out)?;
+        out.write_all(BORDER)?;
+        out.write_all("│ ".as_bytes())?;
+        out.write_all(PLAIN)?;
+        let used = fit(line, room, false, out)?;
+        repeat(" ", room - used, out)?;
+        out.write_all(BORDER)?;
+        out.write_all(" │".as_bytes())?;
+    }
+    Ok(())
+}
+
+fn wrapped(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        if c == '\n' {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+            continue;
+        }
+        let c = if c.is_whitespace() { ' ' } else { c };
+        if c.is_control() || is_invisible(c) {
+            continue;
+        }
+        let c_width = c.width().unwrap_or(0);
+        if used + c_width > width && used > 0 {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        line.push(c);
+        used += c_width;
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 impl Frame {
@@ -241,6 +349,7 @@ mod tests {
             selected: 0,
             empty: "no prompts waiting",
             hint: "Esc close",
+            preview: None,
         }
     }
 
@@ -381,5 +490,63 @@ mod tests {
             assert_eq!(borders, 6, "{columns}");
             assert!(screen.cell(13, left + 2).unwrap().inverse(), "{columns}");
         }
+    }
+
+    #[test]
+    fn the_preview_shows_the_whole_text_a_page_at_a_time() {
+        let text = (1..=40)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let items = [PaletteItem {
+            label: "bob",
+            detail: "line 1",
+        }];
+        let mut palette = view(&items, "");
+        palette.preview = Some(Preview {
+            text: &text,
+            scroll: 0,
+        });
+        let mut out = Vec::new();
+        let fitted = palette.draw(24, 80, &mut out).unwrap();
+        assert_eq!(fitted.lines, 40);
+        assert_eq!(fitted.page, 18 - 2);
+        assert!(!fitted.shows_end(0));
+        assert!(fitted.shows_end(40 - fitted.page));
+        let parser = drawn(&palette, 24, 80);
+        let rows: Vec<String> = (0..24).map(|r| row(&parser, r)).collect();
+        assert!(rows.iter().any(|line| line.contains("│ line 1 ")));
+        assert!(rows.iter().any(|line| line.contains("│ line 16 ")));
+        assert!(!rows.iter().any(|line| line.contains("line 17")));
+        palette.preview = Some(Preview {
+            text: &text,
+            scroll: 99,
+        });
+        let parser = drawn(&palette, 24, 80);
+        let rows: Vec<String> = (0..24).map(|r| row(&parser, r)).collect();
+        assert!(rows.iter().any(|line| line.contains("│ line 40 ")));
+        assert!(!rows.iter().any(|line| line.contains("│ line 24 ")));
+        for line in rows
+            .iter()
+            .filter(|line| line.contains('│') || line.contains('╮'))
+        {
+            assert_eq!(line.trim().chars().count(), 72, "{line}");
+        }
+    }
+
+    #[test]
+    fn wrapping_cuts_long_lines_and_keeps_breaks_and_drops_hidden_characters() {
+        assert_eq!(wrapped("abcdef", 4), ["abcd", "ef"]);
+        assert_eq!(wrapped("a\n\nb", 4), ["a", "", "b"]);
+        assert_eq!(wrapped("", 4), [""]);
+        assert_eq!(
+            wrapped("\u{4e2d}\u{4e2d}\u{4e2d}", 5),
+            ["\u{4e2d}\u{4e2d}", "\u{4e2d}"]
+        );
+        assert_eq!(wrapped("a\x1b[2Jb\u{202e}c\td", 20), ["a[2Jbc d"]);
+        let fitted = Drawn { page: 5, lines: 3 };
+        assert!(fitted.shows_end(0));
+        let none = view(&[], "").draw(3, 80, &mut Vec::new()).unwrap();
+        assert_eq!(none, Drawn::default());
     }
 }

@@ -23,6 +23,8 @@ pub use scan::{
     Segments,
 };
 pub use view::{
+    Drawn,
     PaletteItem,
     PaletteView,
+    Preview,
 };

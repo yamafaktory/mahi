@@ -28,16 +28,23 @@ use mahi_term::{
     PaletteKey,
     PaletteKeys,
     PaletteView,
+    Preview,
 };
 
 use crate::{
-    prompts::Prompts,
+    inject::AgentInput,
+    prompts::{
+        Decision,
+        Prompts,
+    },
     terminal,
 };
 
 const MAX_HELD_BYTES: usize = 1024 * 1024;
 const TITLE: &str = "mahi";
 const EMPTY: &str = "No prompts waiting";
+const HINT_READ: &str = "PgDn reads on · Ctrl-X rejects · Esc closes";
+const HINT_DECIDE: &str = "Enter accepts · Tab always · Ctrl-X rejects · Esc closes";
 const NO_TEAMMATES: &str = "Teammates cannot watch this run, so no prompts come";
 const CLEAR: &[u8] = b"\x1b[2J";
 const REPAINT_PAUSE: Duration = Duration::from_millis(100);
@@ -113,6 +120,9 @@ struct State<W> {
     filter: String,
     selected: usize,
     selected_id: Option<[u8; PROMPT_ID_BYTES]>,
+    scroll: usize,
+    page: usize,
+    read_whole: Option<[u8; PROMPT_ID_BYTES]>,
     keys: PaletteKeys,
 }
 
@@ -136,6 +146,9 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
                 filter: String::new(),
                 selected: 0,
                 selected_id: None,
+                scroll: 0,
+                page: 0,
+                read_whole: None,
                 keys: PaletteKeys::default(),
             }),
             terminal,
@@ -243,10 +256,14 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
             filter,
             selected,
             selected_id,
+            scroll,
+            page,
+            read_whole,
             ..
         } = &mut *state;
         let mut changed = false;
         let mut escaped = false;
+        let mut closing = false;
         let used = keys.read(bytes, |input| {
             match input {
                 PaletteInput::Escape => escaped = true,
@@ -269,14 +286,36 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
                     (*selected, *selected_id) = (selected.saturating_add(1), None);
                     changed = true;
                 }
-                PaletteInput::Up
-                | PaletteInput::Enter
-                | PaletteInput::Tab
-                | PaletteInput::Reject => {}
+                PaletteInput::PageDown => {
+                    *scroll = scroll.saturating_add((*page).max(1));
+                    changed = true;
+                }
+                PaletteInput::PageUp => {
+                    *scroll = scroll.saturating_sub((*page).max(1));
+                    changed = true;
+                }
+                PaletteInput::Enter | PaletteInput::Tab | PaletteInput::Reject => {
+                    let decision = match input {
+                        PaletteInput::Enter => Decision::Accept,
+                        PaletteInput::Tab => Decision::AlwaysAccept,
+                        _ => Decision::Reject,
+                    };
+                    let id = selected_id.or_else(|| self.id_at(filter, *selected));
+                    let read = decision == Decision::Reject || (id.is_some() && id == *read_whole);
+                    if read
+                        && let Some((id, prompts)) = id.zip(self.prompts.as_ref())
+                        && prompts.decide(id, decision)
+                    {
+                        *selected_id = None;
+                        changed = true;
+                        closing |= decision != Decision::Reject;
+                    }
+                }
+                PaletteInput::Up => {}
             }
-            !escaped
+            !escaped && !closing
         });
-        if escaped {
+        if escaped || closing {
             self.release(&mut state)?;
         } else if changed && state.mode == Mode::Open {
             self.draw(&mut state)?;
@@ -321,6 +360,8 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         state.filter.clear();
         state.selected = 0;
         state.selected_id = None;
+        state.scroll = 0;
+        state.read_whole = None;
         state.keys = PaletteKeys::default();
         state.out.write_all(&held)?;
         if was_open {
@@ -339,7 +380,20 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
             state.selected = position;
         }
         state.selected = state.selected.min(lines.len().saturating_sub(1));
-        state.selected_id = lines.get(state.selected).map(|line| line.id);
+        let selected_id = lines.get(state.selected).map(|line| line.id);
+        if selected_id != state.selected_id {
+            state.scroll = 0;
+        }
+        state.selected_id = selected_id;
+        let text = selected_id
+            .zip(self.prompts.as_ref())
+            .and_then(|(id, prompts)| prompts.text_of(id));
+        let read_whole = selected_id.is_some() && state.read_whole == selected_id;
+        let hint = match (&text, read_whole) {
+            (None, _) => self.hint.as_str(),
+            (Some(_), false) => HINT_READ,
+            (Some(_), true) => HINT_DECIDE,
+        };
         let items: Vec<PaletteItem<'_>> = lines
             .iter()
             .map(|line| PaletteItem {
@@ -357,9 +411,23 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
             } else {
                 NO_TEAMMATES
             },
-            hint: &self.hint,
+            hint,
+            preview: text.as_deref().map(|text| Preview {
+                text,
+                scroll: state.scroll,
+            }),
         };
-        view.draw(size.rows, size.cols, &mut state.out)
+        let drawn = view.draw(size.rows, size.cols, &mut state.out)?;
+        state.page = drawn.page;
+        state.scroll = state.scroll.min(drawn.lines.saturating_sub(drawn.page));
+        if text.is_some() && drawn.page > 0 && drawn.shows_end(state.scroll) {
+            let newly_read = state.read_whole != selected_id;
+            state.read_whole = selected_id;
+            if newly_read {
+                return self.draw(state);
+            }
+        }
+        Ok(())
     }
 
     fn waiting_lines(&self, filter: &str) -> Vec<Line> {
@@ -384,6 +452,22 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
             }
         });
         lines
+    }
+
+    fn id_at(&self, filter: &str, index: usize) -> Option<[u8; PROMPT_ID_BYTES]> {
+        let mut found = None;
+        let mut seen = 0;
+        self.prompts.as_ref()?.each_waiting(|waiting| {
+            let shown = contains_ignoring_case(waiting.from.as_str(), filter)
+                || contains_ignoring_case(waiting.text.as_str(), filter);
+            if shown && found.is_none() {
+                if seen == index {
+                    found = Some(waiting.id);
+                }
+                seen += 1;
+            }
+        });
+        found
     }
 
     /// Redraws the open palette, so the prompts that came and their ages show.
@@ -412,6 +496,17 @@ fn contains_ignoring_case(text: &str, part: &str) -> bool {
             .as_bytes()
             .windows(part.len())
             .any(|window| window.eq_ignore_ascii_case(part.as_bytes()))
+}
+
+impl<W: Write, T: AgentTerminal> AgentInput for Screen<W, T> {
+    fn palette_open(&self) -> bool {
+        self.is_open()
+    }
+
+    fn bracketed_paste(&self) -> bool {
+        self.lock()
+            .is_ok_and(|state| state.tracker.bracketed_paste())
+    }
 }
 
 fn push_age(out: &mut String, age: Duration) {
@@ -641,5 +736,81 @@ mod tests {
         let screen = Screen::new(Vec::new(), &terminal, PaletteKey::CTRL_SPACE, None);
         screen.open().unwrap();
         assert!(String::from_utf8_lossy(&written(&screen)).contains("Teammates cannot watch"));
+    }
+
+    #[test]
+    fn enter_accepts_and_closes_ctrl_x_rejects_and_stays_and_tab_always_accepts() {
+        let terminal = FakeTerminal::default();
+        let prompts = Arc::new(Prompts::default());
+        let screen = Screen::new(
+            Vec::new(),
+            &terminal,
+            PaletteKey::CTRL_SPACE,
+            Some(Arc::clone(&prompts)),
+        );
+        let text = |text: &str| mahi_live::PromptText::new(text.to_owned()).unwrap();
+        let name = |name: &str| mahi_core::ParticipantName::new(name).unwrap();
+        prompts.offer(name("bob"), [1; 16], text("one"));
+        prompts.offer(name("carol"), [2; 16], text("two"));
+        prompts.offer(name("dave"), [3; 16], text("three"));
+        screen.open().unwrap();
+        assert_eq!(screen.typed(b"\x18").unwrap(), 1);
+        assert!(screen.is_open());
+        assert_eq!(screen.lock().unwrap().selected_id, Some([2; 16]));
+        screen.typed(b"\r").unwrap();
+        assert!(!screen.is_open());
+        assert_eq!(prompts.next_accepted().unwrap().id, [2; 16]);
+        screen.open().unwrap();
+        screen.typed(b"\t").unwrap();
+        assert!(!screen.is_open());
+        assert_eq!(prompts.next_accepted().unwrap().id, [3; 16]);
+        assert_eq!(
+            prompts.offer(name("dave"), [4; 16], text("four")),
+            mahi_live::PromptOutcome::Accepted
+        );
+        screen.open().unwrap();
+        screen.typed(b"\r").unwrap();
+        assert!(screen.is_open());
+        assert!(!screen.bracketed_paste());
+        screen.close().unwrap();
+        screen.output(b"\x1b[?2004h").unwrap();
+        assert!(screen.bracketed_paste());
+    }
+
+    #[test]
+    fn a_long_prompt_is_accepted_only_after_it_was_read_to_the_end() {
+        let terminal = FakeTerminal::default();
+        let prompts = Arc::new(Prompts::default());
+        let screen = Screen::new(
+            Vec::new(),
+            &terminal,
+            PaletteKey::CTRL_SPACE,
+            Some(Arc::clone(&prompts)),
+        );
+        let long = (1..=60).fold(String::new(), |mut long, n| {
+            writeln!(long, "step {n}").unwrap();
+            long
+        });
+        let name = mahi_core::ParticipantName::new("bob").unwrap();
+        prompts.offer(name, [1; 16], mahi_live::PromptText::new(long).unwrap());
+        screen.open().unwrap();
+        let first = String::from_utf8_lossy(&written(&screen)).into_owned();
+        assert!(
+            first.contains("step 1") && !first.contains("step 60"),
+            "{first}"
+        );
+        assert!(first.contains("PgDn reads on"), "{first}");
+        screen.typed(b"\r\t").unwrap();
+        assert!(screen.is_open());
+        assert!(prompts.next_accepted().is_none());
+        for _ in 0..3 {
+            screen.typed(b"\x1b[6~").unwrap();
+        }
+        let end = String::from_utf8_lossy(&written(&screen)).into_owned();
+        assert!(end.contains("step 60"), "{end}");
+        assert!(end.contains("Enter accepts"), "{end}");
+        screen.typed(b"\r").unwrap();
+        assert!(!screen.is_open());
+        assert_eq!(prompts.next_accepted().unwrap().id, [1; 16]);
     }
 }

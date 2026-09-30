@@ -149,6 +149,11 @@ use crate::{
         HandoffError,
     },
     hook,
+    inject::{
+        self,
+        Activity,
+        Pace,
+    },
     live::{
         self,
         LiveHost,
@@ -1085,12 +1090,7 @@ impl Prepared {
         })
     }
 
-    fn launch(
-        self,
-        environment: &Environment,
-        mut started: Started,
-        termination: TerminationSignals,
-    ) -> Result<Outcome, RunError> {
+    fn announce(&self, started: &Started) {
         eprintln!(
             "mahi: thread {} in {}",
             started.thread,
@@ -1108,6 +1108,15 @@ impl Prepared {
                 self.palette_key
             );
         }
+    }
+
+    fn launch(
+        self,
+        environment: &Environment,
+        mut started: Started,
+        termination: TerminationSignals,
+    ) -> Result<Outcome, RunError> {
+        self.announce(&started);
         let session = self.session_source(&started);
         let restore = session
             .as_ref()
@@ -1170,18 +1179,22 @@ impl Prepared {
             let pusher = Pusher::start(self.git_dir.clone(), refs, move |flag| setup.connect(flag));
             (pusher, name)
         });
+        let activity = Arc::new(Activity::default());
         let (recorder, turns) = start_background(
             &mut started,
             &self.git_dir,
             self.globals,
-            self.hooks,
+            (self.hooks, Arc::clone(&activity)),
             pusher.as_ref().map(|(pusher, _)| pusher.poker()),
             session,
         );
         finish_run(
             child,
             raw,
-            self.palette_key,
+            &UserSide {
+                palette_key: self.palette_key,
+                activity,
+            },
             termination,
             Background {
                 recorder,
@@ -1198,7 +1211,7 @@ fn start_background(
     started: &mut Started,
     git_dir: &Path,
     globals: GlobalPatterns,
-    hooks: UnixListener,
+    (hooks, activity): (UnixListener, Arc<Activity>),
     pushes: Option<PushPoker>,
     session: Option<SessionSource>,
 ) -> (Option<Recorder>, Option<TurnWorker>) {
@@ -1229,7 +1242,7 @@ fn start_background(
         let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
         let closing = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&closing);
-        thread::spawn(move || hook::serve(&hooks, &flag, &messages));
+        thread::spawn(move || hook::serve(&hooks, &flag, &messages, &activity));
         let worker = thread::spawn(move || {
             turns::record(&transcript, &inputs, poker.as_ref(), pushes.as_ref())
         });
@@ -1271,10 +1284,17 @@ fn finish_turns(turns: Option<TurnWorker>) {
     }
 }
 
+/// What the user's side of a run needs: the key that opens the palette, and what the agent
+/// and the user did last, to tell when the agent is idle.
+struct UserSide {
+    palette_key: PaletteKey,
+    activity: Arc<Activity>,
+}
+
 fn finish_run(
     child: PtyChild,
     raw: Option<RawMode>,
-    palette_key: PaletteKey,
+    user: &UserSide,
     termination: TerminationSignals,
     background: Background,
     proxy: Option<Running>,
@@ -1288,7 +1308,7 @@ fn finish_run(
     let (code, received) = supervise(
         child,
         raw,
-        palette_key,
+        user,
         termination,
         live.as_ref().map(|live| (live.tap(), live.prompts())),
     );
@@ -1334,7 +1354,7 @@ fn finish_run(
 fn supervise(
     child: PtyChild,
     raw: Option<RawMode>,
-    palette_key: PaletteKey,
+    user: &UserSide,
     termination: TerminationSignals,
     live: Option<(OutputTap, Arc<Prompts>)>,
 ) -> (Result<Outcome, RunError>, Receiver<Event>) {
@@ -1345,9 +1365,16 @@ fn supervise(
             let _ = stop_events.send(Event::Stopped(signal));
         }
     });
-    let palette = (raw.is_some() && terminal::is_interactive()).then_some(palette_key);
+    let interactive = raw.is_some() && terminal::is_interactive();
     let (tap, prompts) = live.unzip();
-    let code = relay(child, palette, events, &received, tap, prompts);
+    let code = relay(
+        child,
+        interactive.then_some(user.palette_key),
+        &user.activity,
+        (events, &received),
+        tap,
+        prompts,
+    );
     drop(raw);
     (code, received)
 }
@@ -1719,29 +1746,46 @@ impl Host {
 fn relay(
     child: PtyChild,
     palette: Option<PaletteKey>,
-    events: mpsc::Sender<Event>,
-    received: &Receiver<Event>,
+    activity: &Arc<Activity>,
+    (events, received): (mpsc::Sender<Event>, &Receiver<Event>),
     tap: Option<OutputTap>,
     prompts: Option<Arc<Prompts>>,
 ) -> Result<Outcome, RunError> {
-    let writer = child.writer()?;
+    let writer = Arc::new(Mutex::new(child.writer()?));
     let repainter = Repainter::new(child.resizer()?);
     let screen = Arc::new(Screen::new(
         io::stdout(),
         repainter.clone(),
         palette.unwrap_or_default(),
-        prompts,
+        prompts.clone(),
     ));
     let input = palette.map(|key| (Arc::clone(&screen), KeyScanner::new(key)));
-    thread::spawn(move || forward_input(writer, input));
-    let ticking = Arc::new(AtomicBool::new(palette.is_some()));
-    let (tick_screen, still_ticking) = (Arc::clone(&screen), Arc::clone(&ticking));
+    let (input_writer, input_activity) = (Arc::clone(&writer), Arc::clone(activity));
+    thread::spawn(move || forward_input(&input_writer, input, &input_activity));
+    let running = Arc::new(AtomicBool::new(palette.is_some()));
+    let (tick_screen, ticking) = (Arc::clone(&screen), Arc::clone(&running));
     thread::spawn(move || {
-        while still_ticking.load(Ordering::SeqCst) {
+        while ticking.load(Ordering::SeqCst) {
             thread::sleep(PALETTE_TICK);
             let _ = tick_screen.tick();
         }
     });
+    if let Some(prompts) = prompts.filter(|_| palette.is_some()) {
+        let (screen, activity, running) = (
+            Arc::clone(&screen),
+            Arc::clone(activity),
+            Arc::clone(&running),
+        );
+        thread::spawn(move || {
+            inject::give_accepted(
+                &prompts,
+                &activity,
+                &*screen,
+                &writer,
+                (&running, Pace::default()),
+            );
+        });
+    }
     let resize_tap = tap.clone();
     let resize_screen = Arc::clone(&screen);
     thread::spawn(move || {
@@ -1762,9 +1806,14 @@ fn relay(
     let progress = Arc::new(AtomicU64::new(0));
     let output_events = events.clone();
     let output_progress = Arc::clone(&progress);
-    let output_screen = Arc::clone(&screen);
+    let (output_screen, output_activity) = (Arc::clone(&screen), Arc::clone(activity));
     thread::spawn(move || {
-        let ended = copy_output(&mut reader, &output_progress, tap.as_ref(), &output_screen);
+        let ended = copy_output(
+            &mut reader,
+            &output_progress,
+            tap.as_ref(),
+            (&output_screen, &output_activity),
+        );
         let _ = output_events.send(Event::OutputEnded(ended));
     });
     let child = Arc::new(Mutex::new(child));
@@ -1773,7 +1822,7 @@ fn relay(
         let _ = events.send(Event::Exited(wait_for(&waited)));
     });
     let outcome = await_outcome(&child, received, &progress);
-    ticking.store(false, Ordering::SeqCst);
+    running.store(false, Ordering::SeqCst);
     let _ = screen.close();
     outcome
 }
@@ -1880,7 +1929,7 @@ fn copy_output(
     reader: &mut impl Read,
     progress: &AtomicU64,
     tap: Option<&OutputTap>,
-    screen: &UserScreen,
+    (screen, activity): (&UserScreen, &Activity),
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 8192];
     loop {
@@ -1888,6 +1937,7 @@ fn copy_output(
         if read == 0 {
             return screen.close();
         }
+        activity.touched();
         screen.output(&buffer[..read])?;
         if let Some(tap) = tap {
             tap.output(&buffer[..read]);
@@ -1898,7 +1948,11 @@ fn copy_output(
 
 type UserScreen = Screen<io::Stdout, Repainter>;
 
-fn forward_input(mut writer: File, mut palette: Option<(Arc<UserScreen>, KeyScanner)>) {
+fn forward_input(
+    writer: &Mutex<File>,
+    mut palette: Option<(Arc<UserScreen>, KeyScanner)>,
+    activity: &Activity,
+) {
     let mut input = io::stdin().lock();
     let mut buffer = [0_u8; 4096];
     let mut last = b'\n';
@@ -1907,6 +1961,9 @@ fn forward_input(mut writer: File, mut palette: Option<(Arc<UserScreen>, KeyScan
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => return,
+        };
+        let Ok(mut writer) = writer.lock() else {
+            return;
         };
         let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
             match &palette {
@@ -1917,9 +1974,12 @@ fn forward_input(mut writer: File, mut palette: Option<(Arc<UserScreen>, KeyScan
             }
             return;
         };
-        let forwarded = match &mut palette {
-            Some((screen, scanner)) => route_keys(chunk, scanner, screen, &mut writer),
-            None => writer.write_all(chunk),
+        activity.touched();
+        let forwarded = if let Some((screen, scanner)) = &mut palette {
+            route_keys(chunk, scanner, screen, (&mut writer, activity))
+        } else {
+            activity.keys(chunk);
+            writer.write_all(chunk)
         };
         if forwarded.is_err() {
             return;
@@ -1932,18 +1992,21 @@ fn route_keys(
     chunk: &[u8],
     scanner: &mut KeyScanner,
     screen: &UserScreen,
-    writer: &mut File,
+    (writer, activity): (&mut File, &Activity),
 ) -> io::Result<()> {
     for segment in scanner.scan(chunk) {
         match segment {
             Segment::Palette(key) if screen.is_open() => {
                 screen.close()?;
+                activity.keys(key);
                 writer.write_all(key)?;
             }
             Segment::Palette(_) => open_palette(screen)?,
             Segment::Pass(bytes) => {
                 let used = screen.typed(bytes)?;
-                writer.write_all(bytes.get(used..).unwrap_or_default())?;
+                let forwarded = bytes.get(used..).unwrap_or_default();
+                activity.keys(forwarded);
+                writer.write_all(forwarded)?;
             }
         }
     }

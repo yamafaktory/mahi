@@ -26,6 +26,10 @@ pub enum PaletteInput {
     Up,
     /// The down arrow.
     Down,
+    /// Page Up.
+    PageUp,
+    /// Page Down.
+    PageDown,
     /// Escape, which closes the palette.
     Escape,
 }
@@ -179,9 +183,24 @@ fn csi(rest: &[u8]) -> (usize, Option<PaletteInput>) {
         b'A' => Some(PaletteInput::Up),
         b'B' => Some(PaletteInput::Down),
         b'u' => kitty(params),
+        b'~' => page(params),
         _ => None,
     };
     (end + 1, input)
+}
+
+fn page(params: &[u8]) -> Option<PaletteInput> {
+    let mut fields = params.split(|&byte| byte == b';');
+    let key = match number(fields.next()?)? {
+        5 => PaletteInput::PageUp,
+        6 => PaletteInput::PageDown,
+        _ => return None,
+    };
+    let event = fields
+        .next()
+        .and_then(|field| field.split(|&byte| byte == b':').nth(1))
+        .map_or(Some(1), number)?;
+    (event != 3).then_some(key)
 }
 
 fn kitty(params: &[u8]) -> Option<PaletteInput> {
@@ -275,6 +294,14 @@ mod tests {
         assert_eq!(
             inputs(&[b"\x1b[A\x1bOB"]),
             [PaletteInput::Up, PaletteInput::Down]
+        );
+        assert_eq!(
+            inputs(&[b"\x1b[5~\x1b[6~\x1b[6;1:3~\x1b[5;1:2~\x1b[7~"]),
+            [
+                PaletteInput::PageUp,
+                PaletteInput::PageDown,
+                PaletteInput::PageUp
+            ]
         );
         assert_eq!(
             inputs(&["\u{e9}\u{4e2d}".as_bytes()]),

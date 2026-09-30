@@ -8,6 +8,7 @@ mod handoff;
 mod hook;
 mod id;
 mod init;
+mod inject;
 mod invite;
 mod join;
 mod live;

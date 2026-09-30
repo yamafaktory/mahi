@@ -6,6 +6,7 @@ use mahi_term::{
     PaletteItem,
     PaletteKeys,
     PaletteView,
+    Preview,
 };
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
@@ -56,11 +57,16 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         selected: usize::from(split),
         empty: &text,
         hint: &text,
+        preview: Some(Preview {
+            text: &text,
+            scroll: usize::from(split),
+        }),
     };
     let rows = u16::from(split % 64);
     let columns = u16::from(split);
     let mut out = Vec::new();
-    view.draw(rows, columns, &mut out).unwrap();
+    let drawn = view.draw(rows, columns, &mut out).unwrap();
+    assert!(drawn.page <= drawn.lines);
     let mut drawn = OutputTracker::default();
     drawn.feed(&out);
     assert!(drawn.can_draw());

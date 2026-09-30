@@ -3,15 +3,49 @@ const BEL: u8 = 0x07;
 const CAN: u8 = 0x18;
 const SUB: u8 = 0x1a;
 const DEL: u8 = 0x7f;
+const BRACKETED_PASTE: u32 = 2004;
 
 /// Follows the agent's output to tell where mahi may draw: only in the ground state, outside
 /// any escape sequence, control string or UTF-8 character the agent has begun, and not while
 /// the agent keeps a saved cursor (`ESC 7` or `CSI s`) it has not restored, since the terminal
-/// has one place to save it and mahi saves its own there while it draws.
+/// has one place to save it and mahi saves its own there while it draws. It also follows
+/// whether the agent turned bracketed paste on.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OutputTracker {
     state: State,
     saved_cursor: bool,
+    bracketed_paste: bool,
+    modes: PrivateModes,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PrivateModes {
+    private: bool,
+    started: bool,
+    number: u32,
+    names_paste: bool,
+}
+
+impl PrivateModes {
+    fn take(&mut self, byte: u8) {
+        match byte {
+            b'?' if !self.started => self.private = true,
+            b'0'..=b'9' => {
+                self.number = self
+                    .number
+                    .saturating_mul(10)
+                    .saturating_add(u32::from(byte - b'0'));
+            }
+            b';' => self.end_number(),
+            _ => {}
+        }
+        self.started = true;
+    }
+
+    fn end_number(&mut self) {
+        self.names_paste |= self.number == BRACKETED_PASTE;
+        self.number = 0;
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +64,12 @@ enum State {
 }
 
 impl OutputTracker {
+    /// Returns whether the agent turned bracketed paste on (`CSI ? 2004 h`) and not off again.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
     /// Returns whether mahi may draw after the output so far.
     #[must_use]
     pub fn can_draw(&self) -> bool {
@@ -59,6 +99,18 @@ impl OutputTracker {
         match (self.state, byte) {
             (State::Escape, b'7') | (State::Csi { bare: true }, b's') => self.saved_cursor = true,
             (State::Escape, b'8') | (State::Csi { bare: true }, b'u') => self.saved_cursor = false,
+            (State::Escape, b'c') => {
+                self.saved_cursor = false;
+                self.bracketed_paste = false;
+            }
+            (State::Escape, b'[') => self.modes = PrivateModes::default(),
+            (State::Csi { .. }, 0x30..=0x3f) => self.modes.take(byte),
+            (State::Csi { .. }, b'h' | b'l') => {
+                self.modes.end_number();
+                if self.modes.private && self.modes.names_paste {
+                    self.bracketed_paste = byte == b'h';
+                }
+            }
             _ => {}
         }
         self.state = next(self.state, byte);
@@ -198,5 +250,28 @@ mod tests {
         assert!(ends_in_ground(b"\x1b]0;t\x1b[m"));
         assert!(ends_in_ground(b"\xe2\x1b[m"));
         assert!(ends_in_ground(b"\xe2x"));
+    }
+
+    #[test]
+    fn bracketed_paste_follows_the_agents_mode_changes() {
+        let mut tracker = OutputTracker::default();
+        assert!(!tracker.bracketed_paste());
+        tracker.feed(b"\x1b[?2004h");
+        assert!(tracker.bracketed_paste());
+        tracker.feed(b"\x1b[?1049;2004l");
+        assert!(!tracker.bracketed_paste());
+        tracker.feed(b"\x1b[?25;2004;1h");
+        assert!(tracker.bracketed_paste());
+        tracker.feed(b"\x1b[2004l\x1b[?20040l\x1b[?2004;x");
+        assert!(tracker.bracketed_paste());
+        tracker.feed(b"\x1b[?20");
+        tracker.feed(b"04l");
+        assert!(!tracker.bracketed_paste());
+        tracker.feed(b"\x1b[?99999999999999999999h\x1b[>2004h");
+        assert!(!tracker.bracketed_paste());
+        tracker.feed(b"\x1b[?2004h\x1b7");
+        assert!(tracker.bracketed_paste() && !tracker.can_draw());
+        tracker.feed(b"\x1bc");
+        assert!(!tracker.bracketed_paste() && tracker.can_draw());
     }
 }
