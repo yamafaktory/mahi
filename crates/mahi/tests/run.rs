@@ -301,6 +301,13 @@ mod tests {
         }
     }
 
+    fn thread_of(worktree: &Path) -> String {
+        let name = worktree.file_name().unwrap().to_str().unwrap();
+        name.split_once('.')
+            .map_or(name, |(thread, _)| thread)
+            .to_owned()
+    }
+
     fn worktree_of(stderr: &str) -> PathBuf {
         let line = stderr
             .lines()
@@ -339,7 +346,7 @@ mod tests {
             "written\n"
         );
         assert!(!fixture.repo.join("file").exists());
-        let thread = worktree.file_name().unwrap().to_string_lossy().into_owned();
+        let thread = thread_of(&worktree);
         let snapshots = format!("refs/threads/{thread}/agents/tester.sh/snapshots");
         assert_eq!(
             fixture.threads(),
@@ -369,13 +376,7 @@ mod tests {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(0), "{stderr}");
         let worktree = worktree_of(&stderr);
-        let thread: ThreadId = worktree
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let thread: ThreadId = thread_of(&worktree).parse().unwrap();
         let store = Store::open(&fixture.repo).unwrap();
         let meta = load_meta(&store, thread, &fixture.owner, 0).unwrap();
         let tester = ParticipantName::new("tester").unwrap();
@@ -593,7 +594,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
         assert!(stderr.contains("claude-code profile"), "{stderr}");
         let worktree = worktree_of(&stderr);
-        let thread_name = worktree.file_name().unwrap().to_str().unwrap();
+        let thread_name = &thread_of(&worktree);
         let state = fixture
             .repo
             .join(".git/mahi/state")
@@ -673,7 +674,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         );
         let run = fixture.mahi(&["run", "true"]);
         let worktree = worktree_of(&String::from_utf8_lossy(&run.stderr));
-        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let thread = thread_of(&worktree);
         let listed = fixture.mahi(&["threads"]);
         assert_eq!(listed.status.code(), Some(0));
         assert_eq!(
@@ -958,7 +959,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         let stderr = String::from_utf8_lossy(&first.stderr);
         assert_eq!(first.status.code(), Some(0), "{stderr}");
         let worktree = worktree_of(&stderr);
-        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let thread = thread_of(&worktree);
         let before = snapshot_head(&fixture, &thread);
 
         let (code, output) = in_terminal(
@@ -1044,32 +1045,16 @@ cat parser.rs
             .unwrap();
         let stderr = String::from_utf8_lossy(&first.stderr);
         assert_eq!(first.status.code(), Some(0), "{stderr}");
-        let thread = worktree_of(&stderr)
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let thread = thread_of(&worktree_of(&stderr));
         (thread, claude)
     }
 
     #[test]
-    fn a_handoff_needs_no_worktree_a_new_agent_and_a_listed_source_with_work() {
+    fn a_handoff_needs_a_new_agent_and_a_listed_source_with_work() {
         let fixture = fixture();
         let (thread, claude) = worked_thread(&fixture);
         let taker = script(&fixture, "taking", "codex", TAKER);
         let taker = taker.to_str().unwrap();
-
-        let (code, output) = in_terminal(
-            &fixture,
-            &["handoff", &thread, "--from", "tester.claude", "--", taker],
-            None,
-        );
-        assert_eq!(code, 1, "{output}");
-        assert!(
-            output.contains("record and remove it with mahi end"),
-            "{output}"
-        );
         assert!(fixture.mahi(&["end", &thread]).status.success());
         let (code, output) = in_terminal(
             &fixture,
@@ -1114,7 +1099,6 @@ cat parser.rs
     fn another_agent_takes_over_with_the_work_and_a_briefing_of_it() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);
-        assert!(fixture.mahi(&["end", &thread]).status.success());
         let taker = script(&fixture, "taking", "codex", TAKER);
         let taker = taker.to_str().unwrap();
 
@@ -1162,6 +1146,17 @@ cat parser.rs
             .tree()
             .unwrap();
         assert!(tree.find_entry("parser.rs").is_some());
+        let worktrees = fixture.thread_worktrees();
+        assert_eq!(worktrees.len(), 2, "{worktrees:?}");
+        let ended = fixture.mahi(&["end", &thread]);
+        let report = String::from_utf8_lossy(&ended.stderr);
+        assert!(ended.status.success(), "{report}");
+        assert_eq!(
+            report.matches("removed the worktree").count(),
+            2,
+            "{report}"
+        );
+        assert!(fixture.thread_worktrees().is_empty());
     }
 
     #[test]
@@ -1174,12 +1169,7 @@ cat parser.rs
             .unwrap();
         let stderr = String::from_utf8_lossy(&first.stderr);
         assert_eq!(first.status.code(), Some(0), "{stderr}");
-        let thread = worktree_of(&stderr)
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let thread = thread_of(&worktree_of(&stderr));
         assert!(fixture.mahi(&["end", &thread]).status.success());
         let claude = fake_claude(&fixture);
         let (code, output) = in_terminal(
@@ -1214,12 +1204,7 @@ cat parser.rs
         let stderr = String::from_utf8_lossy(&first.stderr);
         assert_eq!(first.status.code(), Some(0), "{stderr}");
         assert!(!stderr.contains("session was not"), "{stderr}");
-        let thread = worktree_of(&stderr)
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let thread = thread_of(&worktree_of(&stderr));
         let session = ThreadRef::new(
             thread.parse().unwrap(),
             RefKind::Session(AgentSlot::new(
@@ -1244,7 +1229,7 @@ cat parser.rs
             "{output}"
         );
         assert!(
-            output.contains(&format!("session=turn in {thread}|")),
+            output.contains(&format!("session=turn in {thread}.claude|")),
             "{output}"
         );
         let (code, output) = in_terminal(
@@ -1255,7 +1240,9 @@ cat parser.rs
         assert_eq!(code, 0, "{output}");
         assert!(!output.contains("restored"), "{output}");
         assert!(
-            output.contains(&format!("session=turn in {thread}|turn in {thread}|")),
+            output.contains(&format!(
+                "session=turn in {thread}.claude|turn in {thread}.claude|"
+            )),
             "{output}"
         );
     }
@@ -1271,12 +1258,7 @@ cat parser.rs
             .unwrap();
         let stderr = String::from_utf8_lossy(&first.stderr);
         assert_eq!(first.status.code(), Some(0), "{stderr}");
-        let thread = worktree_of(&stderr)
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        let thread = thread_of(&worktree_of(&stderr));
         let state = fs::canonicalize(
             fixture
                 .repo
@@ -1331,7 +1313,7 @@ cat parser.rs
             fixture
                 .thread_worktrees()
                 .iter()
-                .any(|worktree| worktree.ends_with(&thread))
+                .any(|worktree| thread_of(worktree) == thread)
         );
     }
 
@@ -1346,7 +1328,7 @@ cat parser.rs
         let stderr = String::from_utf8_lossy(&run.stderr);
         assert_eq!(run.status.code(), Some(0), "{stderr}");
         let worktree = worktree_of(&stderr);
-        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let thread = thread_of(&worktree);
         let state = fixture.repo.join(".git/mahi/state").join(&thread);
         assert!(state.exists());
         let lock = config_dir(&fixture.home).path().join("locks").join(&thread);
@@ -1404,7 +1386,7 @@ cat parser.rs
     fn ended_thread(fixture: &Fixture) -> (PathBuf, String) {
         let run = fixture.mahi(&["run", "true"]);
         let worktree = worktree_of(&String::from_utf8_lossy(&run.stderr));
-        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let thread = thread_of(&worktree);
         (worktree, thread)
     }
 
@@ -1464,7 +1446,7 @@ cat parser.rs
         let fixture = fixture();
         let first = fixture.mahi(&["run", "true"]);
         let worktree = worktree_of(&String::from_utf8_lossy(&first.stderr));
-        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let thread = thread_of(&worktree);
         let config = config_dir(&fixture.home);
         fs::remove_file(config.signing_key_file()).unwrap();
         let other = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
@@ -1488,7 +1470,7 @@ cat parser.rs
         let fixture = fixture();
         let first = fixture.mahi(&["run", "true"]);
         let worktree = worktree_of(&String::from_utf8_lossy(&first.stderr));
-        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let thread = thread_of(&worktree);
         let elsewhere = fixture.root.join("other-agent.sock");
         serve_signatures(
             &elsewhere,
@@ -1591,7 +1573,7 @@ cat parser.rs
 
         let first = fixture.mahi(&["run", "true"]);
         let worktree = worktree_of(&String::from_utf8_lossy(&first.stderr));
-        let here = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let here = thread_of(&worktree);
         let kept = fixture.mahi(&["resume", "--take-remote", &here, "--", "true"]);
         let stderr = String::from_utf8_lossy(&kept.stderr);
         assert_eq!(kept.status.code(), Some(1), "{stderr}");
@@ -1635,7 +1617,7 @@ cat parser.rs
             seen.extend_from_slice(&chunk[..read]);
         }
         let worktree = worktree_of(&String::from_utf8_lossy(&seen));
-        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let thread = thread_of(&worktree);
         let busy = fixture.mahi(&["resume", &thread, "--", "true"]);
         assert_eq!(busy.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&busy.stderr).contains("already running"));
@@ -1655,7 +1637,7 @@ cat parser.rs
 
         let first = fixture.mahi(&["run", "sh", "-c", "echo recorded work > work.txt"]);
         let worktree = worktree_of(&String::from_utf8_lossy(&first.stderr));
-        let thread = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let thread = thread_of(&worktree);
         let (code, output) = in_terminal(
             &fixture,
             &["resume", &thread, "--", "true"],

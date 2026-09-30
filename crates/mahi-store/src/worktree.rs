@@ -151,6 +151,29 @@ impl Store {
         Ok(workdir)
     }
 
+    /// Returns the names of the linked worktrees the repository has registered, whether or not
+    /// their directories are still there, in no particular order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Io`] if the registrations cannot be read.
+    pub fn worktree_names(&self) -> Result<Vec<String>, StoreError> {
+        let registered = match fs::read_dir(self.common_dir().join(WORKTREES)) {
+            Ok(registered) => registered,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = Vec::new();
+        for entry in registered {
+            if let Ok(name) = entry?.file_name().into_string()
+                && validate_name(&name).is_ok()
+            {
+                names.push(name);
+            }
+        }
+        Ok(names)
+    }
+
     /// Removes the registration of the linked worktree `name` when the directory it records
     /// no longer exists, as `git worktree prune` does. Returns whether it removed one.
     ///
@@ -605,6 +628,7 @@ mod tests {
     #[test]
     fn a_removed_worktree_leaves_no_directory_or_registration() {
         let (dir, store) = store();
+        assert!(store.worktree_names().unwrap().is_empty());
         let path = store
             .add_worktree(
                 "agent",
@@ -614,7 +638,9 @@ mod tests {
             )
             .unwrap();
         fs::write(path.join("new"), b"work").unwrap();
+        assert_eq!(store.worktree_names().unwrap(), ["agent"]);
         store.remove_worktree("agent").unwrap();
+        assert!(store.worktree_names().unwrap().is_empty());
         assert!(!path.exists());
         assert!(!store.common_dir().join(WORKTREES).join("agent").exists());
         let main = gix::open(dir.path().join("repo")).unwrap();

@@ -7,6 +7,7 @@ use std::{
         Read,
         Write,
     },
+    path::Path,
     sync::{
         Arc,
         Mutex,
@@ -103,7 +104,10 @@ use crate::{
         Outcome,
         RunError,
     },
-    session::CommitKey,
+    session::{
+        self,
+        CommitKey,
+    },
     settings::{
         Settings,
         SettingsError,
@@ -114,8 +118,8 @@ use crate::{
         RawMode,
     },
     thread_lock::{
+        AgentLock,
         LockError,
-        ThreadLock,
     },
 };
 
@@ -470,7 +474,11 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     };
     if let Some(signer) = signer {
         let _ = node.close();
-        let lock = ThreadLock::acquire(&config, ticket.thread()).map_err(JoinError::Busy)?;
+        let agent = command
+            .agent()
+            .map(|(program, _)| session::agent_from(Path::new(program)))
+            .ok_or(JoinError::OptionsNeedAgent)?;
+        let lock = AgentLock::acquire(&config, ticket.thread(), &agent).map_err(JoinError::Busy)?;
         let me = meta
             .participants()
             .find(|listed| listed.node() == &own)

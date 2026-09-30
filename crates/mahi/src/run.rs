@@ -217,6 +217,7 @@ use crate::{
         RawMode,
     },
     thread_lock::{
+        AgentLock,
         LockError,
         ThreadLock,
     },
@@ -359,10 +360,6 @@ pub(crate) enum RunError {
     )]
     WorktreeHere(ThreadId),
     #[error(
-        "this clone has a worktree for thread {0}; record and remove it with mahi end before handing its work over"
-    )]
-    HandoffWorktreeHere(ThreadId),
-    #[error(
         "you already have an agent called {1} in thread {0}; resume it with mahi resume --agent {1}"
     )]
     AgentThere(ThreadId, AgentName),
@@ -476,7 +473,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         started.discard_or_report(&prepared.store);
         return Err(error);
     }
-    let _lock = match ThreadLock::acquire(&config, started.thread) {
+    let _lock = match AgentLock::acquire(&config, started.thread, started.slot.agent()) {
         Ok(lock) => lock,
         Err(error) => {
             started.discard_or_report(&prepared.store);
@@ -509,9 +506,12 @@ pub(crate) fn resume(
     let bootstrap: Vec<HostAddress> = live::remembered_host(&store, command.thread)
         .into_iter()
         .collect();
-    let _lock = ThreadLock::acquire(&config, command.thread)?;
+    let _whole_thread = command
+        .take_remote
+        .then(|| ThreadLock::acquire(&config, command.thread))
+        .transpose()?;
     let taken = if command.take_remote {
-        if store.worktree_dir(&command.thread.to_string()).is_ok() {
+        if session::has_thread_worktree(&store, command.thread)? {
             return Err(RunError::WorktreeHere(command.thread));
         }
         let signer = agent_signer(environment, &signing)?;
@@ -525,6 +525,9 @@ pub(crate) fn resume(
         None
     };
     let slot = session::pick_slot(&store, command.thread, &participant, command.agent.as_ref())?;
+    let _agent_lock = (!command.take_remote)
+        .then(|| AgentLock::acquire(&config, command.thread, slot.agent()))
+        .transpose()?;
     let (program, arguments, profile) = resumed_command(command, &slot);
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
     let settings = Settings::load(&config)?;
@@ -643,11 +646,8 @@ pub(crate) fn handoff(
     let owner = session::thread_owner(&store, thread, own.clone())
         .map_err(|error| RunError::ThreadOwner(thread, error))?;
     let bootstrap: Vec<HostAddress> = live::remembered_host(&store, thread).into_iter().collect();
-    let _lock = ThreadLock::acquire(&config, thread)?;
-    if store.worktree_dir(&thread.to_string()).is_ok() {
-        return Err(RunError::HandoffWorktreeHere(thread));
-    }
     let agent_name = session::agent_from(Path::new(program));
+    let _lock = AgentLock::acquire(&config, thread, &agent_name)?;
     let slot = AgentSlot::new(participant.clone(), agent_name.clone());
     if store
         .head(&ThreadRef::new(thread, RefKind::Snapshots(slot.clone())))?
@@ -817,7 +817,7 @@ pub(crate) struct Joined {
     pub(crate) participant: ParticipantName,
     pub(crate) owner: ParticipantKey,
     pub(crate) host: HostAddress,
-    pub(crate) lock: ThreadLock,
+    pub(crate) lock: AgentLock,
     pub(crate) commits: CommitKey,
 }
 
@@ -1232,7 +1232,7 @@ fn start_background(
         Recorder::start(
             Target {
                 git_dir: git_dir.to_path_buf(),
-                worktree: started.thread.to_string(),
+                worktree: session::worktree_name(started.thread, started.slot.agent()),
                 snapshots: started.snapshots.clone(),
                 globals,
                 commits: started.commits.clone(),

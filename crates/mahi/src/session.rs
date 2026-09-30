@@ -200,7 +200,7 @@ pub(crate) fn start(
         vec![owner],
         PrivateMeta::new(&title, &branch)?,
     )?;
-    let name = thread.to_string();
+    let name = worktree_name(thread, agent);
     let path = worktrees.join(&name);
     let worktree = store.add_worktree(&name, &path, base, interrupt)?;
     if interrupt.load(Ordering::SeqCst) {
@@ -302,7 +302,7 @@ pub(crate) fn resume(
         .thread_key(reopen.participant, reopen.identity.as_age())
         .map_err(|error| ResumeError::NotParticipant(thread, Box::new(error)))?;
     let slot = pick_slot(store, thread, reopen.participant, reopen.agent)?;
-    let name = thread.to_string();
+    let name = worktree_name(thread, slot.agent());
     let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
     let head = store.head(&snapshots)?;
     let worktree =
@@ -404,7 +404,7 @@ pub(crate) fn enter(
     store
         .commit_tree(base)
         .map_err(|error| EnterError::BaseMissing(base, error))?;
-    let name = thread.to_string();
+    let name = worktree_name(thread, agent);
     let slot = AgentSlot::new(participant, agent.clone());
     let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
     let head = store.head(&snapshots)?;
@@ -468,7 +468,7 @@ pub(crate) fn hand_over(
     store
         .commit_tree(base)
         .map_err(|error| EnterError::BaseMissing(base, error))?;
-    let name = thread.to_string();
+    let name = worktree_name(thread, slot.agent());
     store.prune_worktree(&name)?;
     let worktree =
         store.restore_worktree(&name, &worktrees.join(&name), base, contents, interrupt)?;
@@ -489,12 +489,12 @@ pub(crate) fn hand_over(
 }
 
 /// Finds the user's agent in `thread`: the one named `agent`, or the only one.
-pub(crate) fn pick_slot(
+/// Returns the agents `participant` has in `thread`, from their refs, in order.
+pub(crate) fn own_slots(
     store: &Store,
     thread: ThreadId,
     participant: &ParticipantName,
-    agent: Option<&AgentName>,
-) -> Result<AgentSlot, ResumeError> {
+) -> Result<BTreeSet<AgentSlot>, StoreError> {
     let mut mine = BTreeSet::new();
     for (thread_ref, _) in store.thread_refs()? {
         if thread_ref.thread() != thread {
@@ -507,6 +507,16 @@ pub(crate) fn pick_slot(
             mine.insert(slot.clone());
         }
     }
+    Ok(mine)
+}
+
+pub(crate) fn pick_slot(
+    store: &Store,
+    thread: ThreadId,
+    participant: &ParticipantName,
+    agent: Option<&AgentName>,
+) -> Result<AgentSlot, ResumeError> {
+    let mine = own_slots(store, thread, participant)?;
     if let Some(agent) = agent {
         return mine
             .into_iter()
@@ -604,7 +614,7 @@ impl Started {
             ),
             Created::Agent => (Ok(()), self.state_dir(store)),
         };
-        let worktree = store.remove_worktree(&self.thread.to_string());
+        let worktree = store.remove_worktree(&worktree_name(self.thread, self.slot.agent()));
         if let Some(repository) = self.worktree.parent() {
             let _ = fs::remove_dir(repository);
         }
@@ -627,6 +637,23 @@ pub(crate) enum DiscardError {
     Thread(#[from] ThreadError),
     #[error("cannot remove the agent's state")]
     State(#[source] io::Error),
+}
+
+/// Returns whether this clone has a worktree, there and linked back, for any agent of
+/// `thread`.
+pub(crate) fn has_thread_worktree(store: &Store, thread: ThreadId) -> Result<bool, StoreError> {
+    let prefix = format!("{thread}.");
+    Ok(store.worktree_names()?.iter().any(|name| {
+        name.strip_prefix(&prefix)
+            .is_some_and(|agent| agent.parse::<AgentName>().is_ok())
+            && store.worktree_dir(name).is_ok()
+    }))
+}
+
+/// Returns the name of `agent`'s worktree in `thread`: `<thread-id>.<agent>`, under the
+/// repository's worktree directory and in its git directory's `worktrees/`.
+pub(crate) fn worktree_name(thread: ThreadId, agent: &AgentName) -> String {
+    format!("{thread}.{agent}")
 }
 
 /// Returns where the agents of `thread` keep their state: `<common git dir>/mahi/state/<thread>`.
@@ -898,7 +925,7 @@ pub(crate) mod tests {
             started.worktree,
             std::fs::canonicalize(worktrees(&store))
                 .unwrap()
-                .join(started.thread.to_string())
+                .join(worktree_name(started.thread, started.slot.agent()))
         );
         assert_eq!(
             std::fs::read(started.worktree.join("README")).unwrap(),
@@ -941,7 +968,7 @@ pub(crate) mod tests {
             !store
                 .common_dir()
                 .join("worktrees")
-                .join(started.thread.to_string())
+                .join(worktree_name(started.thread, started.slot.agent()))
                 .exists()
         );
     }
@@ -1120,7 +1147,9 @@ pub(crate) mod tests {
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let mut started = start_with(&store, &signer).unwrap();
         let first = started.first_snapshot.take().unwrap();
-        store.remove_worktree(&started.thread.to_string()).unwrap();
+        store
+            .remove_worktree(&worktree_name(started.thread, started.slot.agent()))
+            .unwrap();
         let slot = AgentSlot::new(
             ParticipantName::new("alice").unwrap(),
             AgentName::new("codex").unwrap(),
@@ -1193,12 +1222,16 @@ pub(crate) mod tests {
         assert_eq!(again.worktree, first.worktree);
         assert_eq!(again.first_snapshot.unwrap().commit, snapshots);
         std::fs::write(first.worktree.join("agent.txt"), "work\n").unwrap();
-        store.remove_worktree(&thread.to_string()).unwrap();
+        store
+            .remove_worktree(&worktree_name(thread, first.slot.agent()))
+            .unwrap();
         let recorded = enter_with(base).unwrap();
         assert!(recorded.worktree.join("README").is_file());
         assert!(!recorded.worktree.join("agent.txt").exists());
         assert_eq!(recorded.first_snapshot.unwrap().commit, snapshots);
-        store.remove_worktree(&thread.to_string()).unwrap();
+        store
+            .remove_worktree(&worktree_name(thread, first.slot.agent()))
+            .unwrap();
         std::fs::create_dir_all(&recorded.worktree).unwrap();
         std::fs::write(recorded.worktree.join("own.txt"), "kept\n").unwrap();
         assert!(matches!(

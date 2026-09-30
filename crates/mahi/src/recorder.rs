@@ -228,7 +228,7 @@ mod tests {
         let recorder = Recorder::start(
             Target {
                 git_dir: store.common_dir().to_path_buf(),
-                worktree: started.thread.to_string(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
                 commits: CommitKey::new(signer.clone()).unwrap(),
@@ -290,7 +290,7 @@ mod tests {
         let recorder = Recorder::start(
             Target {
                 git_dir: store.common_dir().to_path_buf(),
-                worktree: started.thread.to_string(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
                 commits: CommitKey::new(signer.clone()).unwrap(),
@@ -312,7 +312,7 @@ mod tests {
         let recorder = Recorder::start(
             Target {
                 git_dir: store.common_dir().to_path_buf(),
-                worktree: started.thread.to_string(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
                 commits: CommitKey::new(signer.clone()).unwrap(),

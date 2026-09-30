@@ -20,6 +20,8 @@ use mahi_store::{
 };
 use thiserror::Error;
 
+use crate::session;
+
 #[derive(Debug, Error)]
 pub(crate) enum ThreadsError {
     #[error("cannot find the current directory")]
@@ -82,7 +84,7 @@ fn summarise(store: &Store) -> Result<BTreeMap<ThreadId, ThreadSummary>, StoreEr
     }
     for (thread, summary) in &mut with_meta {
         summary.agents = agents.remove(thread).unwrap_or_default();
-        summary.worktree = store.worktree_dir(&thread.to_string()).is_ok();
+        summary.worktree = session::has_thread_worktree(store, *thread)?;
     }
     Ok(with_meta)
 }

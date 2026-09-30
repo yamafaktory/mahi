@@ -86,7 +86,7 @@ pub(crate) enum EndError {
     ParticipantName(#[source] NameError),
     #[error("cannot open the git repository")]
     Store(#[from] StoreError),
-    #[error("thread {0} is still running; stop it before ending it")]
+    #[error("an agent of thread {0} is still running; stop it before ending the thread")]
     Running(ThreadId),
     #[error("cannot lock the thread")]
     Lock(#[source] io::Error),
@@ -117,9 +117,9 @@ pub(crate) enum Ended {
     Stopped(Termination),
 }
 
-/// Ends a thread the user owns and that is not running: records its worktree in a last
-/// snapshot, then removes the worktree, the agents' state and the thread's lock. The thread's
-/// refs stay.
+/// Ends a thread the user owns and none of whose agents runs: records each of the user's
+/// agents' worktrees in a last snapshot, then removes the worktrees, the agents' state and the
+/// thread's locks. The thread's refs stay.
 pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<Ended, EndError> {
     let thread = command.thread;
     let cwd = env::current_dir()
@@ -136,12 +136,17 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
     let store = Store::discover(&cwd)?;
     let owner = session::thread_owner(&store, thread, own)
         .map_err(|error| EndError::ThreadOwner(thread, error))?;
-    let slot = session::pick_slot(&store, thread, &participant, command.agent.as_ref())?;
     let lock = match ThreadLock::acquire(&config, thread) {
         Ok(lock) => lock,
-        Err(LockError::Busy(_)) => return Err(EndError::Running(thread)),
+        Err(LockError::Busy(_) | LockError::AgentBusy(..)) => {
+            return Err(EndError::Running(thread));
+        }
         Err(LockError::Io(error)) => return Err(EndError::Lock(error)),
     };
+    let slots = session::own_slots(&store, thread, &participant)?;
+    if slots.is_empty() {
+        return Err(ResumeError::NoAgent(thread).into());
+    }
     load_meta(&store, thread, &owner, 0)
         .map_err(|error| EndError::NotOwner(thread, Box::new(error)))?;
     let socket = environment
@@ -152,30 +157,39 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
     signer.require_loaded()?;
     let commits = CommitKey::new(signer).map_err(EndError::OwnerKey)?;
     let termination = TerminationSignals::listen().map_err(EndError::Signals)?;
+    let globals = environment.git_patterns();
     let (recorded, caught) = until_stopped(&termination, |interrupt| {
-        record_last(
-            &store,
-            thread,
-            slot,
-            &environment.git_patterns(),
-            &commits,
-            command.force,
-            interrupt,
-        )
+        slots
+            .into_iter()
+            .map(|slot| {
+                record_last(
+                    &store,
+                    thread,
+                    slot,
+                    (&globals, &commits),
+                    command.force,
+                    interrupt,
+                )
+            })
+            .collect::<Result<Vec<Recorded>, EndError>>()
     });
     if let Some(signal) = caught {
         return Ok(Ended::Stopped(signal));
     }
-    let Recorded {
-        mut report,
+    let mut report = String::new();
+    for Recorded {
+        report: part,
         worktree,
-    } = recorded?;
-    if let Some(worktree) = worktree {
-        store.remove_worktree(&thread.to_string())?;
-        if let Some(repository) = worktree.parent() {
-            let _ = fs::remove_dir(repository);
+    } in recorded?
+    {
+        report.push_str(&part);
+        if let Some((name, worktree)) = worktree {
+            store.remove_worktree(&name)?;
+            if let Some(repository) = worktree.parent() {
+                let _ = fs::remove_dir(repository);
+            }
+            let _ = writeln!(report, "removed the worktree {}", worktree.display());
         }
-        let _ = writeln!(report, "removed the worktree {}", worktree.display());
     }
     match fs::remove_dir_all(session::state_root(&store, thread)) {
         Ok(()) => report.push_str("removed the agents' state\n"),
@@ -190,22 +204,22 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
     Ok(Ended::Done(report))
 }
 
-/// What the last snapshot left to do: the report so far, and the worktree to remove.
+/// What an agent's last snapshot left to do: the report so far, and the worktree to remove,
+/// by name and directory.
 struct Recorded {
     report: String,
-    worktree: Option<PathBuf>,
+    worktree: Option<(String, PathBuf)>,
 }
 
 fn record_last(
     store: &Store,
     thread: ThreadId,
     slot: AgentSlot,
-    globals: &GlobalPatterns,
-    commits: &CommitKey,
+    (globals, commits): (&GlobalPatterns, &CommitKey),
     force: bool,
     interrupt: &AtomicBool,
 ) -> Result<Recorded, EndError> {
-    let name = thread.to_string();
+    let name = session::worktree_name(thread, slot.agent());
     let mut report = String::new();
     let worktree = match store.worktree_dir(&name) {
         Ok(worktree) => worktree,
@@ -255,7 +269,7 @@ fn record_last(
     }
     Ok(Recorded {
         report,
-        worktree: Some(worktree),
+        worktree: Some((name, worktree)),
     })
 }
 

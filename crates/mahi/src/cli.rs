@@ -297,10 +297,7 @@ pub(crate) struct HandoffCommand {
 pub(crate) struct EndCommand {
     /// The thread to end, as `mahi threads` lists it.
     pub(crate) thread: ThreadId,
-    /// Which of your agents in the thread to record last, when it has several.
-    #[arg(long, value_name = "NAME", value_parser = parse_agent)]
-    pub(crate) agent: Option<AgentName>,
-    /// Removes the worktree even when its last snapshot leaves out paths it cannot record,
+    /// Removes the worktrees even when its last snapshot leaves out paths it cannot record,
     /// such as files too large or unreadable, which are then lost.
     #[arg(long)]
     pub(crate) force: bool,
