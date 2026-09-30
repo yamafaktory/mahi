@@ -3,6 +3,7 @@
 mod card;
 mod commits;
 mod fetched;
+mod handoff;
 mod key;
 mod meta;
 mod node;
@@ -26,6 +27,10 @@ pub use fetched::{
     Accepted,
     Refusal,
     accept_fetched,
+};
+pub use handoff::{
+    Briefing,
+    MAX_BRIEFING_BYTES,
 };
 pub use key::{
     KeyError,

@@ -3,12 +3,17 @@
 #[cfg(not(unix))]
 compile_error!("mahi supports Linux and macOS only");
 
+mod changes;
 mod fetch;
 mod push;
 mod snapshot;
 mod store;
 mod worktree;
 
+pub use changes::{
+    Change,
+    Changes,
+};
 pub use fetch::{
     FETCHED_PREFIX,
     MAX_FETCHED_REFS,

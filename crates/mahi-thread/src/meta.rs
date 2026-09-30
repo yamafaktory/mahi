@@ -726,7 +726,7 @@ fn validate_title(title: &str) -> Result<(), InvalidMeta> {
     Ok(())
 }
 
-fn is_invisible(c: char) -> bool {
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'

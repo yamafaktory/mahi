@@ -73,7 +73,7 @@ pub const COMMITTER_EMAIL: &str = "mahi@mahi.invalid";
 const MAX_ENTRY_NAME_BYTES: usize = 255;
 const MAX_COMMIT_BYTES: u64 = 64 * 1024;
 const SIGNATURE_HEADER: &str = "gpgsig";
-const MAX_TREE_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_TREE_BYTES: u64 = 1024 * 1024;
 const DISABLE_REFLOG: &str = "core.logAllRefUpdates=false";
 const REF_LOCK_TIMEOUT: &str = "core.filesRefLockTimeout=5000";
 
@@ -706,7 +706,21 @@ impl Store {
         })
     }
 
-    fn require_bounded(&self, id: ObjectId, expected: Kind, limit: u64) -> Result<(), StoreError> {
+    pub(crate) fn require_bounded(
+        &self,
+        id: ObjectId,
+        expected: Kind,
+        limit: u64,
+    ) -> Result<(), StoreError> {
+        self.bounded_size(id, expected, limit).map(|_| ())
+    }
+
+    pub(crate) fn bounded_size(
+        &self,
+        id: ObjectId,
+        expected: Kind,
+        limit: u64,
+    ) -> Result<u64, StoreError> {
         let header = self
             .repo
             .try_find_header(id)?
@@ -715,7 +729,7 @@ impl Store {
         if header.size() > limit {
             return Err(StoreError::TooLarge { id, limit });
         }
-        Ok(())
+        Ok(header.size())
     }
 
     pub(crate) fn require_kind(&self, id: ObjectId, expected: Kind) -> Result<(), StoreError> {
