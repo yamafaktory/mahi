@@ -40,6 +40,7 @@ iroh-gossip = { version = "0.101.0", default-features = false, features = ["net"
 libc = { version = "0.2.189", default-features = false }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode", "safe-encode", "std"] }
 n0-future = { version = "0.3.2", default-features = false }
+mahi-agent = { path = "crates/mahi-agent" }
 mahi-core = { path = "crates/mahi-core" }
 mahi-http = { path = "crates/mahi-http" }
 mahi-crypto = { path = "crates/mahi-crypto" }

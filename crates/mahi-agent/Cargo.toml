@@ -1,0 +1,18 @@
+[package]
+authors.workspace = true
+description = "How mahi speaks with the agents it wraps: their hooks' messages and their own files."
+edition.workspace = true
+license.workspace = true
+name = "mahi-agent"
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+mahi-thread = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

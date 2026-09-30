@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 age = { version = "0.11.5", default-features = false }
 libfuzzer-sys = "0.4.13"
+mahi-agent = { path = "../crates/mahi-agent" }
 mahi-core = { path = "../crates/mahi-core" }
 mahi-crypto = { path = "../crates/mahi-crypto" }
 mahi-http = { path = "../crates/mahi-http" }
@@ -113,6 +114,20 @@ bench = false
 [[bin]]
 name = "proxy-request"
 path = "fuzz_targets/proxy_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent-hook"
+path = "fuzz_targets/agent_hook.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "claude-code"
+path = "fuzz_targets/claude_code.rs"
 test = false
 doc = false
 bench = false

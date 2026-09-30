@@ -8,7 +8,9 @@ use clap::{
     Args,
     Parser,
     Subcommand,
+    builder::TypedValueParser as _,
 };
+use mahi_agent::hook::HookKind;
 use mahi_core::{
     AgentName,
     AgentSlot,
@@ -27,7 +29,6 @@ use crate::{
         EnvName,
         EnvNameError,
     },
-    hook::HookKind,
     profile::Profile,
     remote::RemoteName,
 };
@@ -139,7 +140,7 @@ impl InviteCommand {
 #[derive(Debug, Args, PartialEq, Eq)]
 pub(crate) struct HookCommand {
     /// What happened.
-    #[arg(value_enum)]
+    #[arg(value_parser = hook_kind())]
     pub(crate) kind: HookKind,
 }
 
@@ -303,6 +304,14 @@ pub(crate) struct EndCommand {
     /// such as files too large or unreadable, which are then lost.
     #[arg(long)]
     pub(crate) force: bool,
+}
+
+fn hook_kind() -> impl clap::builder::TypedValueParser<Value = HookKind> {
+    clap::builder::PossibleValuesParser::new(
+        HookKind::all()
+            .map(|kind| clap::builder::PossibleValue::new(kind.as_str()).help(kind.description())),
+    )
+    .try_map(|name| HookKind::parse(name.as_bytes()).ok_or("not a hook event"))
 }
 
 fn parse_agent(text: &str) -> Result<AgentName, NameError> {

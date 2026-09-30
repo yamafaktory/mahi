@@ -28,16 +28,21 @@ use std::{
     },
 };
 
-use clap::ValueEnum;
-use mahi_thread::MAX_EVENT_BYTES;
+use mahi_agent::hook::{
+    self,
+    MAX_MESSAGE_BYTES,
+};
+pub(crate) use mahi_agent::hook::{
+    HookKind,
+    HookMessage,
+    MAX_PAYLOAD_BYTES,
+};
 use rustix::event::{
     PollFd,
     PollFlags,
     Timespec,
 };
 
-const LONGEST_NAME: usize = 16;
-const LENGTH_BYTES: usize = 4;
 const DEADLINE: Duration = Duration::from_secs(2);
 const DRAIN_LIMIT: Duration = Duration::from_secs(5);
 const ERROR_PAUSE: Duration = Duration::from_millis(50);
@@ -45,27 +50,6 @@ const POLL: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 50_000_000,
 };
-
-/// The largest payload a hook can report: an event holds its name, a newline, and the payload.
-pub(crate) const MAX_PAYLOAD_BYTES: usize = MAX_EVENT_BYTES - LONGEST_NAME - 1;
-
-/// What an agent's hook reports to the `mahi run` that started the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum HookKind {
-    /// The user sent the agent a prompt.
-    Prompt,
-    /// The agent used a tool, which may have changed the worktree.
-    Tool,
-    /// The agent finished its turn.
-    TurnEnd,
-}
-
-/// One event an agent's hook reported, with the payload it read from its standard input.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct HookMessage {
-    pub(crate) kind: HookKind,
-    pub(crate) payload: Vec<u8>,
-}
 
 /// What the hook server hands on: a message, or its end once the agent is gone.
 #[derive(Debug, PartialEq, Eq)]
@@ -77,22 +61,6 @@ pub(crate) enum Delivery {
     },
 }
 
-impl HookKind {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Prompt => "prompt",
-            Self::Tool => "tool",
-            Self::TurnEnd => "turn-end",
-        }
-    }
-
-    pub(crate) fn parse(name: &[u8]) -> Option<Self> {
-        [Self::Prompt, Self::Tool, Self::TurnEnd]
-            .into_iter()
-            .find(|kind| kind.as_str().as_bytes() == name)
-    }
-}
-
 /// Sends `kind` and up to [`MAX_PAYLOAD_BYTES`] of `input` to the socket at `socket`, as the
 /// event's name, a newline, the payload's length as four big-endian bytes, and the payload.
 ///
@@ -102,16 +70,12 @@ pub(crate) fn send(socket: &Path, kind: HookKind, input: impl Read) -> io::Resul
     input
         .take(u64::try_from(MAX_PAYLOAD_BYTES).unwrap_or(u64::MAX) + 1)
         .read_to_end(&mut payload)?;
-    if payload.len() > MAX_PAYLOAD_BYTES {
-        payload.clear();
-    }
-    let length = u32::try_from(payload.len()).map_err(io::Error::other)?;
+    let message = hook::encode(kind, &payload)
+        .or_else(|| hook::encode(kind, &[]))
+        .ok_or_else(|| io::Error::other("cannot encode the hook message"))?;
     let mut stream = UnixStream::connect(socket)?;
     stream.set_write_timeout(Some(DEADLINE))?;
-    stream.write_all(kind.as_str().as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.write_all(&length.to_be_bytes())?;
-    stream.write_all(&payload)?;
+    stream.write_all(&message)?;
     stream.shutdown(Shutdown::Write)
 }
 
@@ -203,7 +167,6 @@ fn serve_connections(
 
 fn receive(mut stream: UnixStream) -> Option<HookMessage> {
     let deadline = Instant::now() + DEADLINE;
-    let limit = LONGEST_NAME + 1 + LENGTH_BYTES + MAX_PAYLOAD_BYTES;
     let mut received = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {
@@ -219,22 +182,11 @@ fn receive(mut stream: UnixStream) -> Option<HookMessage> {
             break;
         }
         received.extend_from_slice(buffer.get(..read)?);
-        if received.len() > limit {
+        if received.len() > MAX_MESSAGE_BYTES {
             return None;
         }
     }
-    let end = received
-        .iter()
-        .take(LONGEST_NAME + 1)
-        .position(|&byte| byte == b'\n')?;
-    let kind = HookKind::parse(received.get(..end)?)?;
-    let rest = received.get(end + 1..)?;
-    let (length, payload) = rest.split_first_chunk::<LENGTH_BYTES>()?;
-    let length = usize::try_from(u32::from_be_bytes(*length)).ok()?;
-    (length == payload.len() && length <= MAX_PAYLOAD_BYTES).then(|| HookMessage {
-        kind,
-        payload: payload.to_vec(),
-    })
+    hook::decode(&received)
 }
 
 #[cfg(test)]
@@ -328,7 +280,7 @@ mod tests {
     #[test]
     fn a_payload_over_the_limit_is_sent_empty_and_cut_off_raw() {
         let server = server();
-        let large = vec![b'a'; MAX_PAYLOAD_BYTES + LENGTH_BYTES + LONGEST_NAME + 2];
+        let large = vec![b'a'; MAX_MESSAGE_BYTES + 1];
         raw(&server.socket, &framed(b"tool", 0, &large));
         send(&server.socket, HookKind::Prompt, large.as_slice()).unwrap();
         assert_eq!(next(&server), message(HookKind::Prompt, b""));

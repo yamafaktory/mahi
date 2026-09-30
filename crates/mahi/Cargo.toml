@@ -13,6 +13,7 @@ version.workspace = true
 age = { workspace = true }
 clap = { workspace = true }
 getrandom = { workspace = true }
+mahi-agent = { workspace = true }
 mahi-core = { workspace = true }
 mahi-crypto = { workspace = true }
 mahi-http = { workspace = true }
@@ -25,8 +26,6 @@ mahi-ssh = { workspace = true }
 mahi-store = { workspace = true }
 mahi-thread = { workspace = true }
 rustix = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 sha2 = { workspace = true }
 ssh-key = { workspace = true }
 subtle = { workspace = true }

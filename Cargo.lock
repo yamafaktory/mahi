@@ -3466,6 +3466,7 @@ dependencies = [
  "getrandom 0.4.3",
  "gix",
  "libc",
+ "mahi-agent",
  "mahi-core",
  "mahi-crypto",
  "mahi-http",
@@ -3478,8 +3479,6 @@ dependencies = [
  "mahi-store",
  "mahi-thread",
  "rustix",
- "serde",
- "serde_json",
  "sha2 0.10.9",
  "signature 2.2.0",
  "ssh-key 0.6.7",
@@ -3488,6 +3487,15 @@ dependencies = [
  "thiserror 2.0.21",
  "vt100",
  "zeroize",
+]
+
+[[package]]
+name = "mahi-agent"
+version = "0.1.0"
+dependencies = [
+ "mahi-thread",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
