@@ -900,10 +900,18 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         let fixture = fixture();
         let settings = config_dir(&fixture.home).settings_file();
         std::fs::write(&settings, "palette-key = \"f5\"\n").unwrap();
-        let mut session = Session::start(&fixture, &[&["run"][..], &ECHO_AGENT].concat());
+        let mut session = Session::start(
+            &fixture,
+            &[
+                "run",
+                "sh",
+                "-c",
+                "printf 'ready\\n'; read first; read line; echo \"got:$line\"",
+            ],
+        );
         session.wait_for("ready");
         assert!(session.text().contains("F5 opens mahi's palette"));
-        session.type_keys(b"\0");
+        session.type_keys(b"\0\r");
         session.wait_for("^@");
         session.type_keys(b"\x1b[15~");
         session.wait_for_screen("╭─ mahi");
