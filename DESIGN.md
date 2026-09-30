@@ -15,6 +15,7 @@ Review shouldn't be a gate at the end. When teammates watch, steer and prompt ea
 - **Git-native.** All durable state lives in git refs on the project's existing remote. The result of a thread is one ordinary remote branch.
 - **Private by default.** Rich history (transcripts, agent state) is end-to-end encrypted before it becomes a git object.
 - **Sandboxed.** Every agent runs inside an OS-level sandbox, so teammates can prompt each other's agents safely.
+- **Fuzzed.** Everything that reads untrusted input is fuzzed as well as unit-tested (see Testing).
 - **Use the forge for what it's good at.** Final diff viewing and approval happen in GitHub/GitLab. mahi does not rebuild review tooling.
 
 ## Non-goals (decided)
@@ -232,6 +233,13 @@ Branch deletion triggers cleanup:
 - Async work across time zones goes through the remote; realtime needs peers online together.
 - The LLM itself is a hosted API unless a local model is used.
 
+## Testing
+
+- Unit and integration tests cover behaviour; property tests (`proptest`) cover invariants such as round trips and ordering, inside the unit tests.
+- Fuzzing is used wherever it can be: every decoder and parser of input from a peer, a remote, an agent, a transcript or a file in a worktree has a fuzz target. The targets live in `fuzz/`, a crate outside the workspace built with `cargo-fuzz` (libFuzzer, on nightly, as `rustfmt` already is). It is a development tool only, never part of the mahi binary, so the pure-Rust rule for mahi's dependencies is unchanged. Each target checks that any input is accepted or refused without a panic, a hang or memory beyond the documented bounds, and, where there is an encoder, that decoding what was encoded gives it back.
+- Targets, by crate: `mahi-core` (thread ref names, participant, agent and slot names); `mahi-crypto` (opening sealed content, unwrapping thread keys); `mahi-identity` (ssh-agent answers, identity and key files); `mahi-thread` (`meta` documents and their signatures, participant cards, transcript turns, session manifests and pieces, fetched-ref acceptance, handoff briefings); `mahi-store` (send-pack advertisements and reports, tree listings and changed paths, snapshot names); `mahi-ssh` (`known_hosts`, remote URLs, exec output); `mahi-live` (tickets, live frames, meta requests); `mahi-proxy` (`CONNECT` requests and host names); `mahi-tls` (records, handshake messages, certificates and their verification); `mahi` (hook messages, Claude Code hook payloads and session logs, profiles' session directories).
+- `just fuzz <target> [seconds]` runs one target. CI runs every target briefly on each push to `main` and for longer on a nightly schedule, with the corpora cached between runs. A crash becomes a regression test, with its input, in the unit tests of the crate it was found in.
+
 ## Milestones
 
 1. `mahi run -- <agent>`: sandbox, snapshots, encrypted transcript refs, local `mahi resume`, local `mahi end`.
@@ -240,6 +248,8 @@ Branch deletion triggers cleanup:
 4. Multi-agent threads: remote prompt queue, `mahi agent add`, merges, MCP coordination tools.
 5. Landing: integration, curated commits with trailers, PR description generation.
 6. Compaction and branch-deletion cleanup; caps on how much snapshots and transcripts add to the repository.
+
+Fuzzing (see Testing) comes as its own step after milestone 3, covering every parser written so far, and then grows with each new one.
 
 ## Later
 
