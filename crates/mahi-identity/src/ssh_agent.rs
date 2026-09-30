@@ -113,21 +113,7 @@ impl SshAgent {
         put_string(&mut body, data)?;
         body.extend_from_slice(&0u32.to_be_bytes());
         let response = self.exchange(&body, MAX_RESPONSE_BYTES)?;
-        match response.split_first() {
-            Some((&SIGN_RESPONSE, rest)) => {
-                let (blob, rest) = take_string(rest).ok_or(AgentError::Malformed)?;
-                if !rest.is_empty() {
-                    return Err(AgentError::Malformed);
-                }
-                let signature = Signature::try_from(blob).map_err(|_| AgentError::Malformed)?;
-                if signature.algorithm() != Algorithm::Ed25519 {
-                    return Err(AgentError::Malformed);
-                }
-                Ok(signature)
-            }
-            Some((&FAILURE, [])) => Err(AgentError::Refused),
-            _ => Err(AgentError::Malformed),
-        }
+        parse_signature(&response)
     }
 
     /// Lists the ed25519 keys the agent holds, each once, with their comments. Keys of other
@@ -141,36 +127,7 @@ impl SshAgent {
     /// [`AgentError`] if the connection fails.
     pub fn ed25519_keys(&self) -> Result<Vec<PublicKey>, AgentError> {
         let response = self.exchange(&[IDENTITIES_REQUEST], MAX_IDENTITIES_BYTES)?;
-        let rest = match response.split_first() {
-            Some((&IDENTITIES_ANSWER, rest)) => rest,
-            Some((&FAILURE, [])) => return Err(AgentError::Refused),
-            _ => return Err(AgentError::Malformed),
-        };
-        let (count, mut rest) = rest.split_first_chunk::<4>().ok_or(AgentError::Malformed)?;
-        let count = u32::from_be_bytes(*count);
-        if count > MAX_IDENTITIES {
-            return Err(AgentError::Malformed);
-        }
-        let mut keys = Vec::new();
-        for _ in 0..count {
-            let (blob, after_blob) = take_string(rest).ok_or(AgentError::Malformed)?;
-            let (comment, after_comment) = take_string(after_blob).ok_or(AgentError::Malformed)?;
-            rest = after_comment;
-            let Ok(mut key) = PublicKey::from_bytes(blob) else {
-                continue;
-            };
-            let duplicate = keys
-                .iter()
-                .any(|known: &PublicKey| known.key_data() == key.key_data());
-            if key.algorithm() == Algorithm::Ed25519 && !duplicate {
-                key.set_comment(sanitised(comment));
-                keys.push(key);
-            }
-        }
-        if !rest.is_empty() {
-            return Err(AgentError::Malformed);
-        }
-        Ok(keys)
+        parse_identities(&response)
     }
 
     fn exchange(&self, body: &[u8], max_response: u32) -> Result<Vec<u8>, AgentError> {
@@ -239,6 +196,59 @@ impl AgentSigner {
             .map_err(|_| AgentError::WrongKey)?;
         Ok(signature)
     }
+}
+
+/// Reads the agent's answer to a sign request: an ed25519 signature, or a refusal.
+pub(crate) fn parse_signature(response: &[u8]) -> Result<Signature, AgentError> {
+    match response.split_first() {
+        Some((&SIGN_RESPONSE, rest)) => {
+            let (blob, rest) = take_string(rest).ok_or(AgentError::Malformed)?;
+            if !rest.is_empty() {
+                return Err(AgentError::Malformed);
+            }
+            let signature = Signature::try_from(blob).map_err(|_| AgentError::Malformed)?;
+            if signature.algorithm() != Algorithm::Ed25519 {
+                return Err(AgentError::Malformed);
+            }
+            Ok(signature)
+        }
+        Some((&FAILURE, [])) => Err(AgentError::Refused),
+        _ => Err(AgentError::Malformed),
+    }
+}
+
+/// Reads the agent's answer to a key listing: its ed25519 keys, each once.
+pub(crate) fn parse_identities(response: &[u8]) -> Result<Vec<PublicKey>, AgentError> {
+    let rest = match response.split_first() {
+        Some((&IDENTITIES_ANSWER, rest)) => rest,
+        Some((&FAILURE, [])) => return Err(AgentError::Refused),
+        _ => return Err(AgentError::Malformed),
+    };
+    let (count, mut rest) = rest.split_first_chunk::<4>().ok_or(AgentError::Malformed)?;
+    let count = u32::from_be_bytes(*count);
+    if count > MAX_IDENTITIES {
+        return Err(AgentError::Malformed);
+    }
+    let mut keys = Vec::new();
+    for _ in 0..count {
+        let (blob, after_blob) = take_string(rest).ok_or(AgentError::Malformed)?;
+        let (comment, after_comment) = take_string(after_blob).ok_or(AgentError::Malformed)?;
+        rest = after_comment;
+        let Ok(mut key) = PublicKey::from_bytes(blob) else {
+            continue;
+        };
+        let duplicate = keys
+            .iter()
+            .any(|known: &PublicKey| known.key_data() == key.key_data());
+        if key.algorithm() == Algorithm::Ed25519 && !duplicate {
+            key.set_comment(sanitised(comment));
+            keys.push(key);
+        }
+    }
+    if !rest.is_empty() {
+        return Err(AgentError::Malformed);
+    }
+    Ok(keys)
 }
 
 fn sanitised(comment: &[u8]) -> String {
@@ -453,6 +463,35 @@ mod tests {
             "{shown:?}"
         );
         assert_eq!(shown.chars().count(), MAX_COMMENT_CHARS);
+    }
+
+    #[test]
+    fn answers_are_read_without_the_agent() {
+        assert!(matches!(
+            parse_signature(&[FAILURE]),
+            Err(AgentError::Refused)
+        ));
+        assert!(matches!(
+            parse_signature(&[FAILURE, 0]),
+            Err(AgentError::Malformed)
+        ));
+        assert!(matches!(
+            parse_signature(&[SIGN_RESPONSE]),
+            Err(AgentError::Malformed)
+        ));
+        assert!(matches!(
+            parse_identities(&[FAILURE]),
+            Err(AgentError::Refused)
+        ));
+        let key = ed25519();
+        let entries: Vec<(Vec<u8>, &[u8])> = vec![(key.public_key().to_bytes().unwrap(), b"one")];
+        let answer = identities(&entries, 1, &[]);
+        let keys = parse_identities(answer.get(4..).unwrap()).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(matches!(
+            parse_identities(identities(&entries, 1, b"x").get(4..).unwrap()),
+            Err(AgentError::Malformed)
+        ));
     }
 
     #[test]

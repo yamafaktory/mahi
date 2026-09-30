@@ -5,6 +5,8 @@ compile_error!("mahi supports Linux and macOS only");
 
 mod changes;
 mod fetch;
+#[cfg(fuzzing)]
+pub mod fuzzing;
 mod push;
 mod snapshot;
 mod store;

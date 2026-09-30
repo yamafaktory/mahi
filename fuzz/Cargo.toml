@@ -19,6 +19,7 @@ mahi-identity = { path = "../crates/mahi-identity" }
 mahi-live = { path = "../crates/mahi-live" }
 mahi-proxy = { path = "../crates/mahi-proxy" }
 mahi-ssh = { path = "../crates/mahi-ssh" }
+mahi-store = { path = "../crates/mahi-store" }
 mahi-thread = { path = "../crates/mahi-thread" }
 
 [workspace]
@@ -128,6 +129,20 @@ bench = false
 [[bin]]
 name = "claude-code"
 path = "fuzz_targets/claude_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh-agent-answer"
+path = "fuzz_targets/ssh_agent_answer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "send-pack"
+path = "fuzz_targets/send_pack.rs"
 test = false
 doc = false
 bench = false

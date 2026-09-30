@@ -361,7 +361,7 @@ fn advertisement<T: Transport>(
     })
 }
 
-fn parse_advertisement(
+pub(crate) fn parse_advertisement(
     next_line: &mut dyn FnMut(&mut String) -> io::Result<usize>,
     refs: &[ThreadRef],
 ) -> Result<(HashMap<String, ObjectId>, HashSet<ObjectId>), StoreError> {
@@ -402,7 +402,7 @@ fn parse_advertisement(
     ))
 }
 
-fn read_report(
+pub(crate) fn read_report(
     next_line: &mut dyn FnMut(&mut String) -> io::Result<usize>,
     sent: &HashSet<String>,
 ) -> Result<HashMap<String, Option<String>>, StoreError> {
