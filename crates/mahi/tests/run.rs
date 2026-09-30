@@ -761,6 +761,167 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         (exit_code(status.unwrap()), text)
     }
 
+    struct Session {
+        mahi: mahi_sandbox::PtyChild,
+        terminal: std::fs::File,
+        output: Arc<Mutex<Vec<u8>>>,
+        reader: thread::JoinHandle<()>,
+    }
+
+    impl Session {
+        fn start(fixture: &Fixture, arguments: &[&str]) -> Self {
+            let mut command = PtyCommand::new(
+                Path::new(env!("CARGO_BIN_EXE_mahi")),
+                &fixture.repo,
+                WindowSize { rows: 24, cols: 80 },
+            );
+            for argument in arguments {
+                command = command.arg(argument);
+            }
+            let mahi = command
+                .env("PATH", "/usr/bin:/bin:/usr")
+                .env("HOME", &fixture.home)
+                .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+                .env("SSH_AUTH_SOCK", &fixture.socket)
+                .env("USER", "tester")
+                .env("MAHI_LIVE", "off")
+                .spawn()
+                .unwrap();
+            let terminal = mahi.writer().unwrap();
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let collected = Arc::clone(&output);
+            let mut reader = mahi.reader().unwrap();
+            let reader = thread::spawn(move || {
+                let mut buffer = [0_u8; 4096];
+                while let Ok(read) = reader.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    collected.lock().unwrap().extend_from_slice(&buffer[..read]);
+                }
+            });
+            Self {
+                mahi,
+                terminal,
+                output,
+                reader,
+            }
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+        }
+
+        fn screen(&self) -> String {
+            let mut parser = vt100::Parser::new(24, 80, 0);
+            parser.process(&self.output.lock().unwrap());
+            parser.screen().contents()
+        }
+
+        fn wait_for(&self, text: &str) {
+            wait_until(text, || self.text().contains(text));
+        }
+
+        fn wait_for_screen(&self, text: &str) {
+            wait_until(text, || self.screen().contains(text));
+        }
+
+        fn type_keys(&mut self, keys: &[u8]) {
+            self.terminal.write_all(keys).unwrap();
+        }
+
+        fn pause_between_keys() {
+            thread::sleep(Duration::from_millis(300));
+        }
+
+        fn finish(mut self) -> (i32, String) {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = self.mahi.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "mahi did not finish");
+                thread::sleep(Duration::from_millis(20));
+            };
+            wait_until("the end of mahi's output", || self.reader.is_finished());
+            (exit_code(status), self.text())
+        }
+    }
+
+    const ECHO_AGENT: [&str; 3] = [
+        "sh",
+        "-c",
+        "printf 'ready\\n'; read line; echo \"got:$line\"",
+    ];
+
+    #[test]
+    fn ctrl_space_opens_the_palette_over_the_agent_and_escape_gives_the_keys_back() {
+        let fixture = fixture();
+        let mut session = Session::start(&fixture, &[&["run"][..], &ECHO_AGENT].concat());
+        session.wait_for("ready");
+        assert!(session.text().contains("Ctrl-Space opens mahi's palette"));
+        session.type_keys(b"\0");
+        session.wait_for_screen("╭─ mahi");
+        session.type_keys(b"abc");
+        session.wait_for_screen("› abc");
+        session.type_keys(b"\x1b");
+        Session::pause_between_keys();
+        session.type_keys(b"hello\r");
+        let (code, text) = session.finish();
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("got:hello"), "{text}");
+        assert!(!text.contains("got:abc"), "{text}");
+    }
+
+    #[test]
+    fn output_held_while_the_palette_is_open_is_shown_when_the_agent_ends() {
+        let fixture = fixture();
+        let mut session = Session::start(
+            &fixture,
+            &[
+                "run",
+                "sh",
+                "-c",
+                "printf 'ready\\n'; sleep 1; printf 'late-output\\n'",
+            ],
+        );
+        session.wait_for("ready");
+        session.type_keys(b"\0");
+        session.wait_for_screen("╭─ mahi");
+        let (code, text) = session.finish();
+        assert_eq!(code, 0, "{text}");
+        let box_at = text.find('╭').unwrap();
+        let late_at = text.find("late-output").expect(&text);
+        assert!(late_at > box_at, "{text}");
+    }
+
+    #[test]
+    fn palette_key_in_config_toml_changes_the_key_and_a_bad_one_stops_the_run() {
+        let fixture = fixture();
+        let settings = config_dir(&fixture.home).settings_file();
+        std::fs::write(&settings, "palette-key = \"f5\"\n").unwrap();
+        let mut session = Session::start(&fixture, &[&["run"][..], &ECHO_AGENT].concat());
+        session.wait_for("ready");
+        assert!(session.text().contains("F5 opens mahi's palette"));
+        session.type_keys(b"\0");
+        session.wait_for("^@");
+        session.type_keys(b"\x1b[15~");
+        session.wait_for_screen("╭─ mahi");
+        session.type_keys(b"\x1b[15~");
+        session.type_keys(b"x\r");
+        let (code, text) = session.finish();
+        assert_eq!(code, 0, "{text}");
+        assert!(text.contains("ready\r\n^@"), "{text:?}");
+        assert!(text.contains("got:\x1b[15~x"), "{text:?}");
+
+        std::fs::write(&settings, "palette-key = \"ctrl-m\"\n").unwrap();
+        let output = fixture.mahi(&[&["run"][..], &ECHO_AGENT].concat());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(output.status.code(), Some(0), "{stderr}");
+        assert!(stderr.contains("palette-key"), "{stderr}");
+        assert!(stderr.contains("config.toml"), "{stderr}");
+    }
+
     fn snapshot_head(fixture: &Fixture, thread: &str) -> gix::ObjectId {
         gix::open(&fixture.repo)
             .unwrap()

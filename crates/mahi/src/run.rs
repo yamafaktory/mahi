@@ -99,6 +99,11 @@ use mahi_store::{
     Store,
     StoreError,
 };
+use mahi_term::{
+    KeyScanner,
+    PaletteKey,
+    Segment,
+};
 use mahi_thread::{
     KeyError,
     OwnerError,
@@ -155,6 +160,10 @@ use crate::{
         NetworkError,
         Running,
     },
+    palette::{
+        Repainter,
+        Screen,
+    },
     profile::{
         self,
         Profile,
@@ -180,6 +189,10 @@ use crate::{
         self,
         SessionOf,
         SessionSource,
+    },
+    settings::{
+        Settings,
+        SettingsError,
     },
     sync::{
         self,
@@ -235,10 +248,14 @@ const OUTPUT_LIMIT: Duration = Duration::from_secs(5);
 const EXIT_POLL: Duration = Duration::from_millis(50);
 const STOP_POLL: Duration = Duration::from_millis(50);
 const KILL_GRACE: Duration = Duration::from_secs(2);
+const PALETTE_WAIT: Duration = Duration::from_millis(200);
+const PALETTE_POLL: Duration = Duration::from_millis(10);
 const BROKEN_PIPE_CODE: i32 = 128 + 13;
 
 #[derive(Debug, Error)]
 pub(crate) enum RunError {
+    #[error(transparent)]
+    Settings(#[from] SettingsError),
     #[error("cannot find the current directory")]
     CurrentDirectory(#[source] io::Error),
     #[error("cannot find the repository's git directory")]
@@ -393,6 +410,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let store = Store::discover(&cwd)?;
     let profile = command.profile();
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let settings = Settings::load(&config)?;
     let credentials = gather_credentials(&config, &command.options, profile, environment)?;
     let mut prepared = Prepared::new(
         environment,
@@ -407,6 +425,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         },
         credentials,
     )?;
+    prepared.palette_key = settings.palette_key;
     prepared.live = live;
     prepared.sync = SyncSetup::gather(&prepared.store, environment, true);
     let agent_name = session::agent_from(Path::new(command.agent()));
@@ -495,6 +514,7 @@ pub(crate) fn resume(
     let slot = session::pick_slot(&store, command.thread, &participant, command.agent.as_ref())?;
     let (program, arguments, profile) = resumed_command(command, &slot);
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let settings = Settings::load(&config)?;
     let credentials = gather_credentials(&config, &command.options, profile, environment)?;
     let mut prepared = Prepared::new(
         environment,
@@ -509,6 +529,7 @@ pub(crate) fn resume(
         },
         credentials,
     )?;
+    prepared.palette_key = settings.palette_key;
     prepared.live = live_setup(environment, &config, owner.clone(), bootstrap)?;
     prepared.sync = SyncSetup::gather(&prepared.store, environment, owns_meta);
     let commits = match listed_and_fetched(
@@ -623,6 +644,7 @@ pub(crate) fn handoff(
     }
     let profile = command.options.profile_for(program);
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let settings = Settings::load(&config)?;
     let credentials = gather_credentials(&config, &command.options, profile, environment)?;
     let mut prepared = Prepared::new(
         environment,
@@ -637,6 +659,7 @@ pub(crate) fn handoff(
         },
         credentials,
     )?;
+    prepared.palette_key = settings.palette_key;
     prepared.live = live_setup(environment, &config, owner.clone(), bootstrap)?;
     prepared.sync = SyncSetup::gather(&prepared.store, environment, owner == own);
     let commits = match listed_and_fetched(
@@ -804,6 +827,7 @@ pub(crate) fn join_run(
     let store = Store::discover(&cwd)?;
     let profile = command.options.profile_for(program);
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let settings = Settings::load(&config)?;
     let credentials = gather_credentials(&config, &command.options, profile, environment)?;
     let mut prepared = Prepared::new(
         environment,
@@ -818,6 +842,7 @@ pub(crate) fn join_run(
         },
         credentials,
     )?;
+    prepared.palette_key = settings.palette_key;
     prepared.live = live_setup(
         environment,
         &config,
@@ -966,6 +991,7 @@ struct Prepared {
     live: Option<LiveSetup>,
     sync: Option<SyncSetup>,
     handoff: Option<PathBuf>,
+    palette_key: PaletteKey,
 }
 
 impl Prepared {
@@ -1037,6 +1063,7 @@ impl Prepared {
             live: None,
             sync: None,
             handoff: None,
+            palette_key: PaletteKey::default(),
         })
     }
 
@@ -1071,6 +1098,12 @@ impl Prepared {
             eprintln!(
                 "mahi: {} profile (--no-profile runs the agent without it)",
                 profile.name
+            );
+        }
+        if terminal::is_interactive() {
+            eprintln!(
+                "mahi: {} opens mahi's palette (palette-key in config.toml changes it)",
+                self.palette_key
             );
         }
         let session = self.session_source(&started);
@@ -1146,6 +1179,7 @@ impl Prepared {
         finish_run(
             child,
             raw,
+            self.palette_key,
             termination,
             Background {
                 recorder,
@@ -1238,6 +1272,7 @@ fn finish_turns(turns: Option<TurnWorker>) {
 fn finish_run(
     child: PtyChild,
     raw: Option<RawMode>,
+    palette_key: PaletteKey,
     termination: TerminationSignals,
     background: Background,
     proxy: Option<Running>,
@@ -1248,7 +1283,13 @@ fn finish_run(
         turns,
         pusher,
     } = background;
-    let (code, received) = supervise(child, raw, termination, live.as_ref().map(LiveHost::tap));
+    let (code, received) = supervise(
+        child,
+        raw,
+        palette_key,
+        termination,
+        live.as_ref().map(LiveHost::tap),
+    );
     if let Some(live) = live {
         live.stop();
     }
@@ -1291,6 +1332,7 @@ fn finish_run(
 fn supervise(
     child: PtyChild,
     raw: Option<RawMode>,
+    palette_key: PaletteKey,
     termination: TerminationSignals,
     tap: Option<OutputTap>,
 ) -> (Result<Outcome, RunError>, Receiver<Event>) {
@@ -1301,7 +1343,8 @@ fn supervise(
             let _ = stop_events.send(Event::Stopped(signal));
         }
     });
-    let code = relay(child, raw.is_some(), events, &received, tap);
+    let palette = (raw.is_some() && terminal::is_interactive()).then_some(palette_key);
+    let code = relay(child, palette, events, &received, tap);
     drop(raw);
     (code, received)
 }
@@ -1672,24 +1715,31 @@ impl Host {
 
 fn relay(
     child: PtyChild,
-    interactive: bool,
+    palette: Option<PaletteKey>,
     events: mpsc::Sender<Event>,
     received: &Receiver<Event>,
     tap: Option<OutputTap>,
 ) -> Result<Outcome, RunError> {
     let writer = child.writer()?;
-    thread::spawn(move || forward_input(writer, interactive));
-    let resizer = child.resizer()?;
+    let repainter = Repainter::new(child.resizer()?);
+    let screen = Arc::new(Screen::new(
+        io::stdout(),
+        repainter.clone(),
+        palette.unwrap_or_default(),
+    ));
+    let input = palette.map(|key| (Arc::clone(&screen), KeyScanner::new(key)));
+    thread::spawn(move || forward_input(writer, input));
     let resize_tap = tap.clone();
+    let resize_screen = Arc::clone(&screen);
     thread::spawn(move || {
         let Ok(changes) = WindowChanges::listen() else {
             return;
         };
         while changes.wait().is_ok() {
-            let size = terminal::size();
-            if resizer.resize(size).is_err() {
+            let Some(size) = repainter.follow() else {
                 break;
-            }
+            };
+            let _ = resize_screen.resized();
             if let Some(tap) = &resize_tap {
                 tap.resize(size);
             }
@@ -1699,8 +1749,9 @@ fn relay(
     let progress = Arc::new(AtomicU64::new(0));
     let output_events = events.clone();
     let output_progress = Arc::clone(&progress);
+    let output_screen = Arc::clone(&screen);
     thread::spawn(move || {
-        let ended = copy_output(&mut reader, &output_progress, tap.as_ref());
+        let ended = copy_output(&mut reader, &output_progress, tap.as_ref(), &output_screen);
         let _ = output_events.send(Event::OutputEnded(ended));
     });
     let child = Arc::new(Mutex::new(child));
@@ -1708,20 +1759,30 @@ fn relay(
     thread::spawn(move || {
         let _ = events.send(Event::Exited(wait_for(&waited)));
     });
+    let outcome = await_outcome(&child, received, &progress);
+    let _ = screen.close();
+    outcome
+}
+
+fn await_outcome(
+    child: &Mutex<PtyChild>,
+    received: &Receiver<Event>,
+    progress: &AtomicU64,
+) -> Result<Outcome, RunError> {
     let mut output_done = false;
     loop {
         match received.recv() {
             Ok(Event::Exited(code)) if output_done => return Ok(Outcome::Exited(code?)),
             Ok(Event::Exited(code)) => {
-                return finish_output(received, &progress, code?);
+                return finish_output(received, progress, code?);
             }
             Ok(Event::OutputEnded(Ok(()))) => output_done = true,
             Ok(Event::OutputEnded(Err(error))) => {
-                kill(&child);
+                kill(child);
                 return output_failure(error).map(Outcome::Exited);
             }
             Ok(Event::Stopped(signal)) => {
-                kill(&child);
+                kill(child);
                 if !output_done {
                     await_output_end(received);
                 }
@@ -1805,16 +1866,15 @@ fn copy_output(
     reader: &mut impl Read,
     progress: &AtomicU64,
     tap: Option<&OutputTap>,
+    screen: &UserScreen,
 ) -> io::Result<()> {
-    let mut output = io::stdout().lock();
     let mut buffer = [0_u8; 8192];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
-            return Ok(());
+            return screen.close();
         }
-        output.write_all(&buffer[..read])?;
-        output.flush()?;
+        screen.output(&buffer[..read])?;
         if let Some(tap) = tap {
             tap.output(&buffer[..read]);
         }
@@ -1822,7 +1882,9 @@ fn copy_output(
     }
 }
 
-fn forward_input(mut writer: File, interactive: bool) {
+type UserScreen = Screen<io::Stdout, Repainter>;
+
+fn forward_input(mut writer: File, mut palette: Option<(Arc<UserScreen>, KeyScanner)>) {
     let mut input = io::stdin().lock();
     let mut buffer = [0_u8; 4096];
     let mut last = b'\n';
@@ -1833,16 +1895,54 @@ fn forward_input(mut writer: File, interactive: bool) {
             Err(_) => return,
         };
         let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
-            if !interactive {
-                end_input(&mut writer, last);
+            match &palette {
+                Some((screen, _)) => {
+                    let _ = screen.close();
+                }
+                None => end_input(&mut writer, last),
             }
             return;
         };
-        if writer.write_all(chunk).is_err() {
+        let forwarded = match &mut palette {
+            Some((screen, scanner)) => route_keys(chunk, scanner, screen, &mut writer),
+            None => writer.write_all(chunk),
+        };
+        if forwarded.is_err() {
             return;
         }
         last = chunk.last().copied().unwrap_or(last);
     }
+}
+
+fn route_keys(
+    chunk: &[u8],
+    scanner: &mut KeyScanner,
+    screen: &UserScreen,
+    writer: &mut File,
+) -> io::Result<()> {
+    for segment in scanner.scan(chunk) {
+        match segment {
+            Segment::Palette(key) if screen.is_open() => {
+                screen.close()?;
+                writer.write_all(key)?;
+            }
+            Segment::Palette(_) => open_palette(screen)?,
+            Segment::Pass(bytes) => {
+                let used = screen.typed(bytes)?;
+                writer.write_all(bytes.get(used..).unwrap_or_default())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_palette(screen: &UserScreen) -> io::Result<()> {
+    screen.open()?;
+    let deadline = Instant::now() + PALETTE_WAIT;
+    while screen.is_opening() && Instant::now() < deadline {
+        thread::sleep(PALETTE_POLL);
+    }
+    screen.open_now()
 }
 
 fn end_input(writer: &mut File, last: u8) {

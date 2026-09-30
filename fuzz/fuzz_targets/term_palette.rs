@@ -16,12 +16,14 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let mut keys = PaletteKeys::default();
     let mut filter = String::new();
     for chunk in [first, second] {
-        keys.read(chunk, |key| {
+        let used = keys.read(chunk, |key| {
             if let PaletteInput::Text(c) = key {
                 assert!(!c.is_control());
                 filter.push(c);
             }
+            true
         });
+        assert_eq!(used, chunk.len());
     }
     let body: Vec<u8> = input.iter().copied().filter(|&byte| byte != 0x1b).collect();
     let pasted = [&b"\x1b[200~"[..], &body].concat();
@@ -29,10 +31,13 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let mut keys = PaletteKeys::default();
     let mut escaped = false;
     for chunk in [&pasted[..cut], &pasted[cut..]] {
-        keys.read(chunk, |key| match key {
-            PaletteInput::Text(_) => {}
-            PaletteInput::Escape if cut == 1 => escaped = true,
-            _ => assert!(escaped, "a key inside a paste: {key:?}"),
+        keys.read(chunk, |key| {
+            match key {
+                PaletteInput::Text(_) => {}
+                PaletteInput::Escape if cut == 1 => escaped = true,
+                _ => assert!(escaped, "a key inside a paste: {key:?}"),
+            }
+            true
         });
     }
     let mut tracker = OutputTracker::default();

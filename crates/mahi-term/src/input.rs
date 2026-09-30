@@ -41,10 +41,11 @@ pub struct PaletteKeys {
 }
 
 impl PaletteKeys {
-    /// Reads `chunk` and calls `on` with each key it holds. An escape alone at the end of a
-    /// chunk is the Escape key; the start of a bracketed paste split between chunks is still
-    /// recognised, so nothing pasted is read as a key.
-    pub fn read(&mut self, chunk: &[u8], mut on: impl FnMut(PaletteInput)) {
+    /// Reads `chunk` and calls `on` with each key it holds, until `on` returns `false`, and
+    /// returns how many bytes it read. An escape alone at the end of a chunk is the Escape
+    /// key; the start of a bracketed paste split between chunks is still recognised, so
+    /// nothing pasted is read as a key.
+    pub fn read(&mut self, chunk: &[u8], mut on: impl FnMut(PaletteInput) -> bool) -> usize {
         let mut at = 0;
         while let Some(rest) = chunk.get(at..).filter(|rest| !rest.is_empty()) {
             let (used, input) = if self.pasting {
@@ -53,10 +54,13 @@ impl PaletteKeys {
                 self.typed(rest)
             };
             at += used;
-            if let Some(input) = input {
-                on(input);
+            if let Some(input) = input
+                && !on(input)
+            {
+                break;
             }
         }
+        at
     }
 
     fn pasted(&mut self, rest: &[u8]) -> (usize, Option<PaletteInput>) {
@@ -231,7 +235,10 @@ mod tests {
         let mut keys = PaletteKeys::default();
         let mut inputs = Vec::new();
         for chunk in chunks {
-            keys.read(chunk, |input| inputs.push(input));
+            keys.read(chunk, |input| {
+                inputs.push(input);
+                true
+            });
         }
         inputs
     }
@@ -330,5 +337,15 @@ mod tests {
             }
         }
         assert_eq!(inputs(&[b"\x1b[2", b"x"]), text("x"));
+    }
+
+    #[test]
+    fn reading_stops_where_the_caller_says_and_tells_how_far_it_got() {
+        let mut keys = PaletteKeys::default();
+        let chunk = b"ab\x1b[27urest";
+        let used = keys.read(chunk, |input| input != PaletteInput::Escape);
+        assert_eq!(&chunk[used..], b"rest");
+        let used = keys.read(b"xyz", |_| true);
+        assert_eq!(used, 3);
     }
 }

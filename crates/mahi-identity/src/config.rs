@@ -10,6 +10,7 @@ const IDENTITY_FILE: &str = "identity.age";
 const RECIPIENT_FILE: &str = "identity.pub";
 const SIGNING_KEY_FILE: &str = "signing-key.pub";
 const NODE_KEY_FILE: &str = "node.key";
+const SETTINGS_FILE: &str = "config.toml";
 
 /// mahi's per-user configuration directory.
 ///
@@ -73,6 +74,12 @@ impl ConfigDir {
     pub fn node_key_file(&self) -> PathBuf {
         self.0.join(NODE_KEY_FILE)
     }
+
+    /// Returns the path of the user's settings, `config.toml`.
+    #[must_use]
+    pub fn settings_file(&self) -> PathBuf {
+        self.0.join(SETTINGS_FILE)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -105,6 +112,7 @@ mod tests {
     fn the_identity_file_is_inside_the_directory() {
         let dir = ConfigDir::resolve(Some(Path::new("/home/alice")), None).unwrap();
         assert_eq!(dir.identity_file(), dir.path().join("identity.age"));
+        assert_eq!(dir.settings_file(), dir.path().join("config.toml"));
     }
 
     #[cfg(target_os = "macos")]

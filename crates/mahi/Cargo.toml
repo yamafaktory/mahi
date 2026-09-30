@@ -24,13 +24,16 @@ mahi-sandbox = { workspace = true }
 mahi-schedule = { workspace = true }
 mahi-ssh = { workspace = true }
 mahi-store = { workspace = true }
+mahi-term = { workspace = true }
 mahi-thread = { workspace = true }
 rustix = { workspace = true }
+serde = { workspace = true }
 sha2 = { workspace = true }
 ssh-key = { workspace = true }
 subtle = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+toml = { workspace = true }
 vt100 = { workspace = true }
 zeroize = { workspace = true }
 

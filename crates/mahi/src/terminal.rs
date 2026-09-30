@@ -41,6 +41,12 @@ impl Drop for RawMode {
     }
 }
 
+/// Returns whether the user types into a terminal and sees the agent's output in one, which
+/// the palette needs.
+pub(crate) fn is_interactive() -> bool {
+    rustix::termios::isatty(io::stdin().as_fd()) && rustix::termios::isatty(io::stdout().as_fd())
+}
+
 pub(crate) fn size() -> WindowSize {
     size_of_terminal(io::stdin().as_fd())
         .or_else(|| size_of_terminal(io::stdout().as_fd()))
