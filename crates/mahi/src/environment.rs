@@ -67,6 +67,8 @@ pub(crate) struct Environment {
     pub(crate) passed_on: Vec<(&'static str, OsString)>,
     pub(crate) pass_env: Vec<Passed>,
     pub(crate) live: LiveMode,
+    pub(crate) https_proxy: Option<String>,
+    pub(crate) no_proxy: Option<String>,
 }
 
 /// Whether `mahi run` and `mahi resume` let teammates watch, from `MAHI_LIVE`.
@@ -177,6 +179,7 @@ impl Environment {
     pub(crate) fn read(required: &[EnvName], optional: &[EnvName]) -> Self {
         let value = |name| env::var_os(name).filter(|value| !value.is_empty());
         let path = |name| value(name).map(PathBuf::from);
+        let text = |name| value(name).and_then(|value| value.into_string().ok());
         Self {
             home: path("HOME"),
             xdg_config_home: path("XDG_CONFIG_HOME"),
@@ -189,6 +192,8 @@ impl Environment {
             user: value("USER").and_then(|user| user.into_string().ok()),
             temp_dir: env::temp_dir(),
             live: LiveMode::parse(value("MAHI_LIVE").as_ref()),
+            https_proxy: text("https_proxy").or_else(|| text("HTTPS_PROXY")),
+            no_proxy: text("no_proxy").or_else(|| text("NO_PROXY")),
             passed_on: PASSED_ON
                 .iter()
                 .filter_map(|&name| value(name).map(|value| (name, value)))

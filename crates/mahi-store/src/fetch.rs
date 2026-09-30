@@ -69,6 +69,7 @@ impl Store {
             .map_err(gix::Error::from_error)?;
         let prepared = remote
             .to_connection_with_transport(transport)
+            .with_credentials(|_| Ok(None))
             .prepare_fetch(gix::progress::Discard, ref_map::Options::default())
             .map_err(gix::Error::from_error)?;
         if prepared.ref_map().mappings.is_empty() {

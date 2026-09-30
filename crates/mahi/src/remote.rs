@@ -1,6 +1,9 @@
 use std::{
     env,
-    fmt,
+    fmt::{
+        self,
+        Write as _,
+    },
     fs::{
         self,
         File,
@@ -13,6 +16,10 @@ use std::{
     str::FromStr,
 };
 
+use mahi_http::{
+    HttpsRemote,
+    RemoteError as HttpsUrlError,
+};
 use mahi_ssh::{
     RemoteError as UrlError,
     SshRemote,
@@ -36,6 +43,7 @@ use crate::{
 const SYNC: &str = "sync";
 const REMOTE: &str = "remote";
 const MAX_SETTING_BYTES: u64 = 512;
+const HTTPS: &str = "https://";
 
 /// A git remote name, as `mahi remote` takes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,11 +73,17 @@ pub(crate) enum RemoteError {
     Store(#[from] StoreError),
     #[error("this repository has no remote called {0}")]
     NoSuchRemote(RemoteName),
-    #[error("remote {name} is not an ssh remote, and mahi reaches remotes over ssh only")]
+    #[error("remote {name} is not an ssh remote, and mahi reaches remotes over ssh or https only")]
     NotSsh {
         name: RemoteName,
         #[source]
         source: UrlError,
+    },
+    #[error("remote {name} cannot be used over https")]
+    NotHttps {
+        name: RemoteName,
+        #[source]
+        source: HttpsUrlError,
     },
     #[error("cannot read or write the remote setting")]
     Io(#[from] io::Error),
@@ -138,7 +152,7 @@ pub(crate) fn remote(command: &RemoteCommand) -> Result<String, RemoteError> {
         _ => None,
     };
     if let Some((name, visibility)) = chosen {
-        let url = ssh_push_url(&store, name)?;
+        let url = push_url(&store, name)?;
         let setting = SyncRemote {
             name: name.clone(),
             visibility,
@@ -147,40 +161,82 @@ pub(crate) fn remote(command: &RemoteCommand) -> Result<String, RemoteError> {
         return Ok(describe(&setting, &url));
     }
     Ok(match sync_remote(&store)? {
-        Some(setting) => describe(&setting, &ssh_push_url(&store, &setting.name)?),
+        Some(setting) => describe(&setting, &push_url(&store, &setting.name)?),
         None => "threads of this clone are not pushed; choose a remote with \
                  mahi remote <name> --private or --public\n"
             .to_owned(),
     })
 }
 
-fn describe(setting: &SyncRemote, url: &SshRemote) -> String {
+/// Where a remote is reached: over SSH, or over HTTPS.
+#[derive(Debug, Clone)]
+pub(crate) enum RemoteUrl {
+    Ssh(SshRemote),
+    Https(HttpsRemote),
+}
+
+impl fmt::Display for RemoteUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ssh(url) => url.fmt(formatter),
+            Self::Https(url) => url.fmt(formatter),
+        }
+    }
+}
+
+fn describe(setting: &SyncRemote, url: &RemoteUrl) -> String {
     let snapshots = match setting.visibility {
         Visibility::Private => "with the agents' snapshots",
         Visibility::Public => "without the agents' snapshots, which stay here",
     };
-    format!(
+    let mut text = format!(
         "threads of this clone are pushed to {} ({url}), a {} remote, {snapshots}\n",
         setting.name, setting.visibility
-    )
+    );
+    if let RemoteUrl::Https(url) = url {
+        match crate::sync::https_credential(url) {
+            Some(name) => {
+                let _ = writeln!(
+                    text,
+                    "its token is the credential {name}: store it with mahi credential add {name}"
+                );
+            }
+            None => {
+                text.push_str(
+                    "its host has no credential name, so it is reached without a token\n",
+                );
+            }
+        }
+    }
+    text
 }
 
-/// Returns the SSH URL the remote `name` pushes to.
-pub(crate) fn ssh_push_url(store: &Store, name: &RemoteName) -> Result<SshRemote, RemoteError> {
-    ssh_url(name, store.remote_url(name.as_str(), true)?)
+/// Returns the URL the remote `name` pushes to.
+pub(crate) fn push_url(store: &Store, name: &RemoteName) -> Result<RemoteUrl, RemoteError> {
+    remote_url(name, store.remote_url(name.as_str(), true)?)
 }
 
-/// Returns the SSH URL the remote `name` fetches from.
-pub(crate) fn ssh_fetch_url(store: &Store, name: &RemoteName) -> Result<SshRemote, RemoteError> {
-    ssh_url(name, store.remote_url(name.as_str(), false)?)
+/// Returns the URL the remote `name` fetches from.
+pub(crate) fn fetch_url(store: &Store, name: &RemoteName) -> Result<RemoteUrl, RemoteError> {
+    remote_url(name, store.remote_url(name.as_str(), false)?)
 }
 
-fn ssh_url(name: &RemoteName, url: Option<String>) -> Result<SshRemote, RemoteError> {
+fn remote_url(name: &RemoteName, url: Option<String>) -> Result<RemoteUrl, RemoteError> {
     let url = url.ok_or_else(|| RemoteError::NoSuchRemote(name.clone()))?;
-    SshRemote::parse(&url).map_err(|source| RemoteError::NotSsh {
-        name: name.clone(),
-        source,
-    })
+    if url.starts_with(HTTPS) {
+        return HttpsRemote::parse(&url)
+            .map(RemoteUrl::Https)
+            .map_err(|source| RemoteError::NotHttps {
+                name: name.clone(),
+                source,
+            });
+    }
+    SshRemote::parse(&url)
+        .map(RemoteUrl::Ssh)
+        .map_err(|source| RemoteError::NotSsh {
+            name: name.clone(),
+            source,
+        })
 }
 
 /// Returns the remote this clone pushes its threads to, if one was chosen.
@@ -325,27 +381,46 @@ mod tests {
     }
 
     #[test]
-    fn only_an_existing_remote_with_an_ssh_push_url_is_taken() {
+    fn only_an_existing_remote_with_an_ssh_or_https_push_url_is_taken() {
         let (_dir, store) = store_with(
             "[remote \"origin\"]\n\turl = git@github.com:org/repo.git\n\
              [remote \"web\"]\n\turl = https://user:secret@example.org/r.git\n\
+             [remote \"forge\"]\n\turl = https://token@git.example.org/r.git\n\
+             [remote \"plain\"]\n\turl = http://example.org/r.git\n\
              [remote \"home\"]\n\turl = ssh://me@[::1]:22/~/repo\n",
         );
         assert_eq!(
-            ssh_push_url(&store, &name("origin")).unwrap().to_string(),
+            push_url(&store, &name("origin")).unwrap().to_string(),
             "git@github.com:org/repo.git"
         );
         assert_eq!(
-            ssh_push_url(&store, &name("home")).unwrap().to_string(),
+            push_url(&store, &name("home")).unwrap().to_string(),
             "me@[::1]:~/repo"
         );
-        let refused = ssh_push_url(&store, &name("web")).unwrap_err();
-        assert!(matches!(refused, RemoteError::NotSsh { .. }));
-        assert!(!refused.to_string().contains("secret"), "{refused}");
+        let forge = push_url(&store, &name("forge")).unwrap();
+        assert!(matches!(forge, RemoteUrl::Https(_)));
+        assert_eq!(forge.to_string(), "https://git.example.org/r.git");
+        let refused = push_url(&store, &name("web")).unwrap_err();
+        assert!(matches!(refused, RemoteError::NotHttps { .. }));
+        assert!(!format!("{refused:?}").contains("secret"), "{refused:?}");
         assert!(matches!(
-            ssh_push_url(&store, &name("missing")),
+            push_url(&store, &name("plain")),
+            Err(RemoteError::NotSsh { .. })
+        ));
+        assert!(matches!(
+            push_url(&store, &name("missing")),
             Err(RemoteError::NoSuchRemote(_))
         ));
+        let setting = SyncRemote {
+            name: name("forge"),
+            visibility: Visibility::Private,
+        };
+        let told = describe(&setting, &forge);
+        assert!(
+            told.contains("mahi credential add https-git-example-org"),
+            "{told}"
+        );
+        assert!(!told.contains("token@"), "{told}");
         for bad in ["", "-o", ".x", "a/b", "git@host:x"] {
             assert!(bad.parse::<RemoteName>().is_err(), "{bad}");
         }

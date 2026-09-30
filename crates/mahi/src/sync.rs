@@ -30,6 +30,18 @@ use mahi_core::{
     ThreadId,
     ThreadRef,
 };
+use mahi_http::{
+    HttpsAccess,
+    HttpsRemote,
+    ProxySetting,
+    Roots,
+    Token,
+};
+use mahi_identity::{
+    ConfigDir,
+    Credential,
+    CredentialName,
+};
 use mahi_sandbox::{
     Termination,
     TerminationSignals,
@@ -61,23 +73,35 @@ use crate::{
         self,
         RemoteError,
         RemoteName,
+        RemoteUrl,
         Visibility,
     },
     run::until_stopped,
 };
 
 const MAX_CAUSE_CHARS: usize = 300;
+const HTTPS_CREDENTIAL: &str = "https-";
 const SYSTEM_KNOWN_HOSTS: [&str; 2] = ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"];
 
 /// Where and how a run pushes its thread refs, gathered before the agent starts.
 #[derive(Debug, Clone)]
 pub(crate) struct SyncSetup {
     pub(crate) name: RemoteName,
-    remote: SshRemote,
+    remote: RemoteUrl,
     visibility: Visibility,
     owns_meta: bool,
-    access: SshAccess,
+    access: Access,
 }
+
+/// How a remote is reached: the SSH or the HTTPS side of what the environment gives.
+#[derive(Debug, Clone)]
+enum Access {
+    Ssh(SshAccess),
+    Https(HttpsAccess),
+}
+
+/// A transport to a remote, over SSH or HTTPS.
+pub(crate) type AnyTransport = Box<dyn Transport + Send>;
 
 /// What reaching a remote over SSH needs from the environment.
 #[derive(Debug, Clone)]
@@ -130,15 +154,13 @@ impl SyncSetup {
         let chosen = remote::sync_remote(store)
             .and_then(|chosen| {
                 chosen
-                    .map(|chosen| {
-                        remote::ssh_push_url(store, &chosen.name).map(|url| (chosen, url))
-                    })
+                    .map(|chosen| remote::push_url(store, &chosen.name).map(|url| (chosen, url)))
                     .transpose()
             })
             .inspect_err(|error| crate::report_with("threads are not pushed", error))
             .ok()??;
         let (chosen, remote) = chosen;
-        let access = SshAccess::gather(environment)
+        let access = Access::gather(environment, &remote)
             .inspect_err(|missing| eprintln!("mahi: threads are not pushed: {missing}"))
             .ok()?;
         Some(Self {
@@ -155,10 +177,103 @@ impl SyncSetup {
         pushed_refs(thread, slot, self.visibility, self.owns_meta)
     }
 
-    /// Connects to the remote over SSH, stopping once `interrupt` is set.
-    pub(crate) fn connect(&self, interrupt: &Arc<AtomicBool>) -> Result<SshTransport, PushError> {
+    /// Connects to the remote. Over SSH, connecting stops once `interrupt` is set; over HTTPS,
+    /// each wait is bounded instead.
+    pub(crate) fn connect(&self, interrupt: &Arc<AtomicBool>) -> Result<AnyTransport, PushError> {
         Ok(self.access.connect(&self.remote, interrupt)?)
     }
+}
+
+impl Access {
+    /// Gathers what reaching `remote` needs, or says what is missing.
+    fn gather(environment: &Environment, remote: &RemoteUrl) -> Result<Self, String> {
+        match remote {
+            RemoteUrl::Ssh(_) => SshAccess::gather(environment)
+                .map(Self::Ssh)
+                .map_err(str::to_owned),
+            RemoteUrl::Https(url) => https_access(environment, url).map(Self::Https),
+        }
+    }
+
+    fn connect(
+        &self,
+        remote: &RemoteUrl,
+        interrupt: &Arc<AtomicBool>,
+    ) -> Result<AnyTransport, ConnectError> {
+        match (self, remote) {
+            (Self::Ssh(access), RemoteUrl::Ssh(url)) => {
+                Ok(Box::new(access.connect(url, interrupt)?))
+            }
+            (Self::Https(access), RemoteUrl::Https(url)) => {
+                Ok(Box::new(mahi_http::connect(url, access)?))
+            }
+            _ => Err(ConnectError::Mismatch),
+        }
+    }
+}
+
+/// Gathers what reaching the HTTPS remote `url` needs: the proxy from `HTTPS_PROXY` and
+/// `NO_PROXY`, and the token stored for its host, if any (see [`https_credential`]).
+fn https_access(environment: &Environment, url: &HttpsRemote) -> Result<HttpsAccess, String> {
+    let proxy = ProxySetting::from_values(
+        environment.https_proxy.as_deref(),
+        environment.no_proxy.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let token = match https_credential(url) {
+        Some(name) => {
+            let config = ConfigDir::resolve(
+                environment.home.as_deref(),
+                environment.xdg_config_home.as_deref(),
+            )
+            .map_err(|error| error.to_string())?;
+            Credential::load(&config, &name)
+                .map_err(|error| format!("cannot read the credential {name}: {error}"))?
+                .map(|credential| {
+                    Token::new(String::from_utf8_lossy(credential.expose()).into_owned())
+                })
+        }
+        None => None,
+    };
+    Ok(HttpsAccess {
+        proxy,
+        roots: Roots::WebPki,
+        token,
+    })
+}
+
+/// Returns the name of the credential that holds the token for an HTTPS remote's host and
+/// port: `https-` and the host in lowercase with each `-` doubled and each `.` turned into `-`,
+/// then `---` and the port unless it is 443, such as `https-github-com` or
+/// `https-git--hub-example-com---8443`. Since a host's labels never start or end with `-`, no
+/// two hosts share a name, and the prefix keeps them apart from the agents' credentials. A host
+/// that is not a plain DNS name or IPv4 address, or whose name is too long, has none.
+pub(crate) fn https_credential(url: &HttpsRemote) -> Option<CredentialName> {
+    let host = url.host();
+    let plain = host.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    });
+    if !plain {
+        return None;
+    }
+    let mut name = String::with_capacity(HTTPS_CREDENTIAL.len() + 2 * host.len() + 8);
+    name.push_str(HTTPS_CREDENTIAL);
+    for byte in host.bytes() {
+        match byte {
+            b'-' => name.push_str("--"),
+            b'.' => name.push('-'),
+            other => name.push(char::from(other.to_ascii_lowercase())),
+        }
+    }
+    if let Some(port) = url.port().filter(|port| *port != 443) {
+        let _ = write!(name, "---{port}");
+    }
+    name.parse().ok()
 }
 
 impl SshAccess {
@@ -206,6 +321,10 @@ pub(crate) enum ConnectError {
     KnownHosts(#[from] KnownHostsError),
     #[error("cannot reach the remote")]
     Ssh(#[from] SshError),
+    #[error("cannot reach the remote")]
+    Https(#[from] mahi_http::ConnectError),
+    #[error("the remote's url changed kind since it was read")]
+    Mismatch,
 }
 
 #[derive(Debug, Error)]
@@ -220,10 +339,10 @@ pub(crate) enum FetchError {
 
 /// Fetches `thread` from the clone's chosen remote, or else from `origin`, accepts what
 /// checks out for the participant `local` trusting `owner`, and tells the user what changed.
-/// Once `interrupt` is set, the fetch stops within 100 ms, and nothing is accepted unless
-/// accepting had already begun.
-/// A remote that is not chosen and not an SSH remote is skipped quietly, and a thread the
-/// remote does not have leaves everything as it was.
+/// Once `interrupt` is set, the fetch stops within 100 ms over SSH, and over HTTPS once the
+/// request in flight ends; nothing is accepted unless accepting had already begun. A remote
+/// that is not chosen and neither an SSH nor an HTTPS remote is skipped quietly, and a thread
+/// the remote does not have leaves everything as it was.
 pub(crate) fn fetch_thread(
     store: &Store,
     environment: &Environment,
@@ -240,7 +359,7 @@ pub(crate) fn fetch_thread(
             return;
         }
     };
-    let access = match SshAccess::gather(environment) {
+    let access = match Access::gather(environment, &url) {
         Ok(access) => access,
         Err(missing) => {
             if chosen {
@@ -261,15 +380,15 @@ pub(crate) fn fetch_thread(
 
 /// Returns the remote to fetch from and its URL, and whether it was chosen: the chosen remote
 /// at the URL it pushes to, where its threads are, or else `origin` when it fetches over SSH.
-fn fetch_source(store: &Store) -> Result<Option<(RemoteName, SshRemote, bool)>, RemoteError> {
+fn fetch_source(store: &Store) -> Result<Option<(RemoteName, RemoteUrl, bool)>, RemoteError> {
     if let Some(chosen) = remote::sync_remote(store)? {
-        let url = remote::ssh_push_url(store, &chosen.name)?;
+        let url = remote::push_url(store, &chosen.name)?;
         return Ok(Some((chosen.name, url, true)));
     }
     let Ok(origin) = "origin".parse::<RemoteName>() else {
         return Ok(None);
     };
-    Ok(remote::ssh_fetch_url(store, &origin)
+    Ok(remote::fetch_url(store, &origin)
         .ok()
         .map(|url| (origin, url, false)))
 }
@@ -606,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn the_chosen_remote_is_fetched_where_it_pushes_or_else_an_ssh_origin() {
+    fn the_chosen_remote_is_fetched_where_it_pushes_or_else_an_ssh_or_https_origin() {
         let store_with = |remotes: &str| {
             let dir = tempfile::tempdir().unwrap();
             gix::init(dir.path()).unwrap();
@@ -625,6 +744,15 @@ mod tests {
         let (_dir, store) = store_with(
             "[remote \"origin\"]\n\turl = https://example.org/r.git\n\tpushurl = git@example.org:r.git\n",
         );
+        assert_eq!(
+            source(&store).unwrap(),
+            Some((
+                "origin".to_owned(),
+                "https://example.org/r.git".to_owned(),
+                false
+            ))
+        );
+        let (_dir, store) = store_with("[remote \"origin\"]\n\turl = http://example.org/r.git\n");
         assert!(matches!(source(&store), Ok(None)));
         let (_dir, store) = store_with("[remote \"origin\"]\n\turl = git@example.org:r.git\n");
         assert_eq!(
@@ -653,7 +781,7 @@ mod tests {
                 true
             ))
         );
-        let (_dir, store) = store_with("[remote \"web\"]\n\turl = https://example.org/r.git\n");
+        let (_dir, store) = store_with("[remote \"web\"]\n\turl = http://example.org/r.git\n");
         std::fs::create_dir_all(store.common_dir().join("mahi").join("sync")).unwrap();
         std::fs::write(
             store.common_dir().join("mahi").join("sync").join("remote"),
@@ -661,6 +789,83 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(source(&store), Err(RemoteError::NotSsh { .. })));
+    }
+
+    #[test]
+    fn an_https_remote_gets_the_proxy_and_only_its_own_hosts_token() {
+        let home = tempfile::tempdir().unwrap();
+        let environment = Environment {
+            home: Some(home.path().to_path_buf()),
+            https_proxy: Some("proxy.corp:3128".to_owned()),
+            no_proxy: Some("internal.corp".to_owned()),
+            ..Environment::default()
+        };
+        let url = HttpsRemote::parse("https://git.example.com/r.git").unwrap();
+        assert!(https_access(&environment, &url).unwrap().token.is_none());
+        let config = ConfigDir::resolve(Some(home.path()), None).unwrap();
+        mahi_identity::Credential::new(zeroize::Zeroizing::new(b"tok".to_vec()))
+            .unwrap()
+            .save(&config, &"https-git-example-com".parse().unwrap())
+            .unwrap();
+        let access = https_access(&environment, &url).unwrap();
+        assert!(access.token.is_some());
+        assert_eq!(
+            access.proxy.unwrap().for_host("git.example.com"),
+            Some("http://proxy.corp:3128")
+        );
+        let lookalike = HttpsRemote::parse("https://git-example.com/r.git").unwrap();
+        assert!(
+            https_access(&environment, &lookalike)
+                .unwrap()
+                .token
+                .is_none()
+        );
+        let socks = Environment {
+            https_proxy: Some("socks5://proxy.corp:1080".to_owned()),
+            ..Environment::default()
+        };
+        assert!(https_access(&socks, &url).is_err());
+    }
+
+    #[test]
+    fn each_https_host_and_port_has_its_own_credential_name() {
+        let name = |url: &str| {
+            https_credential(&HttpsRemote::parse(url).unwrap()).map(|name| name.to_string())
+        };
+        let names = [
+            name("https://GitHub.com/org/r.git"),
+            name("https://gitlab.acme.com/r.git"),
+            name("https://gitlab-acme.com/r.git"),
+            name("https://gitlab.acme-com/r.git"),
+            name("https://gitlab-acme-com/r.git"),
+            name("https://xn--bcher-kva.example/r.git"),
+            name("https://gitlab.acme.com:8443/r.git"),
+            name("https://gitlab.acme.com:443/r.git"),
+            name("https://10.0.0.1/r.git"),
+        ];
+        assert_eq!(
+            names,
+            [
+                Some("https-github-com".to_owned()),
+                Some("https-gitlab-acme-com".to_owned()),
+                Some("https-gitlab--acme-com".to_owned()),
+                Some("https-gitlab-acme--com".to_owned()),
+                Some("https-gitlab--acme--com".to_owned()),
+                Some("https-xn----bcher--kva-example".to_owned()),
+                Some("https-gitlab-acme-com---8443".to_owned()),
+                Some("https-gitlab-acme-com".to_owned()),
+                Some("https-10-0-0-1".to_owned()),
+            ]
+        );
+        assert_eq!(
+            name("https://claude/r.git").as_deref(),
+            Some("https-claude")
+        );
+        assert_eq!(name("https://[::1]/r.git"), None);
+        assert_eq!(
+            name(&format!("https://{}.com/r.git", "a".repeat(130))),
+            None
+        );
     }
 
     #[test]

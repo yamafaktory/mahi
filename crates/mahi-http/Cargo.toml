@@ -21,6 +21,8 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+mahi-core = { workspace = true }
+mahi-store = { workspace = true }
 rustls = { workspace = true }
 tempfile = { workspace = true }
 

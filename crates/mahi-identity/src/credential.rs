@@ -16,10 +16,10 @@ use crate::{
 };
 
 const CREDENTIALS: &str = "credentials";
-const LONGEST_NAME: usize = 32;
+const LONGEST_NAME: usize = 128;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
 
-/// The name a credential is stored under: 1 to 32 lowercase letters, digits and inner hyphens.
+/// The name a credential is stored under: 1 to 128 lowercase letters, digits and inner hyphens.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CredentialName(String);
 

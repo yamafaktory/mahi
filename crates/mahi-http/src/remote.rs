@@ -59,6 +59,12 @@ impl HttpsRemote {
         self.url.host().unwrap_or_default()
     }
 
+    /// Returns the port the URL names, if any.
+    #[must_use]
+    pub fn port(&self) -> Option<u16> {
+        self.url.port
+    }
+
     /// Returns the user name the URL names, if any.
     #[must_use]
     pub fn user(&self) -> Option<&str> {
@@ -67,6 +73,12 @@ impl HttpsRemote {
 
     pub(crate) fn url(&self) -> &gix::Url {
         &self.url
+    }
+}
+
+impl fmt::Display for HttpsRemote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.url.to_bstring())
     }
 }
 
@@ -91,6 +103,7 @@ mod tests {
         assert_eq!(named.user(), Some("bob"));
         assert_eq!(named.url().user(), None);
         assert!(!named.url().to_bstring().to_string().contains("bob"));
+        assert_eq!(named.to_string(), "https://git.example.com:8443/app.git");
         for (url, error) in [
             ("http://git.example.com/app.git", RemoteError::NotHttps),
             ("git@git.example.com:app.git", RemoteError::NotHttps),

@@ -15,6 +15,7 @@ clap = { workspace = true }
 getrandom = { workspace = true }
 mahi-core = { workspace = true }
 mahi-crypto = { workspace = true }
+mahi-http = { workspace = true }
 mahi-identity = { workspace = true }
 mahi-live = { workspace = true }
 mahi-proxy = { workspace = true }
