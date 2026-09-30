@@ -79,7 +79,13 @@ use rustix::fs::{
 };
 use thiserror::Error;
 
-use crate::profile;
+use crate::{
+    profile,
+    prompts::{
+        Answer,
+        Prompts,
+    },
+};
 
 /// How often a host rereads its `meta` at most, whoever asks.
 pub(crate) const REREAD_EVERY: Duration = Duration::from_secs(5);
@@ -112,6 +118,10 @@ const PUBLISHED: &str = "live";
 const HOSTS: &str = "hosts";
 const MAX_PUBLISHED_BYTES: u64 = 4096;
 const PUBLISH_EVERY: Duration = Duration::from_secs(2);
+/// How long a host that stops keeps telling senders their prompts were dropped.
+const LAST_ANSWERS_WAIT: Duration = Duration::from_secs(2);
+/// The most answers a host keeps to send again after the network failed it.
+const MAX_UNSENT_ANSWERS: usize = 256;
 
 /// What a host needs to open the live layer, gathered before the agent starts.
 #[derive(Debug)]
@@ -281,9 +291,13 @@ pub(crate) struct LiveHost {
     node: Arc<LiveNode>,
     tap: OutputTap,
     stop: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<()>>,
+    stop_broadcast: Arc<AtomicBool>,
+    listener: JoinHandle<()>,
+    publisher: JoinHandle<()>,
+    broadcaster: JoinHandle<()>,
     config: ConfigDir,
     thread: ThreadId,
+    prompts: Arc<Prompts>,
 }
 
 impl LiveHost {
@@ -318,8 +332,10 @@ impl LiveHost {
             LiveKeys::derive(thread_key, thread)?,
             setup.node_key.secret(),
         )?;
-        let receiver =
+        let mut receiver =
             FrameReceiver::new(LiveKeys::derive(thread_key, thread)?, peers.participants());
+        receiver.take_prompts_for(&sender, slot.participant().clone());
+        let prompts = Arc::new(Prompts::default());
         let screen = Arc::new(Mutex::new(Screen {
             parser: vt100::Parser::new(size.rows, size.cols, 0),
             taken: 0,
@@ -328,21 +344,26 @@ impl LiveHost {
         let dropped = Arc::new(AtomicBool::new(false));
         let wanted = Arc::new(Mutex::new(VecDeque::with_capacity(PENDING_SCREENS)));
         let stop = Arc::new(AtomicBool::new(false));
+        let stop_broadcast = Arc::new(AtomicBool::new(false));
         let broadcaster = Broadcaster {
             topic: Arc::clone(&topic),
             sender,
-            slot,
+            slot: slot.clone(),
+            prompts: Arc::clone(&prompts),
+            answers: Vec::new(),
             screen: Arc::clone(&screen),
             tapped,
             dropped: Arc::clone(&dropped),
             wanted: Arc::clone(&wanted),
-            stop: Arc::clone(&stop),
+            stop: Arc::clone(&stop_broadcast),
             held_through: 0,
             sent_at: Instant::now(),
         };
         let listener = Listener {
             topic,
             receiver,
+            slot,
+            prompts: Arc::clone(&prompts),
             peers,
             wanted,
             stop: Arc::clone(&stop),
@@ -359,13 +380,13 @@ impl LiveHost {
                 dropped,
             },
             stop,
-            workers: vec![
-                thread::spawn(move || broadcaster.run()),
-                thread::spawn(move || listener.run()),
-                publisher,
-            ],
+            stop_broadcast,
+            broadcaster: thread::spawn(move || broadcaster.run()),
+            listener: thread::spawn(move || listener.run()),
+            publisher,
             config: setup.config.clone(),
             thread,
+            prompts,
         })
     }
 
@@ -374,12 +395,20 @@ impl LiveHost {
         self.tap.clone()
     }
 
-    /// Stops the live layer once the agent is gone: output still queued is dropped.
+    /// Returns the prompts teammates sent the agent.
+    pub(crate) fn prompts(&self) -> Arc<Prompts> {
+        Arc::clone(&self.prompts)
+    }
+
+    /// Stops the live layer once the agent is gone: output still queued is dropped, and so
+    /// are the prompts waiting, whose senders are told.
     pub(crate) fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
-        for worker in self.workers {
-            let _ = worker.join();
-        }
+        let _ = self.listener.join();
+        let _ = self.publisher.join();
+        self.prompts.close();
+        self.stop_broadcast.store(true, Ordering::SeqCst);
+        let _ = self.broadcaster.join();
         withdraw_address(&self.config, self.thread);
         if let Ok(node) = Arc::try_unwrap(self.node) {
             let _ = node.close();
@@ -410,6 +439,8 @@ struct Broadcaster {
     topic: Arc<LiveTopic>,
     sender: FrameSender,
     slot: AgentSlot,
+    prompts: Arc<Prompts>,
+    answers: Vec<Answer>,
     screen: Arc<Mutex<Screen>>,
     tapped: Receiver<Tapped>,
     dropped: Arc<AtomicBool>,
@@ -423,6 +454,7 @@ impl Broadcaster {
     fn run(mut self) {
         while !self.stopping() {
             self.send_screen_if_needed();
+            self.send_answers(None);
             if self.sent_at.elapsed() >= HEARTBEAT_EVERY {
                 let beat = Body::Heartbeat {
                     slot: self.slot.clone(),
@@ -455,6 +487,30 @@ impl Broadcaster {
                 self.dropped.store(true, Ordering::SeqCst);
             }
         }
+        self.send_answers(Some(Instant::now() + LAST_ANSWERS_WAIT));
+    }
+
+    fn send_answers(&mut self, deadline: Option<Instant>) {
+        let mut answers = std::mem::take(&mut self.answers);
+        self.prompts.take_answers(&mut answers);
+        let mut sent = 0;
+        for answer in &answers {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            let body = Body::PromptAnswer {
+                slot: self.slot.clone(),
+                id: answer.id,
+                outcome: answer.outcome,
+            };
+            if !self.send(&body) {
+                break;
+            }
+            sent += 1;
+        }
+        answers.drain(..sent);
+        answers.truncate(MAX_UNSENT_ANSWERS);
+        self.answers = answers;
     }
 
     fn stopping(&self) -> bool {
@@ -511,11 +567,13 @@ impl Broadcaster {
     }
 }
 
-/// Reads the topic and passes the screen requests of participants to the broadcaster, at
-/// most one per second from each.
+/// Reads the topic, passes the screen requests of participants to the broadcaster, at most
+/// one per second from each, and takes the prompts they send the host's agent.
 struct Listener {
     topic: Arc<LiveTopic>,
     receiver: FrameReceiver,
+    slot: AgentSlot,
+    prompts: Arc<Prompts>,
     peers: Arc<HostPeers>,
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
@@ -536,8 +594,13 @@ impl Listener {
             let Ok(received) = self.receiver.open(&frame) else {
                 continue;
             };
-            let Body::ScreenRequest { challenge } = received.body else {
-                continue;
+            let challenge = match received.body {
+                Body::ScreenRequest { challenge } => challenge,
+                Body::Prompt { slot, id, text, .. } if slot == self.slot => {
+                    self.prompts.offer(received.participant, id, text);
+                    continue;
+                }
+                _ => continue,
             };
             answered.retain(|_, at| at.elapsed() < SCREEN_EVERY);
             if answered.contains_key(&received.sender) {

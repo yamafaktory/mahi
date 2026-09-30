@@ -15,6 +15,7 @@ mod network;
 mod palette;
 mod profile;
 mod prompt;
+mod prompts;
 mod recorder;
 mod remote;
 mod run;

@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io::{
         self,
         Write,
@@ -9,9 +10,13 @@ use std::{
         MutexGuard,
     },
     thread,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
+use mahi_live::PROMPT_ID_BYTES;
 use mahi_sandbox::{
     PtyResizer,
     WindowSize,
@@ -19,18 +24,24 @@ use mahi_sandbox::{
 use mahi_term::{
     OutputTracker,
     PaletteInput,
+    PaletteItem,
     PaletteKey,
     PaletteKeys,
     PaletteView,
 };
 
-use crate::terminal;
+use crate::{
+    prompts::Prompts,
+    terminal,
+};
 
 const MAX_HELD_BYTES: usize = 1024 * 1024;
 const TITLE: &str = "mahi";
 const EMPTY: &str = "No prompts waiting";
+const NO_TEAMMATES: &str = "Teammates cannot watch this run, so no prompts come";
 const CLEAR: &[u8] = b"\x1b[2J";
 const REPAINT_PAUSE: Duration = Duration::from_millis(100);
+const DETAIL_CHARS: usize = 200;
 
 /// The user's terminal as the palette needs it: its size, and a way to make the agent redraw
 /// its screen.
@@ -89,6 +100,7 @@ impl AgentTerminal for Repainter {
 pub(crate) struct Screen<W, T> {
     state: Mutex<State<W>>,
     terminal: T,
+    prompts: Option<Arc<Prompts>>,
     hint: String,
 }
 
@@ -99,6 +111,8 @@ struct State<W> {
     mode: Mode,
     held: Vec<u8>,
     filter: String,
+    selected: usize,
+    selected_id: Option<[u8; PROMPT_ID_BYTES]>,
     keys: PaletteKeys,
 }
 
@@ -110,8 +124,9 @@ enum Mode {
 }
 
 impl<W: Write, T: AgentTerminal> Screen<W, T> {
-    /// Starts a screen that writes to `out`, with the palette closed.
-    pub(crate) fn new(out: W, terminal: T, key: PaletteKey) -> Self {
+    /// Starts a screen that writes to `out`, with the palette closed; the palette lists the
+    /// teammates' `prompts`, when teammates can send any.
+    pub(crate) fn new(out: W, terminal: T, key: PaletteKey, prompts: Option<Arc<Prompts>>) -> Self {
         Self {
             state: Mutex::new(State {
                 out,
@@ -119,9 +134,12 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
                 mode: Mode::Agent,
                 held: Vec::new(),
                 filter: String::new(),
+                selected: 0,
+                selected_id: None,
                 keys: PaletteKeys::default(),
             }),
             terminal,
+            prompts,
             hint: format!("Esc closes · {key} twice sends {key} to the agent"),
         }
     }
@@ -220,7 +238,13 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         if state.mode == Mode::Agent {
             return Ok(0);
         }
-        let State { keys, filter, .. } = &mut *state;
+        let State {
+            keys,
+            filter,
+            selected,
+            selected_id,
+            ..
+        } = &mut *state;
         let mut changed = false;
         let mut escaped = false;
         let used = keys.read(bytes, |input| {
@@ -228,14 +252,27 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
                 PaletteInput::Escape => escaped = true,
                 PaletteInput::Text(character) => {
                     filter.push(character);
+                    (*selected, *selected_id) = (0, None);
                     changed = true;
                 }
-                PaletteInput::Backspace => changed |= filter.pop().is_some(),
-                PaletteInput::Enter
+                PaletteInput::Backspace => {
+                    if filter.pop().is_some() {
+                        (*selected, *selected_id) = (0, None);
+                        changed = true;
+                    }
+                }
+                PaletteInput::Up if *selected > 0 => {
+                    (*selected, *selected_id) = (*selected - 1, None);
+                    changed = true;
+                }
+                PaletteInput::Down => {
+                    (*selected, *selected_id) = (selected.saturating_add(1), None);
+                    changed = true;
+                }
+                PaletteInput::Up
+                | PaletteInput::Enter
                 | PaletteInput::Tab
-                | PaletteInput::Reject
-                | PaletteInput::Up
-                | PaletteInput::Down => {}
+                | PaletteInput::Reject => {}
             }
             !escaped
         });
@@ -282,6 +319,8 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         state.tracker.feed(&held);
         state.mode = Mode::Agent;
         state.filter.clear();
+        state.selected = 0;
+        state.selected_id = None;
         state.keys = PaletteKeys::default();
         state.out.write_all(&held)?;
         if was_open {
@@ -292,16 +331,97 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
 
     fn draw(&self, state: &mut State<W>) -> io::Result<()> {
         let size = self.terminal.size();
+        let lines = self.waiting_lines(&state.filter);
+        if let Some(position) = state
+            .selected_id
+            .and_then(|id| lines.iter().position(|line| line.id == id))
+        {
+            state.selected = position;
+        }
+        state.selected = state.selected.min(lines.len().saturating_sub(1));
+        state.selected_id = lines.get(state.selected).map(|line| line.id);
+        let items: Vec<PaletteItem<'_>> = lines
+            .iter()
+            .map(|line| PaletteItem {
+                label: &line.from,
+                detail: &line.detail,
+            })
+            .collect();
         let view = PaletteView {
             title: TITLE,
             filter: &state.filter,
-            items: &[],
-            selected: 0,
-            empty: EMPTY,
+            items: &items,
+            selected: state.selected,
+            empty: if self.prompts.is_some() {
+                EMPTY
+            } else {
+                NO_TEAMMATES
+            },
             hint: &self.hint,
         };
         view.draw(size.rows, size.cols, &mut state.out)
     }
+
+    fn waiting_lines(&self, filter: &str) -> Vec<Line> {
+        let mut lines = Vec::new();
+        let Some(prompts) = &self.prompts else {
+            return lines;
+        };
+        let now = Instant::now();
+        prompts.each_waiting(|waiting| {
+            let from = waiting.from.as_str();
+            let text = waiting.text.as_str();
+            if contains_ignoring_case(from, filter) || contains_ignoring_case(text, filter) {
+                let mut detail = String::with_capacity(DETAIL_CHARS + 8);
+                push_age(&mut detail, now.saturating_duration_since(waiting.at));
+                detail.push_str(" · ");
+                detail.extend(text.chars().take(DETAIL_CHARS));
+                lines.push(Line {
+                    id: waiting.id,
+                    from: from.to_owned(),
+                    detail,
+                });
+            }
+        });
+        lines
+    }
+
+    /// Redraws the open palette, so the prompts that came and their ages show.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error writing to the screen gives.
+    pub(crate) fn tick(&self) -> io::Result<()> {
+        let mut state = self.lock()?;
+        if state.mode == Mode::Open {
+            self.draw(&mut state)?;
+        }
+        state.out.flush()
+    }
+}
+
+struct Line {
+    id: [u8; PROMPT_ID_BYTES],
+    from: String,
+    detail: String,
+}
+
+fn contains_ignoring_case(text: &str, part: &str) -> bool {
+    part.is_empty()
+        || text
+            .as_bytes()
+            .windows(part.len())
+            .any(|window| window.eq_ignore_ascii_case(part.as_bytes()))
+}
+
+fn push_age(out: &mut String, age: Duration) {
+    let seconds = age.as_secs();
+    let (count, unit) = match seconds {
+        0..60 => (seconds, 's'),
+        60..3600 => (seconds / 60, 'm'),
+        _ => (seconds / 3600, 'h'),
+    };
+    let _ = write!(out, "{count}{unit}");
 }
 
 #[cfg(test)]
@@ -329,7 +449,12 @@ mod tests {
     }
 
     fn screen(terminal: &FakeTerminal) -> Screen<Vec<u8>, &FakeTerminal> {
-        Screen::new(Vec::new(), terminal, PaletteKey::CTRL_SPACE)
+        Screen::new(
+            Vec::new(),
+            terminal,
+            PaletteKey::CTRL_SPACE,
+            Some(Arc::new(Prompts::default())),
+        )
     }
 
     fn written(screen: &Screen<Vec<u8>, &FakeTerminal>) -> Vec<u8> {
@@ -452,5 +577,69 @@ mod tests {
         let reopened = String::from_utf8_lossy(&written(&screen)).into_owned();
         assert!(reopened.contains("› "));
         assert!(!reopened.contains("fi"));
+    }
+
+    #[test]
+    fn waiting_prompts_are_listed_filtered_and_selected() {
+        let terminal = FakeTerminal::default();
+        let prompts = Arc::new(Prompts::default());
+        let screen = Screen::new(
+            Vec::new(),
+            &terminal,
+            PaletteKey::CTRL_SPACE,
+            Some(Arc::clone(&prompts)),
+        );
+        let text = |text: &str| mahi_live::PromptText::new(text.to_owned()).unwrap();
+        let name = |name: &str| mahi_core::ParticipantName::new(name).unwrap();
+        prompts.offer(name("bob"), [1; 16], text("fix the parser test"));
+        prompts.offer(name("carol"), [2; 16], text("add a changelog entry"));
+        screen.open().unwrap();
+        let drawn = String::from_utf8_lossy(&written(&screen)).into_owned();
+        assert!(drawn.contains("bob"), "{drawn}");
+        assert!(drawn.contains("0s · fix the parser test"), "{drawn}");
+        assert!(drawn.contains("carol"), "{drawn}");
+        screen.typed(b"changelog").unwrap();
+        let filtered = String::from_utf8_lossy(&written(&screen)).into_owned();
+        assert!(
+            filtered.contains("carol") && !filtered.contains("bob"),
+            "{filtered}"
+        );
+        screen
+            .typed(b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x1b[B\x1b[B")
+            .unwrap();
+        assert_eq!(screen.lock().unwrap().selected_id, Some([2; 16]));
+        prompts.offer(name("dave"), [3; 16], text("x".repeat(8000).as_str()));
+        screen.typed(b"\x1b[A").unwrap();
+        assert_eq!(screen.lock().unwrap().selected_id, Some([1; 16]));
+        written(&screen);
+        screen.tick().unwrap();
+        let ticked = String::from_utf8_lossy(&written(&screen)).into_owned();
+        assert!(ticked.contains("dave"), "{ticked}");
+        assert_eq!(screen.lock().unwrap().selected_id, Some([1; 16]));
+        assert!(contains_ignoring_case("Fix The Parser", "the pars"));
+        assert!(!contains_ignoring_case("fix", "fixes"));
+    }
+
+    #[test]
+    fn ages_read_in_seconds_minutes_or_hours() {
+        for (seconds, shown) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m"),
+            (3599, "59m"),
+            (7200, "2h"),
+        ] {
+            let mut out = String::new();
+            push_age(&mut out, Duration::from_secs(seconds));
+            assert_eq!(out, shown);
+        }
+    }
+
+    #[test]
+    fn without_a_live_layer_the_palette_says_no_prompts_come() {
+        let terminal = FakeTerminal::default();
+        let screen = Screen::new(Vec::new(), &terminal, PaletteKey::CTRL_SPACE, None);
+        screen.open().unwrap();
+        assert!(String::from_utf8_lossy(&written(&screen)).contains("Teammates cannot watch"));
     }
 }

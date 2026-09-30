@@ -172,6 +172,7 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
+    prompts::Prompts,
     recorder::{
         RecordError,
         Recorder,
@@ -250,6 +251,7 @@ const STOP_POLL: Duration = Duration::from_millis(50);
 const KILL_GRACE: Duration = Duration::from_secs(2);
 const PALETTE_WAIT: Duration = Duration::from_millis(200);
 const PALETTE_POLL: Duration = Duration::from_millis(10);
+const PALETTE_TICK: Duration = Duration::from_secs(1);
 const BROKEN_PIPE_CODE: i32 = 128 + 13;
 
 #[derive(Debug, Error)]
@@ -1288,7 +1290,7 @@ fn finish_run(
         raw,
         palette_key,
         termination,
-        live.as_ref().map(LiveHost::tap),
+        live.as_ref().map(|live| (live.tap(), live.prompts())),
     );
     if let Some(live) = live {
         live.stop();
@@ -1334,7 +1336,7 @@ fn supervise(
     raw: Option<RawMode>,
     palette_key: PaletteKey,
     termination: TerminationSignals,
-    tap: Option<OutputTap>,
+    live: Option<(OutputTap, Arc<Prompts>)>,
 ) -> (Result<Outcome, RunError>, Receiver<Event>) {
     let (events, received) = mpsc::channel();
     let stop_events = events.clone();
@@ -1344,7 +1346,8 @@ fn supervise(
         }
     });
     let palette = (raw.is_some() && terminal::is_interactive()).then_some(palette_key);
-    let code = relay(child, palette, events, &received, tap);
+    let (tap, prompts) = live.unzip();
+    let code = relay(child, palette, events, &received, tap, prompts);
     drop(raw);
     (code, received)
 }
@@ -1719,6 +1722,7 @@ fn relay(
     events: mpsc::Sender<Event>,
     received: &Receiver<Event>,
     tap: Option<OutputTap>,
+    prompts: Option<Arc<Prompts>>,
 ) -> Result<Outcome, RunError> {
     let writer = child.writer()?;
     let repainter = Repainter::new(child.resizer()?);
@@ -1726,9 +1730,18 @@ fn relay(
         io::stdout(),
         repainter.clone(),
         palette.unwrap_or_default(),
+        prompts,
     ));
     let input = palette.map(|key| (Arc::clone(&screen), KeyScanner::new(key)));
     thread::spawn(move || forward_input(writer, input));
+    let ticking = Arc::new(AtomicBool::new(palette.is_some()));
+    let (tick_screen, still_ticking) = (Arc::clone(&screen), Arc::clone(&ticking));
+    thread::spawn(move || {
+        while still_ticking.load(Ordering::SeqCst) {
+            thread::sleep(PALETTE_TICK);
+            let _ = tick_screen.tick();
+        }
+    });
     let resize_tap = tap.clone();
     let resize_screen = Arc::clone(&screen);
     thread::spawn(move || {
@@ -1760,6 +1773,7 @@ fn relay(
         let _ = events.send(Event::Exited(wait_for(&waited)));
     });
     let outcome = await_outcome(&child, received, &progress);
+    ticking.store(false, Ordering::SeqCst);
     let _ = screen.close();
     outcome
 }
