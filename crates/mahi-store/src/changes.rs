@@ -128,10 +128,22 @@ impl Walk<'_> {
             self.changes.truncated = true;
             return Ok(());
         };
-        let mut names: Vec<&Vec<u8>> = before.keys().chain(after.keys()).collect();
-        names.sort();
-        names.dedup();
-        for name in names {
+        let mut olds = before.keys().peekable();
+        let mut news = after.keys().peekable();
+        loop {
+            let name = match (olds.peek(), news.peek()) {
+                (Some(old), Some(new)) if old < new => olds.next(),
+                (Some(old), Some(new)) if old == new => {
+                    news.next();
+                    olds.next()
+                }
+                (_, Some(_)) => news.next(),
+                (Some(_), None) => olds.next(),
+                (None, None) => None,
+            };
+            let Some(name) = name else {
+                break;
+            };
             if self.full() {
                 return Ok(());
             }

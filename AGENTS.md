@@ -92,6 +92,11 @@ Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) an
   typed values inward.
 - **Ownership.** Take `&str`, `&[T]` and `&Path` in arguments. Take ownership only when the
   function stores the value. Do not clone to satisfy the borrow checker without a reason.
+- **Allocations.** Avoid needless allocations and copies everywhere, not only on hot paths:
+  borrow instead of cloning, write into an existing buffer (`write!`) instead of building
+  `String`s with `format!` in loops, reuse buffers across iterations, prefer iterators to
+  collecting into temporary `Vec`s, and size collections up front when the size is known. An
+  allocation that makes the code clearer and is not in a loop or on a data path is fine.
 - **Visibility.** Make items private by default. Use `pub(crate)` inside a crate, and `pub`
   only for the crate API.
 - **Imports.** Put `use` declarations at the top of the module, in the groups that rustfmt

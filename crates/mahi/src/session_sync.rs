@@ -112,7 +112,8 @@ pub(crate) fn record(
     };
     let mut files = 0;
     let mut bytes: u64 = 0;
-    walk(&root, "", 0, &mut 0, &mut |_, _, size| {
+    let mut path = String::new();
+    walk(&root, &mut path, 0, &mut 0, &mut |_, _, size| {
         files += 1;
         bytes = bytes.saturating_add(size);
         if files > MAX_SESSION_FILES {
@@ -126,7 +127,8 @@ pub(crate) fn record(
     let session = session_ref(of.thread, of.slot);
     let previous = store.head(&session)?;
     let mut writer = SessionWriter::new(store, of.key, commits.key(), previous)?;
-    walk(&root, "", 0, &mut 0, &mut |path, fd, _| {
+    path.clear();
+    walk(&root, &mut path, 0, &mut 0, &mut |path, fd, _| {
         writer.add(path, &mut File::from(fd))?;
         Ok(())
     })?;
@@ -164,7 +166,7 @@ type Visit<'v> = dyn FnMut(SessionPath, OwnedFd, u64) -> Result<(), SyncError> +
 
 fn walk(
     dir: &OwnedFd,
-    prefix: &str,
+    path: &mut String,
     depth: usize,
     entries: &mut usize,
     visit: &mut Visit<'_>,
@@ -184,15 +186,13 @@ fn walk(
         }
     }
     names.sort();
-    for name in names {
-        let path = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        let Ok(session_path) = SessionPath::new(&path) else {
-            continue;
-        };
+    let parent = path.len();
+    for name in &names {
+        path.truncate(parent);
+        if parent > 0 {
+            path.push('/');
+        }
+        path.push_str(name);
         let opened = rustix::fs::openat(
             dir,
             name.as_str(),
@@ -216,15 +216,19 @@ fn walk(
         let stat = rustix::fs::fstat(&fd).map_err(|error| SyncError::Read(error.into()))?;
         match FileType::from_raw_mode(stat.st_mode) {
             FileType::Directory if depth < MAX_DEPTH => {
-                walk(&fd, &path, depth + 1, entries, visit)?;
+                walk(&fd, path, depth + 1, entries, visit)?;
             }
             FileType::RegularFile => {
+                let Ok(session_path) = SessionPath::new(path) else {
+                    continue;
+                };
                 let size = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
                 visit(session_path, fd, size)?;
             }
             _ => {}
         }
     }
+    path.truncate(parent);
     Ok(())
 }
 

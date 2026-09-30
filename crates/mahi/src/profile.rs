@@ -174,16 +174,29 @@ pub(crate) fn claude_code_log_line(line: &[u8]) -> Option<LogLine> {
         .message
         .filter(|message| genuine && message.model.as_deref() != Some("<synthetic>"))
         .map(|message| {
-            message
+            let mut text = String::new();
+            let mut left = MAX_LOG_TEXT_CHARS;
+            let parts = message
                 .content
                 .iter()
                 .filter(|part| part.kind.as_deref() == Some("text"))
-                .filter_map(|part| part.text.as_deref())
-                .collect::<Vec<_>>()
-                .join("\n")
+                .filter_map(|part| part.text.as_deref());
+            for part in parts {
+                if left == 0 {
+                    break;
+                }
+                if !text.is_empty() {
+                    text.push('\n');
+                    left -= 1;
+                }
+                for character in part.chars().take(left) {
+                    text.push(character);
+                    left -= 1;
+                }
+            }
+            text
         })
-        .filter(|text| !text.trim().is_empty())
-        .map(|text| cut_chars(&text, MAX_LOG_TEXT_CHARS));
+        .filter(|text| !text.trim().is_empty());
     Some(LogLine { timestamp, reply })
 }
 

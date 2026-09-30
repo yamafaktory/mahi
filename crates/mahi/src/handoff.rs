@@ -259,7 +259,11 @@ impl<F: FnMut(&[u8])> Write for Lines<F> {
                 Some(at) => (rest.get(..at).unwrap_or_default(), Some(at + 1)),
                 None => (rest, None),
             };
-            if !self.skipping {
+            if ends.is_some() && self.partial.is_empty() && !self.skipping {
+                if !piece.is_empty() && piece.len() <= MAX_LOG_LINE_BYTES {
+                    (self.visit)(piece);
+                }
+            } else if !self.skipping {
                 if self.partial.len() + piece.len() > MAX_LOG_LINE_BYTES {
                     self.skipping = true;
                     self.partial.clear();
@@ -312,7 +316,12 @@ fn tool_text(payload: &[u8]) -> String {
             .find_map(|field| input.get(*field).and_then(Value::as_str))
     });
     match detail {
-        Some(detail) => kept(&format!("{name} {detail}")),
+        Some(detail) => name
+            .chars()
+            .chain(std::iter::once(' '))
+            .chain(detail.chars())
+            .take(MAX_KEPT_CHARS)
+            .collect(),
         None => kept(name),
     }
 }
@@ -373,6 +382,11 @@ mod tests {
             tool_text(br#"{"tool_name":"TodoWrite","tool_input":{}}"#),
             "TodoWrite"
         );
+        let long = format!(
+            "{{\"tool_name\":\"{}\",\"tool_input\":{{\"command\":\"ls\"}}}}",
+            "n".repeat(MAX_KEPT_CHARS + 10)
+        );
+        assert_eq!(tool_text(long.as_bytes()).chars().count(), MAX_KEPT_CHARS);
         assert_eq!(prompt_text(&[b'x'; 10_000]).chars().count(), MAX_KEPT_CHARS);
         assert_eq!(
             split_event(b"prompt\n{}"),
