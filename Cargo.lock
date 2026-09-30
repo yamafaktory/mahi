@@ -3646,7 +3646,10 @@ dependencies = [
 name = "mahi-term"
 version = "0.1.0"
 dependencies = [
+ "mahi-core",
  "thiserror 2.0.21",
+ "unicode-width",
+ "vt100",
 ]
 
 [[package]]

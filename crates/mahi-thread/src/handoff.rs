@@ -3,12 +3,11 @@ use std::fmt::{
     Write as _,
 };
 
+use mahi_core::is_invisible;
 use mahi_store::{
     Change,
     Changes,
 };
-
-use crate::meta::is_invisible;
 
 /// The largest briefing [`Briefing::render`] writes, in bytes.
 pub const MAX_BRIEFING_BYTES: usize = 64 * 1024;

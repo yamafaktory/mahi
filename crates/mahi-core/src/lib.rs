@@ -3,6 +3,7 @@
 mod id;
 mod name;
 mod refs;
+mod text;
 
 pub use id::{
     ParseThreadIdError,
@@ -22,3 +23,4 @@ pub use refs::{
     THREADS_PREFIX,
     ThreadRef,
 };
+pub use text::is_invisible;

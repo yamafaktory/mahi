@@ -1,6 +1,6 @@
 [package]
 authors.workspace = true
-description = "The terminal side of mahi's in-session UI: the palette key and what the user types."
+description = "The terminal side of mahi's in-session UI: its palette, its key, and where it may draw."
 edition.workspace = true
 license.workspace = true
 name = "mahi-term"
@@ -10,7 +10,12 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+mahi-core = { workspace = true }
 thiserror = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+vt100 = { workspace = true }
 
 [lints]
 workspace = true

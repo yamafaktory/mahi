@@ -9,6 +9,7 @@ use mahi_core::{
     NameError,
     ParticipantName,
     ThreadId,
+    is_invisible,
 };
 use mahi_crypto::{
     OpenError,
@@ -733,29 +734,6 @@ fn validate_title(title: &str) -> Result<(), InvalidMeta> {
         return Err(InvalidMeta::TitleCharacter);
     }
     Ok(())
-}
-
-pub(crate) fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{034F}'
-            | '\u{061C}'
-            | '\u{115F}'
-            | '\u{1160}'
-            | '\u{180B}'..='\u{180F}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{3164}'
-            | '\u{FFA0}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{E0000}'..='\u{E007F}'
-    )
 }
 
 fn validate_branch(branch: &str) -> Result<(), InvalidMeta> {

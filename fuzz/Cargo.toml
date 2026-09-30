@@ -157,3 +157,10 @@ path = "fuzz_targets/term_scan.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "term-palette"
+path = "fuzz_targets/term_palette.rs"
+test = false
+doc = false
+bench = false
