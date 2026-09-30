@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    error::Error,
     path::Path,
 };
 
@@ -12,6 +13,7 @@ use gix::{
     objs::{
         Commit,
         Tree,
+        WriteTo,
         tree::{
             Entry,
             EntryKind,
@@ -43,6 +45,26 @@ use mahi_crypto::{
 };
 use thiserror::Error;
 
+/// Signs commits the way git signs them with SSH keys.
+pub trait CommitSigner {
+    /// Returns the armored SSH signature (`-----BEGIN SSH SIGNATURE-----`) of `payload`, a
+    /// commit without its signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signature cannot be made.
+    fn sign_commit(&self, payload: &[u8]) -> Result<String, Box<dyn Error + Send + Sync>>;
+}
+
+/// A commit's signature, as its `gpgsig` header holds it, and the bytes it signs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSignature {
+    /// The armored signature.
+    pub armored: String,
+    /// The commit without its signature header.
+    pub payload: Vec<u8>,
+}
+
 /// The committer and author name on every thread commit.
 pub const COMMITTER_NAME: &str = "mahi";
 /// The committer and author email on every thread commit.
@@ -50,6 +72,7 @@ pub const COMMITTER_EMAIL: &str = "mahi@mahi.invalid";
 
 const MAX_ENTRY_NAME_BYTES: usize = 255;
 const MAX_COMMIT_BYTES: u64 = 64 * 1024;
+const SIGNATURE_HEADER: &str = "gpgsig";
 const MAX_TREE_BYTES: u64 = 1024 * 1024;
 const DISABLE_REFLOG: &str = "core.logAllRefUpdates=false";
 const REF_LOCK_TIMEOUT: &str = "core.filesRefLockTimeout=5000";
@@ -149,6 +172,9 @@ pub enum StoreError {
     /// A remote's URL is not UTF-8.
     #[error("the url of remote {0} is not UTF-8")]
     NonUtf8Url(String),
+    /// A commit could not be signed.
+    #[error("cannot sign the commit")]
+    Sign(#[source] Box<dyn Error + Send + Sync>),
     /// A push failed as a whole, for the reason given.
     #[error("push failed: {0}")]
     PushFailed(String),
@@ -487,10 +513,62 @@ impl Store {
         tree: ObjectId,
         message: &str,
     ) -> Result<ObjectId, StoreError> {
+        self.append_with(thread_ref, expected, tree, message, None)
+    }
+
+    /// Commits `tree` on top of `thread_ref` as [`Store::append`] does, with the commit signed
+    /// by `signer` the way git signs commits with SSH: a `gpgsig` header holding the signature
+    /// of the commit without it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Sign`] if `signer` cannot sign, or the errors of
+    /// [`Store::append`].
+    pub fn append_signed(
+        &self,
+        thread_ref: &ThreadRef,
+        expected: Option<ObjectId>,
+        tree: ObjectId,
+        message: &str,
+        signer: &dyn CommitSigner,
+    ) -> Result<ObjectId, StoreError> {
+        self.append_with(thread_ref, expected, tree, message, Some(signer))
+    }
+
+    /// Returns the SSH signature `commit` carries and the bytes it signs, or `None` if the
+    /// commit is not signed. The commit is size-checked before it is loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `commit` is not a commit,
+    /// [`StoreError::TooLarge`] if it is larger than 64 KiB, or [`StoreError::Git`] if it
+    /// cannot be read or parsed.
+    pub fn commit_signature(
+        &self,
+        commit: ObjectId,
+    ) -> Result<Option<CommitSignature>, StoreError> {
+        self.require_bounded(commit, Kind::Commit, MAX_COMMIT_BYTES)?;
+        let object = self.repo.find_object(commit)?;
+        let found = gix::objs::CommitRefIter::signature(&object.data, self.repo.object_hash())
+            .map_err(gix::Error::from)?;
+        Ok(found.map(|(armored, signed)| CommitSignature {
+            armored: armored.to_string(),
+            payload: signed.to_bstring().into(),
+        }))
+    }
+
+    fn append_with(
+        &self,
+        thread_ref: &ThreadRef,
+        expected: Option<ObjectId>,
+        tree: ObjectId,
+        message: &str,
+        signer: Option<&dyn CommitSigner>,
+    ) -> Result<ObjectId, StoreError> {
         self.require_kind(tree, Kind::Tree)?;
         self.require_head(thread_ref, expected)?;
 
-        let commit = Commit {
+        let mut commit = Commit {
             tree,
             parents: expected.into_iter().collect(),
             author: generic_signature(),
@@ -499,6 +577,14 @@ impl Store {
             message: message.into(),
             extra_headers: Vec::new(),
         };
+        if let Some(signer) = signer {
+            let mut payload = Vec::new();
+            commit.write_to(&mut payload)?;
+            let signature = signer.sign_commit(&payload).map_err(StoreError::Sign)?;
+            commit
+                .extra_headers
+                .push((SIGNATURE_HEADER.into(), signature.into()));
+        }
         let id = self.repo.write_object(&commit)?.detach();
 
         let previous = match expected {
@@ -1084,6 +1170,82 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    struct Recording(std::sync::Mutex<Vec<Vec<u8>>>);
+
+    impl CommitSigner for Recording {
+        fn sign_commit(&self, payload: &[u8]) -> Result<String, Box<dyn Error + Send + Sync>> {
+            self.0.lock().unwrap().push(payload.to_vec());
+            Ok(
+                "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\nAAAA\n-----END SSH SIGNATURE-----"
+                    .to_owned(),
+            )
+        }
+    }
+
+    struct Refusing;
+
+    impl CommitSigner for Refusing {
+        fn sign_commit(&self, _: &[u8]) -> Result<String, Box<dyn Error + Send + Sync>> {
+            Err("the agent refused".into())
+        }
+    }
+
+    #[test]
+    fn a_signed_commit_gives_back_its_signature_and_the_bytes_it_signs() {
+        let (_dir, store) = store();
+        let thread_ref = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
+        let blob = store.write_blob(b"x").unwrap();
+        let tree = store.write_tree(&[("x", EntryKind::Blob, blob)]).unwrap();
+        let signer = Recording(std::sync::Mutex::new(Vec::new()));
+        let first = store
+            .append_signed(&thread_ref, None, tree, "first", &signer)
+            .unwrap();
+        let signature = store.commit_signature(first).unwrap().unwrap();
+        assert_eq!(
+            signature.armored,
+            "-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\nAAAA\n-----END SSH SIGNATURE-----\n"
+        );
+        assert_eq!(signature.payload, signer.0.lock().unwrap()[0]);
+        assert_eq!(store.parent(first).unwrap(), None);
+        assert_eq!(store.commit_tree(first).unwrap(), tree);
+        let second = store
+            .append(&thread_ref, Some(first), tree, "second")
+            .unwrap();
+        assert_eq!(store.commit_signature(second).unwrap(), None);
+        assert!(matches!(
+            store.append_signed(&thread_ref, Some(second), tree, "third", &Refusing),
+            Err(StoreError::Sign(_))
+        ));
+        assert_eq!(store.head(&thread_ref).unwrap(), Some(second));
+    }
+
+    #[test]
+    fn a_commit_signature_is_read_only_from_a_commit_of_bounded_size() {
+        let (_dir, store) = store();
+        let blob = store.write_blob(b"x").unwrap();
+        assert!(matches!(
+            store.commit_signature(blob),
+            Err(StoreError::WrongObject { .. })
+        ));
+        let tree = store.write_tree(&[("x", EntryKind::Blob, blob)]).unwrap();
+        let huge = "m".repeat(64 * 1024);
+        let repo = gix::open(store.common_dir()).unwrap();
+        let commit = Commit {
+            tree,
+            parents: Vec::new().into(),
+            author: generic_signature(),
+            committer: generic_signature(),
+            encoding: None,
+            message: huge.into(),
+            extra_headers: Vec::new(),
+        };
+        let big = repo.write_object(&commit).unwrap().detach();
+        assert!(matches!(
+            store.commit_signature(big),
+            Err(StoreError::TooLarge { .. })
+        ));
     }
 
     #[test]

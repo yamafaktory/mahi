@@ -1,6 +1,7 @@
 //! Threads of mahi: their signed meta document, participants and transcripts.
 
 mod card;
+mod commits;
 mod fetched;
 mod key;
 mod meta;
@@ -14,6 +15,11 @@ mod transcript;
 pub use card::{
     CardError,
     ParticipantCard,
+};
+pub use commits::{
+    COMMIT_NAMESPACE,
+    GitSigner,
+    signed_by,
 };
 pub use fetched::{
     Accepted,

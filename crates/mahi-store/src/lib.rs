@@ -31,6 +31,8 @@ pub use snapshot::{
 pub use store::{
     COMMITTER_EMAIL,
     COMMITTER_NAME,
+    CommitSignature,
+    CommitSigner,
     Store,
     StoreError,
 };
