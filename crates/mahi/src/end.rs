@@ -150,7 +150,7 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
         .ok_or(EndError::NoSshAgent)?;
     let signer = AgentSigner::new(SshAgent::new(socket), signing.public_key().clone())?;
     signer.require_loaded()?;
-    let commits = CommitKey::new(signer);
+    let commits = CommitKey::new(signer).map_err(EndError::OwnerKey)?;
     let termination = TerminationSignals::listen().map_err(EndError::Signals)?;
     let (recorded, caught) = until_stopped(&termination, |interrupt| {
         record_last(

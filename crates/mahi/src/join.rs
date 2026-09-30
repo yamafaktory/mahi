@@ -60,6 +60,7 @@ use mahi_store::{
     StoreError,
 };
 use mahi_thread::{
+    KeyError,
     MetaError,
     NodeId,
     OwnerError,
@@ -171,6 +172,8 @@ pub(crate) enum JoinError {
         "the thread lists another signing key for you than the one mahi init set up; ask the owner to invite your current card (mahi id)"
     )]
     KeyChanged,
+    #[error("your signing key cannot sign commits")]
+    SigningKey(#[source] KeyError),
 }
 
 /// What a viewer shows: the screen of one agent of the participant it follows, rebuilt in its
@@ -456,9 +459,8 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
             }
             None => meta,
         };
-        let signing_key = ParticipantKey::from_public_key(signer.public_key())
-            .map_err(|_| JoinError::KeyChanged)?;
-        let (participant, key) = unlock(&meta, own, Some(&signing_key), &config)?;
+        let commits = CommitKey::new(signer).map_err(JoinError::SigningKey)?;
+        let (participant, key) = unlock(&meta, own, Some(commits.key()), &config)?;
         let joined = Joined {
             thread: ticket.thread(),
             base: meta.base(),
@@ -467,7 +469,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
             owner: ticket.owner().clone(),
             host: ticket.host().clone(),
             lock,
-            commits: CommitKey::new(signer),
+            commits,
         };
         return run::join_run(command, environment, joined)
             .map_err(|error| JoinError::Run(Box::new(error)));
@@ -849,7 +851,7 @@ mod tests {
                 public: &PublicIdentity::from(&LocalIdentity::generate()),
                 node: NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
                 signer: &key,
-                commits: &CommitKey::new(key.clone()),
+                commits: &CommitKey::new(key.clone()).unwrap(),
                 participant: name("alice"),
                 agent: &agent_from(std::path::Path::new("claude")),
                 worktrees: worktrees.path(),

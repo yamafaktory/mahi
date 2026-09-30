@@ -36,6 +36,7 @@ pub(crate) struct Profile {
     pub(crate) state_env: &'static str,
     pub(crate) resume_args: &'static [&'static str],
     pub(crate) credential: Option<(&'static str, &'static str)>,
+    pub(crate) session_dir: Option<fn(&Path) -> Option<String>>,
     install: fn(&OwnedFd) -> io::Result<()>,
 }
 
@@ -52,8 +53,27 @@ const CLAUDE_CODE: Profile = Profile {
     state_env: "CLAUDE_CONFIG_DIR",
     resume_args: &["--continue"],
     credential: Some(("claude", "CLAUDE_CODE_OAUTH_TOKEN")),
+    session_dir: Some(claude_code_session_dir),
     install: install_claude_code,
 };
+
+const CLAUDE_CODE_LONGEST_PROJECT: usize = 200;
+
+/// Returns where Claude Code keeps the sessions of an agent working in `worktree`, inside its
+/// config directory: `projects/` and the worktree's path with every character other than an
+/// ASCII letter or digit replaced by `-`, one for each UTF-16 unit, as Claude Code names it.
+/// A name Claude Code would shorten, past 200 characters, gives `None`.
+fn claude_code_session_dir(worktree: &Path) -> Option<String> {
+    let mut name = String::new();
+    for character in worktree.to_str()?.chars() {
+        if character.is_ascii_alphanumeric() {
+            name.push(character);
+        } else {
+            name.extend(std::iter::repeat_n('-', character.len_utf16()));
+        }
+    }
+    (name.len() <= CLAUDE_CODE_LONGEST_PROJECT).then(|| format!("projects/{name}"))
+}
 
 const PROFILES: [&Profile; 1] = [&CLAUDE_CODE];
 
@@ -280,6 +300,29 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn claude_code_sessions_are_found_under_the_worktree_path_it_names() {
+        assert_eq!(
+            claude_code_session_dir(Path::new(
+                "/home/u/.local/share/mahi/worktrees/app-1f2e/0123abcd"
+            ))
+            .as_deref(),
+            Some("projects/-home-u--local-share-mahi-worktrees-app-1f2e-0123abcd")
+        );
+        let long = format!("/{}", "a".repeat(199));
+        assert!(claude_code_session_dir(Path::new(&long)).is_some());
+        let longer = format!("/{}", "a".repeat(200));
+        assert_eq!(claude_code_session_dir(Path::new(&longer)), None);
+        assert_eq!(
+            claude_code_session_dir(Path::new("/tmp/é")).as_deref(),
+            Some("projects/-tmp--")
+        );
+        assert_eq!(
+            claude_code_session_dir(Path::new("/tmp/\u{1f600}")).as_deref(),
+            Some("projects/-tmp---")
+        );
     }
 
     #[test]

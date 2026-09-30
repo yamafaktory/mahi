@@ -17,6 +17,7 @@ mod recorder;
 mod remote;
 mod run;
 mod session;
+mod session_sync;
 mod sync;
 mod terminal;
 mod thread_lock;

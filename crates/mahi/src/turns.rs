@@ -1,7 +1,12 @@
 use std::{
     mem,
     path::PathBuf,
-    sync::mpsc::Receiver,
+    sync::mpsc::{
+        self,
+        Receiver,
+        SyncSender,
+    },
+    thread,
 };
 
 use mahi_core::{
@@ -32,6 +37,12 @@ use crate::{
         HookMessage,
     },
     session::CommitKey,
+    session_sync::{
+        self,
+        SessionOf,
+        SessionSource,
+        SyncError,
+    },
     sync::PushPoker,
 };
 
@@ -46,6 +57,7 @@ pub(crate) struct Transcript {
     pub(crate) slot: AgentSlot,
     pub(crate) tip: Option<TranscriptTip>,
     pub(crate) commits: CommitKey,
+    pub(crate) session: Option<SessionSource>,
 }
 
 /// How recording the transcript went, and the first error it met.
@@ -54,6 +66,7 @@ pub(crate) struct Summary {
     pub(crate) turns: u64,
     pub(crate) dropped: u64,
     pub(crate) error: Option<TurnError>,
+    pub(crate) session_error: Option<SyncError>,
 }
 
 #[derive(Debug, Error)]
@@ -81,6 +94,69 @@ pub(crate) fn record(
             };
         }
     };
+    thread::scope(|scope| {
+        let (wake, woken) = mpsc::sync_channel(1);
+        let sessions = transcript
+            .session
+            .as_ref()
+            .map(|source| scope.spawn(move || record_sessions(transcript, source, &woken, pushes)));
+        let mut summary = record_turns(&store, transcript, inputs, poker, pushes, &wake);
+        drop(wake);
+        if let Some(sessions) = sessions {
+            match sessions.join() {
+                Ok(error) => summary.session_error = error,
+                Err(_) => summary.session_error = Some(SyncError::Stopped),
+            }
+        }
+        summary
+    })
+}
+
+/// Records the agent's session each time `woken` is poked, a burst of pokes being one record,
+/// and once more when it closes; returns the first error.
+fn record_sessions(
+    transcript: &Transcript,
+    source: &SessionSource,
+    woken: &Receiver<()>,
+    pushes: Option<&PushPoker>,
+) -> Option<SyncError> {
+    let store = match Store::open(&transcript.git_dir) {
+        Ok(store) => store,
+        Err(error) => return Some(error.into()),
+    };
+    let of = SessionOf {
+        thread: transcript.thread,
+        slot: &transcript.slot,
+        key: &transcript.key,
+        own: transcript.commits.key(),
+    };
+    let mut first = None;
+    let mut record = || match session_sync::record(&store, of, source, &transcript.commits) {
+        Ok(Some(_)) => {
+            if let Some(pushes) = pushes {
+                pushes.poke();
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            first.get_or_insert(error);
+        }
+    };
+    while woken.recv().is_ok() {
+        record();
+    }
+    record();
+    first
+}
+
+fn record_turns(
+    store: &Store,
+    transcript: &Transcript,
+    inputs: &Receiver<Delivery>,
+    poker: Option<&Poker>,
+    pushes: Option<&PushPoker>,
+    sessions: &SyncSender<()>,
+) -> Summary {
     let mut turns = Turns::after(transcript.tip);
     while let Ok(delivery) = inputs.recv() {
         let message = match delivery {
@@ -97,11 +173,12 @@ pub(crate) fn record(
         }
         let ends = message.kind == HookKind::TurnEnd;
         turns.push(&message);
-        if ends && turns.seal_or_note(&store, transcript) {
+        if ends && turns.seal_or_note(store, transcript) {
+            let _ = sessions.try_send(());
             pushes.inspect(|pushes| pushes.poke());
         }
     }
-    turns.seal_or_note(&store, transcript);
+    turns.seal_or_note(store, transcript);
     turns.summary
 }
 
@@ -234,6 +311,7 @@ mod tests {
             slot: started.slot.clone(),
             tip: None,
             commits: started.commits.clone(),
+            session: None,
         };
         let (sender, inputs) = mpsc::channel();
         for input in [
@@ -279,6 +357,7 @@ mod tests {
             slot: started.slot.clone(),
             tip: None,
             commits: started.commits.clone(),
+            session: None,
         };
         let (sender, inputs) = mpsc::channel();
         sender.send(hook(HookKind::Prompt, b"one")).unwrap();
@@ -311,6 +390,7 @@ mod tests {
             slot: started.slot.clone(),
             tip: None,
             commits: started.commits.clone(),
+            session: None,
         };
         let (mut scheduler, poker) = Scheduler::new(
             Schedule::new(

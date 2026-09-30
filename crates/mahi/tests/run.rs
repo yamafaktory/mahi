@@ -560,6 +560,9 @@ echo token=${CLAUDE_CODE_OAUTH_TOKEN:-none}
 echo apikey=${ANTHROPIC_API_KEY:-none}
 echo proxy=${HTTPS_PROXY:-none}
 grep -q 'hook turn-end' "$CLAUDE_CONFIG_DIR/settings.json" && echo hooks=ok
+project="$CLAUDE_CONFIG_DIR/projects/$(pwd -P | sed 's/[^a-zA-Z0-9]/-/g')"
+[ -f "$project/s.jsonl" ] && echo "session=$(tr '\n' '|' < "$project/s.jsonl")"
+{ mkdir -p "$project" && echo "turn in $(basename "$(pwd -P)")" >> "$project/s.jsonl"; } 2>/dev/null
 printf 'fix it' | "$MAHI_BIN" hook prompt
 "$MAHI_BIN" hook tool < /dev/null
 "$MAHI_BIN" hook turn-end < /dev/null
@@ -832,6 +835,64 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
     }
 
     #[test]
+    fn claudes_session_is_recorded_and_restored_once_its_state_is_gone() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let claude = fake_claude(&fixture);
+        let first = fixture
+            .command(&["run", claude.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert_eq!(first.status.code(), Some(0), "{stderr}");
+        assert!(!stderr.contains("session was not"), "{stderr}");
+        let thread = worktree_of(&stderr)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let session = ThreadRef::new(
+            thread.parse().unwrap(),
+            RefKind::Session(AgentSlot::new(
+                ParticipantName::new("tester").unwrap(),
+                AgentName::new("claude").unwrap(),
+            )),
+        );
+        let store = Store::open(&fixture.repo).unwrap();
+        all_signed_by(&store, &session, &fixture.owner);
+        let ended = fixture.mahi(&["end", &thread]);
+        assert_eq!(ended.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&ended.stderr).contains("removed the agents' state"));
+
+        let (code, output) = in_terminal(
+            &fixture,
+            &["resume", &thread, "--", claude.to_str().unwrap()],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("restored the agent's session (1 file)"),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("session=turn in {thread}|")),
+            "{output}"
+        );
+        let (code, output) = in_terminal(
+            &fixture,
+            &["resume", &thread, "--", claude.to_str().unwrap()],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(!output.contains("restored"), "{output}");
+        assert!(
+            output.contains(&format!("session=turn in {thread}|turn in {thread}|")),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn resuming_claude_continues_its_conversation_in_the_same_state() {
         let fixture = fixture();
         save_identity(&fixture);
@@ -897,7 +958,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         assert_eq!(code, 1, "{output}");
         assert!(output.contains("is not a private directory"), "{output}");
         assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
-        assert_eq!(fixture.threads().len(), 3);
+        assert_eq!(fixture.threads().len(), 4);
         assert!(
             fixture
                 .thread_worktrees()
@@ -963,7 +1024,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             &snapshots,
             &fixture.owner,
         );
-        assert_eq!(fixture.threads().len(), 3);
+        assert_eq!(fixture.threads().len(), 4);
         let listed = fixture.mahi(&["threads"]);
         assert!(String::from_utf8_lossy(&listed.stdout).contains("no worktree"));
 

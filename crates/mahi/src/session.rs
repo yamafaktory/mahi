@@ -76,15 +76,26 @@ pub(crate) const SNAPSHOT_MESSAGE: &str = "snapshot";
 
 /// What signs the user's agent commits: their snapshots and transcript turns.
 #[derive(Clone)]
-pub(crate) struct CommitKey(Arc<dyn CommitSigner + Send + Sync>);
+pub(crate) struct CommitKey {
+    signer: Arc<dyn CommitSigner + Send + Sync>,
+    key: ParticipantKey,
+}
 
 impl CommitKey {
-    pub(crate) fn new<S: SshSigner + Send + Sync + 'static>(signer: S) -> Self {
-        Self(Arc::new(GitSigner(signer)))
+    pub(crate) fn new<S: SshSigner + Send + Sync + 'static>(signer: S) -> Result<Self, KeyError> {
+        let key = ParticipantKey::from_public_key(signer.public_key())?;
+        Ok(Self {
+            signer: Arc::new(GitSigner(signer)),
+            key,
+        })
     }
 
     pub(crate) fn signer(&self) -> &dyn CommitSigner {
-        &*self.0
+        &*self.signer
+    }
+
+    pub(crate) fn key(&self) -> &ParticipantKey {
+        &self.key
     }
 }
 
@@ -706,7 +717,7 @@ pub(crate) mod tests {
         start_until(
             store,
             signer,
-            &CommitKey::new(signer.clone()),
+            &CommitKey::new(signer.clone()).unwrap(),
             &AtomicBool::new(false),
         )
     }
@@ -780,7 +791,7 @@ pub(crate) mod tests {
             start_until(
                 &store,
                 &signer,
-                &CommitKey::new(signer.clone()),
+                &CommitKey::new(signer.clone()).unwrap(),
                 &AtomicBool::new(true)
             ),
             Err(StartError::Store(StoreError::Interrupted))
@@ -793,7 +804,7 @@ pub(crate) mod tests {
         let (_dir, store) = repository_on_main();
         let interrupt = AtomicBool::new(false);
         let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        let commits = CommitKey::new(key.clone());
+        let commits = CommitKey::new(key.clone()).unwrap();
         let signer = InterruptedWhileSigning(key, &interrupt);
         assert!(matches!(
             start_until(&store, &signer, &commits, &interrupt),
@@ -919,7 +930,7 @@ pub(crate) mod tests {
     fn a_thread_that_cannot_be_signed_leaves_no_worktree() {
         let (_dir, store) = repository_on_main();
         let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        let commits = CommitKey::new(key.clone());
+        let commits = CommitKey::new(key.clone()).unwrap();
         let signer = RefusingSigner(key);
         assert!(matches!(
             start_until(&store, &signer, &commits, &AtomicBool::new(false)),
@@ -1049,7 +1060,8 @@ pub(crate) mod tests {
                     worktrees: &worktrees(&store),
                     commits: &CommitKey::new(
                         PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
-                    ),
+                    )
+                    .unwrap(),
                 },
                 &GlobalPatterns::default(),
                 &AtomicBool::new(false),

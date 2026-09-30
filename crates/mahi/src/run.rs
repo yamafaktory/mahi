@@ -164,6 +164,11 @@ use crate::{
         StartError,
         Started,
     },
+    session_sync::{
+        self,
+        SessionOf,
+        SessionSource,
+    },
     sync::{
         self,
         PushPoker,
@@ -350,7 +355,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     let node = session::own_node(&config).map_err(RunError::NotInitialised)?;
     let live = live_setup(environment, &config, own_key(&signing)?, Vec::new())?;
     let signer = agent_signer(environment, &signing)?;
-    let commits = CommitKey::new(signer.clone());
+    let commits = CommitKey::new(signer.clone()).map_err(RunError::OwnerKey)?;
     let participant = session::participant_from(environment.user.as_deref())
         .map_err(RunError::ParticipantName)?;
     let store = Store::discover(&cwd)?;
@@ -546,7 +551,7 @@ fn listed_and_fetched(
         load_meta(store, command.thread, owner, current.generation())
             .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
     }
-    Ok(Ok(CommitKey::new(signer)))
+    Ok(Ok(CommitKey::new(signer).map_err(RunError::OwnerKey)?))
 }
 
 /// Returns what the live layer needs, unless `MAHI_LIVE` turns it off.
@@ -841,6 +846,22 @@ impl Prepared {
         })
     }
 
+    /// Returns where the agent keeps its session, when its profile names a directory for it.
+    fn session_source(&self, started: &Started) -> Option<SessionSource> {
+        self.profile.and_then(|profile| profile.session_dir).and_then(|dir| {
+            let named = fs::canonicalize(&started.worktree).ok().and_then(|worktree| dir(&worktree));
+            if named.is_none() {
+                eprintln!(
+                    "mahi: the agent's session is not kept, since its worktree's path cannot name it"
+                );
+            }
+            Some(SessionSource {
+                state: started.state_dir(&self.store),
+                dir: named?,
+            })
+        })
+    }
+
     fn launch(
         self,
         environment: &Environment,
@@ -858,7 +879,22 @@ impl Prepared {
                 profile.name
             );
         }
+        let session = self.session_source(&started);
+        let restore = session
+            .as_ref()
+            .zip(started.key.as_ref())
+            .map(|(source, key)| Restore {
+                store: &self.store,
+                of: SessionOf {
+                    thread: started.thread,
+                    slot: &started.slot,
+                    key,
+                    own: started.commits.key(),
+                },
+                dir: &source.dir,
+            });
         let launch = Launch {
+            restore,
             arguments: &self.arguments,
             environment,
             agent: &self.agent,
@@ -910,6 +946,7 @@ impl Prepared {
             self.globals,
             self.hooks,
             pusher.as_ref().map(|(pusher, _)| pusher.poker()),
+            session,
         );
         finish_run(
             child,
@@ -932,6 +969,7 @@ fn start_background(
     globals: GlobalPatterns,
     hooks: UnixListener,
     pushes: Option<PushPoker>,
+    session: Option<SessionSource>,
 ) -> (Option<Recorder>, Option<TurnWorker>) {
     let recorder = started.first_snapshot.take().map(|first| {
         Recorder::start(
@@ -954,6 +992,7 @@ fn start_background(
             slot: started.slot.clone(),
             tip: started.tip,
             commits: started.commits.clone(),
+            session,
         };
         let poker = recorder.as_ref().map(Recorder::poker);
         let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
@@ -995,6 +1034,9 @@ fn finish_turns(turns: Option<TurnWorker>) {
     }
     if let Some(error) = summary.error {
         crate::report(&error);
+    }
+    if let Some(error) = summary.session_error {
+        crate::report_with("the agent's session was not fully recorded", &error);
     }
 }
 
@@ -1233,7 +1275,15 @@ pub(crate) fn until_stopped<T>(
     })
 }
 
+/// Where to restore the agent's recorded session, once its state directory is ready.
+struct Restore<'a> {
+    store: &'a Store,
+    of: SessionOf<'a>,
+    dir: &'a str,
+}
+
 struct Launch<'a> {
+    restore: Option<Restore<'a>>,
     credentials: &'a [Handed],
     profile: Option<&'static Profile>,
     state: Option<PathBuf>,
@@ -1248,6 +1298,22 @@ struct Launch<'a> {
 }
 
 impl Launch<'_> {
+    fn restore_session(&self, state: &Path) {
+        let Some(restore) = &self.restore else {
+            return;
+        };
+        let source = SessionSource {
+            state: state.to_path_buf(),
+            dir: restore.dir.to_owned(),
+        };
+        match session_sync::restore(restore.store, restore.of, &source) {
+            Ok(0) => {}
+            Ok(1) => eprintln!("mahi: restored the agent's session (1 file)"),
+            Ok(count) => eprintln!("mahi: restored the agent's session ({count} files)"),
+            Err(error) => crate::report_with("the agent's session was not restored", &error),
+        }
+    }
+
     fn prepare_state(&self) -> Result<Option<PathBuf>, RunError> {
         let (Some(profile), Some(state)) = (self.profile, &self.state) else {
             return Ok(None);
@@ -1303,6 +1369,7 @@ impl Launch<'_> {
         sandbox.allow_connect(self.hook_socket)?;
         let state = self.prepare_state()?;
         if let Some(state) = &state {
+            self.restore_session(state);
             sandbox.bind(state, Access::ReadWrite)?;
         }
         if let Some(network) = &network {

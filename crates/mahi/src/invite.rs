@@ -327,7 +327,7 @@ mod tests {
                 public: &PublicIdentity::from(&identity),
                 node: NodeId::from_bytes(node_key.public()).unwrap(),
                 signer: &key,
-                commits: &CommitKey::new(key.clone()),
+                commits: &CommitKey::new(key.clone()).unwrap(),
                 participant: ParticipantName::new("alice").unwrap(),
                 agent: &agent_from(std::path::Path::new("claude")),
                 worktrees: worktrees.path(),
