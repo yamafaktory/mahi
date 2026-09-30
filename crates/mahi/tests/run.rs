@@ -1126,6 +1126,61 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
     }
 
     #[test]
+    fn taking_a_thread_from_the_remote_checks_the_key_first_and_needs_the_thread_there() {
+        let fixture = fixture();
+        let thread = "0123456789abcdef0123456789abcdef";
+        let elsewhere = fixture.root.join("other-agent.sock");
+        serve_signatures(
+            &elsewhere,
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+            None,
+        );
+        let config = fixture.repo.join(".git/config");
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str("[remote \"origin\"]\n\turl = ssh://127.0.0.1:1/unreachable.git\n");
+        fs::write(&config, text).unwrap();
+        let refused = fixture
+            .command(&["resume", "--take-remote", thread, "--", "true"])
+            .env("SSH_AUTH_SOCK", &elsewhere)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("does not hold your signing key"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("fetching"), "{stderr}");
+        let missing = fixture.mahi(&["resume", "--take-remote", thread, "--", "true"]);
+        let stderr = String::from_utf8_lossy(&missing.stderr);
+        assert_eq!(missing.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("fetching the thread from origin"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("has no agent of yours"), "{stderr}");
+
+        let first = fixture.mahi(&["run", "true"]);
+        let worktree = worktree_of(&String::from_utf8_lossy(&first.stderr));
+        let here = worktree.file_name().unwrap().to_str().unwrap().to_owned();
+        let kept = fixture.mahi(&["resume", "--take-remote", &here, "--", "true"]);
+        let stderr = String::from_utf8_lossy(&kept.stderr);
+        assert_eq!(kept.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("record and remove it with mahi end"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("fetching"), "{stderr}");
+        assert!(fixture.mahi(&["end", &here]).status.success());
+        let taken = fixture.mahi(&["resume", "--take-remote", &here, "--", "true"]);
+        let stderr = String::from_utf8_lossy(&taken.stderr);
+        assert!(
+            stderr.contains("fetching the thread from origin"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
     fn a_running_thread_cannot_be_resumed_by_another_mahi() {
         let fixture = fixture();
         let mut running = KillOnDrop(

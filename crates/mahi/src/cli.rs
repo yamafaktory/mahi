@@ -260,6 +260,11 @@ pub(crate) struct ResumeCommand {
     /// Which of your agents in the thread to resume, when it has several.
     #[arg(long, value_name = "NAME", value_parser = parse_agent)]
     pub(crate) agent: Option<AgentName>,
+    /// Also takes your own agents' refs from the remote, as another machine of yours pushed
+    /// them: forward only, and only commits signed with your key. This resumes a thread on a
+    /// clone that does not have it yet.
+    #[arg(long)]
+    pub(crate) take_remote: bool,
     #[command(flatten)]
     pub(crate) options: LaunchOptions,
     /// A command to run instead of the thread's agent and its profile's resume arguments,
@@ -483,6 +488,7 @@ mod tests {
             thread,
             "--agent",
             "claude",
+            "--take-remote",
             "--allow-host",
             "api.example.com",
             "--",
@@ -495,12 +501,13 @@ mod tests {
         };
         assert_eq!(resume.thread.to_string(), thread);
         assert_eq!(resume.agent.unwrap().as_str(), "claude");
+        assert!(resume.take_remote);
         assert_eq!(resume.options.allow_hosts().len(), 1);
         assert_eq!(resume.command, ["claude", "--resume"]);
         let Command::Resume(bare) = parse(&["resume", thread]).unwrap().command else {
             panic!("expected the resume command");
         };
-        assert!(bare.command.is_empty() && bare.agent.is_none());
+        assert!(bare.command.is_empty() && bare.agent.is_none() && !bare.take_remote);
         for bad in [
             vec!["resume"],
             vec!["resume", "not-an-id"],

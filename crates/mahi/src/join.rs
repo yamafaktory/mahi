@@ -446,7 +446,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
                     environment,
                     ticket.thread(),
                     ticket.owner(),
-                    &me,
+                    Some(&me),
                 );
                 if let Some(signal) = stopped {
                     return Ok(Outcome::Stopped(signal));

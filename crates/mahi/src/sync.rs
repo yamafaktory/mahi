@@ -229,7 +229,7 @@ pub(crate) fn fetch_thread(
     environment: &Environment,
     thread: ThreadId,
     owner: &ParticipantKey,
-    local: &ParticipantName,
+    local: Option<&ParticipantName>,
     interrupt: &Arc<AtomicBool>,
 ) {
     let (name, url, chosen) = match fetch_source(store) {
@@ -282,7 +282,7 @@ pub(crate) fn fetch_until_stopped(
     environment: &Environment,
     thread: ThreadId,
     owner: &ParticipantKey,
-    local: &ParticipantName,
+    local: Option<&ParticipantName>,
 ) -> Option<Termination> {
     let Ok(termination) = TerminationSignals::listen() else {
         let never = Arc::new(AtomicBool::new(false));
@@ -300,7 +300,7 @@ fn fetch_and_accept<T: Transport>(
     transport: T,
     thread: ThreadId,
     owner: &ParticipantKey,
-    local: &ParticipantName,
+    local: Option<&ParticipantName>,
     interrupt: &AtomicBool,
 ) -> Result<Option<Accepted>, FetchError> {
     let fetched = store.fetch_thread(transport, thread, interrupt);
@@ -832,7 +832,7 @@ mod git_tests {
             connect(),
             started.thread,
             &owner,
-            &bob,
+            Some(&bob),
             &AtomicBool::new(false),
         )
         .unwrap()
@@ -844,7 +844,7 @@ mod git_tests {
             connect(),
             started.thread,
             &owner,
-            &bob,
+            Some(&bob),
             &AtomicBool::new(false),
         )
         .unwrap()
@@ -857,7 +857,7 @@ mod git_tests {
                 connect(),
                 elsewhere,
                 &owner,
-                &bob,
+                Some(&bob),
                 &AtomicBool::new(false)
             )
             .unwrap()
@@ -870,7 +870,7 @@ mod git_tests {
                 connect(),
                 started.thread,
                 &owner,
-                &bob,
+                Some(&bob),
                 &AtomicBool::new(true)
             ),
             Err(FetchError::Fetch(StoreError::Interrupted))
@@ -885,11 +885,64 @@ mod git_tests {
                 connect(),
                 started.thread,
                 &wrong,
-                &bob,
+                Some(&bob),
                 &AtomicBool::new(false)
             ),
             Err(FetchError::Accept(ThreadError::FetchedMetaRefused { .. }))
         ));
         assert_eq!(other.head(&meta).unwrap(), None);
+    }
+
+    #[test]
+    fn the_users_own_refs_are_taken_only_when_asked() {
+        let (_owner_dir, owner_store) = crate::session::tests::repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let owner = ParticipantKey::from_public_key(signer.public_key()).unwrap();
+        let started = crate::session::tests::start_with(&owner_store, &signer).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]);
+        let connect = || {
+            file::connect(remote.as_os_str().as_encoded_bytes(), Protocol::V1, false)
+                .unwrap_or_else(|never| match never {})
+        };
+        let meta = ThreadRef::new(started.thread, RefKind::Meta);
+        owner_store
+            .push_refs(
+                connect(),
+                &[meta.clone(), started.snapshots.clone()],
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let alice = ParticipantName::new("alice").unwrap();
+        let (_mine_dir, mine) = crate::session::tests::repository_on_main();
+        let skipped = fetch_and_accept(
+            &mine,
+            connect(),
+            started.thread,
+            &owner,
+            Some(&alice),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(skipped.skipped, std::slice::from_ref(&started.snapshots));
+        assert_eq!(mine.head(&started.snapshots).unwrap(), None);
+        let taken = fetch_and_accept(
+            &mine,
+            connect(),
+            started.thread,
+            &owner,
+            None,
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(taken.updated, std::slice::from_ref(&started.snapshots));
+        assert_eq!(
+            mine.head(&started.snapshots).unwrap(),
+            owner_store.head(&started.snapshots).unwrap()
+        );
     }
 }

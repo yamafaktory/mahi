@@ -305,6 +305,10 @@ pub(crate) enum RunError {
         "thread {0} does not list your signing key for {1}; resume as the user who started or joined it"
     )]
     NotListed(ThreadId, ParticipantName),
+    #[error(
+        "this clone has a worktree for thread {0}, whose files would hide what is taken from the remote; record and remove it with mahi end, or resume without --take-remote"
+    )]
+    WorktreeHere(ThreadId),
 }
 
 #[derive(Debug)]
@@ -436,8 +440,22 @@ pub(crate) fn resume(
     let bootstrap: Vec<HostAddress> = live::remembered_host(&store, command.thread)
         .into_iter()
         .collect();
-    let slot = session::pick_slot(&store, command.thread, &participant, command.agent.as_ref())?;
     let _lock = ThreadLock::acquire(&config, command.thread)?;
+    let taken = if command.take_remote {
+        if store.worktree_dir(&command.thread.to_string()).is_ok() {
+            return Err(RunError::WorktreeHere(command.thread));
+        }
+        let signer = agent_signer(environment, &signing)?;
+        if let Some(signal) =
+            sync::fetch_until_stopped(&store, environment, command.thread, &owner, None)
+        {
+            return Ok(Outcome::Stopped(signal));
+        }
+        Some(signer)
+    } else {
+        None
+    };
+    let slot = session::pick_slot(&store, command.thread, &participant, command.agent.as_ref())?;
     let (program, arguments, profile) = resumed_command(command, &slot);
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
     let credentials = gather_credentials(&config, &command.options, profile, environment)?;
@@ -456,33 +474,18 @@ pub(crate) fn resume(
     )?;
     prepared.live = live_setup(environment, &config, owner.clone(), bootstrap)?;
     prepared.sync = SyncSetup::gather(&prepared.store, environment, owns_meta);
-    let current = load_meta(&prepared.store, command.thread, &owner, 0)
-        .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
-    let me = current
-        .participants()
-        .find(|listed| listed.key() == &own)
-        .filter(|listed| listed.name() == &participant)
-        .ok_or_else(|| RunError::NotListed(command.thread, participant.clone()))?;
-    let commits = CommitKey::new(agent_signer(environment, &signing)?);
-    {
-        let stopped = sync::fetch_until_stopped(
-            &prepared.store,
-            environment,
-            command.thread,
-            &owner,
-            me.name(),
-        );
-        if let Some(signal) = stopped {
-            return Ok(Outcome::Stopped(signal));
-        }
-        load_meta(
-            &prepared.store,
-            command.thread,
-            &owner,
-            current.generation(),
-        )
-        .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
-    }
+    let commits = match listed_and_fetched(
+        &prepared.store,
+        environment,
+        command,
+        &owner,
+        (&own, &participant),
+        &signing,
+        taken,
+    )? {
+        Ok(commits) => commits,
+        Err(signal) => return Ok(Outcome::Stopped(signal)),
+    };
     let passphrase = TerminalPrompt::open()
         .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
         .map_err(RunError::Terminal)?;
@@ -508,6 +511,42 @@ pub(crate) fn resume(
         return Ok(Outcome::Stopped(signal));
     }
     prepared.launch(environment, started?, termination)
+}
+
+/// Checks that the thread's `meta` lists the user's key `own` under the name `participant`,
+/// fetches the thread as that participant unless `--take-remote` already fetched it, and
+/// returns the key that signs the user's commits: `signer`, or one made from `signing`. The
+/// inner `Err` is the signal that stopped the fetch.
+fn listed_and_fetched(
+    store: &Store,
+    environment: &Environment,
+    command: &ResumeCommand,
+    owner: &ParticipantKey,
+    (own, participant): (&ParticipantKey, &ParticipantName),
+    signing: &SigningKey,
+    signer: Option<AgentSigner>,
+) -> Result<Result<CommitKey, Termination>, RunError> {
+    let current = load_meta(store, command.thread, owner, 0)
+        .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
+    let me = current
+        .participants()
+        .find(|listed| listed.key() == own)
+        .filter(|listed| listed.name() == participant)
+        .ok_or_else(|| RunError::NotListed(command.thread, participant.clone()))?;
+    let signer = match signer {
+        Some(signer) => signer,
+        None => agent_signer(environment, signing)?,
+    };
+    if !command.take_remote {
+        let stopped =
+            sync::fetch_until_stopped(store, environment, command.thread, owner, Some(me.name()));
+        if let Some(signal) = stopped {
+            return Ok(Err(signal));
+        }
+        load_meta(store, command.thread, owner, current.generation())
+            .map_err(|error| ResumeError::Meta(command.thread, Box::new(error)))?;
+    }
+    Ok(Ok(CommitKey::new(signer)))
 }
 
 /// Returns what the live layer needs, unless `MAHI_LIVE` turns it off.

@@ -57,7 +57,8 @@ enum Advance {
 }
 
 /// Accepts the refs [`Store::fetch_thread`] fetched for `thread`, after checking them, on
-/// behalf of the participant `local`.
+/// behalf of the participant `local`, whose own refs are left alone; with no `local`, as when
+/// the user takes their own refs from another machine, every listed participant's are taken.
 ///
 /// The fetched `meta` comes first. Its document must be the thread's and signed by
 /// `trusted_owner`; a newer generation than the local one, or the same document, then becomes
@@ -83,7 +84,7 @@ pub fn accept_fetched(
     store: &Store,
     thread: ThreadId,
     trusted_owner: &ParticipantKey,
-    local: &ParticipantName,
+    local: Option<&ParticipantName>,
 ) -> Result<Accepted, ThreadError> {
     let meta_ref = ThreadRef::new(thread, RefKind::Meta);
     let fetched = store.fetched_refs(thread)?;
@@ -107,7 +108,7 @@ pub fn accept_fetched(
             }
         };
         let writer = slot
-            .filter(|slot| slot.participant() != local)
+            .filter(|slot| Some(slot.participant()) != local)
             .and_then(|slot| {
                 current
                     .participants()
@@ -332,7 +333,7 @@ mod tests {
             &setup.store,
             setup.thread,
             &setup.owner_key,
-            &ParticipantName::new("bob").unwrap(),
+            Some(&ParticipantName::new("bob").unwrap()),
         )
     }
 
@@ -619,7 +620,7 @@ mod tests {
                 &setup.store,
                 unfetched,
                 &setup.owner_key,
-                &ParticipantName::new("bob").unwrap()
+                Some(&ParticipantName::new("bob").unwrap())
             ),
             Err(ThreadError::NotFound(thread)) if thread == unfetched
         ));
