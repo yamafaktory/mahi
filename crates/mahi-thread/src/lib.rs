@@ -8,6 +8,7 @@ mod meta;
 mod node;
 mod owners;
 mod pins;
+mod session_files;
 mod signer;
 mod thread;
 mod transcript;
@@ -50,6 +51,19 @@ pub use owners::{
     remembered_owner,
 };
 pub use pins::PinError;
+pub use session_files::{
+    MAX_SESSION_BYTES,
+    MAX_SESSION_CHUNKS,
+    MAX_SESSION_FILES,
+    MAX_SESSION_PATH_BYTES,
+    SESSION_CHUNK_BYTES,
+    SessionError,
+    SessionFile,
+    SessionPath,
+    SessionReader,
+    SessionWriter,
+    session_ref,
+};
 pub use signer::{
     SignError,
     SshSigner,

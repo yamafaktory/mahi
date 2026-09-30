@@ -399,6 +399,53 @@ impl Store {
         Ok(Some(data))
     }
 
+    /// Returns the blob entries of the tree `commit` records, each with its UTF-8 name; entries
+    /// of other kinds, or with other names, are left out. The commit and the tree are
+    /// size-checked before they are loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `commit` is not a commit,
+    /// [`StoreError::TooLarge`] if the commit or its tree is over its limit, or
+    /// [`StoreError::Git`] if reading fails.
+    pub fn commit_blobs(&self, commit: ObjectId) -> Result<Vec<(String, ObjectId)>, StoreError> {
+        self.require_bounded(commit, Kind::Commit, MAX_COMMIT_BYTES)?;
+        let tree_id = self
+            .repo
+            .find_commit(commit)?
+            .tree_id()
+            .map_err(gix::Error::from)?
+            .detach();
+        self.require_bounded(tree_id, Kind::Tree, MAX_TREE_BYTES)?;
+        let tree = self.repo.find_tree(tree_id)?;
+        let mut blobs = Vec::new();
+        for entry in tree.iter() {
+            let entry = entry.map_err(gix::Error::from)?;
+            if !entry.mode().is_blob() {
+                continue;
+            }
+            if let Ok(name) = std::str::from_utf8(entry.filename()) {
+                blobs.push((name.to_owned(), entry.object_id()));
+            }
+        }
+        Ok(blobs)
+    }
+
+    /// Reads the blob `id`, refusing it from its header when it is larger than `max_len`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `id` is not a blob, [`StoreError::TooLarge`] if it
+    /// is larger than `max_len`, or [`StoreError::Git`] if reading fails.
+    pub fn read_blob(&self, id: ObjectId, max_len: u64) -> Result<Vec<u8>, StoreError> {
+        self.require_bounded(id, Kind::Blob, max_len)?;
+        let data = self.repo.find_object(id)?.detach().data;
+        if data.len() as u64 > max_len {
+            return Err(StoreError::TooLarge { id, limit: max_len });
+        }
+        Ok(data)
+    }
+
     /// Returns the tree `commit` records.
     ///
     /// # Errors
@@ -1245,6 +1292,39 @@ mod tests {
         assert!(matches!(
             store.commit_signature(big),
             Err(StoreError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_commits_blobs_are_listed_by_name_and_read_within_their_limit() {
+        let (_dir, store) = store();
+        let small = store.write_blob(b"small").unwrap();
+        let large = store.write_blob(&[7; 100]).unwrap();
+        let inner = store.write_tree(&[("x", EntryKind::Blob, small)]).unwrap();
+        let tree = store
+            .write_tree(&[
+                ("a", EntryKind::Blob, small),
+                ("b", EntryKind::Blob, large),
+                ("dir", EntryKind::Tree, inner),
+            ])
+            .unwrap();
+        let commit = store.append(&transcript_ref(), None, tree, "x").unwrap();
+        assert_eq!(
+            store.commit_blobs(commit).unwrap(),
+            [("a".to_owned(), small), ("b".to_owned(), large)]
+        );
+        assert_eq!(store.read_blob(small, 5).unwrap(), b"small");
+        assert!(matches!(
+            store.read_blob(large, 99),
+            Err(StoreError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            store.read_blob(tree, 1 << 20),
+            Err(StoreError::WrongObject { .. })
+        ));
+        assert!(matches!(
+            store.commit_blobs(small),
+            Err(StoreError::WrongObject { .. })
         ));
     }
 

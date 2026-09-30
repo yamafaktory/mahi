@@ -140,6 +140,13 @@ refs/threads/<id>/agents/<participant>.<agent>/session     # native agent sessio
 - Turn numbers go up by one from commit to commit, and sequence numbers strictly increase within and across turns. Appending checks the new turn against the transcript's tip (its newest commit, turn number and running last sequence number), which the host keeps in memory or recovers by opening only the newest commit; it never opens earlier turns. Reading walks newest first, holds one turn at a time, and checks every commit it walks, which also has to have at most one parent.
 - Reading is bounded: 1 MiB per event, 100,000 events and 64 MiB per encoded turn (plus the sealing overhead for the stored blob), and the caller chooses how many turns to read back.
 
+### Native session files
+
+- An agent's own session files (for Claude Code, the conversation it resumes with `--continue`) are recorded on `refs/threads/<id>/agents/<participant>.<agent>/session`, one commit per change, signed like the agent's other commits.
+- Each file is cut into 64 KiB pieces, each sealed to the thread key on its own and named in the commit's tree by its tag: a BLAKE3 keyed hash under a key derived from the thread key, so names reveal nothing without it. A piece the previous commit holds is reused rather than sealed again, once that commit is found signed by the user's own key, so a session file that only grew, as a conversation log does, costs the pieces it gained. A sealed `manifest` in the same tree lists each file's path, size and piece tags, in a versioned `postcard` record; paths are relative, `/`-separated, with no empty, `.` or `..` component. A commit whose files are exactly the previous commit's is not written.
+- Recording and reading are bounded: 4096 files, 8192 distinct pieces and 512 MiB of file contents per commit, 1024-byte paths 16 components deep. Reading checks the manifest (valid paths in strictly ascending order, none a directory of another or equal to another but for ASCII case, sizes that match their piece counts, every piece present, at most 4096 files as it decodes) before anything is written, then each piece's size and tag as it is copied out.
+- What the pieces show without the key: how many there are, which ones repeat from commit to commit (so that a file grew, and its size to 64 KiB), and the compressed size of each, like every sealed blob; a conversation's last piece is sealed again at each change, so its compressed size is seen as it grows.
+
 ## Session lifecycle
 
 `mahi run -- claude` (or any agent):
