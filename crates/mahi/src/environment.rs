@@ -69,6 +69,11 @@ pub(crate) struct Environment {
     pub(crate) live: LiveMode,
     pub(crate) https_proxy: Option<String>,
     pub(crate) no_proxy: Option<String>,
+    pub(crate) term: Option<String>,
+    pub(crate) term_program: Option<String>,
+    pub(crate) tmux: bool,
+    pub(crate) kitty: bool,
+    pub(crate) vte: bool,
 }
 
 /// Whether `mahi run` and `mahi resume` let teammates watch, from `MAHI_LIVE`.
@@ -194,6 +199,11 @@ impl Environment {
             live: LiveMode::parse(value("MAHI_LIVE").as_ref()),
             https_proxy: text("https_proxy").or_else(|| text("HTTPS_PROXY")),
             no_proxy: text("no_proxy").or_else(|| text("NO_PROXY")),
+            term: text("TERM"),
+            term_program: text("TERM_PROGRAM"),
+            tmux: value("TMUX").is_some(),
+            kitty: value("KITTY_WINDOW_ID").is_some(),
+            vte: value("VTE_VERSION").is_some(),
             passed_on: PASSED_ON
                 .iter()
                 .filter_map(|&name| value(name).map(|value| (name, value)))

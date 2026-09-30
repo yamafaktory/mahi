@@ -70,6 +70,13 @@ impl OutputTracker {
         self.bracketed_paste
     }
 
+    /// Returns whether the output so far ends outside anything the agent has begun, where mahi
+    /// may write a sequence that does not move the cursor, such as a notification's.
+    #[must_use]
+    pub fn is_ground(&self) -> bool {
+        self.state == State::Ground
+    }
+
     /// Returns whether mahi may draw after the output so far.
     #[must_use]
     pub fn can_draw(&self) -> bool {
@@ -270,7 +277,7 @@ mod tests {
         tracker.feed(b"\x1b[?99999999999999999999h\x1b[>2004h");
         assert!(!tracker.bracketed_paste());
         tracker.feed(b"\x1b[?2004h\x1b7");
-        assert!(tracker.bracketed_paste() && !tracker.can_draw());
+        assert!(tracker.bracketed_paste() && !tracker.can_draw() && tracker.is_ground());
         tracker.feed(b"\x1bc");
         assert!(!tracker.bracketed_paste() && tracker.can_draw());
     }

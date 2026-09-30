@@ -2375,6 +2375,9 @@ cat parser.rs
         keys.write_all(b"run the tests\r").unwrap();
         wait_until("the host to queue bob's prompt", || seen("waiting"));
 
+        host.wait_for(
+            "\x1b]9;mahi: bob sent a prompt (Ctrl-Space to read it): run the tests\x07\x07",
+        );
         host.type_keys(b"\0");
         host.wait_for_screen("run the tests");
         host.type_keys(b"\r");

@@ -4,6 +4,7 @@ use std::{
         OsStr,
         OsString,
     },
+    fmt::Write as _,
     fs::{
         self,
         File,
@@ -101,8 +102,10 @@ use mahi_store::{
 };
 use mahi_term::{
     KeyScanner,
+    Notice,
     PaletteKey,
     Segment,
+    TerminalHints,
 };
 use mahi_thread::{
     KeyError,
@@ -177,7 +180,10 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
-    prompts::Prompts,
+    prompts::{
+        Arrival,
+        Prompts,
+    },
     recorder::{
         RecordError,
         Recorder,
@@ -1194,6 +1200,13 @@ impl Prepared {
             &UserSide {
                 palette_key: self.palette_key,
                 activity,
+                notice: Notice::for_terminal(TerminalHints {
+                    term: environment.term.as_deref(),
+                    term_program: environment.term_program.as_deref(),
+                    kitty: environment.kitty,
+                    vte: environment.vte,
+                    tmux: environment.tmux,
+                }),
             },
             termination,
             Background {
@@ -1289,6 +1302,7 @@ fn finish_turns(turns: Option<TurnWorker>) {
 struct UserSide {
     palette_key: PaletteKey,
     activity: Arc<Activity>,
+    notice: Notice,
 }
 
 fn finish_run(
@@ -1369,7 +1383,7 @@ fn supervise(
     let (tap, prompts) = live.unzip();
     let code = relay(
         child,
-        interactive.then_some(user.palette_key),
+        interactive.then_some((user.palette_key, user.notice)),
         &user.activity,
         (events, &received),
         tap,
@@ -1745,7 +1759,7 @@ impl Host {
 
 fn relay(
     child: PtyChild,
-    palette: Option<PaletteKey>,
+    palette: Option<(PaletteKey, Notice)>,
     activity: &Arc<Activity>,
     (events, received): (mpsc::Sender<Event>, &Receiver<Event>),
     tap: Option<OutputTap>,
@@ -1756,18 +1770,32 @@ fn relay(
     let screen = Arc::new(Screen::new(
         io::stdout(),
         repainter.clone(),
-        palette.unwrap_or_default(),
+        palette.map(|(key, _)| key).unwrap_or_default(),
         prompts.clone(),
     ));
-    let input = palette.map(|key| (Arc::clone(&screen), KeyScanner::new(key)));
+    let input = palette.map(|(key, _)| (Arc::clone(&screen), KeyScanner::new(key)));
     let (input_writer, input_activity) = (Arc::clone(&writer), Arc::clone(activity));
     thread::spawn(move || forward_input(&input_writer, input, &input_activity));
     let running = Arc::new(AtomicBool::new(palette.is_some()));
     let (tick_screen, ticking) = (Arc::clone(&screen), Arc::clone(&running));
+    let told = prompts.clone().zip(palette);
     thread::spawn(move || {
+        let mut arrivals = Vec::new();
+        let mut notice = Vec::new();
+        let mut text = String::new();
         while ticking.load(Ordering::SeqCst) {
             thread::sleep(PALETTE_TICK);
             let _ = tick_screen.tick();
+            if let Some((prompts, (key, notifier))) = &told {
+                prompts.take_arrivals(&mut arrivals);
+                for arrival in arrivals.drain(..) {
+                    notice.clear();
+                    text.clear();
+                    arrival_text(&arrival, *key, &mut text);
+                    notifier.write("mahi", &text, &mut notice);
+                    let _ = tick_screen.notify(&notice);
+                }
+            }
         }
     });
     if let Some(prompts) = prompts.filter(|_| palette.is_some()) {
@@ -1825,6 +1853,22 @@ fn relay(
     running.store(false, Ordering::SeqCst);
     let _ = screen.close();
     outcome
+}
+
+fn arrival_text(arrival: &Arrival, key: PaletteKey, out: &mut String) {
+    let _ = if arrival.accepted {
+        write!(
+            out,
+            "{}'s prompt goes to the agent: {}",
+            arrival.from, arrival.first_words
+        )
+    } else {
+        write!(
+            out,
+            "{} sent a prompt ({key} to read it): {}",
+            arrival.from, arrival.first_words
+        )
+    };
 }
 
 fn await_outcome(

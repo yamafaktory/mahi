@@ -18,6 +18,8 @@ const MAX_WAITING: usize = 32;
 const MAX_WAITING_FROM_ONE: usize = 8;
 const MAX_ANSWERS: usize = 256;
 const MAX_ACCEPTED: usize = 32;
+const MAX_ARRIVALS: usize = 8;
+const ARRIVAL_CHARS: usize = 80;
 
 /// The prompts teammates sent the host's agent, waiting for the host user, and the answers
 /// their senders are owed.
@@ -32,7 +34,16 @@ struct State {
     accepted: VecDeque<Accepted>,
     trusted: HashSet<ParticipantName>,
     answers: VecDeque<Answer>,
+    arrivals: VecDeque<Arrival>,
     closed: bool,
+}
+
+/// A prompt that just came, for the host user to be told of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Arrival {
+    pub(crate) from: ParticipantName,
+    pub(crate) first_words: String,
+    pub(crate) accepted: bool,
 }
 
 /// A prompt the host user accepted, waiting for the agent to be idle.
@@ -83,7 +94,11 @@ impl Prompts {
             return PromptOutcome::Dropped;
         };
         if !state.closed && state.trusted.contains(&from) {
+            let first_words: String = text.as_str().chars().take(ARRIVAL_CHARS).collect();
             let outcome = state.accept(id, text);
+            if outcome == PromptOutcome::Accepted {
+                state.arrived(&from, &first_words, true);
+            }
             state.answer(id, outcome);
             return outcome;
         }
@@ -98,6 +113,7 @@ impl Prompts {
         {
             PromptOutcome::Dropped
         } else {
+            state.arrived(&from, text.as_str(), false);
             state.waiting.push_back(Waiting {
                 id,
                 from,
@@ -155,6 +171,13 @@ impl Prompts {
         self.state.lock().ok()?.accepted.pop_front()
     }
 
+    /// Moves the prompts that came since the last call into `into`, oldest first.
+    pub(crate) fn take_arrivals(&self, into: &mut Vec<Arrival>) {
+        if let Ok(mut state) = self.state.lock() {
+            into.extend(state.arrivals.drain(..));
+        }
+    }
+
     /// Moves the answers owed into `into`, oldest first.
     pub(crate) fn take_answers(&self, into: &mut Vec<Answer>) {
         if let Ok(mut state) = self.state.lock() {
@@ -185,6 +208,17 @@ impl Prompts {
 }
 
 impl State {
+    fn arrived(&mut self, from: &ParticipantName, text: &str, accepted: bool) {
+        if self.arrivals.len() == MAX_ARRIVALS {
+            self.arrivals.pop_front();
+        }
+        self.arrivals.push_back(Arrival {
+            from: from.clone(),
+            first_words: text.chars().take(ARRIVAL_CHARS).collect(),
+            accepted,
+        });
+    }
+
     fn accept(&mut self, id: [u8; PROMPT_ID_BYTES], text: PromptText) -> PromptOutcome {
         if self.accepted.len() >= MAX_ACCEPTED {
             return PromptOutcome::Dropped;
@@ -374,5 +408,46 @@ mod tests {
             prompts.offer(name("bob"), [2; 16], text()),
             PromptOutcome::Dropped
         );
+    }
+
+    #[test]
+    fn arrivals_are_noted_for_the_host_user_and_bounded() {
+        let prompts = Prompts::default();
+        prompts.offer(name("bob"), [1; 16], text());
+        prompts.decide([1; 16], Decision::AlwaysAccept);
+        prompts.offer(name("bob"), [2; 16], text());
+        prompts.close();
+        prompts.offer(name("carol"), [3; 16], text());
+        let mut arrivals = Vec::new();
+        prompts.take_arrivals(&mut arrivals);
+        assert_eq!(
+            arrivals
+                .iter()
+                .map(|arrival| (arrival.from.as_str(), arrival.accepted))
+                .collect::<Vec<_>>(),
+            [("bob", false), ("bob", true)]
+        );
+        assert_eq!(arrivals[0].first_words, "fix the test");
+        let full = Prompts::default();
+        full.offer(name("bob"), [0; 16], text());
+        full.decide([0; 16], Decision::AlwaysAccept);
+        for id in 1..=MAX_ACCEPTED {
+            full.offer(name("bob"), [u8::try_from(id).unwrap(); 16], text());
+        }
+        arrivals.clear();
+        full.take_arrivals(&mut arrivals);
+        assert_eq!(arrivals.len(), MAX_ARRIVALS);
+        assert!(full.next_accepted().is_some());
+        let mut owed = Vec::new();
+        full.take_answers(&mut owed);
+        assert_eq!(owed.last().unwrap().outcome, PromptOutcome::Dropped);
+        let many = Prompts::default();
+        for id in 0..12 {
+            many.offer(name(&format!("p{id}")), [id; 16], text());
+        }
+        arrivals.clear();
+        many.take_arrivals(&mut arrivals);
+        assert_eq!(arrivals.len(), MAX_ARRIVALS);
+        assert_eq!(arrivals[0].from.as_str(), "p4");
     }
 }

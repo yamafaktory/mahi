@@ -124,6 +124,7 @@ struct State<W> {
     page: usize,
     read_whole: Option<[u8; PROMPT_ID_BYTES]>,
     keys: PaletteKeys,
+    notice: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +151,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
                 page: 0,
                 read_whole: None,
                 keys: PaletteKeys::default(),
+                notice: Vec::new(),
             }),
             terminal,
             prompts,
@@ -174,6 +176,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
             Mode::Agent => {
                 state.tracker.feed(bytes);
                 state.out.write_all(bytes)?;
+                write_notice(&mut state)?;
             }
             Mode::Opening => {
                 let written = state.tracker.feed_until_drawable(bytes);
@@ -182,6 +185,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
                 if state.tracker.can_draw() {
                     state.held.extend_from_slice(later);
                     state.mode = Mode::Open;
+                    write_notice(&mut state)?;
                     self.draw(&mut state)?;
                 }
             }
@@ -190,6 +194,26 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
                 self.release(&mut state)?;
             }
             Mode::Open => state.held.extend_from_slice(bytes),
+        }
+        state.out.flush()
+    }
+
+    /// Writes `notice`, the sequence that asks the terminal for a notification, where the
+    /// agent's output allows it: at once when it does, and otherwise as soon as it does,
+    /// replacing a notice still waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error writing to the screen gives.
+    pub(crate) fn notify(&self, notice: &[u8]) -> io::Result<()> {
+        let mut state = self.lock()?;
+        state.notice.clear();
+        state.notice.extend_from_slice(notice);
+        if state.mode == Mode::Open {
+            let pending = std::mem::take(&mut state.notice);
+            state.out.write_all(&pending)?;
+        } else if state.mode == Mode::Agent {
+            write_notice(&mut state)?;
         }
         state.out.flush()
     }
@@ -364,6 +388,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         state.read_whole = None;
         state.keys = PaletteKeys::default();
         state.out.write_all(&held)?;
+        write_notice(state)?;
         if was_open {
             self.terminal.repaint();
         }
@@ -507,6 +532,14 @@ impl<W: Write, T: AgentTerminal> AgentInput for Screen<W, T> {
         self.lock()
             .is_ok_and(|state| state.tracker.bracketed_paste())
     }
+}
+
+fn write_notice<W: Write>(state: &mut State<W>) -> io::Result<()> {
+    if state.notice.is_empty() || !state.tracker.is_ground() {
+        return Ok(());
+    }
+    let notice = std::mem::take(&mut state.notice);
+    state.out.write_all(&notice)
 }
 
 fn push_age(out: &mut String, age: Duration) {
@@ -813,5 +846,45 @@ mod tests {
         screen.typed(b"\r").unwrap();
         assert!(!screen.is_open());
         assert_eq!(prompts.next_accepted().unwrap().id, [1; 16]);
+    }
+
+    #[test]
+    fn a_notice_waiting_while_the_palette_was_forced_open_comes_after_the_held_output() {
+        let terminal = FakeTerminal::default();
+        let screen = screen(&terminal);
+        screen.output(b"\x1b]0;tit").unwrap();
+        screen.open().unwrap();
+        screen.notify(b"NOTICE").unwrap();
+        screen.open_now().unwrap();
+        written(&screen);
+        screen.output(b"le\x07after").unwrap();
+        screen.close().unwrap();
+        let out = written(&screen);
+        let notice = out.windows(6).position(|window| window == b"NOTICE");
+        assert_eq!(notice, Some(out.len() - 6), "{out:?}");
+        assert!(out.starts_with(b"le\x07after"));
+        screen.output(b"\x1b7saved").unwrap();
+        written(&screen);
+        screen.notify(b"TOLD").unwrap();
+        assert_eq!(written(&screen), b"TOLD");
+    }
+
+    #[test]
+    fn a_notice_waits_for_the_agent_to_finish_a_sequence() {
+        let terminal = FakeTerminal::default();
+        let screen = screen(&terminal);
+        screen.notify(b"\x07").unwrap();
+        assert_eq!(written(&screen), b"\x07");
+        screen.output(b"\x1b[1;3").unwrap();
+        written(&screen);
+        screen.notify(b"first").unwrap();
+        screen.notify(b"second").unwrap();
+        assert!(written(&screen).is_empty());
+        screen.output(b"1m").unwrap();
+        assert_eq!(written(&screen), b"1msecond");
+        screen.open().unwrap();
+        written(&screen);
+        screen.notify(b"open").unwrap();
+        assert_eq!(written(&screen), b"open");
     }
 }

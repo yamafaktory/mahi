@@ -4,6 +4,7 @@
 
 mod input;
 mod key;
+mod notify;
 mod output;
 mod scan;
 mod view;
@@ -15,6 +16,11 @@ pub use input::{
 pub use key::{
     PaletteKey,
     PaletteKeyError,
+};
+pub use notify::{
+    Notice,
+    Notifier,
+    TerminalHints,
 };
 pub use output::OutputTracker;
 pub use scan::{

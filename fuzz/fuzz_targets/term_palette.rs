@@ -1,7 +1,9 @@
 #![no_main]
 
 use mahi_term::{
+    Notice,
     OutputTracker,
+    TerminalHints,
     PaletteInput,
     PaletteItem,
     PaletteKeys,
@@ -71,4 +73,21 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     drawn.feed(&out);
     assert!(drawn.can_draw());
     assert!(!out.windows(2).any(|pair| pair == b"\x1b]" || pair == b"\x1bP"));
+    for (term, tmux) in [
+        ("xterm", false),
+        ("foot", true),
+        ("xterm-kitty", false),
+        ("xterm-kitty", true),
+    ] {
+        let mut notice = Vec::new();
+        let hints = TerminalHints {
+            term: Some(term),
+            tmux,
+            ..TerminalHints::default()
+        };
+        Notice::for_terminal(hints).write(&text, &filter, &mut notice);
+        let mut told = OutputTracker::default();
+        told.feed(&notice);
+        assert!(told.can_draw());
+    }
 });
