@@ -10,14 +10,21 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+aes = { workspace = true }
+aes-gcm = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+chacha20 = { workspace = true }
+ghash = { workspace = true }
 gix = { workspace = true }
 hmac = { workspace = true }
+poly1305 = { workspace = true }
 russh = { workspace = true }
 sha1 = { workspace = true }
+subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net"] }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 mahi-core = { workspace = true }

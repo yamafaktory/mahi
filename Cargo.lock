@@ -3616,19 +3616,26 @@ dependencies = [
 name = "mahi-ssh"
 version = "0.1.0"
 dependencies = [
+ "aes 0.8.4",
+ "aes-gcm 0.10.3",
  "base64 0.22.1",
  "bytes",
+ "chacha20 0.9.1",
+ "ghash 0.5.1",
  "gix",
  "hmac 0.12.1",
  "mahi-core",
  "mahi-store",
+ "poly1305 0.8.0",
  "proptest",
  "russh",
  "sha1 0.10.7",
+ "subtle",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
+ "zeroize",
 ]
 
 [[package]]
@@ -4659,6 +4666,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash 0.5.1",
+ "zeroize",
 ]
 
 [[package]]

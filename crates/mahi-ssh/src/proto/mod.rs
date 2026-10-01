@@ -6,5 +6,7 @@
     )
 )]
 
+pub(crate) mod cipher;
 pub(crate) mod message;
+pub(crate) mod packet;
 pub(crate) mod wire;
