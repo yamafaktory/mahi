@@ -178,3 +178,10 @@ path = "fuzz_targets/ssh_packets.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ssh-transport"
+path = "fuzz_targets/ssh_transport.rs"
+test = false
+doc = false
+bench = false

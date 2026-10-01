@@ -3532,15 +3532,21 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chacha20 0.9.1",
+ "getrandom 0.4.3",
  "ghash 0.5.1",
  "gix",
  "hmac 0.12.1",
+ "ml-kem",
  "poly1305 0.8.0",
  "russh",
  "sha1 0.10.7",
+ "sha2 0.10.9",
+ "signature 2.2.0",
+ "ssh-key 0.6.7",
  "subtle",
  "thiserror 2.0.21",
  "tokio",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -3688,6 +3694,7 @@ dependencies = [
  "pkcs8 0.11.0",
  "rand_core 0.10.1",
  "sha3 0.11.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -3699,6 +3706,7 @@ dependencies = [
  "ctutils",
  "hybrid-array",
  "num-traits",
+ "zeroize",
 ]
 
 [[package]]

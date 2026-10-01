@@ -7,8 +7,13 @@ use crate::proto::{
         CipherName,
         Opener,
     },
+    kex::HostKeyAlgorithm,
     message::Message,
     packet::Inbound,
+    transport::{
+        Poll,
+        Transport,
+    },
 };
 
 /// Decodes `data` as the payload of an SSH message and checks that encoding what was decoded
@@ -51,6 +56,37 @@ pub fn packets(data: &[u8]) {
             while let Ok(Some(payload)) = inbound.next(&mut opener, sequence) {
                 let _ = Message::decode(payload);
                 sequence = sequence.wrapping_add(1);
+            }
+        }
+    }
+}
+
+/// Feeds `data` to a new client connection as the server's bytes, in pieces, from the
+/// identification line through the key exchange, as far as it gets.
+///
+/// # Panics
+///
+/// Panics if a new connection cannot be started, which needs only random bytes.
+pub fn transport(data: &[u8]) {
+    let mut transport = Transport::new(&HostKeyAlgorithm::ALL).expect("a new connection starts");
+    for chunk in data.chunks(1031) {
+        let sent = transport.output().len();
+        transport.advance_output(sent);
+        if transport.receive(chunk).is_err() {
+            return;
+        }
+        loop {
+            match transport.poll() {
+                Ok(Poll::Message) => {
+                    let _ = Message::decode(transport.message());
+                }
+                Ok(Poll::HostKey) => {
+                    if transport.accept_host_key().is_err() {
+                        return;
+                    }
+                }
+                Ok(Poll::Pending) => break,
+                Err(_) => return,
             }
         }
     }

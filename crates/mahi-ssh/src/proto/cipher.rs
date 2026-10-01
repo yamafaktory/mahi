@@ -90,6 +90,18 @@ pub(crate) struct Opener(Keys);
 
 pub(crate) struct Sealer(Keys);
 
+impl std::fmt::Debug for Opener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Opener")
+    }
+}
+
+impl std::fmt::Debug for Sealer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Sealer")
+    }
+}
+
 enum Keys {
     Clear,
     ChaCha {

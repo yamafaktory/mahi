@@ -54,14 +54,24 @@ impl Inbound {
         opener: &mut Opener,
         sequence: u32,
     ) -> Result<Option<&[u8]>, PacketError> {
+        let range = self.next_range(opener, sequence)?;
+        Ok(range.map(|range| self.payload(range)))
+    }
+
+    pub(crate) fn next_range(
+        &mut self,
+        opener: &mut Opener,
+        sequence: u32,
+    ) -> Result<Option<Range<usize>>, PacketError> {
         if let Some(error) = self.failed {
             return Err(error);
         }
-        match self.open(opener, sequence) {
-            Ok(Some(payload)) => Ok(self.buffer.get(payload)),
-            Ok(None) => Ok(None),
-            Err(error) => Err(self.fail(error)),
-        }
+        self.open(opener, sequence)
+            .map_err(|error| self.fail(error))
+    }
+
+    pub(crate) fn payload(&self, range: Range<usize>) -> &[u8] {
+        self.buffer.get(range).unwrap_or_default()
     }
 
     fn open(
