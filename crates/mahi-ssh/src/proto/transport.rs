@@ -260,6 +260,10 @@ impl Transport {
         self.authenticated = true;
     }
 
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.authenticated
+    }
+
     fn rekey(&mut self) -> Result<(), TransportError> {
         if self.authenticated && self.exchange.is_none() && self.session_id.is_some() {
             self.send_kexinit()?;

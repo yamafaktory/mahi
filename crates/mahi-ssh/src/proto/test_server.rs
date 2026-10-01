@@ -299,3 +299,37 @@ impl TestServer {
         self.send_sequence = 0;
     }
 }
+
+pub(crate) fn pump(
+    client: &mut super::transport::Transport,
+    server: &mut TestServer,
+) -> Result<super::transport::Poll, super::transport::TransportError> {
+    use super::transport::Poll;
+    for _ in 0..16 {
+        let from_client = client.output().to_vec();
+        client.advance_output(from_client.len());
+        server.receive(&from_client);
+        let from_server = server.take_output();
+        client.receive(&from_server)?;
+        let poll = client.poll()?;
+        if poll != Poll::Pending || (from_client.is_empty() && from_server.is_empty()) {
+            return Ok(poll);
+        }
+    }
+    Ok(Poll::Pending)
+}
+
+pub(crate) fn connected(algorithm: HostKeyAlgorithm) -> (super::transport::Transport, TestServer) {
+    let mut server = TestServer::new(host_key(algorithm));
+    let mut client = super::transport::Transport::new(&[algorithm]).unwrap();
+    assert_eq!(
+        pump(&mut client, &mut server),
+        Ok(super::transport::Poll::HostKey)
+    );
+    client.accept_host_key().unwrap();
+    assert_eq!(
+        pump(&mut client, &mut server),
+        Ok(super::transport::Poll::Pending)
+    );
+    (client, server)
+}
