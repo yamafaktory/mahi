@@ -42,7 +42,7 @@ pub(crate) enum ChannelError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ChannelId(u32);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Event<'a> {
     Nothing,
     Opened(ChannelId),
@@ -93,12 +93,7 @@ impl Connection {
         &mut self,
         transport: &mut Transport,
     ) -> Result<ChannelId, ChannelError> {
-        let slot = self
-            .channels
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or(self.channels.len());
-        let local = u32::try_from(slot).map_err(|_| ChannelError::Closed)?;
+        let local = u32::try_from(self.channels.len()).map_err(|_| ChannelError::Closed)?;
         self.send(
             transport,
             Message::ChannelOpen {
@@ -109,14 +104,10 @@ impl Connection {
                 data: b"",
             },
         )?;
-        let channel = Some(Channel {
+        self.channels.push(Some(Channel {
             local_window: WINDOW,
             ..Channel::default()
-        });
-        match self.channels.get_mut(slot) {
-            Some(free) => *free = channel,
-            None => self.channels.push(channel),
-        }
+        }));
         Ok(ChannelId(local))
     }
 
@@ -920,15 +911,18 @@ mod tests {
     }
 
     #[test]
-    fn closed_slots_are_reused() {
+    fn channel_ids_are_never_reused_on_a_connection() {
         let mut pair = Pair::new();
         let first = pair.open(100, 30);
         pair.server
             .send_message(Message::ChannelClose { recipient: first.0 });
         pair.events().unwrap();
         let second = pair.connection.open_session(&mut pair.client).unwrap();
-        assert_eq!(second, first);
-        assert_eq!(pair.connection.channels.len(), 1);
+        assert_ne!(second, first);
+        assert_eq!(
+            pair.connection.send_data(&mut pair.client, first, b"stale"),
+            Err(ChannelError::UnknownChannel)
+        );
     }
 
     #[test]

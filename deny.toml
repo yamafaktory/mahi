@@ -9,7 +9,7 @@ targets = [
 [advisories]
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable; it is a compile-time macro of iroh's netlink crates and none of it runs in mahi" },
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained, not vulnerable; it is a compile-time macro of age 0.11's i18n-embed-fl and none of it runs in mahi. age 0.11 is used because age 0.12's ml-kem 0.2 cannot share kem 0.3 with russh; drop this with the next age release" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained, not vulnerable; it is a compile-time macro of age 0.11's i18n-embed-fl and none of it runs in mahi. age 0.11 is used because age 0.12's ml-kem 0.2 cannot share kem 0.3 with the ml-kem 0.3 of mahi-ssh's key exchange; drop this with the next age release" },
     { id = "RUSTSEC-2023-0071", reason = "the Marvin timing attack recovers private keys; rsa is used only in mahi-tls, only to verify signatures with public keys, never to decrypt or sign" },
 ]
 
@@ -40,6 +40,4 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = [
-    "https://github.com/ToyOSOrg/russh",
-]
+allow-git = []

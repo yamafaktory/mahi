@@ -53,6 +53,7 @@ pub(crate) struct TestServer {
     pub(crate) tamper: Tamper,
     pub(crate) before_newkeys: Option<Vec<u8>>,
     pub(crate) received: Vec<Vec<u8>>,
+    pub(crate) kexinits: usize,
     inbound: Inbound,
     opener: Opener,
     sealer: Sealer,
@@ -95,6 +96,7 @@ impl TestServer {
             tamper: Tamper::None,
             before_newkeys: None,
             received: Vec::new(),
+            kexinits: 0,
             inbound: Inbound::default(),
             opener: Opener::clear(),
             sealer: Sealer::clear(),
@@ -172,6 +174,7 @@ impl TestServer {
             self.receive_sequence = self.receive_sequence.wrapping_add(1);
             match payload[0] {
                 message::KEXINIT => {
+                    self.kexinits += 1;
                     self.client_kexinit = Some(payload);
                     if self.server_kexinit.is_none() {
                         self.send_kexinit();

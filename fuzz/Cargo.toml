@@ -148,8 +148,6 @@ test = false
 doc = false
 bench = false
 
-[patch.crates-io]
-russh = { git = "https://github.com/ToyOSOrg/russh", rev = "15eb197d28f12a4c6ac573850458545457f7bf55" }
 
 [[bin]]
 name = "term-scan"

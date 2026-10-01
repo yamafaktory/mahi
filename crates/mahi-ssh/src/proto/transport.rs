@@ -290,6 +290,7 @@ impl Transport {
         self.authenticated = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn is_authenticated(&self) -> bool {
         self.authenticated
     }

@@ -15,11 +15,11 @@ use hmac::{
     Hmac,
     Mac,
 };
-use russh::keys::{
+use sha1::Sha1;
+use ssh_key::{
     Algorithm,
     PublicKey,
 };
-use sha1::Sha1;
 use thiserror::Error;
 
 const MAX_FILE_BYTES: u64 = 16 << 20;
@@ -266,15 +266,15 @@ fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use russh::keys::{
+    use ssh_key::{
         PrivateKey,
-        key::safe_rng,
+        rand_core::OsRng,
     };
 
     use super::*;
 
     fn ed25519() -> PublicKey {
-        PrivateKey::random(&mut safe_rng(), Algorithm::Ed25519)
+        PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
             .unwrap()
             .public_key()
             .clone()
@@ -309,9 +309,9 @@ mod tests {
     #[test]
     fn a_host_listed_with_other_key_types_only_is_unknown() {
         let ecdsa = PrivateKey::random(
-            &mut safe_rng(),
+            &mut OsRng,
             Algorithm::Ecdsa {
-                curve: russh::keys::EcdsaCurve::NistP256,
+                curve: ssh_key::EcdsaCurve::NistP256,
             },
         )
         .unwrap()

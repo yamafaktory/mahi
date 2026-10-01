@@ -19,23 +19,25 @@ use std::{
 };
 
 use bytes::Bytes;
-use russh::{
-    ChannelMsg,
-    ChannelReadHalf,
-    ChannelWriteHalf,
-    client::Msg,
-};
 use thiserror::Error;
 use tokio::{
     runtime::Handle,
-    sync::mpsc,
+    sync::{
+        mpsc,
+        oneshot,
+    },
+};
+
+use crate::{
+    proto::channel::ChannelId,
+    session::{
+        Command,
+        Started,
+    },
 };
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const INTERRUPT_POLL: Duration = Duration::from_millis(100);
-const MAX_ERROR_OUTPUT: usize = 4 << 10;
-const QUEUED_CHUNKS: usize = 16;
-const STDERR: u32 = 1;
 
 /// A command running on the remote host.
 ///
@@ -55,16 +57,19 @@ pub struct Interrupted;
 pub struct ExecOutput {
     interrupt: Option<Arc<AtomicBool>>,
     runtime: Handle,
-    chunks: mpsc::Receiver<Bytes>,
+    chunks: mpsc::UnboundedReceiver<Bytes>,
     chunk: Bytes,
     ending: Arc<Mutex<Ending>>,
+    commands: mpsc::Sender<Command>,
+    id: ChannelId,
 }
 
 /// The command's standard input, written with [`Write`].
 pub struct ExecInput {
     interrupt: Option<Arc<AtomicBool>>,
     runtime: Handle,
-    channel: Arc<ChannelWriteHalf<Msg>>,
+    commands: mpsc::Sender<Command>,
+    id: ChannelId,
 }
 
 /// How a command ended without success.
@@ -85,43 +90,35 @@ pub enum RemoteFailure {
 }
 
 #[derive(Debug, Default)]
-struct Ending {
-    closed: bool,
-    status: Option<u32>,
-    signal: Option<String>,
-    errors: Vec<u8>,
+pub(crate) struct Ending {
+    pub(crate) closed: bool,
+    pub(crate) status: Option<u32>,
+    pub(crate) signal: Option<String>,
+    pub(crate) errors: Vec<u8>,
 }
 
 impl Exec {
     pub(crate) fn start(
         runtime: Handle,
-        channel: russh::Channel<Msg>,
-        early: Vec<u8>,
+        started: Started,
+        commands: mpsc::Sender<Command>,
         interrupt: Option<Arc<AtomicBool>>,
     ) -> Self {
-        let (read, write) = channel.split();
-        let write = Arc::new(write);
-        let (sender, chunks) = mpsc::channel(QUEUED_CHUNKS);
-        let ending = Arc::new(Mutex::new(Ending::default()));
-        runtime.spawn(receive(
-            read,
-            write.clone(),
-            Bytes::from(early),
-            sender,
-            ending.clone(),
-        ));
         Self {
             output: ExecOutput {
                 interrupt: interrupt.clone(),
                 runtime: runtime.clone(),
-                chunks,
+                chunks: started.output,
                 chunk: Bytes::new(),
-                ending,
+                ending: started.ending,
+                commands: commands.clone(),
+                id: started.id,
             },
             input: ExecInput {
                 interrupt,
                 runtime,
-                channel: write,
+                commands,
+                id: started.id,
             },
         }
     }
@@ -144,15 +141,27 @@ impl ExecInput {
     ///
     /// Panics if called from async code.
     pub fn finish(&mut self) -> io::Result<()> {
-        let channel = &self.channel;
+        let (ack, done) = oneshot::channel();
+        self.request(Command::Eof { id: self.id, ack }, done)
+    }
+
+    fn request(&self, command: Command, done: oneshot::Receiver<io::Result<()>>) -> io::Result<()> {
+        let commands = &self.commands;
         let interrupt = self.interrupt.as_deref();
         self.runtime
             .block_on(until_interrupted(interrupt, async {
-                tokio::time::timeout(IDLE_TIMEOUT, channel.eof()).await
+                tokio::time::timeout(IDLE_TIMEOUT, async {
+                    commands
+                        .send(command)
+                        .await
+                        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                    done.await
+                        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?
+                })
+                .await
             }))
             .ok_or_else(|| io::Error::other(Interrupted))?
             .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
-            .map_err(io::Error::other)
     }
 }
 
@@ -172,7 +181,10 @@ impl Read for ExecOutput {
                 .ok_or_else(|| io::Error::other(Interrupted))?
                 .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
             match next {
-                Some(chunk) => self.chunk = chunk,
+                Some(chunk) => {
+                    self.release(chunk.len());
+                    self.chunk = chunk;
+                }
                 None => return self.end().map(|()| 0),
             }
         }
@@ -187,6 +199,14 @@ impl Read for ExecOutput {
 }
 
 impl ExecOutput {
+    fn release(&self, count: usize) {
+        let commands = &self.commands;
+        let id = self.id;
+        let _ = self
+            .runtime
+            .block_on(commands.send(Command::Consumed { id, count }));
+    }
+
     fn end(&self) -> io::Result<()> {
         let ending = self.ending.lock().unwrap_or_else(PoisonError::into_inner);
         let said = printable(&ending.errors);
@@ -207,16 +227,16 @@ impl ExecOutput {
 
 impl Write for ExecInput {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let channel = &self.channel;
-        let interrupt = self.interrupt.as_deref();
-        let data = Bytes::copy_from_slice(buffer);
-        self.runtime
-            .block_on(until_interrupted(interrupt, async {
-                tokio::time::timeout(IDLE_TIMEOUT, channel.data_bytes(data)).await
-            }))
-            .ok_or_else(|| io::Error::other(Interrupted))?
-            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
-            .map_err(io::Error::other)?;
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let (ack, done) = oneshot::channel();
+        let command = Command::Write {
+            id: self.id,
+            data: Bytes::copy_from_slice(buffer),
+            ack,
+        };
+        self.request(command, done)?;
         Ok(buffer.len())
     }
 
@@ -245,56 +265,7 @@ pub(crate) async fn until_interrupted<F: Future>(
     }
 }
 
-async fn receive(
-    mut channel: ChannelReadHalf,
-    write: Arc<ChannelWriteHalf<Msg>>,
-    early: Bytes,
-    chunks: mpsc::Sender<Bytes>,
-    ending: Arc<Mutex<Ending>>,
-) {
-    let record = |update: &dyn Fn(&mut Ending)| {
-        update(&mut ending.lock().unwrap_or_else(PoisonError::into_inner));
-    };
-    if !early.is_empty() && chunks.send(early).await.is_err() {
-        let _ = write.close().await;
-        return;
-    }
-    while let Some(message) = channel.wait().await {
-        match message {
-            ChannelMsg::Data { data } => {
-                if chunks.send(data).await.is_err() {
-                    let _ = write.close().await;
-                    return;
-                }
-            }
-            ChannelMsg::ExtendedData { data, ext: STDERR } => record(&|ending| {
-                let room = MAX_ERROR_OUTPUT.saturating_sub(ending.errors.len());
-                ending
-                    .errors
-                    .extend_from_slice(data.get(..room.min(data.len())).unwrap_or_default());
-            }),
-            ChannelMsg::ExitStatus { exit_status } => {
-                record(&|ending| ending.status = Some(exit_status));
-            }
-            ChannelMsg::ExitSignal {
-                signal_name,
-                error_message,
-                ..
-            } => {
-                let signal = printable(format!("{signal_name:?} {error_message}").as_bytes());
-                record(&|ending| ending.signal = Some(signal.clone()));
-            }
-            ChannelMsg::Eof => record(&|ending| ending.closed = true),
-            ChannelMsg::Close => {
-                record(&|ending| ending.closed = true);
-                return;
-            }
-            _ => {}
-        }
-    }
-}
-
-fn printable(bytes: &[u8]) -> String {
+pub(crate) fn printable(bytes: &[u8]) -> String {
     let text: String = String::from_utf8_lossy(bytes)
         .chars()
         .map(|c| {
@@ -322,6 +293,12 @@ fn hidden(c: char) -> bool {
                 | '\u{feff}'
                 | '\u{fff9}'..='\u{fffb}'
         )
+}
+
+impl Drop for ExecOutput {
+    fn drop(&mut self) {
+        let _ = self.commands.try_send(Command::Close { id: self.id });
+    }
 }
 
 impl fmt::Debug for Exec {

@@ -20,7 +20,7 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 signature = { workspace = true }
-ssh-key = { workspace = true, features = ["getrandom"] }
+ssh-key = { workspace = true, features = ["getrandom", "p256", "p384", "rsa"] }
 tempfile = { workspace = true }
 
 [lints]

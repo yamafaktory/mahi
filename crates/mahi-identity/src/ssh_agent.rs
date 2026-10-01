@@ -130,6 +130,36 @@ impl SshAgent {
         parse_identities(&response)
     }
 
+    /// Lists the keys the agent holds that can log in to an SSH server, in the agent's order and
+    /// each once: ed25519 and ECDSA P-256 and P-384 keys. Certificates, RSA keys and keys mahi
+    /// cannot parse are left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Malformed`] if the answer is not a key list, or another
+    /// [`AgentError`] if the connection fails.
+    pub fn login_keys(&self) -> Result<Vec<PublicKey>, AgentError> {
+        let response = self.exchange(&[IDENTITIES_REQUEST], MAX_IDENTITIES_BYTES)?;
+        parse_login_keys(&response)
+    }
+
+    /// Asks the agent to sign `data` with `key`, and returns the signature as the agent encoded
+    /// it, for the caller to check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::Refused`] if the agent does not sign, [`AgentError::Malformed`] if
+    /// its answer is not a signature response, or another [`AgentError`] if the connection
+    /// fails.
+    pub fn sign_blob(&self, key: &PublicKey, data: &[u8]) -> Result<Vec<u8>, AgentError> {
+        let mut body = vec![SIGN_REQUEST];
+        put_string(&mut body, &key.to_bytes()?)?;
+        put_string(&mut body, data)?;
+        body.extend_from_slice(&0u32.to_be_bytes());
+        let response = self.exchange(&body, MAX_RESPONSE_BYTES)?;
+        parse_signature_blob(&response).map(<[u8]>::to_vec)
+    }
+
     fn exchange(&self, body: &[u8], max_response: u32) -> Result<Vec<u8>, AgentError> {
         let deadline = Instant::now() + self.timeout;
         let mut stream = UnixStream::connect(&self.socket)
@@ -200,25 +230,55 @@ impl AgentSigner {
 
 /// Reads the agent's answer to a sign request: an ed25519 signature, or a refusal.
 pub(crate) fn parse_signature(response: &[u8]) -> Result<Signature, AgentError> {
+    let blob = parse_signature_blob(response)?;
+    let signature = Signature::try_from(blob).map_err(|_| AgentError::Malformed)?;
+    if signature.algorithm() != Algorithm::Ed25519 {
+        return Err(AgentError::Malformed);
+    }
+    Ok(signature)
+}
+
+pub(crate) fn parse_signature_blob(response: &[u8]) -> Result<&[u8], AgentError> {
     match response.split_first() {
         Some((&SIGN_RESPONSE, rest)) => {
             let (blob, rest) = take_string(rest).ok_or(AgentError::Malformed)?;
             if !rest.is_empty() {
                 return Err(AgentError::Malformed);
             }
-            let signature = Signature::try_from(blob).map_err(|_| AgentError::Malformed)?;
-            if signature.algorithm() != Algorithm::Ed25519 {
-                return Err(AgentError::Malformed);
-            }
-            Ok(signature)
+            Ok(blob)
         }
         Some((&FAILURE, [])) => Err(AgentError::Refused),
         _ => Err(AgentError::Malformed),
     }
 }
 
+fn is_ed25519(algorithm: &Algorithm) -> bool {
+    *algorithm == Algorithm::Ed25519
+}
+
+fn is_login_key(algorithm: &Algorithm) -> bool {
+    matches!(
+        algorithm,
+        Algorithm::Ed25519
+            | Algorithm::Ecdsa {
+                curve: ssh_key::EcdsaCurve::NistP256 | ssh_key::EcdsaCurve::NistP384
+            }
+    )
+}
+
 /// Reads the agent's answer to a key listing: its ed25519 keys, each once.
 pub(crate) fn parse_identities(response: &[u8]) -> Result<Vec<PublicKey>, AgentError> {
+    parse_keys(response, is_ed25519)
+}
+
+pub(crate) fn parse_login_keys(response: &[u8]) -> Result<Vec<PublicKey>, AgentError> {
+    parse_keys(response, is_login_key)
+}
+
+fn parse_keys(
+    response: &[u8],
+    wanted: fn(&Algorithm) -> bool,
+) -> Result<Vec<PublicKey>, AgentError> {
     let rest = match response.split_first() {
         Some((&IDENTITIES_ANSWER, rest)) => rest,
         Some((&FAILURE, [])) => return Err(AgentError::Refused),
@@ -240,7 +300,7 @@ pub(crate) fn parse_identities(response: &[u8]) -> Result<Vec<PublicKey>, AgentE
         let duplicate = keys
             .iter()
             .any(|known: &PublicKey| known.key_data() == key.key_data());
-        if key.algorithm() == Algorithm::Ed25519 && !duplicate {
+        if wanted(&key.algorithm()) && !duplicate {
             key.set_comment(sanitised(comment));
             keys.push(key);
         }
@@ -449,6 +509,64 @@ mod tests {
         assert_eq!(keys[1].key_data(), second.public_key().key_data());
         assert_eq!(keys[1].comment(), "home");
         assert_eq!(list(identities(&[], 0, &[])).unwrap(), []);
+    }
+
+    fn ecdsa(curve: ssh_key::EcdsaCurve) -> PrivateKey {
+        PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ecdsa { curve }).unwrap()
+    }
+
+    #[test]
+    fn login_keys_are_ed25519_and_ecdsa_in_the_agents_order() {
+        let p384 = ecdsa(ssh_key::EcdsaCurve::NistP384);
+        let ed = ed25519();
+        let p256 = ecdsa(ssh_key::EcdsaCurve::NistP256);
+        let rsa = PublicKey::from_openssh(
+            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQCon5LKy0wKilz4XciwFziIQp1K5se6f/fSH7d9re1rFspyRZiiUwgo51S35FCUUwaDULJEiBTb6VDNULuiPeYtAIBmRWyMvvQTchT2UNTSVYj5vOkuMpu/eBtkuzI6EtnVbqwhXeEAjIHn+dHpJNGB6o3d2uHolL+L48qCD4YQhQ==",
+        )
+        .unwrap();
+        let entries: Vec<(Vec<u8>, &[u8])> = vec![
+            (p384.public_key().to_bytes().unwrap(), b"a"),
+            (rsa.to_bytes().unwrap(), b"rsa"),
+            (ed.public_key().to_bytes().unwrap(), b"b"),
+            (unknown_key_blob(), b"unknown"),
+            (p256.public_key().to_bytes().unwrap(), b"c"),
+            (ed.public_key().to_bytes().unwrap(), b"again"),
+        ];
+        let answer = identities(&entries, 6, &[]);
+        let agent = fake_agent(move |_| answer);
+        let keys = SshAgent::new(&agent.socket).login_keys().unwrap();
+        agent.handle.join().unwrap();
+        let listed: Vec<_> = keys.iter().map(PublicKey::key_data).collect();
+        assert_eq!(
+            listed,
+            [
+                p384.public_key().key_data(),
+                ed.public_key().key_data(),
+                p256.public_key().key_data()
+            ]
+        );
+        let answer = identities(&entries, 6, &[]);
+        let only_ed25519 = parse_identities(&answer[4..]).unwrap();
+        assert_eq!(only_ed25519.len(), 1);
+    }
+
+    #[test]
+    fn a_login_signature_comes_back_as_the_agent_encoded_it() {
+        let key = ecdsa(ssh_key::EcdsaCurve::NistP256);
+        let public = key.public_key().clone();
+        let agent = fake_agent(signing_agent(key));
+        let blob = SshAgent::new(&agent.socket)
+            .sign_blob(&public, b"data")
+            .unwrap();
+        agent.handle.join().unwrap();
+        let signature = Signature::try_from(blob.as_slice()).unwrap();
+        assert_eq!(signature.algorithm(), public.algorithm());
+        signature::Verifier::verify(public.key_data(), b"data", &signature).unwrap();
+        let agent = fake_agent(|_| frame(&[FAILURE]));
+        assert!(matches!(
+            SshAgent::new(&agent.socket).sign_blob(&public, b"data"),
+            Err(AgentError::Refused)
+        ));
     }
 
     #[test]

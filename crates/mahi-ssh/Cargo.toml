@@ -19,16 +19,16 @@ ghash = { workspace = true }
 getrandom = { workspace = true }
 gix = { workspace = true }
 hmac = { workspace = true }
+mahi-identity = { workspace = true }
 ml-kem = { workspace = true }
 poly1305 = { workspace = true }
-russh = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 signature = { workspace = true }
 ssh-key = { workspace = true, features = ["p256", "p384"] }
 subtle = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "net"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net"] }
 x25519-dalek = { workspace = true }
 zeroize = { workspace = true }
 

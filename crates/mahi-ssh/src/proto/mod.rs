@@ -1,11 +1,3 @@
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the protocol is wired into the session in a later piece"
-    )
-)]
-
 pub(crate) mod auth;
 pub(crate) mod channel;
 pub(crate) mod cipher;

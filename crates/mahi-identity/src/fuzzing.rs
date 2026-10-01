@@ -8,4 +8,5 @@ use crate::ssh_agent;
 pub fn agent_answer(data: &[u8]) {
     let _ = ssh_agent::parse_signature(data);
     let _ = ssh_agent::parse_identities(data);
+    let _ = ssh_agent::parse_login_keys(data);
 }
