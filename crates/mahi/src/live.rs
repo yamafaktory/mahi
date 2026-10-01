@@ -85,6 +85,10 @@ use crate::{
         Answer,
         Prompts,
     },
+    thread_lock::{
+        LiveLock,
+        LockError,
+    },
 };
 
 /// How often a host rereads its `meta` at most, whoever asks.
@@ -102,6 +106,10 @@ pub(crate) enum HostError {
     Live(#[from] LiveError),
     #[error("cannot prepare the live frames")]
     Frame(#[from] FrameError),
+    #[error("another of your mahis hosts this thread's live layer")]
+    AnotherHost,
+    #[error("cannot take the live layer's lock")]
+    Lock(#[from] LockError),
 }
 
 /// How many chunks of output wait for the broadcaster before newer ones are dropped.
@@ -288,6 +296,7 @@ impl OutputTap {
 /// the threads that broadcast it and answer screen requests.
 #[derive(Debug)]
 pub(crate) struct LiveHost {
+    _hosting: LiveLock,
     node: Arc<LiveNode>,
     tap: OutputTap,
     stop: Arc<AtomicBool>,
@@ -311,6 +320,8 @@ impl LiveHost {
         thread_key: &ThreadKey,
         size: WindowSize,
     ) -> Result<Self, HostError> {
+        let hosting =
+            LiveLock::try_acquire(&setup.config, thread)?.ok_or(HostError::AnotherHost)?;
         withdraw_address(&setup.config, thread);
         let peers = Arc::new(HostPeers::new(
             git_dir.to_path_buf(),
@@ -373,6 +384,7 @@ impl LiveHost {
             thread::spawn(move || publish(&node, &stop, &config, thread))
         };
         Ok(Self {
+            _hosting: hosting,
             node,
             tap: OutputTap {
                 screen,

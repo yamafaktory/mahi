@@ -1159,6 +1159,102 @@ cat parser.rs
         assert!(fixture.thread_worktrees().is_empty());
     }
 
+    const LOOKER: &str = r#"#!/bin/sh
+echo "notes=${MAHI_HANDOFF:-none}"
+if [ -e parser.rs ]; then echo "parser=present"; else echo "parser=absent"; fi
+"#;
+
+    #[test]
+    fn more_agents_start_from_the_base_or_another_agents_snapshot_without_a_briefing() {
+        let fixture = fixture();
+        let (thread, claude) = worked_thread(&fixture);
+        let fresh = script(&fixture, "fresh", "codex", LOOKER);
+        let (code, output) = in_terminal(
+            &fixture,
+            &["agent", "add", &thread, "--", fresh.to_str().unwrap()],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("starting codex from the thread's base"),
+            "{output}"
+        );
+        assert!(output.contains("notes=none"), "{output}");
+        assert!(output.contains("parser=absent"), "{output}");
+
+        let forked = script(&fixture, "forked", "aider", LOOKER);
+        let (code, output) = in_terminal(
+            &fixture,
+            &[
+                "agent",
+                "add",
+                &thread,
+                "--from",
+                "tester.claude",
+                "--",
+                forked.to_str().unwrap(),
+            ],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("starting aider from tester.claude's latest snapshot"),
+            "{output}"
+        );
+        assert!(output.contains("notes=none"), "{output}");
+        assert!(output.contains("parser=present"), "{output}");
+        let store = Store::open(&fixture.repo).unwrap();
+        for agent in ["codex", "aider"] {
+            let added = ThreadRef::new(
+                thread.parse().unwrap(),
+                RefKind::Snapshots(AgentSlot::new(
+                    ParticipantName::new("tester").unwrap(),
+                    AgentName::new(agent).unwrap(),
+                )),
+            );
+            all_signed_by(&store, &added, &fixture.owner);
+        }
+        assert_eq!(fixture.thread_worktrees().len(), 3);
+
+        for (agent, from) in [
+            (claude.to_str().unwrap(), None),
+            (fresh.to_str().unwrap(), Some("tester.claude")),
+        ] {
+            let mut args = vec!["agent", "add", &thread];
+            if let Some(from) = from {
+                args.extend(["--from", from]);
+            }
+            args.extend(["--", agent]);
+            let (code, output) = in_terminal(&fixture, &args, None);
+            assert_eq!(code, 1, "{output}");
+            assert!(output.contains("already have an agent called"), "{output}");
+        }
+        let stranger = script(&fixture, "stranger", "gemini", LOOKER);
+        let stranger = stranger.to_str().unwrap();
+        for (from, said) in [
+            (
+                "mallory.claude",
+                "does not list a participant called mallory",
+            ),
+            ("tester.ghost", "tester.ghost has no snapshot here"),
+        ] {
+            let (code, output) = in_terminal(
+                &fixture,
+                &["agent", "add", &thread, "--from", from, "--", stranger],
+                None,
+            );
+            assert_eq!(code, 1, "{output}");
+            assert!(output.contains(said), "{output}");
+        }
+        let ended = fixture.mahi(&["end", &thread]);
+        assert!(
+            ended.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ended.stderr)
+        );
+        assert!(fixture.thread_worktrees().is_empty());
+    }
+
     #[test]
     fn claude_taking_over_starts_with_the_prompt_to_read_the_notes() {
         let fixture = fixture();

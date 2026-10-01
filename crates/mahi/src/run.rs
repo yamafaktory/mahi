@@ -131,6 +131,7 @@ use thiserror::Error;
 
 use crate::{
     cli::{
+        AgentAddCommand,
         HandoffCommand,
         JoinCommand,
         LaunchOptions,
@@ -159,6 +160,7 @@ use crate::{
     },
     live::{
         self,
+        HostError,
         LiveHost,
         LiveSetup,
         OutputTap,
@@ -628,8 +630,44 @@ pub(crate) fn handoff(
     command: &HandoffCommand,
     environment: &Environment,
 ) -> Result<Outcome, RunError> {
-    let (program, arguments) = command.command.split_first().ok_or(RunError::NoAgent)?;
-    let thread = command.thread;
+    start_new_agent(
+        command.thread,
+        (&command.command, &command.options),
+        Start::Handoff(&command.from),
+        environment,
+    )
+}
+
+/// Starts another of the user's agents in `command.thread`, next to the ones already running,
+/// in its own worktree: from the thread's base, or from `command.from`'s latest snapshot.
+pub(crate) fn agent_add(
+    command: &AgentAddCommand,
+    environment: &Environment,
+) -> Result<Outcome, RunError> {
+    start_new_agent(
+        command.thread,
+        (&command.command, &command.options),
+        Start::Fresh(command.from.as_ref()),
+        environment,
+    )
+}
+
+/// Where a new agent of the user's starts in a thread.
+#[derive(Clone, Copy, Debug)]
+enum Start<'a> {
+    /// From this agent's latest snapshot, with a briefing of its work.
+    Handoff(&'a AgentSlot),
+    /// From this agent's latest snapshot, or else the thread's base, without a briefing.
+    Fresh(Option<&'a AgentSlot>),
+}
+
+fn start_new_agent(
+    thread: ThreadId,
+    (command, options): (&[OsString], &LaunchOptions),
+    start: Start<'_>,
+    environment: &Environment,
+) -> Result<Outcome, RunError> {
+    let (program, arguments) = command.split_first().ok_or(RunError::NoAgent)?;
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(RunError::CurrentDirectory)?;
@@ -655,10 +693,10 @@ pub(crate) fn handoff(
     {
         return Err(RunError::AgentThere(thread, agent_name));
     }
-    let profile = command.options.profile_for(program);
-    let hosts = allowed_hosts(command.options.allow_hosts(), profile);
+    let profile = options.profile_for(program);
+    let hosts = allowed_hosts(options.allow_hosts(), profile);
     let settings = Settings::load(&config)?;
-    let credentials = gather_credentials(&config, &command.options, profile, environment)?;
+    let credentials = gather_credentials(&config, options, profile, environment)?;
     let mut prepared = Prepared::new(
         environment,
         host,
@@ -689,9 +727,14 @@ pub(crate) fn handoff(
     };
     let meta = load_meta(&prepared.store, thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
-    let from = &command.from;
-    let (key, contents) = brief(&mut prepared, &meta, from, &participant, &config)?;
-    eprintln!("mahi: handing {from}'s work over to {agent_name}");
+    let (key, contents) = starting_point(
+        start,
+        &mut prepared,
+        &meta,
+        &participant,
+        &config,
+        &agent_name,
+    )?;
     let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
     let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
     let (started, caught) = until_stopped(&termination, |interrupt| {
@@ -725,6 +768,37 @@ pub(crate) fn handoff(
     prepared.launch(environment, started, termination)
 }
 
+/// Returns the thread key and the tree a new agent's worktree starts from, writing its
+/// briefing first for a handoff.
+fn starting_point(
+    start: Start<'_>,
+    prepared: &mut Prepared,
+    meta: &VerifiedMeta,
+    participant: &ParticipantName,
+    config: &ConfigDir,
+    agent_name: &AgentName,
+) -> Result<(ThreadKey, ObjectId), RunError> {
+    match start {
+        Start::Handoff(from) => {
+            let briefed = brief(prepared, meta, from, participant, config)?;
+            eprintln!("mahi: handing {from}'s work over to {agent_name}");
+            Ok(briefed)
+        }
+        Start::Fresh(Some(from)) => {
+            let contents = source_tree(&prepared.store, meta, from)?;
+            let key = unlock_thread_key(meta, participant, config)?;
+            eprintln!("mahi: starting {agent_name} from {from}'s latest snapshot");
+            Ok((key, contents))
+        }
+        Start::Fresh(None) => {
+            let contents = prepared.store.commit_tree(meta.base())?;
+            let key = unlock_thread_key(meta, participant, config)?;
+            eprintln!("mahi: starting {agent_name} from the thread's base");
+            Ok((key, contents))
+        }
+    }
+}
+
 /// Checks that `meta` lists `from`'s participant and that `from` has a snapshot, then asks for
 /// the passphrase and writes the briefing of `from`'s work for the agent. Returns the thread
 /// key and the tree of `from`'s latest snapshot.
@@ -735,6 +809,16 @@ fn brief(
     participant: &ParticipantName,
     config: &ConfigDir,
 ) -> Result<(ThreadKey, ObjectId), RunError> {
+    let contents = source_tree(&prepared.store, meta, from)?;
+    let key = unlock_thread_key(meta, participant, config)?;
+    let notes =
+        handoff::briefing(&prepared.store, &key, meta, from, (meta.base(), contents))?.render();
+    prepared.write_handoff(&notes)?;
+    Ok((key, contents))
+}
+
+/// Returns the tree of `from`'s latest snapshot, once `meta` lists `from`'s participant.
+fn source_tree(store: &Store, meta: &VerifiedMeta, from: &AgentSlot) -> Result<ObjectId, RunError> {
     let thread = meta.thread();
     if !meta
         .participants()
@@ -745,25 +829,26 @@ fn brief(
             from.participant().clone(),
         ));
     }
-    let source = prepared
-        .store
+    let source = store
         .head(&ThreadRef::new(thread, RefKind::Snapshots(from.clone())))?
         .ok_or_else(|| RunError::NoSourceSnapshot(from.clone()))?;
-    let contents = prepared.store.commit_tree(source)?;
+    Ok(store.commit_tree(source)?)
+}
+
+/// Asks for the passphrase of the user's mahi key and opens `meta`'s thread key with it.
+fn unlock_thread_key(
+    meta: &VerifiedMeta,
+    participant: &ParticipantName,
+    config: &ConfigDir,
+) -> Result<ThreadKey, RunError> {
     let passphrase = TerminalPrompt::open()
         .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
         .map_err(RunError::Terminal)?;
     let identity =
         LocalIdentity::load(&config.identity_file(), &passphrase).map_err(RunError::Unlock)?;
     drop(passphrase);
-    let key = meta
-        .thread_key(participant, identity.as_age())
-        .map_err(|error| ResumeError::NotParticipant(thread, Box::new(error)))?;
-    drop(identity);
-    let notes =
-        handoff::briefing(&prepared.store, &key, meta, from, (meta.base(), contents))?.render();
-    prepared.write_handoff(&notes)?;
-    Ok((key, contents))
+    meta.thread_key(participant, identity.as_age())
+        .map_err(|error| ResumeError::NotParticipant(meta.thread(), Box::new(error)).into())
 }
 
 /// Returns what the live layer needs, unless `MAHI_LIVE` turns it off.
@@ -1153,22 +1238,7 @@ impl Prepared {
             credentials: &self.credentials,
         };
         let (sandbox, network) = (self.sandbox, self.network);
-        let live = self
-            .live
-            .as_ref()
-            .zip(started.key.as_ref())
-            .and_then(|(setup, key)| {
-                LiveHost::start(
-                    setup,
-                    &self.git_dir,
-                    started.thread,
-                    started.slot.clone(),
-                    key,
-                    terminal::size(),
-                )
-                .inspect_err(|error| eprintln!("mahi: teammates cannot watch this thread: {error}"))
-                .ok()
-            });
+        let live = start_live(self.live.as_ref(), &self.git_dir, &started);
         let launched = started.launch(&self.store, || launch.spawn(sandbox, network));
         let (child, raw, proxy) = match launched {
             Ok(launched) => launched,
@@ -1218,6 +1288,28 @@ impl Prepared {
             live,
         )
     }
+}
+
+/// Opens the live layer for `started`'s agent, unless it is off; a failure is reported, and the
+/// agent runs without it.
+fn start_live(setup: Option<&LiveSetup>, git_dir: &Path, started: &Started) -> Option<LiveHost> {
+    let (setup, key) = setup.zip(started.key.as_ref())?;
+    LiveHost::start(
+        setup,
+        git_dir,
+        started.thread,
+        started.slot.clone(),
+        key,
+        terminal::size(),
+    )
+    .inspect_err(|error| match error {
+        HostError::AnotherHost => eprintln!(
+            "mahi: teammates cannot watch {} yet: another of your mahis hosts the thread",
+            started.slot.agent()
+        ),
+        _ => eprintln!("mahi: teammates cannot watch this thread: {error}"),
+    })
+    .ok()
 }
 
 fn start_background(

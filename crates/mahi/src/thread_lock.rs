@@ -48,6 +48,13 @@ pub(crate) struct AgentLock {
     _agent: Held,
 }
 
+/// The lock the mahi hosting a thread's live layer holds, alone, while it hosts: the user's
+/// other mahis in the thread find it taken.
+#[derive(Debug)]
+pub(crate) struct LiveLock {
+    _held: Held,
+}
+
 #[derive(Debug)]
 struct Held {
     file: OwnedFd,
@@ -94,11 +101,28 @@ impl ThreadLock {
                 remove_if_absent_is_fine(&entry.path())?;
             }
         }
+        remove_if_absent_is_fine(&self.directory.join(live_name(self.thread)))?;
         if self.held.still_at_its_path()? {
             remove_if_absent_is_fine(&self.held.path)?;
         }
         Ok(())
     }
+}
+
+impl LiveLock {
+    /// Takes the live-layer lock of `thread` alone, or returns `None` at once if another mahi
+    /// of the user hosts the thread's live layer.
+    pub(crate) fn try_acquire(
+        config: &ConfigDir,
+        thread: ThreadId,
+    ) -> Result<Option<Self>, LockError> {
+        let directory = locks_dir(config)?;
+        Ok(Held::take(&directory.join(live_name(thread)), true)?.map(|held| Self { _held: held }))
+    }
+}
+
+fn live_name(thread: ThreadId) -> String {
+    format!("{thread}@live")
 }
 
 impl AgentLock {
@@ -246,5 +270,30 @@ mod tests {
         assert!(!locks.join(format!("{thread}.claude")).exists());
         assert!(!locks.join(format!("{thread}.codex")).exists());
         assert!(locks.join(format!("{other}.claude")).exists());
+    }
+
+    #[test]
+    fn a_threads_live_lock_is_held_once_and_goes_when_the_thread_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ConfigDir::resolve(Some(dir.path()), Some(dir.path())).unwrap();
+        let thread = ThreadId::random().unwrap();
+        let other = ThreadId::random().unwrap();
+        let hosting = LiveLock::try_acquire(&config, thread).unwrap().unwrap();
+        assert!(LiveLock::try_acquire(&config, thread).unwrap().is_none());
+        let _elsewhere = LiveLock::try_acquire(&config, other).unwrap().unwrap();
+        drop(hosting);
+        let next = LiveLock::try_acquire(&config, thread).unwrap().unwrap();
+        drop(next);
+        ThreadLock::acquire(&config, thread)
+            .unwrap()
+            .remove()
+            .unwrap();
+        assert!(
+            !config
+                .path()
+                .join(LOCKS)
+                .join(format!("{thread}@live"))
+                .exists()
+        );
     }
 }

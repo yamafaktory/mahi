@@ -44,6 +44,7 @@ use clap::Parser;
 
 use crate::{
     cli::{
+        AgentCommand,
         Cli,
         Command,
         CredentialCommand,
@@ -61,6 +62,7 @@ fn main() {
         Command::Run(command) => command.options.pass_env().to_vec(),
         Command::Resume(command) => command.options.pass_env().to_vec(),
         Command::Handoff(command) => command.options.pass_env().to_vec(),
+        Command::Agent(AgentCommand::Add(command)) => command.options.pass_env().to_vec(),
         Command::Join(command) if command.agent().is_some() => command.options.pass_env().to_vec(),
         _ => Vec::new(),
     };
@@ -120,6 +122,9 @@ fn main() {
             0
         }
         Command::Handoff(command) => outcome_code(run::handoff(&command, &environment)),
+        Command::Agent(AgentCommand::Add(command)) => {
+            outcome_code(run::agent_add(&command, &environment))
+        }
         Command::Resume(command) => outcome_code(run::resume(&command, &environment)),
         Command::Run(command) => outcome_code(run::run(&command, &environment)),
     };
