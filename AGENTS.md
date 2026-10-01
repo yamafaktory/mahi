@@ -35,6 +35,7 @@ just deny       # cargo-deny: advisories, licenses, banned crates, unknown sourc
 just check      # fmt-check + clippy + test + deny
 just fuzz <t> [s] # run one fuzz target (nightly, cargo-fuzz) for s seconds
 just fuzz-all [s]  # run every fuzz target in turn
+just mutants <crate> [args] # cargo-mutants on one crate, e.g. -f 'crates/mahi-ssh/src/proto/*'
 ```
 
 CI (`.github/workflows/checks.yml`) runs `just fmt-check`, `just clippy`,

@@ -22,6 +22,7 @@ tokio = { workspace = true, features = ["io-util", "net"] }
 [dev-dependencies]
 mahi-core = { workspace = true }
 mahi-store = { workspace = true }
+proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "process", "rt-multi-thread"] }
 tokio-stream = { workspace = true }

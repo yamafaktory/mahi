@@ -2,8 +2,11 @@
 //! logins through ssh-agent.
 
 mod exec;
+#[cfg(fuzzing)]
+pub mod fuzzing;
 mod git;
 mod known_hosts;
+mod proto;
 mod remote;
 mod session;
 

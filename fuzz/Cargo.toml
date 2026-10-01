@@ -164,3 +164,10 @@ path = "fuzz_targets/term_palette.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ssh-message"
+path = "fuzz_targets/ssh_message.rs"
+test = false
+doc = false
+bench = false

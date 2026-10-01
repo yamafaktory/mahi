@@ -3622,6 +3622,7 @@ dependencies = [
  "hmac 0.12.1",
  "mahi-core",
  "mahi-store",
+ "proptest",
  "russh",
  "sha1 0.10.7",
  "tempfile",

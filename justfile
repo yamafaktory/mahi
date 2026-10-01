@@ -29,6 +29,10 @@ run *args:
 
 check: fmt-check clippy test deny
 
+[positional-arguments]
+mutants crate *args:
+    cargo mutants --test-tool nextest --cargo-arg=--locked --package "$1" "${@:2}"
+
 fuzz target seconds="60":
     cd fuzz && cargo +nightly fuzz run --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{target}} -- -max_total_time={{seconds}} -timeout=10
 
