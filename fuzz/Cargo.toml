@@ -185,3 +185,17 @@ path = "fuzz_targets/ssh_transport.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ssh-login"
+path = "fuzz_targets/ssh_login.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh-connection"
+path = "fuzz_targets/ssh_connection.rs"
+test = false
+doc = false
+bench = false

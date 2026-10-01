@@ -435,6 +435,7 @@ mod tests {
         let refused = key(Algorithm::Ed25519);
         let accepted = key(p256());
         let (mut transport, mut server, mut script) = setup(Some(&accepted));
+        assert!(!transport.is_authenticated());
         let mut auth = Auth::start(
             &mut transport,
             "git",

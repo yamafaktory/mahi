@@ -7,6 +7,7 @@
 )]
 
 pub(crate) mod auth;
+pub(crate) mod channel;
 pub(crate) mod cipher;
 pub(crate) mod kex;
 pub(crate) mod message;

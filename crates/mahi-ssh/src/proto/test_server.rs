@@ -305,14 +305,16 @@ pub(crate) fn pump(
     server: &mut TestServer,
 ) -> Result<super::transport::Poll, super::transport::TransportError> {
     use super::transport::Poll;
-    for _ in 0..16 {
+    for _ in 0..1024 {
         let from_client = client.output().to_vec();
         client.advance_output(from_client.len());
         server.receive(&from_client);
-        let from_server = server.take_output();
-        client.receive(&from_server)?;
+        let mut from_server = server.take_output();
+        let fed = from_server.len().min(client.room());
+        client.receive(&from_server[..fed])?;
+        server.output = from_server.split_off(fed);
         let poll = client.poll()?;
-        if poll != Poll::Pending || (from_client.is_empty() && from_server.is_empty()) {
+        if poll != Poll::Pending || (from_client.is_empty() && fed == 0) {
             return Ok(poll);
         }
     }

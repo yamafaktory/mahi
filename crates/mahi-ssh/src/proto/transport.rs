@@ -46,6 +46,7 @@ const REKEY_PACKETS: u64 = 1 << 28;
 const MAX_DESCRIPTION: usize = 256;
 const COMPACT_OUTPUT: usize = 64 << 10;
 const MAX_PENDING_OUTPUT: usize = 1 << 20;
+const MAX_HELD: usize = 256 << 10;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub(crate) enum TransportError {
@@ -67,6 +68,8 @@ pub(crate) enum TransportError {
     Unimplemented(u32),
     #[error("a message was sent before the key exchange finished")]
     NotReady,
+    #[error("more than 256 KiB was sent during a rekey")]
+    HeldOverflow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +131,7 @@ pub(crate) struct Transport {
     sent_since_kex: (u64, u64),
     rekey_after: (u64, u64),
     authenticated: bool,
+    held: Vec<u8>,
     current: Option<Range<usize>>,
     scratch: Vec<u8>,
     failed: Option<TransportError>,
@@ -167,6 +171,7 @@ impl Transport {
             sent_since_kex: (0, 0),
             rekey_after: (REKEY_BYTES, REKEY_PACKETS),
             authenticated: false,
+            held: Vec::new(),
             current: None,
             scratch: Vec::new(),
             failed: None,
@@ -174,6 +179,18 @@ impl Transport {
         transport.output.extend_from_slice(CLIENT_ID);
         transport.output.extend_from_slice(b"\r\n");
         transport.send_kexinit()?;
+        Ok(transport)
+    }
+
+    #[cfg(fuzzing)]
+    pub(crate) fn established() -> Result<Self, TransportError> {
+        let mut transport = Self::new(&[HostKeyAlgorithm::Ed25519])?;
+        transport.identification = None;
+        transport.exchange = None;
+        transport.session_id = Some([0; 32]);
+        transport.first = false;
+        transport.authenticated = true;
+        transport.output.clear();
         Ok(transport)
     }
 
@@ -195,6 +212,10 @@ impl Transport {
             self.current = None;
         }
         result
+    }
+
+    pub(crate) fn room(&self) -> usize {
+        self.inbound.room()
     }
 
     pub(crate) fn output(&self) -> &[u8] {
@@ -240,8 +261,17 @@ impl Transport {
     }
 
     fn send_ready(&mut self, payload: &[u8]) -> Result<(), TransportError> {
-        if !self.ready() {
+        if self.session_id.is_none() || self.first {
             return Err(TransportError::NotReady);
+        }
+        if self.exchange.is_some() {
+            if self.held.len() + 4 + payload.len() > MAX_HELD {
+                return Err(TransportError::HeldOverflow);
+            }
+            let length = u32::try_from(payload.len()).map_err(|_| WireError::TooLong)?;
+            self.held.extend_from_slice(&length.to_be_bytes());
+            self.held.extend_from_slice(payload);
+            return Ok(());
         }
         self.seal(payload)?;
         if self.due(self.sent_since_kex) {
@@ -262,6 +292,11 @@ impl Transport {
 
     pub(crate) fn is_authenticated(&self) -> bool {
         self.authenticated
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_rekey_after(&mut self, bytes: u64, packets: u64) {
+        self.rekey_after = (bytes, packets);
     }
 
     fn rekey(&mut self) -> Result<(), TransportError> {
@@ -567,6 +602,17 @@ impl Transport {
         self.receive_sequence = 0;
         self.received_since_kex = (0, 0);
         self.first = false;
+        let mut held = std::mem::take(&mut self.held);
+        let mut rest = held.as_slice();
+        while let Some((length, after)) = rest.split_first_chunk::<4>() {
+            let (payload, after) = after
+                .split_at_checked(u32::from_be_bytes(*length) as usize)
+                .ok_or(TransportError::NotReady)?;
+            self.seal(payload)?;
+            rest = after;
+        }
+        held.clear();
+        self.held = held;
         Ok(())
     }
 
@@ -742,8 +788,12 @@ mod tests {
         client.set_authenticated();
         client.start_rekey().unwrap();
         assert!(!client.ready());
-        assert_eq!(client.send(b"\x05"), Err(TransportError::NotReady));
+        let mut held = Vec::new();
+        Message::ServiceRequest(b"held").encode(&mut held).unwrap();
+        client.send(&held).unwrap();
         assert_eq!(pump(&mut client, &mut server), Ok(Poll::Pending));
+        assert_eq!(server.received, [held]);
+        server.received.clear();
         assert!(client.ready());
         assert_eq!(client.session_id(), Some(&first));
         round_trip(&mut client, &mut server);
@@ -933,6 +983,39 @@ mod tests {
             opener: Opener::clear(),
         };
         assert_eq!(format!("{keys:?}"), "NewKeys");
+    }
+
+    #[test]
+    fn at_most_256_kib_is_held_during_a_rekey() {
+        let (mut client, _server) = connected(
+            HostKeyAlgorithm::Ed25519,
+            "curve25519-sha256",
+            "aes128-gcm@openssh.com",
+        );
+        client.set_authenticated();
+        client.start_rekey().unwrap();
+        let exact = vec![2; (64 << 10) - 4];
+        for _ in 0..4 {
+            client.send(&exact).unwrap();
+        }
+        assert_eq!(client.held.len(), MAX_HELD);
+        assert_eq!(client.send(b""), Err(TransportError::HeldOverflow));
+        assert_eq!(client.poll(), Err(TransportError::HeldOverflow));
+        let (mut client, mut server) = connected(
+            HostKeyAlgorithm::Ed25519,
+            "curve25519-sha256",
+            "aes128-gcm@openssh.com",
+        );
+        client.set_authenticated();
+        client.start_rekey().unwrap();
+        let payload = vec![2; 64 << 10];
+        for _ in 0..3 {
+            client.send(&payload).unwrap();
+        }
+        assert_eq!(pump(&mut client, &mut server), Ok(Poll::Pending));
+        assert_eq!(server.received.len(), 3);
+        assert!(client.held.is_empty());
+        client.send(&payload).unwrap();
     }
 
     #[test]
