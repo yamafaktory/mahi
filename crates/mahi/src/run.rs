@@ -1368,6 +1368,16 @@ impl Prepared {
     }
 }
 
+/// Splits the agent's `arguments` before the first `--`, after which the agent takes no
+/// options.
+fn split_at_separator(arguments: &[OsString]) -> (&[OsString], &[OsString]) {
+    let at = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(arguments.len());
+    arguments.split_at(at)
+}
+
 /// Serves the tools of `started`'s agent, in the thread whose `meta` is `owner`'s and whose
 /// records `key` opens, to its `mahi mcp` at `listener` on a thread of its own; the agent may
 /// ask for merges when `can_merge`, as the user has a palette and the run takes snapshots.
@@ -1997,6 +2007,37 @@ struct Launch<'a> {
 }
 
 impl Launch<'_> {
+    /// Adds the agent's arguments: the user's, then, when its profile names a flag for it, the
+    /// file in its state directory `state` that tells it where `mahi mcp` is, then the first
+    /// prompt of a handoff, after the variadic flag so it is not taken as one of its values.
+    fn agent_arguments(&self, mut pty: PtyCommand, state: Option<&Path>) -> PtyCommand {
+        let flag = self
+            .profile
+            .and_then(|profile| profile.mcp_flag)
+            .zip(state.filter(|_| self.tools_config().is_some()));
+        let (before, after) = split_at_separator(self.arguments);
+        for argument in before {
+            pty = pty.arg(argument);
+        }
+        if let Some((flag, state)) = flag {
+            pty = pty.arg(flag).arg(state.join(profile::MCP_CONFIG));
+        }
+        for argument in after {
+            pty = pty.arg(argument);
+        }
+        match self.handoff {
+            Some(notes) => self.ask_to_read(pty, notes),
+            None => pty,
+        }
+    }
+
+    /// Returns the mahi binary and the socket the agent's tools are served at, as text a
+    /// profile's configuration can hold, when both are known and are UTF-8.
+    fn tools_config(&self) -> Option<(&str, &str)> {
+        let mahi = self.environment.mahi_exe.as_deref()?.to_str()?;
+        Some((mahi, self.mcp_socket.to_str()?))
+    }
+
     /// Gives the agent the first prompt asking it to read the handoff `notes`, when its
     /// profile takes one, or else tells the user to give it.
     fn ask_to_read(&self, pty: PtyCommand, notes: &Path) -> PtyCommand {
@@ -2045,7 +2086,9 @@ impl Launch<'_> {
         let directory = profile::open_private_dir(&parent_dir, name)
             .map_err(RunError::State)?
             .ok_or_else(not_private)?;
-        profile.install(&directory).map_err(RunError::State)?;
+        profile
+            .install(&directory, self.tools_config())
+            .map_err(RunError::State)?;
         Ok(Some(parent.join(name)))
     }
 
@@ -2087,13 +2130,8 @@ impl Launch<'_> {
         if let Some(network) = &network {
             sandbox.open_loopback_port(network.port())?;
         }
-        let mut pty = PtyCommand::new(&self.agent.program, self.worktree, terminal::size());
-        for argument in self.arguments {
-            pty = pty.arg(argument);
-        }
-        if let Some(notes) = self.handoff {
-            pty = self.ask_to_read(pty, notes);
-        }
+        let pty = PtyCommand::new(&self.agent.program, self.worktree, terminal::size());
+        let mut pty = self.agent_arguments(pty, state.as_deref());
         for (name, value) in &self.environment.passed_on {
             pty = pty.env(name, value);
         }
@@ -2911,5 +2949,18 @@ mod tests {
         assert_eq!(after_merge(&merged(None), Some(&prompts), &own), "merged\n");
         let already = MergeDone::Already("already\n".to_owned());
         assert_eq!(after_merge(&already, Some(&prompts), &own), "already\n");
+    }
+
+    #[test]
+    fn options_go_before_the_agents_first_separator() {
+        let arguments: Vec<OsString> = ["--continue", "--", "a prompt", "--"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let (before, after) = split_at_separator(&arguments);
+        assert_eq!(before, &arguments[..1]);
+        assert_eq!(after, &arguments[1..]);
+        let plain = [OsString::from("x")];
+        assert_eq!(split_at_separator(&plain), (&plain[..], &[][..]));
     }
 }

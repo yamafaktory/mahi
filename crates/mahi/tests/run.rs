@@ -605,6 +605,18 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             stdout.contains(&format!("config={}", state.display())),
             "{stdout}"
         );
+        assert!(
+            stdout.contains(&format!(
+                "args=--mcp-config {}",
+                state.join("mcp.json").display()
+            )),
+            "{stdout}"
+        );
+        assert!(
+            fs::read_to_string(state.join("mcp.json"))
+                .unwrap()
+                .contains("\"mcp\"")
+        );
         for expected in [
             "quiet=1",
             "updates=1",
@@ -1711,7 +1723,7 @@ cat parser.rs
         );
         assert_eq!(code, 0, "{output}");
         assert!(
-            output.contains("args=-- Read the handoff notes at "),
+            output.contains("/mcp.json -- Read the handoff notes at "),
             "{output}"
         );
         assert!(!output.contains("tell the agent"), "{output}");

@@ -28,6 +28,10 @@ use rustix::{
     io::Errno,
 };
 
+/// Writes a profile's files into the agent's state directory, given the mahi binary and the
+/// socket its tools are served at, when the agent should start `mahi mcp`.
+type Install = fn(&OwnedFd, Option<(&str, &str)>) -> io::Result<()>;
+
 /// Reads one line of an agent's own session log.
 pub(crate) type ReadLogLine = fn(&[u8]) -> Option<LogLine>;
 
@@ -46,8 +50,12 @@ pub(crate) struct Profile {
     pub(crate) session_dir: Option<fn(&Path) -> Option<String>>,
     pub(crate) takes_prompt: bool,
     pub(crate) log_line: Option<ReadLogLine>,
-    install: fn(&OwnedFd) -> io::Result<()>,
+    pub(crate) mcp_flag: Option<&'static str>,
+    install: Install,
 }
+
+/// The file in the agent's state directory that tells it where `mahi mcp` is.
+pub(crate) const MCP_CONFIG: &str = "mcp.json";
 
 const CLAUDE_CODE: Profile = Profile {
     name: "claude-code",
@@ -65,12 +73,14 @@ const CLAUDE_CODE: Profile = Profile {
     session_dir: Some(claude_code::session_dir),
     takes_prompt: true,
     log_line: Some(claude_code::log_line),
+    mcp_flag: Some("--mcp-config"),
     install: install_claude_code,
 };
 
 const PROFILES: [&Profile; 1] = [&CLAUDE_CODE];
 
 const CLAUDE_CODE_SETTINGS: &str = r#"{
+  "permissions": { "allow": ["mcp__mahi"] },
   "hooks": {
     "UserPromptSubmit": [
       { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook prompt" }] }
@@ -114,14 +124,31 @@ impl Profile {
     }
 
     /// Writes the profile's files into the agent's state directory, open as `state`, replacing
-    /// what the agent may have left there without following any symbolic link it planted.
-    pub(crate) fn install(&self, state: &OwnedFd) -> io::Result<()> {
-        (self.install)(state)
+    /// what the agent may have left there without following any symbolic link it planted; with
+    /// `tools`, the mahi binary and the socket its tools are served at, they also tell the agent
+    /// to start `mahi mcp`.
+    pub(crate) fn install(&self, state: &OwnedFd, tools: Option<(&str, &str)>) -> io::Result<()> {
+        (self.install)(state, tools)
     }
 }
 
-fn install_claude_code(state: &OwnedFd) -> io::Result<()> {
+fn install_claude_code(state: &OwnedFd, tools: Option<(&str, &str)>) -> io::Result<()> {
     replace(state, "settings.json", CLAUDE_CODE_SETTINGS.as_bytes())?;
+    if let Some((mahi, socket)) = tools {
+        let config = serde_json::json!({
+            "mcpServers": {
+                "mahi": {
+                    "type": "stdio",
+                    "command": mahi,
+                    "args": ["mcp"],
+                    "env": { "MAHI_MCP_SOCKET": socket }
+                }
+            }
+        });
+        let mut bytes = serde_json::to_vec_pretty(&config).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        replace(state, MCP_CONFIG, &bytes)?;
+    }
     create_if_missing(state, ".claude.json", CLAUDE_CODE_STATE.as_bytes())
 }
 
@@ -275,7 +302,7 @@ mod tests {
     #[test]
     fn claude_code_hooks_report_prompts_tools_and_turn_ends_to_mahi() {
         let dir = tempfile::tempdir().unwrap();
-        CLAUDE_CODE.install(&open_dir(dir.path())).unwrap();
+        CLAUDE_CODE.install(&open_dir(dir.path()), None).unwrap();
         let settings = fs::read_to_string(dir.path().join("settings.json")).unwrap();
         for (event, kind) in [
             ("UserPromptSubmit", "prompt"),
@@ -300,7 +327,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         fs::create_dir(&state).unwrap();
-        CLAUDE_CODE.install(&open_dir(&state)).unwrap();
+        CLAUDE_CODE.install(&open_dir(&state), None).unwrap();
         assert_eq!(
             fs::read_to_string(state.join(".claude.json")).unwrap(),
             CLAUDE_CODE_STATE
@@ -312,7 +339,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         assert!(!state.join(".claude.json.mahi").exists());
         fs::write(state.join(".claude.json"), "{\"kept\": true}").unwrap();
-        CLAUDE_CODE.install(&open_dir(&state)).unwrap();
+        CLAUDE_CODE.install(&open_dir(&state), None).unwrap();
         assert_eq!(
             fs::read_to_string(state.join(".claude.json")).unwrap(),
             "{\"kept\": true}"
@@ -321,7 +348,7 @@ mod tests {
         let linked = dir.path().join("linked");
         fs::create_dir(&linked).unwrap();
         std::os::unix::fs::symlink(&outside, linked.join(".claude.json")).unwrap();
-        CLAUDE_CODE.install(&open_dir(&linked)).unwrap();
+        CLAUDE_CODE.install(&open_dir(&linked), None).unwrap();
         assert!(!outside.exists());
         assert!(
             fs::symlink_metadata(linked.join(".claude.json"))
@@ -339,8 +366,8 @@ mod tests {
         fs::create_dir(&state).unwrap();
         std::os::unix::fs::symlink(&outside, state.join("settings.json")).unwrap();
         std::os::unix::fs::symlink(&outside, state.join(".settings.json.mahi")).unwrap();
-        CLAUDE_CODE.install(&open_dir(&state)).unwrap();
-        CLAUDE_CODE.install(&open_dir(&state)).unwrap();
+        CLAUDE_CODE.install(&open_dir(&state), None).unwrap();
+        CLAUDE_CODE.install(&open_dir(&state), None).unwrap();
         assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
         let settings = state.join("settings.json");
         assert!(!fs::symlink_metadata(&settings).unwrap().is_symlink());
@@ -372,5 +399,31 @@ mod tests {
         for (name, _) in CLAUDE_CODE.env {
             assert!(!name.contains("API_KEY") && !name.contains("AUTH_TOKEN"));
         }
+    }
+
+    #[test]
+    fn claude_code_is_told_where_mahi_mcp_is_and_may_use_its_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        CLAUDE_CODE
+            .install(
+                &open_dir(dir.path()),
+                Some(("/opt/mahi \"x\"/mahi", "/tmp/s/mcp.sock")),
+            )
+            .unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join(MCP_CONFIG)).unwrap()).unwrap();
+        assert_eq!(
+            config["mcpServers"]["mahi"]["command"],
+            "/opt/mahi \"x\"/mahi"
+        );
+        assert_eq!(config["mcpServers"]["mahi"]["args"][0], "mcp");
+        assert_eq!(
+            config["mcpServers"]["mahi"]["env"]["MAHI_MCP_SOCKET"],
+            "/tmp/s/mcp.sock"
+        );
+        let settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["permissions"]["allow"][0], "mcp__mahi");
+        assert_eq!(CLAUDE_CODE.mcp_flag, Some("--mcp-config"));
     }
 }
