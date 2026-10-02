@@ -4,6 +4,7 @@
 compile_error!("mahi supports Linux and macOS only");
 
 mod changes;
+mod diff;
 mod fetch;
 #[cfg(fuzzing)]
 pub mod fuzzing;
@@ -16,6 +17,10 @@ mod worktree;
 pub use changes::{
     Change,
     Changes,
+};
+pub use diff::{
+    FileDiff,
+    MAX_DIFFED_BYTES,
 };
 pub use fetch::{
     FETCHED_PREFIX,

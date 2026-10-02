@@ -1527,6 +1527,61 @@ printf '%s\n' \
         assert!(String::from_utf8_lossy(&outside.stderr).contains("serves an agent"));
     }
 
+    const READER: &str = r#"#!/bin/sh
+call() {
+  printf '{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$1" "$2" "$3"
+}
+{
+  printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}'
+  call 1 read_transcript '{"agent":"tester.claude"}'
+  call 2 read_diff '{"agent":"tester.claude"}'
+  call 3 read_diff '{"agent":"tester.claude","path":"parser.rs"}'
+  call 4 read_diff '{"agent":"mallory.claude"}'
+  call 5 read_transcript '{"agent":"tester.claude","last":99}'
+} | "$MAHI_BIN" mcp
+"#;
+
+    #[test]
+    fn an_agent_reads_another_agents_transcript_and_diff_through_its_tools() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let reader = script(&fixture, "reading", "codex", READER);
+        let (code, output) = in_terminal(
+            &fixture,
+            &["agent", "add", &thread, "--", reader.to_str().unwrap()],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        let replies: std::collections::HashMap<i64, serde_json::Value> = output
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('{'))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|reply| Some((reply["id"].as_i64()?, reply)))
+            .collect();
+        let text = |id: i64| {
+            replies[&id]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let transcript = text(1);
+        assert!(
+            transcript.contains("asked: build the parser"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("used: Write parser.rs"), "{transcript}");
+        assert!(text(2).contains("added \"parser.rs\""), "{}", text(2));
+        assert!(text(3).contains("+fn parse() {}"), "{}", text(3));
+        assert_eq!(replies[&4]["result"]["isError"], true);
+        assert!(
+            text(4).contains("lists no participant called mallory"),
+            "{}",
+            text(4)
+        );
+        assert_eq!(replies[&5]["error"]["code"], -32602);
+    }
+
     #[test]
     fn a_merge_into_itself_into_an_unnamed_agent_of_several_or_from_an_unlisted_one_is_refused() {
         let fixture = fixture();

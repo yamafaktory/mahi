@@ -1,10 +1,13 @@
 use std::{
     mem,
     path::PathBuf,
-    sync::mpsc::{
-        self,
-        Receiver,
-        SyncSender,
+    sync::{
+        Arc,
+        mpsc::{
+            self,
+            Receiver,
+            SyncSender,
+        },
     },
     thread,
 };
@@ -52,7 +55,7 @@ const EVENT_OVERHEAD: usize = 64;
 #[derive(Debug)]
 pub(crate) struct Transcript {
     pub(crate) git_dir: PathBuf,
-    pub(crate) key: ThreadKey,
+    pub(crate) key: Arc<ThreadKey>,
     pub(crate) thread: ThreadId,
     pub(crate) slot: AgentSlot,
     pub(crate) tip: Option<TranscriptTip>,
@@ -306,7 +309,7 @@ mod tests {
         let mut started = start_with(&store, &signer).unwrap();
         let transcript = Transcript {
             git_dir: store.common_dir().to_path_buf(),
-            key: started.key.take().unwrap(),
+            key: Arc::new(started.key.take().unwrap()),
             thread: started.thread,
             slot: started.slot.clone(),
             tip: None,
@@ -349,7 +352,7 @@ mod tests {
         let (_dir, store) = repository_on_main();
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let mut started = start_with(&store, &signer).unwrap();
-        let key = started.key.take().unwrap();
+        let key = Arc::new(started.key.take().unwrap());
         let first = Transcript {
             git_dir: store.common_dir().to_path_buf(),
             key,
@@ -385,7 +388,7 @@ mod tests {
         let mut started = start_with(&store, &signer).unwrap();
         let transcript = Transcript {
             git_dir: store.common_dir().to_path_buf(),
-            key: started.key.take().unwrap(),
+            key: Arc::new(started.key.take().unwrap()),
             thread: started.thread,
             slot: started.slot.clone(),
             tip: None,

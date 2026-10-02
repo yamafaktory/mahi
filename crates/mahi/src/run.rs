@@ -1316,6 +1316,7 @@ impl Prepared {
             (pusher, name)
         });
         let activity = Arc::new(Activity::default());
+        let key = started.key.take().map(Arc::new);
         let (recorder, turns) = start_background(
             &mut started,
             &self.git_dir,
@@ -1323,8 +1324,9 @@ impl Prepared {
             (self.hooks, Arc::clone(&activity)),
             pusher.as_ref().map(|(pusher, _)| pusher.poker()),
             session,
+            key.clone(),
         );
-        let tools = serve_tools(self.mcp, self.owner, &self.git_dir, &started);
+        let tools = serve_tools(self.mcp, (self.owner, key), &self.git_dir, &started);
         let merging = door
             .zip(recorder.as_ref().map(Recorder::merger))
             .map(|(door, merger)| Merging {
@@ -1361,11 +1363,12 @@ impl Prepared {
     }
 }
 
-/// Serves the tools of `started`'s agent, in the thread whose `meta` is `owner`'s, to its
-/// `mahi mcp` at `listener` on a thread of its own, and returns the flag that stops it.
+/// Serves the tools of `started`'s agent, in the thread whose `meta` is `owner`'s and whose
+/// records `key` opens, to its `mahi mcp` at `listener` on a thread of its own, and returns
+/// the flag that stops it.
 fn serve_tools(
     listener: UnixListener,
-    owner: Option<ParticipantKey>,
+    (owner, key): (Option<ParticipantKey>, Option<Arc<ThreadKey>>),
     git_dir: &Path,
     started: &Started,
 ) -> Arc<AtomicBool> {
@@ -1376,8 +1379,7 @@ fn serve_tools(
     };
     let tools = ThreadTools::new(
         git_dir.to_path_buf(),
-        started.thread,
-        owner,
+        (started.thread, owner, key),
         started.slot.clone(),
     );
     let flag = Arc::clone(&serving);
@@ -1530,6 +1532,7 @@ fn start_background(
     (hooks, activity): (UnixListener, Arc<Activity>),
     pushes: Option<PushPoker>,
     session: Option<SessionSource>,
+    key: Option<Arc<ThreadKey>>,
 ) -> (Option<Recorder>, Option<TurnWorker>) {
     let recorder = started.first_snapshot.take().map(|first| {
         Recorder::start(
@@ -1545,7 +1548,7 @@ fn start_background(
             Schedule::default(),
         )
     });
-    let turns = started.key.take().map(|key| {
+    let turns = key.map(|key| {
         let transcript = Transcript {
             git_dir: git_dir.to_path_buf(),
             key,

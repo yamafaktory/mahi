@@ -33,13 +33,20 @@ use std::{
     },
 };
 
-use mahi_agent::mcp::{
-    self,
-    Call,
-    Incoming,
-    MAX_MESSAGE_BYTES,
-    RpcError,
-    Tool,
+use mahi_agent::{
+    claude_code::{
+        prompt_text,
+        tool_text,
+    },
+    hook::HookKind,
+    mcp::{
+        self,
+        Call,
+        Incoming,
+        MAX_MESSAGE_BYTES,
+        RpcError,
+        Tool,
+    },
 };
 use mahi_core::{
     AgentName,
@@ -47,12 +54,20 @@ use mahi_core::{
     ParticipantName,
     RefKind,
     ThreadId,
+    ThreadRef,
     is_invisible,
 };
-use mahi_store::Store;
+use mahi_crypto::ThreadKey;
+use mahi_store::{
+    Change,
+    FileDiff,
+    ObjectId,
+    Store,
+};
 use mahi_thread::{
     ParticipantKey,
     load_meta,
+    walk_turns,
 };
 use serde_json::{
     Map,
@@ -60,8 +75,16 @@ use serde_json::{
     json,
 };
 
+use crate::handoff;
+
 const MOST_CONNECTIONS: usize = 4;
 const META_REREAD: Duration = Duration::from_secs(5);
+const MAX_SLOT_CHARS: usize = 65;
+const MAX_PATH_CHARS: usize = 4096;
+const MAX_LISTED_CHANGES: usize = 500;
+const DEFAULT_TURNS: usize = 10;
+const MAX_TURNS: usize = 30;
+const TURNS_BUDGET: usize = MAX_TOOL_TEXT - 512;
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 const WRITE_WAIT: Duration = Duration::from_secs(10);
 /// The most text a tool answers with, in bytes.
@@ -237,21 +260,23 @@ pub(crate) fn push_clean(out: &mut String, text: &str) {
 }
 
 /// The tools of the agent `me` in `thread`, read from the repository at `git_dir`, whose
-/// `meta` is `owner`'s.
+/// `meta` is `owner`'s and whose records `key` opens.
 #[derive(Debug)]
 pub(crate) struct ThreadTools {
     git_dir: PathBuf,
     thread: ThreadId,
     owner: ParticipantKey,
+    key: Option<Arc<ThreadKey>>,
     me: AgentSlot,
-    participants: Mutex<Option<(Instant, Vec<Listed>)>>,
+    meta: Mutex<Option<(Instant, MetaView)>>,
 }
 
-/// A participant `meta` lists, and whether they own the thread.
+/// What the tools read of `meta`: the participants it lists, whether each owns the thread,
+/// and the thread's base.
 #[derive(Debug, Clone)]
-struct Listed {
-    name: ParticipantName,
-    owner: bool,
+struct MetaView {
+    listed: Vec<(ParticipantName, bool)>,
+    base: ObjectId,
 }
 
 fn failed(error: &dyn std::error::Error) -> ToolError {
@@ -259,51 +284,53 @@ fn failed(error: &dyn std::error::Error) -> ToolError {
 }
 
 impl ThreadTools {
-    /// Returns the tools of the agent `me` in `thread`, whose `meta` is `owner`'s, in the
-    /// repository at `git_dir`.
+    /// Returns the tools of the agent `me` in `thread`, whose `meta` is `owner`'s and whose
+    /// records `key` opens, in the repository at `git_dir`.
     pub(crate) fn new(
         git_dir: PathBuf,
-        thread: ThreadId,
-        owner: ParticipantKey,
+        (thread, owner, key): (ThreadId, ParticipantKey, Option<Arc<ThreadKey>>),
         me: AgentSlot,
     ) -> Self {
         Self {
             git_dir,
             thread,
             owner,
+            key,
             me,
-            participants: Mutex::new(None),
+            meta: Mutex::new(None),
         }
     }
 
-    /// Returns the participants `meta` lists, read again at most every five seconds, since
+    /// Returns what the tools read of `meta`, read again at most every five seconds, since
     /// reading `meta` takes its pin's lock.
-    fn participants(&self, store: &Store) -> Result<Vec<Listed>, ToolError> {
-        let Ok(mut cached) = self.participants.lock() else {
-            return Err(ToolError::Failed(
-                "the participants cannot be read".to_owned(),
-            ));
+    fn meta(&self, store: &Store) -> Result<MetaView, ToolError> {
+        let Ok(mut cached) = self.meta.lock() else {
+            return Err(ToolError::Failed("the thread cannot be read".to_owned()));
         };
-        if let Some((read_at, listed)) = cached.as_ref()
+        if let Some((read_at, view)) = cached.as_ref()
             && read_at.elapsed() < META_REREAD
         {
-            return Ok(listed.clone());
+            return Ok(view.clone());
         }
         let meta = load_meta(store, self.thread, &self.owner, 0).map_err(|error| failed(&error))?;
-        let listed: Vec<Listed> = meta
-            .participants()
-            .map(|listed| Listed {
-                name: listed.name().clone(),
-                owner: listed.key() == &self.owner,
-            })
-            .collect();
-        *cached = Some((Instant::now(), listed.clone()));
-        Ok(listed)
+        let view = MetaView {
+            listed: meta
+                .participants()
+                .map(|listed| (listed.name().clone(), listed.key() == &self.owner))
+                .collect(),
+            base: meta.base(),
+        };
+        *cached = Some((Instant::now(), view.clone()));
+        Ok(view)
+    }
+
+    fn store(&self) -> Result<Store, ToolError> {
+        Store::open(&self.git_dir).map_err(|error| failed(&error))
     }
 
     fn list_agents(&self) -> Result<String, ToolError> {
-        let store = Store::open(&self.git_dir).map_err(|error| failed(&error))?;
-        let participants = self.participants(&store)?;
+        let store = self.store()?;
+        let view = self.meta(&store)?;
         let mut agents: BTreeMap<ParticipantName, Vec<AgentName>> = BTreeMap::new();
         for (thread_ref, _) in store.thread_refs().map_err(|error| failed(&error))? {
             if thread_ref.thread() != self.thread {
@@ -320,10 +347,9 @@ impl ThreadTools {
             "Thread {}. You are {}. Participants and their agents:\n",
             self.thread, self.me
         );
-        for listed in &participants {
-            let name = &listed.name;
+        for (name, owner) in &view.listed {
             let _ = write!(text, "- {name}");
-            if listed.owner {
+            if *owner {
                 text.push_str(" (owner)");
             }
             text.push(':');
@@ -340,25 +366,230 @@ impl ThreadTools {
             }
             text.push('\n');
         }
-        let mut cleaned = String::with_capacity(text.len());
-        push_clean(&mut cleaned, &text);
-        Ok(cleaned)
+        Ok(cleaned(&text))
     }
+
+    fn read_diff(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
+        let store = self.store()?;
+        let view = self.meta(&store)?;
+        let slot = listed_agent(arguments, &view)?;
+        let path = mcp::text_argument(arguments, "path", MAX_PATH_CHARS)?;
+        let snapshot = store
+            .head(&ThreadRef::new(
+                self.thread,
+                RefKind::Snapshots(slot.clone()),
+            ))
+            .map_err(|error| failed(&error))?
+            .ok_or_else(|| ToolError::Failed(format!("{slot} has no snapshot here")))?;
+        let tree = |commit| store.commit_tree(commit).map_err(|error| failed(&error));
+        let (base, latest) = (tree(view.base)?, tree(snapshot)?);
+        let Some(path) = path else {
+            let changes = store
+                .changed_paths(base, latest, MAX_LISTED_CHANGES)
+                .map_err(|error| failed(&error))?;
+            let mut text =
+                format!("Files {slot}'s latest snapshot changed from the thread's base:\n");
+            for (path, change) in &changes.paths {
+                let what = match change {
+                    Change::Added => "added",
+                    Change::Deleted => "deleted",
+                    Change::Modified => "modified",
+                };
+                let _ = writeln!(text, "{what} {path:?}");
+            }
+            if changes.paths.is_empty() {
+                text.push_str("none\n");
+            }
+            if changes.truncated {
+                text.push_str("(more changed than are listed)\n");
+            }
+            return Ok(cleaned(&text));
+        };
+        let diffed = store
+            .file_diff(base, latest, path)
+            .map_err(|error| failed(&error))?;
+        Ok(match diffed {
+            FileDiff::Text(diff) => cleaned(&diff),
+            FileDiff::Same => format!("{slot} did not change {path:?} from the thread's base"),
+            FileDiff::Binary => format!("{path:?} is not text"),
+            FileDiff::TooLarge => format!("{path:?} is too large to show"),
+            FileDiff::NotAFile => format!("{path:?} is not a file"),
+        })
+    }
+
+    fn read_transcript(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
+        let key = self.key.as_ref().ok_or_else(|| {
+            ToolError::Failed("this run cannot open the thread's records".to_owned())
+        })?;
+        let store = self.store()?;
+        let view = self.meta(&store)?;
+        let slot = listed_agent(arguments, &view)?;
+        let last = match arguments.get("last") {
+            None | Some(Value::Null) => DEFAULT_TURNS,
+            Some(value) => value
+                .as_u64()
+                .and_then(|last| usize::try_from(last).ok())
+                .filter(|last| (1..=MAX_TURNS).contains(last))
+                .ok_or(ToolError::Arguments)?,
+        };
+        let mut read = TurnsRead::default();
+        let walked = walk_turns(&store, key, self.thread, &slot, last, |turn| {
+            read.take(
+                turn.turn(),
+                turn.events().iter().map(mahi_thread::Event::payload),
+            );
+        });
+        if read.kept.is_empty() {
+            walked.map_err(|error| failed(&error))?;
+            return Ok(format!("{slot} has no recorded turns here"));
+        }
+        let mut text = format!("The latest turns of {slot}, oldest first:\n");
+        if walked.is_err() {
+            text.push_str("(older turns could not be read)\n");
+        }
+        if read.left_out > 0 {
+            let _ = writeln!(text, "({} older turns left out for size)", read.left_out);
+        }
+        for range in read.kept.iter().rev() {
+            text.push_str(read.text.get(range.clone()).unwrap_or_default());
+        }
+        Ok(cleaned(&text))
+    }
+}
+
+/// The turns `read_transcript` keeps, newest first, written into one buffer within
+/// [`MAX_TOOL_TEXT`]: past that, the rest of a turn and the older turns are left out.
+#[derive(Debug, Default)]
+struct TurnsRead {
+    text: String,
+    kept: Vec<std::ops::Range<usize>>,
+    left_out: usize,
+}
+
+impl TurnsRead {
+    fn take<'a>(&mut self, number: u64, events: impl Iterator<Item = &'a [u8]>) {
+        if self.text.len() >= TURNS_BUDGET {
+            self.left_out += 1;
+            return;
+        }
+        let start = self.text.len();
+        let _ = writeln!(self.text, "Turn {number}:");
+        for payload in events {
+            if self.text.len() > TURNS_BUDGET {
+                break;
+            }
+            let Some((name, payload)) = handoff::split_event(payload) else {
+                continue;
+            };
+            match HookKind::parse(name) {
+                Some(HookKind::Prompt) => {
+                    let _ = writeln!(self.text, "  asked: {}", prompt_text(payload));
+                }
+                Some(HookKind::Tool) => {
+                    let _ = writeln!(self.text, "  used: {}", tool_text(payload));
+                }
+                Some(HookKind::TurnEnd) | None => {}
+            }
+        }
+        if self.text.len() > TURNS_BUDGET {
+            if !self.kept.is_empty() {
+                self.text.truncate(start);
+                self.left_out += 1;
+                return;
+            }
+            let mut end = TURNS_BUDGET;
+            while !self.text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.truncate(end);
+            self.text
+                .push_str("\n  (the rest of this turn is left out for size)\n");
+        }
+        self.kept.push(start..self.text.len());
+    }
+}
+
+/// Returns the agent the argument `agent` names, once `meta` lists its participant.
+fn listed_agent(arguments: &Map<String, Value>, view: &MetaView) -> Result<AgentSlot, ToolError> {
+    let slot: AgentSlot = mcp::text_argument(arguments, "agent", MAX_SLOT_CHARS)?
+        .ok_or(ToolError::Arguments)?
+        .parse()
+        .map_err(|_| ToolError::Arguments)?;
+    if !view
+        .listed
+        .iter()
+        .any(|(name, _)| name == slot.participant())
+    {
+        return Err(ToolError::Failed(format!(
+            "the thread lists no participant called {}",
+            slot.participant()
+        )));
+    }
+    Ok(slot)
+}
+
+fn cleaned(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(MAX_TOOL_TEXT));
+    push_clean(&mut out, text);
+    out
 }
 
 impl Toolbox for ThreadTools {
     fn tools(&self) -> Vec<Tool> {
-        vec![Tool {
-            name: "list_agents",
-            description: "Lists the thread's participants and their agents, as \
-                          <participant>.<agent>, marking which one you are.",
-            input_schema: json!({ "type": "object", "properties": {} }),
-        }]
+        let agent = json!({
+            "type": "string",
+            "description": "The agent, as <participant>.<agent>, as list_agents names it."
+        });
+        vec![
+            Tool {
+                name: "list_agents",
+                description: "Lists the thread's participants and their agents, as \
+                              <participant>.<agent>, marking which one you are.",
+                input_schema: json!({ "type": "object", "properties": {} }),
+            },
+            Tool {
+                name: "read_diff",
+                description: "Shows what an agent changed: the files its latest snapshot \
+                              changed from the thread's base, or, with a path, the diff of \
+                              that file.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "agent": agent,
+                        "path": {
+                            "type": "string",
+                            "description": "A file, /-separated, from the thread's root."
+                        }
+                    },
+                    "required": ["agent"]
+                }),
+            },
+            Tool {
+                name: "read_transcript",
+                description: "Shows what an agent was asked and which tools it used, turn \
+                              by turn, for its latest turns.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "agent": agent,
+                        "last": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_TURNS,
+                            "description": "How many of its latest turns, 10 if left out."
+                        }
+                    },
+                    "required": ["agent"]
+                }),
+            },
+        ]
     }
 
-    fn call(&self, name: &str, _arguments: &Map<String, Value>) -> Result<String, ToolError> {
+    fn call(&self, name: &str, arguments: &Map<String, Value>) -> Result<String, ToolError> {
         match name {
             "list_agents" => self.list_agents(),
+            "read_diff" => self.read_diff(arguments),
+            "read_transcript" => self.read_transcript(arguments),
             _ => Err(ToolError::Unknown),
         }
     }
@@ -535,5 +766,44 @@ mod tests {
         relay_with(&path, input, &mut output).unwrap();
         assert_eq!(output, b"bye\n");
         closer.join().unwrap();
+    }
+
+    #[test]
+    fn the_newest_turns_are_kept_within_the_budget_and_older_ones_left_out() {
+        let prompt = |text: &str| format!("prompt\n{{\"prompt\":\"{text}\"}}").into_bytes();
+        let long = "x".repeat(3000);
+        let mut read = TurnsRead::default();
+        for number in (1..=40_u64).rev() {
+            let events: Vec<Vec<u8>> = (0..3)
+                .map(|_| prompt(&format!("{number} {long}")))
+                .collect();
+            read.take(number, events.iter().map(Vec::as_slice));
+        }
+        assert!(read.text.len() <= TURNS_BUDGET + 4096);
+        assert!(read.text.starts_with("Turn 40:\n  asked: 40 "));
+        assert!(read.left_out > 0);
+        assert_eq!(read.kept.len() + read.left_out, 40);
+
+        let mut crossing = TurnsRead::default();
+        let newest: Vec<Vec<u8>> = (0..10)
+            .map(|_| prompt(&long))
+            .chain([prompt("last line")])
+            .collect();
+        crossing.take(9, newest.iter().map(Vec::as_slice));
+        let older: Vec<Vec<u8>> = (0..12).map(|_| prompt(&long)).collect();
+        crossing.take(8, older.iter().map(Vec::as_slice));
+        assert_eq!(crossing.kept.len(), 1);
+        assert_eq!(crossing.left_out, 1);
+        assert!(crossing.text.ends_with("asked: last line\n"));
+        assert!(crossing.text.len() <= TURNS_BUDGET);
+
+        let mut huge = TurnsRead::default();
+        let events: Vec<Vec<u8>> = (0..100).map(|_| prompt(&long)).collect();
+        huge.take(7, events.iter().map(Vec::as_slice));
+        assert_eq!(huge.kept.len(), 1);
+        assert!(
+            huge.text
+                .ends_with("(the rest of this turn is left out for size)\n")
+        );
     }
 }

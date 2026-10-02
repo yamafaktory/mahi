@@ -279,7 +279,8 @@ impl<F: FnMut(&[u8])> Write for Lines<F> {
     }
 }
 
-fn split_event(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+/// Splits a recorded hook event into its name and its payload.
+pub(crate) fn split_event(payload: &[u8]) -> Option<(&[u8], &[u8])> {
     let at = payload.iter().position(|byte| *byte == b'\n')?;
     Some((payload.get(..at)?, payload.get(at + 1..)?))
 }

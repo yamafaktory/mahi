@@ -27,6 +27,7 @@ getrandom = "0.4.3"
 ghash = { version = "0.5.1", default-features = false, features = ["zeroize"] }
 gix = { version = "0.88.0", default-features = false, features = ["attributes", "blocking-network-client", "excludes", "index", "merge", "pack-cache-lru-dynamic", "parallel", "sha1", "worktree-mutation"] }
 gix-hash = "0.27.0"
+gix-imara-diff = { version = "0.3.0", default-features = false, features = ["unified_diff"] }
 gix-error = "0.4.0"
 gix-features = { version = "0.50.0", default-features = false, features = ["io-pipe"] }
 gix-pack = { version = "0.75.0", default-features = false, features = ["generate"] }
