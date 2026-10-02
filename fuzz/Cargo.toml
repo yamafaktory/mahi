@@ -197,3 +197,10 @@ path = "fuzz_targets/ssh_connection.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "live-local"
+path = "fuzz_targets/live_local.rs"
+test = false
+doc = false
+bench = false

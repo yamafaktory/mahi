@@ -65,6 +65,7 @@ pub const MAX_PROMPTS_PER_RUN: usize = 1024;
 
 /// The keys of a thread's live stream, derived from its thread key: the gossip topic, which
 /// only participants can find, and the key frames are sealed with.
+#[derive(Clone)]
 pub struct LiveKeys {
     thread: ThreadId,
     topic: [u8; 32],
@@ -185,7 +186,7 @@ pub enum PromptOutcome {
 }
 
 impl PromptOutcome {
-    fn code(self) -> u8 {
+    pub(crate) fn code(self) -> u8 {
         match self {
             Self::Queued => 0,
             Self::Accepted => 1,
@@ -194,7 +195,7 @@ impl PromptOutcome {
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Self::Queued),
             1 => Some(Self::Accepted),
@@ -374,6 +375,12 @@ impl LiveKeys {
             topic: *topic,
             seal,
         })
+    }
+
+    /// Returns the thread whose stream these keys are for.
+    #[must_use]
+    pub fn thread(&self) -> ThreadId {
+        self.thread
     }
 
     /// Returns the gossip topic of the thread's live stream.

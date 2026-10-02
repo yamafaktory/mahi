@@ -77,6 +77,7 @@ use mahi_identity::{
 };
 use mahi_live::{
     HostAddress,
+    LiveKeys,
     Relays,
 };
 use mahi_proxy::HostName;
@@ -153,6 +154,10 @@ use crate::{
         HandoffError,
     },
     hook,
+    hub::{
+        Link,
+        OutputTap,
+    },
     inject::{
         self,
         Activity,
@@ -161,9 +166,7 @@ use crate::{
     live::{
         self,
         HostError,
-        LiveHost,
         LiveSetup,
-        OutputTap,
     },
     network::{
         Network,
@@ -866,6 +869,10 @@ fn live_setup(
     };
     Ok(Some(LiveSetup {
         config: config.clone(),
+        runtime: environment
+            .xdg_runtime_dir
+            .clone()
+            .unwrap_or_else(|| environment.temp_dir.clone()),
         node_key: NodeKey::load(&config.node_key_file()).map_err(RunError::NotInitialised)?,
         owner,
         relays,
@@ -1202,7 +1209,7 @@ impl Prepared {
     }
 
     fn launch(
-        self,
+        mut self,
         environment: &Environment,
         mut started: Started,
         termination: TerminationSignals,
@@ -1238,7 +1245,7 @@ impl Prepared {
             credentials: &self.credentials,
         };
         let (sandbox, network) = (self.sandbox, self.network);
-        let live = start_live(self.live.as_ref(), &self.git_dir, &started);
+        let live = start_live(self.live.take(), &self.git_dir, &started);
         let launched = started.launch(&self.store, || launch.spawn(sandbox, network));
         let (child, raw, proxy) = match launched {
             Ok(launched) => launched,
@@ -1290,26 +1297,22 @@ impl Prepared {
     }
 }
 
-/// Opens the live layer for `started`'s agent, unless it is off; a failure is reported, and the
+/// Joins the live layer for `started`'s agent, unless it is off; a failure is reported, and the
 /// agent runs without it.
-fn start_live(setup: Option<&LiveSetup>, git_dir: &Path, started: &Started) -> Option<LiveHost> {
+fn start_live(setup: Option<LiveSetup>, git_dir: &Path, started: &Started) -> Option<Link> {
     let (setup, key) = setup.zip(started.key.as_ref())?;
-    LiveHost::start(
-        setup,
-        git_dir,
-        started.thread,
-        started.slot.clone(),
-        key,
-        terminal::size(),
-    )
-    .inspect_err(|error| match error {
-        HostError::AnotherHost => eprintln!(
-            "mahi: teammates cannot watch {} yet: another of your mahis hosts the thread",
-            started.slot.agent()
-        ),
-        _ => eprintln!("mahi: teammates cannot watch this thread: {error}"),
-    })
-    .ok()
+    LiveKeys::derive(key, started.thread)
+        .map_err(HostError::from)
+        .and_then(|keys| {
+            Link::start(
+                setup,
+                git_dir,
+                (started.slot.clone(), keys),
+                terminal::size(),
+            )
+        })
+        .inspect_err(|error| eprintln!("mahi: teammates cannot watch this thread: {error}"))
+        .ok()
 }
 
 fn start_background(
@@ -1404,7 +1407,7 @@ fn finish_run(
     termination: TerminationSignals,
     background: Background,
     proxy: Option<Running>,
-    live: Option<LiveHost>,
+    live: Option<Link>,
 ) -> Result<Outcome, RunError> {
     let Background {
         recorder,

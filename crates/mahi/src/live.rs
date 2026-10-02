@@ -41,7 +41,6 @@ use mahi_core::{
     ParticipantName,
     ThreadId,
 };
-use mahi_crypto::ThreadKey;
 use mahi_identity::{
     ConfigDir,
     NodeKey,
@@ -58,7 +57,10 @@ use mahi_live::{
     LiveTopic,
     MAX_CHUNK_BYTES,
     MAX_SCREEN_PARTS,
+    PROMPT_ID_BYTES,
     Peers,
+    PromptOutcome,
+    PromptText,
     Relays,
 };
 use mahi_sandbox::WindowSize;
@@ -108,12 +110,20 @@ pub(crate) enum HostError {
     Frame(#[from] FrameError),
     #[error("another of your mahis hosts this thread's live layer")]
     AnotherHost,
+    #[error("the agent is already served by this host")]
+    SlotTaken,
+    #[error("an agent of another participant cannot be served by this host")]
+    NotOwnSlot,
+    #[error("cannot open the socket the user's other mahis reach the host on")]
+    Hub(#[source] io::Error),
     #[error("cannot take the live layer's lock")]
     Lock(#[from] LockError),
 }
 
 /// How many chunks of output wait for the broadcaster before newer ones are dropped.
 const TAP_QUEUE: usize = 1024;
+/// How many prompts for another mahi's agent wait for it to take them.
+const GUEST_OFFERS: usize = 32;
 /// How often a host answers the screen requests of one requester at most.
 const SCREEN_EVERY: Duration = Duration::from_secs(1);
 /// How many screen requests from different requesters wait to be answered together.
@@ -123,6 +133,10 @@ const UNASKED: [u8; 16] = [0; 16];
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
 const PUBLISHED: &str = "live";
+#[cfg(target_os = "macos")]
+const MAX_SOCKET_PATH: usize = 103;
+#[cfg(not(target_os = "macos"))]
+const MAX_SOCKET_PATH: usize = 107;
 const HOSTS: &str = "hosts";
 const MAX_PUBLISHED_BYTES: u64 = 4096;
 const PUBLISH_EVERY: Duration = Duration::from_secs(2);
@@ -135,6 +149,7 @@ const MAX_UNSENT_ANSWERS: usize = 256;
 #[derive(Debug)]
 pub(crate) struct LiveSetup {
     pub(crate) config: ConfigDir,
+    pub(crate) runtime: PathBuf,
     pub(crate) node_key: NodeKey,
     pub(crate) owner: ParticipantKey,
     pub(crate) relays: Relays,
@@ -231,36 +246,40 @@ fn withdraw_address(config: &ConfigDir, thread: ThreadId) {
     }
 }
 
-/// The host's copy of the agent's screen, and how many chunks of output and resizes it has
-/// taken, so a snapshot says which queued chunks it already holds.
+/// A copy of an agent's screen, and how many chunks of output and resizes it has taken, so a
+/// snapshot says which queued chunks it already holds.
 struct Screen {
     parser: vt100::Parser,
     taken: u64,
 }
 
-/// Where the agent's terminal is copied for teammates: the host's own screen, fed as the
-/// output goes by, and the queue of numbered chunks to broadcast. It never blocks: when the
-/// network falls behind, chunks are dropped and the broadcaster sends the whole screen again.
+/// Which of the agents a host serves a chunk belongs to.
+type AgentId = u32;
+
+/// Where an agent's terminal is copied for teammates: the host's copy of its screen, fed as
+/// the output goes by, and the queue of numbered chunks to broadcast. It never blocks: when the
+/// network falls behind, chunks are dropped and the broadcaster sends the whole screens again.
 #[derive(Clone)]
-pub(crate) struct OutputTap {
+pub(crate) struct HostTap {
+    agent: AgentId,
     screen: Arc<Mutex<Screen>>,
     queue: SyncSender<Tapped>,
     dropped: Arc<AtomicBool>,
 }
 
-impl std::fmt::Debug for OutputTap {
+impl std::fmt::Debug for HostTap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OutputTap").finish_non_exhaustive()
+        f.debug_struct("HostTap").finish_non_exhaustive()
     }
 }
 
 #[derive(Debug)]
-enum Tapped {
-    Output(u64, Vec<u8>),
-    Resize(u64, WindowSize),
+pub(crate) enum Tapped {
+    Output(AgentId, u64, Vec<u8>),
+    Resize(AgentId, u64, WindowSize),
 }
 
-impl OutputTap {
+impl HostTap {
     /// Takes a chunk of the agent's output.
     pub(crate) fn output(&self, bytes: &[u8]) {
         for chunk in bytes.chunks(MAX_CHUNK_BYTES) {
@@ -270,7 +289,7 @@ impl OutputTap {
             screen.parser.process(chunk);
             screen.taken += 1;
             let taken = screen.taken;
-            self.enqueue(Tapped::Output(taken, chunk.to_vec()));
+            self.enqueue(Tapped::Output(self.agent, taken, chunk.to_vec()));
         }
     }
 
@@ -282,7 +301,19 @@ impl OutputTap {
         screen.parser.screen_mut().set_size(size.rows, size.cols);
         screen.taken += 1;
         let taken = screen.taken;
-        self.enqueue(Tapped::Resize(taken, size));
+        self.enqueue(Tapped::Resize(self.agent, taken, size));
+    }
+
+    /// Replaces the copy of the agent's screen with `screen`, drawn at `size`, and has the
+    /// whole screens sent again.
+    pub(crate) fn reset(&self, size: WindowSize, screen: &[u8]) {
+        let Ok(mut copy) = self.screen.lock() else {
+            return;
+        };
+        copy.parser = vt100::Parser::new(size.rows, size.cols, 0);
+        copy.parser.process(screen);
+        copy.taken += 1;
+        self.dropped.store(true, Ordering::SeqCst);
     }
 
     fn enqueue(&self, tapped: Tapped) {
@@ -292,13 +323,168 @@ impl OutputTap {
     }
 }
 
-/// The live layer of a thread's host: its node, the topic its agent's terminal goes to, and
-/// the threads that broadcast it and answer screen requests.
+/// A prompt a teammate sent an agent another mahi of the user runs, for that mahi to offer
+/// its agent.
+#[derive(Debug)]
+pub(crate) struct Offer {
+    pub(crate) from: ParticipantName,
+    pub(crate) id: [u8; PROMPT_ID_BYTES],
+    pub(crate) text: PromptText,
+}
+
+/// Where the prompts for one of the agents a host serves go, and its answers come from.
+enum Inbox {
+    Local(Arc<Prompts>),
+    Remote {
+        offers: SyncSender<Offer>,
+        answers: Arc<Mutex<VecDeque<Answer>>>,
+    },
+}
+
+struct Hosted {
+    id: AgentId,
+    slot: AgentSlot,
+    screen: Arc<Mutex<Screen>>,
+    inbox: Inbox,
+    held_through: u64,
+    unsent: Vec<Answer>,
+    leaving: Option<Instant>,
+}
+
+impl Hosted {
+    fn is_leaving(&self) -> bool {
+        self.leaving.is_some()
+    }
+
+    fn owes_answers(&self) -> bool {
+        !self.unsent.is_empty()
+            || match &self.inbox {
+                Inbox::Local(_) => false,
+                Inbox::Remote { answers, .. } => {
+                    answers.lock().is_ok_and(|answers| !answers.is_empty())
+                }
+            }
+    }
+
+    fn take_unsent(&mut self) -> Vec<Answer> {
+        let mut answers = std::mem::take(&mut self.unsent);
+        if let Inbox::Remote {
+            answers: queued, ..
+        } = &self.inbox
+            && let Ok(mut queued) = queued.lock()
+        {
+            answers.extend(queued.drain(..));
+        }
+        answers.truncate(MAX_UNSENT_ANSWERS);
+        answers
+    }
+}
+
+/// The agents a host serves: its own, and those of the user's other mahis in the thread.
+#[derive(Default)]
+struct Registry {
+    agents: Vec<Hosted>,
+    next: AgentId,
+}
+
+impl Registry {
+    fn add(
+        &mut self,
+        slot: AgentSlot,
+        size: WindowSize,
+        inbox: Inbox,
+    ) -> Option<(AgentId, Arc<Mutex<Screen>>)> {
+        let mut unsent = Vec::new();
+        if let Some(index) = self.agents.iter().position(|hosted| hosted.slot == slot) {
+            let left = self.agents.get_mut(index)?;
+            if !left.is_leaving() {
+                return None;
+            }
+            unsent = left.take_unsent();
+            self.agents.swap_remove(index);
+        }
+        let id = self.next;
+        self.next = self.next.checked_add(1)?;
+        let screen = Arc::new(Mutex::new(Screen {
+            parser: vt100::Parser::new(size.rows, size.cols, 0),
+            taken: 0,
+        }));
+        self.agents.push(Hosted {
+            id,
+            slot,
+            screen: Arc::clone(&screen),
+            inbox,
+            held_through: 0,
+            unsent,
+            leaving: None,
+        });
+        Some((id, screen))
+    }
+
+    fn get(&mut self, id: AgentId) -> Option<&mut Hosted> {
+        self.agents.iter_mut().find(|hosted| hosted.id == id)
+    }
+
+    fn forget_left(&mut self, now: Instant) {
+        self.agents.retain(|hosted| {
+            hosted
+                .leaving
+                .is_none_or(|until| now < until && hosted.owes_answers())
+        });
+    }
+}
+
+/// An agent of another of the user's mahis in the thread, which this host serves while that
+/// mahi stays connected: its output and resizes go through `tap`, the prompts teammates send it
+/// arrive on `offers`, and its answers go to `answers`. Dropping it stops serving the agent,
+/// once the answers it passed on are sent or [`LAST_ANSWERS_WAIT`] is over.
+pub(crate) struct Guest {
+    id: AgentId,
+    registry: Arc<Mutex<Registry>>,
+    pub(crate) tap: HostTap,
+    offers: Option<Receiver<Offer>>,
+    answers: Arc<Mutex<VecDeque<Answer>>>,
+}
+
+impl Guest {
+    /// Hands over the prompts teammates send the agent, once.
+    pub(crate) fn take_offers(&mut self) -> Option<Receiver<Offer>> {
+        self.offers.take()
+    }
+
+    /// Passes on what became of a prompt, for its sender; past 256 unsent, answers are lost.
+    pub(crate) fn answer(&self, answer: Answer) {
+        if let Ok(mut answers) = self.answers.lock()
+            && answers.len() < MAX_UNSENT_ANSWERS
+        {
+            answers.push_back(answer);
+        }
+    }
+}
+
+impl std::fmt::Debug for Guest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guest").finish_non_exhaustive()
+    }
+}
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(hosted) = registry.get(self.id)
+        {
+            hosted.leaving = Some(Instant::now() + LAST_ANSWERS_WAIT);
+        }
+    }
+}
+
+/// The live layer of a thread's host: its node, the topic its agents' terminals go to, and
+/// the threads that broadcast them and answer screen requests.
 #[derive(Debug)]
 pub(crate) struct LiveHost {
     _hosting: LiveLock,
     node: Arc<LiveNode>,
-    tap: OutputTap,
+    tap: HostTap,
     stop: Arc<AtomicBool>,
     stop_broadcast: Arc<AtomicBool>,
     listener: JoinHandle<()>,
@@ -306,7 +492,20 @@ pub(crate) struct LiveHost {
     broadcaster: JoinHandle<()>,
     config: ConfigDir,
     thread: ThreadId,
+    owner: ParticipantName,
     prompts: Arc<Prompts>,
+    registry: Arc<Mutex<Registry>>,
+    queue: SyncSender<Tapped>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for Registry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registry")
+            .field("agents", &self.agents.len())
+            .field("next", &self.next)
+            .finish()
+    }
 }
 
 impl LiveHost {
@@ -315,11 +514,11 @@ impl LiveHost {
     pub(crate) fn start(
         setup: &LiveSetup,
         git_dir: &Path,
-        thread: ThreadId,
-        slot: AgentSlot,
-        thread_key: &ThreadKey,
-        size: WindowSize,
+        (slot, keys): (AgentSlot, &LiveKeys),
+        (size, drawn): (WindowSize, &[u8]),
+        prompts: Arc<Prompts>,
     ) -> Result<Self, HostError> {
+        let thread = keys.thread();
         let hosting =
             LiveLock::try_acquire(&setup.config, thread)?.ok_or(HostError::AnotherHost)?;
         withdraw_address(&setup.config, thread);
@@ -334,23 +533,20 @@ impl LiveHost {
             setup.relays,
             Arc::clone(&peers) as Arc<dyn Peers>,
         )?);
-        let topic = Arc::new(node.join(
-            LiveKeys::derive(thread_key, thread)?.topic(),
-            &setup.bootstrap,
-            None,
-        )?);
-        let sender = FrameSender::new(
-            LiveKeys::derive(thread_key, thread)?,
-            setup.node_key.secret(),
-        )?;
-        let mut receiver =
-            FrameReceiver::new(LiveKeys::derive(thread_key, thread)?, peers.participants());
-        receiver.take_prompts_for(&sender, slot.participant().clone());
-        let prompts = Arc::new(Prompts::default());
-        let screen = Arc::new(Mutex::new(Screen {
-            parser: vt100::Parser::new(size.rows, size.cols, 0),
-            taken: 0,
-        }));
+        let topic = Arc::new(node.join(keys.topic(), &setup.bootstrap, None)?);
+        let sender = FrameSender::new(keys.clone(), setup.node_key.secret())?;
+        let mut receiver = FrameReceiver::new(keys.clone(), peers.participants());
+        let owner = slot.participant().clone();
+        receiver.take_prompts_for(&sender, owner.clone());
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let (agent, screen) = registry
+            .lock()
+            .ok()
+            .and_then(|mut registry| registry.add(slot, size, Inbox::Local(Arc::clone(&prompts))))
+            .ok_or(HostError::SlotTaken)?;
+        if let Ok(mut copy) = screen.lock() {
+            copy.parser.process(drawn);
+        }
         let (queue, tapped) = mpsc::sync_channel(TAP_QUEUE);
         let dropped = Arc::new(AtomicBool::new(false));
         let wanted = Arc::new(Mutex::new(VecDeque::with_capacity(PENDING_SCREENS)));
@@ -359,22 +555,17 @@ impl LiveHost {
         let broadcaster = Broadcaster {
             topic: Arc::clone(&topic),
             sender,
-            slot: slot.clone(),
-            prompts: Arc::clone(&prompts),
-            answers: Vec::new(),
-            screen: Arc::clone(&screen),
+            registry: Arc::clone(&registry),
             tapped,
             dropped: Arc::clone(&dropped),
             wanted: Arc::clone(&wanted),
             stop: Arc::clone(&stop_broadcast),
-            held_through: 0,
             sent_at: Instant::now(),
         };
         let listener = Listener {
             topic,
             receiver,
-            slot,
-            prompts: Arc::clone(&prompts),
+            registry: Arc::clone(&registry),
             peers,
             wanted,
             stop: Arc::clone(&stop),
@@ -386,10 +577,11 @@ impl LiveHost {
         Ok(Self {
             _hosting: hosting,
             node,
-            tap: OutputTap {
+            tap: HostTap {
+                agent,
                 screen,
-                queue,
-                dropped,
+                queue: queue.clone(),
+                dropped: Arc::clone(&dropped),
             },
             stop,
             stop_broadcast,
@@ -398,18 +590,27 @@ impl LiveHost {
             publisher,
             config: setup.config.clone(),
             thread,
+            owner,
             prompts,
+            registry,
+            queue,
+            dropped,
         })
     }
 
     /// Returns where the agent's terminal is copied.
-    pub(crate) fn tap(&self) -> OutputTap {
+    pub(crate) fn tap(&self) -> HostTap {
         self.tap.clone()
     }
 
-    /// Returns the prompts teammates sent the agent.
-    pub(crate) fn prompts(&self) -> Arc<Prompts> {
-        Arc::clone(&self.prompts)
+    /// Returns what serves the agents of the user's other mahis in the thread.
+    pub(crate) fn handle(&self) -> HostHandle {
+        HostHandle {
+            owner: self.owner.clone(),
+            registry: Arc::clone(&self.registry),
+            queue: self.queue.clone(),
+            dropped: Arc::clone(&self.dropped),
+        }
     }
 
     /// Stops the live layer once the agent is gone: output still queued is dropped, and so
@@ -426,6 +627,156 @@ impl LiveHost {
             let _ = node.close();
         }
     }
+}
+
+/// What serves the agents of the user's other mahis in the thread, while the host runs.
+#[derive(Clone)]
+pub(crate) struct HostHandle {
+    owner: ParticipantName,
+    registry: Arc<Mutex<Registry>>,
+    queue: SyncSender<Tapped>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for HostHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostHandle").finish_non_exhaustive()
+    }
+}
+
+impl HostHandle {
+    /// A handle for tests, with no live layer behind it: what its agents send goes to the
+    /// returned queue, and the screens can be read back.
+    #[cfg(test)]
+    pub(crate) fn for_tests(owner: ParticipantName) -> (Self, Receiver<Tapped>) {
+        let (queue, tapped) = mpsc::sync_channel(TAP_QUEUE);
+        (
+            Self {
+                owner,
+                registry: Arc::new(Mutex::new(Registry::default())),
+                queue,
+                dropped: Arc::new(AtomicBool::new(false)),
+            },
+            tapped,
+        )
+    }
+
+    /// Returns the contents of the screen of the agent `slot` this handle serves, for tests.
+    #[cfg(test)]
+    pub(crate) fn screen_of(&self, slot: &AgentSlot) -> Option<String> {
+        let registry = self.registry.lock().ok()?;
+        let hosted = registry.agents.iter().find(|hosted| &hosted.slot == slot)?;
+        let screen = hosted.screen.lock().ok()?;
+        Some(screen.parser.screen().contents())
+    }
+
+    /// Offers a teammate's prompt to the agent `slot` as a received frame would, for tests.
+    #[cfg(test)]
+    pub(crate) fn offer(
+        &self,
+        slot: &AgentSlot,
+        from: ParticipantName,
+        id: [u8; PROMPT_ID_BYTES],
+        text: PromptText,
+    ) {
+        let registry = self.registry.lock().unwrap();
+        let hosted = registry
+            .agents
+            .iter()
+            .find(|hosted| &hosted.slot == slot)
+            .unwrap();
+        if let Inbox::Remote { offers, .. } = &hosted.inbox {
+            offers.try_send(Offer { from, id, text }).unwrap();
+        }
+    }
+
+    /// Takes the answers the agent `slot` sent back, for tests.
+    #[cfg(test)]
+    pub(crate) fn answers_of(&self, slot: &AgentSlot) -> Vec<Answer> {
+        let registry = self.registry.lock().unwrap();
+        let hosted = registry
+            .agents
+            .iter()
+            .find(|hosted| &hosted.slot == slot)
+            .unwrap();
+        match &hosted.inbox {
+            Inbox::Remote { answers, .. } => answers.lock().unwrap().drain(..).collect(),
+            Inbox::Local(_) => Vec::new(),
+        }
+    }
+
+    /// Returns how many agents this handle serves, for tests.
+    #[cfg(test)]
+    pub(crate) fn served(&self) -> usize {
+        self.registry
+            .lock()
+            .map(|registry| {
+                registry
+                    .agents
+                    .iter()
+                    .filter(|hosted| !hosted.is_leaving())
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Starts serving `slot`'s agent, which another mahi of the user runs, with its terminal at
+    /// `size`. The slot must be the user's, and not one already served.
+    pub(crate) fn serve(&self, slot: AgentSlot, size: WindowSize) -> Result<Guest, HostError> {
+        if slot.participant() != &self.owner {
+            return Err(HostError::NotOwnSlot);
+        }
+        let (offers, offered) = mpsc::sync_channel(GUEST_OFFERS);
+        let answers = Arc::new(Mutex::new(VecDeque::new()));
+        let inbox = Inbox::Remote {
+            offers,
+            answers: Arc::clone(&answers),
+        };
+        let (id, screen) = self
+            .registry
+            .lock()
+            .ok()
+            .and_then(|mut registry| registry.add(slot, size, inbox))
+            .ok_or(HostError::SlotTaken)?;
+        self.dropped.store(true, Ordering::SeqCst);
+        Ok(Guest {
+            id,
+            registry: Arc::clone(&self.registry),
+            tap: HostTap {
+                agent: id,
+                screen,
+                queue: self.queue.clone(),
+                dropped: Arc::clone(&self.dropped),
+            },
+            offers: Some(offered),
+            answers,
+        })
+    }
+}
+
+/// Returns the path of the socket the host of `thread`'s live layer serves the user's other
+/// mahis on, in mahi's private directory in `runtime`, creating that directory.
+pub(crate) fn hub_socket(runtime: &Path, thread: ThreadId) -> io::Result<PathBuf> {
+    let parent = rustix::fs::open(
+        runtime,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let name = format!("mahi-{}", rustix::process::geteuid().as_raw());
+    profile::open_private_dir(&parent, &name)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "mahi's runtime directory is not a private directory",
+        )
+    })?;
+    let socket = runtime.join(name).join(format!("{thread}.sock"));
+    if socket.as_os_str().len() > MAX_SOCKET_PATH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the path of the socket for the user's other mahis is too long",
+        ));
+    }
+    Ok(socket)
 }
 
 /// Keeps the host's published address current: the relay it reaches, and its direct addresses.
@@ -445,91 +796,126 @@ fn publish(node: &LiveNode, stop: &AtomicBool, config: &ConfigDir, thread: Threa
     }
 }
 
-/// Sends the agent's terminal in order: output and resizes as they were taken, and whole
+/// Sends the agents' terminals in order: output and resizes as they were taken, and whole
 /// screens when asked or after chunks were dropped, skipping the chunks a screen holds.
 struct Broadcaster {
     topic: Arc<LiveTopic>,
     sender: FrameSender,
-    slot: AgentSlot,
-    prompts: Arc<Prompts>,
-    answers: Vec<Answer>,
-    screen: Arc<Mutex<Screen>>,
+    registry: Arc<Mutex<Registry>>,
     tapped: Receiver<Tapped>,
     dropped: Arc<AtomicBool>,
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
-    held_through: u64,
     sent_at: Instant,
 }
 
 impl Broadcaster {
     fn run(mut self) {
         while !self.stopping() {
-            self.send_screen_if_needed();
+            self.send_screens_if_needed();
             self.send_answers(None);
             if self.sent_at.elapsed() >= HEARTBEAT_EVERY {
-                let beat = Body::Heartbeat {
-                    slot: self.slot.clone(),
-                };
-                self.send(&beat);
+                for slot in self.slots() {
+                    self.send(&Body::Heartbeat { slot });
+                }
                 self.sent_at = Instant::now();
             }
             let Ok(tapped) = self.tapped.recv_timeout(LISTEN_PAUSE) else {
                 continue;
             };
-            self.send_screen_if_needed();
-            let (taken, body) = match tapped {
-                Tapped::Output(taken, bytes) => (
-                    taken,
-                    Body::Output {
-                        slot: self.slot.clone(),
-                        bytes,
-                    },
-                ),
-                Tapped::Resize(taken, size) => (
-                    taken,
-                    Body::Resize {
-                        slot: self.slot.clone(),
-                        rows: size.rows,
-                        columns: size.cols,
-                    },
-                ),
+            self.send_screens_if_needed();
+            let (agent, taken) = match &tapped {
+                Tapped::Output(agent, taken, _) | Tapped::Resize(agent, taken, _) => {
+                    (*agent, *taken)
+                }
             };
-            if taken > self.held_through && !self.send(&body) {
+            let Some((slot, held_through)) = self.registry.lock().ok().and_then(|mut registry| {
+                registry
+                    .get(agent)
+                    .map(|hosted| (hosted.slot.clone(), hosted.held_through))
+            }) else {
+                continue;
+            };
+            let body = match tapped {
+                Tapped::Output(_, _, bytes) => Body::Output { slot, bytes },
+                Tapped::Resize(_, _, size) => Body::Resize {
+                    slot,
+                    rows: size.rows,
+                    columns: size.cols,
+                },
+            };
+            if taken > held_through && !self.send(&body) {
                 self.dropped.store(true, Ordering::SeqCst);
             }
         }
         self.send_answers(Some(Instant::now() + LAST_ANSWERS_WAIT));
     }
 
+    fn slots(&self) -> Vec<AgentSlot> {
+        self.registry
+            .lock()
+            .map(|registry| {
+                registry
+                    .agents
+                    .iter()
+                    .filter(|hosted| !hosted.is_leaving())
+                    .map(|hosted| hosted.slot.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn send_answers(&mut self, deadline: Option<Instant>) {
-        let mut answers = std::mem::take(&mut self.answers);
-        self.prompts.take_answers(&mut answers);
-        let mut sent = 0;
-        for answer in &answers {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                break;
+        let mut owed: Vec<(AgentId, AgentSlot, Vec<Answer>)> = match self.registry.lock() {
+            Ok(mut registry) => registry
+                .agents
+                .iter_mut()
+                .map(|hosted| {
+                    let mut answers = hosted.take_unsent();
+                    if let Inbox::Local(prompts) = &hosted.inbox {
+                        prompts.take_answers(&mut answers);
+                    }
+                    (hosted.id, hosted.slot.clone(), answers)
+                })
+                .collect(),
+            Err(_) => return,
+        };
+        let mut failed = false;
+        for (_, slot, answers) in &mut owed {
+            let mut sent = 0;
+            for answer in answers.iter() {
+                if failed || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    break;
+                }
+                let body = Body::PromptAnswer {
+                    slot: slot.clone(),
+                    id: answer.id,
+                    outcome: answer.outcome,
+                };
+                if !self.send(&body) {
+                    failed = true;
+                    break;
+                }
+                sent += 1;
             }
-            let body = Body::PromptAnswer {
-                slot: self.slot.clone(),
-                id: answer.id,
-                outcome: answer.outcome,
-            };
-            if !self.send(&body) {
-                break;
-            }
-            sent += 1;
+            answers.drain(..sent);
+            answers.truncate(MAX_UNSENT_ANSWERS);
         }
-        answers.drain(..sent);
-        answers.truncate(MAX_UNSENT_ANSWERS);
-        self.answers = answers;
+        if let Ok(mut registry) = self.registry.lock() {
+            for (id, _, answers) in owed {
+                if let Some(hosted) = registry.get(id) {
+                    hosted.unsent = answers;
+                }
+            }
+            registry.forget_left(Instant::now());
+        }
     }
 
     fn stopping(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
 
-    fn send_screen_if_needed(&mut self) {
+    fn send_screens_if_needed(&mut self) {
         let mut challenges: Vec<[u8; 16]> = self
             .wanted
             .lock()
@@ -541,22 +927,30 @@ impl Broadcaster {
         if challenges.is_empty() {
             return;
         }
-        let (state, size, taken) = match self.screen.lock() {
-            Ok(screen) => (
-                screen.parser.screen().state_formatted(),
-                screen.parser.screen().size(),
-                screen.taken,
-            ),
-            Err(_) => return,
-        };
-        let mut screens = Vec::with_capacity(challenges.len());
-        for challenge in challenges {
-            let Ok(parts) = screen_parts(&self.slot, challenge, size, &state) else {
-                return;
-            };
-            screens.push(parts);
+        let mut screens = Vec::new();
+        if let Ok(mut registry) = self.registry.lock() {
+            for hosted in registry
+                .agents
+                .iter_mut()
+                .filter(|hosted| !hosted.is_leaving())
+            {
+                let Ok(screen) = hosted.screen.lock() else {
+                    continue;
+                };
+                let (state, size, taken) = (
+                    screen.parser.screen().state_formatted(),
+                    screen.parser.screen().size(),
+                    screen.taken,
+                );
+                drop(screen);
+                for challenge in &challenges {
+                    if let Ok(parts) = screen_parts(&hosted.slot, *challenge, size, &state) {
+                        screens.push(parts);
+                    }
+                }
+                hosted.held_through = taken;
+            }
         }
-        self.held_through = taken;
         for parts in &screens {
             for part in parts {
                 if self.stopping() || !self.send(part) {
@@ -580,12 +974,11 @@ impl Broadcaster {
 }
 
 /// Reads the topic, passes the screen requests of participants to the broadcaster, at most
-/// one per second from each, and takes the prompts they send the host's agent.
+/// one per second from each, and takes the prompts they send the host's agents.
 struct Listener {
     topic: Arc<LiveTopic>,
     receiver: FrameReceiver,
-    slot: AgentSlot,
-    prompts: Arc<Prompts>,
+    registry: Arc<Mutex<Registry>>,
     peers: Arc<HostPeers>,
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
@@ -608,8 +1001,8 @@ impl Listener {
             };
             let challenge = match received.body {
                 Body::ScreenRequest { challenge } => challenge,
-                Body::Prompt { slot, id, text, .. } if slot == self.slot => {
-                    self.prompts.offer(received.participant, id, text);
+                Body::Prompt { slot, id, text, .. } => {
+                    self.offer(&slot, received.participant, id, text);
                     continue;
                 }
                 _ => continue,
@@ -623,6 +1016,37 @@ impl Listener {
             {
                 wanted.push_back(challenge);
                 answered.insert(received.sender, Instant::now());
+            }
+        }
+    }
+
+    fn offer(
+        &self,
+        slot: &AgentSlot,
+        from: ParticipantName,
+        id: [u8; PROMPT_ID_BYTES],
+        text: PromptText,
+    ) {
+        let Ok(registry) = self.registry.lock() else {
+            return;
+        };
+        let Some(hosted) = registry.agents.iter().find(|hosted| &hosted.slot == slot) else {
+            return;
+        };
+        match &hosted.inbox {
+            Inbox::Local(prompts) => {
+                prompts.offer(from, id, text);
+            }
+            Inbox::Remote { offers, answers } => {
+                if offers.try_send(Offer { from, id, text }).is_err()
+                    && let Ok(mut answers) = answers.lock()
+                    && answers.len() < MAX_UNSENT_ANSWERS
+                {
+                    answers.push_back(Answer {
+                        id,
+                        outcome: PromptOutcome::Dropped,
+                    });
+                }
             }
         }
     }
@@ -942,7 +1366,8 @@ mod tests {
     #[test]
     fn the_tap_numbers_what_the_screen_took_and_flags_what_the_queue_dropped() {
         let (queue, tapped) = mpsc::sync_channel(2);
-        let tap = OutputTap {
+        let tap = HostTap {
+            agent: 7,
             screen: Arc::new(Mutex::new(Screen {
                 parser: vt100::Parser::new(24, 80, 0),
                 taken: 0,
@@ -963,8 +1388,8 @@ mod tests {
         assert_eq!(screen.parser.screen().size(), (30, 100));
         assert!(screen.parser.screen().contents().contains("hello world"));
         drop(screen);
-        assert!(matches!(tapped.try_recv(), Ok(Tapped::Output(1, bytes)) if bytes == b"hello"));
-        assert!(matches!(tapped.try_recv(), Ok(Tapped::Resize(2, _))));
+        assert!(matches!(tapped.try_recv(), Ok(Tapped::Output(7, 1, bytes)) if bytes == b"hello"));
+        assert!(matches!(tapped.try_recv(), Ok(Tapped::Resize(7, 2, _))));
         assert!(tapped.try_recv().is_err());
     }
 
@@ -1025,6 +1450,75 @@ mod tests {
         )
         .unwrap();
         assert!(published_address(&config, thread).is_none());
+    }
+
+    #[test]
+    fn a_leaving_guest_is_kept_until_its_answers_are_sent_and_its_slot_can_come_back() {
+        let alice = ParticipantName::new("alice").unwrap();
+        let codex = AgentSlot::new(alice.clone(), AgentName::new("codex").unwrap());
+        let size = WindowSize { rows: 24, cols: 80 };
+        let (handle, _tapped) = HostHandle::for_tests(alice);
+        let dropped = Answer {
+            id: [1; 16],
+            outcome: PromptOutcome::Dropped,
+        };
+        let guest = handle.serve(codex.clone(), size).unwrap();
+        guest.answer(dropped);
+        drop(guest);
+        assert_eq!(handle.served(), 0);
+        handle.registry.lock().unwrap().forget_left(Instant::now());
+        assert_eq!(handle.registry.lock().unwrap().agents.len(), 1);
+
+        let guest = handle.serve(codex.clone(), size).unwrap();
+        {
+            let registry = handle.registry.lock().unwrap();
+            assert_eq!(registry.agents.len(), 1);
+            assert_eq!(registry.agents.first().unwrap().unsent, [dropped]);
+        }
+        assert!(handle.serve(codex.clone(), size).is_err());
+        drop(guest);
+        handle.registry.lock().unwrap().forget_left(Instant::now());
+        assert_eq!(handle.registry.lock().unwrap().agents.len(), 1);
+        handle
+            .registry
+            .lock()
+            .unwrap()
+            .forget_left(Instant::now() + LAST_ANSWERS_WAIT);
+        assert!(handle.registry.lock().unwrap().agents.is_empty());
+
+        let guest = handle.serve(codex, size).unwrap();
+        drop(guest);
+        handle.registry.lock().unwrap().forget_left(Instant::now());
+        assert!(handle.registry.lock().unwrap().agents.is_empty());
+    }
+
+    #[test]
+    fn the_hub_socket_is_in_a_private_runtime_directory_and_a_long_path_is_refused() {
+        use std::os::unix::fs::{
+            PermissionsExt,
+            symlink,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let thread = ThreadId::random().unwrap();
+        let socket = hub_socket(dir.path(), thread).unwrap();
+        let private = socket.parent().unwrap();
+        assert_eq!(private.parent(), Some(dir.path()));
+        assert_eq!(
+            std::fs::metadata(private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(socket.ends_with(format!("{thread}.sock")));
+
+        let planted = TempDir::new().unwrap();
+        std::fs::remove_dir(private).unwrap();
+        symlink(planted.path(), private).unwrap();
+        assert!(hub_socket(dir.path(), thread).is_err());
+
+        let deep = dir.path().join("d".repeat(MAX_SOCKET_PATH));
+        std::fs::create_dir(&deep).unwrap();
+        let error = hub_socket(&deep, thread).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

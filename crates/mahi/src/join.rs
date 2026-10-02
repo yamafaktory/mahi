@@ -127,6 +127,8 @@ const META_WAIT: Duration = Duration::from_secs(30);
 const RETRY_PAUSE: Duration = Duration::from_secs(1);
 const JOIN_WAIT: Duration = Duration::from_secs(15);
 const ASK_EVERY: Duration = Duration::from_secs(1);
+const MOST_AGENTS: usize = 32;
+const SWITCH_WAIT: Duration = Duration::from_secs(10);
 const RECEIVE_PAUSE: Duration = Duration::from_millis(100);
 const ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h";
 const MAIN_SCREEN: &[u8] = b"\x1b[?1049l";
@@ -205,6 +207,8 @@ pub(crate) enum JoinError {
 /// terminal.
 pub(crate) struct View {
     follows: ParticipantName,
+    agents: Vec<(AgentSlot, Instant)>,
+    wanted: Option<(AgentSlot, Instant)>,
     slot: Option<AgentSlot>,
     screen: Option<vt100::Parser>,
     shown: Option<vt100::Screen>,
@@ -226,6 +230,8 @@ impl View {
     pub(crate) fn new(follows: ParticipantName) -> Self {
         Self {
             follows,
+            agents: Vec::new(),
+            wanted: None,
             slot: None,
             screen: None,
             shown: None,
@@ -251,6 +257,13 @@ impl View {
         if participant != &self.follows {
             return;
         }
+        match &body {
+            Body::Screen { slot, .. }
+            | Body::Output { slot, .. }
+            | Body::Resize { slot, .. }
+            | Body::Heartbeat { slot } => self.seen(slot),
+            Body::ScreenRequest { .. } | Body::Prompt { .. } | Body::PromptAnswer { .. } => {}
+        }
         match body {
             Body::Screen {
                 slot,
@@ -261,7 +274,12 @@ impl View {
                 parts,
                 bytes,
             } => {
-                if self.slot.as_ref().is_none_or(|followed| followed == &slot) {
+                let followed = self
+                    .wanted
+                    .as_ref()
+                    .map(|(wanted, _)| wanted)
+                    .or(self.slot.as_ref());
+                if followed.is_none_or(|followed| followed == &slot) {
                     self.take_part(slot, challenge, (rows, columns), (part, parts), bytes);
                 }
             }
@@ -286,6 +304,55 @@ impl View {
             | Body::Heartbeat { .. }
             | Body::Prompt { .. }
             | Body::PromptAnswer { .. } => {}
+        }
+    }
+
+    /// Returns the agents of the followed participant the view heard from, in name order.
+    pub(crate) fn agents(&self) -> impl Iterator<Item = &AgentSlot> + Clone {
+        self.agents.iter().map(|(slot, _)| slot)
+    }
+
+    /// Shows `slot`'s agent instead, once a screen of it arrives.
+    pub(crate) fn switch_to(&mut self, slot: AgentSlot) {
+        if self.slot.as_ref() == Some(&slot) {
+            self.wanted = None;
+            return;
+        }
+        self.pending = None;
+        self.wanted = Some((slot, Instant::now()));
+    }
+
+    /// Says whether the view waits for the screen of an agent it was switched to.
+    pub(crate) fn is_switching(&self) -> bool {
+        self.wanted.is_some()
+    }
+
+    /// Forgets the agents not heard from for [`HOST_SILENCE`] at `now`, and gives up a switch
+    /// whose screen did not arrive within [`SWITCH_WAIT`].
+    pub(crate) fn expire(&mut self, now: Instant) {
+        self.agents
+            .retain(|(_, heard)| now.saturating_duration_since(*heard) <= HOST_SILENCE);
+        if self
+            .wanted
+            .as_ref()
+            .is_some_and(|(_, since)| now.saturating_duration_since(*since) > SWITCH_WAIT)
+        {
+            self.wanted = None;
+        }
+    }
+
+    fn seen(&mut self, slot: &AgentSlot) {
+        let now = Instant::now();
+        match self.agents.binary_search_by(|(heard, _)| heard.cmp(slot)) {
+            Ok(index) => {
+                if let Some((_, heard)) = self.agents.get_mut(index) {
+                    *heard = now;
+                }
+            }
+            Err(index) if self.agents.len() < MOST_AGENTS => {
+                self.agents.insert(index, (slot.clone(), now));
+            }
+            Err(_) => {}
         }
     }
 
@@ -376,6 +443,7 @@ impl View {
             screen.process(&bytes);
         }
         self.slot = Some(pending.slot);
+        self.wanted = None;
         self.screen = Some(screen);
         self.shown = None;
         self.changed = true;
@@ -682,7 +750,12 @@ fn show(
     while !leave.load(Ordering::SeqCst) {
         let lost = topic.dropped() != dropped;
         dropped = topic.dropped();
-        let wants_screen = !view.is_showing() || unanchored || lost || view.is_stuck(STUCK_SCREEN);
+        view.expire(Instant::now());
+        let wants_screen = !view.is_showing()
+            || view.is_switching()
+            || unanchored
+            || lost
+            || view.is_stuck(STUCK_SCREEN);
         if wants_screen && asked_at.is_none_or(|at| at.elapsed() >= ASK_EVERY) {
             if let Ok(frame) = frames
                 .request_screen()
@@ -717,10 +790,9 @@ fn show(
                     }
                     heard_at = Instant::now();
                     match received.body {
-                        Body::PromptAnswer { slot, id, outcome } => {
-                            let from_shown =
-                                showing_from == Some(received.sender) && view.slot() == Some(&slot);
-                            palette_changed |= from_shown && composer.answered(id, outcome);
+                        Body::PromptAnswer { id, outcome, .. } => {
+                            let from_host = showing_from == Some(received.sender);
+                            palette_changed |= from_host && composer.answered(id, outcome);
                         }
                         body => {
                             let screen = matches!(body, Body::Screen { .. });
@@ -742,6 +814,10 @@ fn show(
                 return Ended::Left;
             }
             palette_changed |= typed.changed;
+            if let Some(slot) = typed.switch {
+                view.switch_to(slot);
+                asked_at = None;
+            }
             if let Some(text) = typed.send {
                 let id = showing_from
                     .and_then(|host| send_prompt(&text, &view, frames, sender, (topic, host)));
@@ -751,22 +827,27 @@ fn show(
                 view.redraw_all();
             }
         }
-        let drawn = view.render();
-        let mut output = io::stdout().lock();
-        if let Some(drawn) = &drawn {
-            let _ = output.write_all(drawn);
-        }
-        if composer.is_open() && (drawn.is_some() || palette_changed) {
-            let size = terminal::size();
-            let _ = composer.draw(size.rows, size.cols, &mut output);
-        }
-        let _ = output.flush();
-        drop(output);
+        draw(&mut view, &mut composer, palette_changed);
         if heard_at.elapsed() > HOST_SILENCE {
             return Ended::Silent;
         }
     }
     Ended::Left
+}
+
+/// Draws what changed of the view, and the palette over it when it is open and either changed.
+fn draw(view: &mut View, composer: &mut Composer, mut palette_changed: bool) {
+    palette_changed |= composer.set_agents(view.agents(), view.slot());
+    let drawn = view.render();
+    let mut output = io::stdout().lock();
+    if let Some(drawn) = &drawn {
+        let _ = output.write_all(drawn);
+    }
+    if composer.is_open() && (drawn.is_some() || palette_changed) {
+        let size = terminal::size();
+        let _ = composer.draw(size.rows, size.cols, &mut output);
+    }
+    let _ = output.flush();
 }
 
 /// Sends `text` as a prompt to the agent the view shows, in the run of its host the viewer
@@ -877,6 +958,84 @@ mod tests {
 
     fn shown(view: &View) -> String {
         view.screen.as_ref().unwrap().screen().contents()
+    }
+
+    #[test]
+    fn the_view_lists_the_agents_it_hears_from_and_switches_once_the_new_screen_arrives() {
+        let alice = name("alice");
+        let (claude, codex) = (slot("alice", "claude"), slot("alice", "codex"));
+        let mut view = View::new(alice.clone());
+        view.apply(&alice, part(&claude, 1, 0, 1, &screen_of(b"claude here")));
+        view.apply(
+            &alice,
+            Body::Heartbeat {
+                slot: codex.clone(),
+            },
+        );
+        view.apply(
+            &name("bob"),
+            Body::Heartbeat {
+                slot: slot("bob", "aider"),
+            },
+        );
+        assert!(view.agents().eq([&claude, &codex]));
+        assert_eq!(view.slot(), Some(&claude));
+        view.switch_to(codex.clone());
+        assert!(view.is_switching());
+        view.apply(&alice, part(&claude, 2, 0, 1, &screen_of(b"claude again")));
+        assert_eq!(view.slot(), Some(&claude));
+        view.apply(&alice, output(&codex, b"ignored before its screen"));
+        view.apply(&alice, part(&codex, 3, 0, 1, &screen_of(b"codex here")));
+        assert!(!view.is_switching());
+        assert_eq!(view.slot(), Some(&codex));
+        view.apply(&alice, output(&claude, b" not shown"));
+        view.apply(&alice, output(&codex, b" more"));
+        let shown = view.screen.as_ref().unwrap().screen().contents();
+        assert!(shown.contains("codex here more"), "{shown}");
+        assert!(!shown.contains("not shown"), "{shown}");
+        view.switch_to(codex.clone());
+        assert!(!view.is_switching());
+    }
+
+    #[test]
+    fn silent_agents_are_forgotten_and_a_switch_to_one_that_never_answers_is_given_up() {
+        let alice = name("alice");
+        let (claude, codex) = (slot("alice", "claude"), slot("alice", "codex"));
+        let mut view = View::new(alice.clone());
+        view.apply(&alice, part(&claude, 1, 0, 1, &screen_of(b"claude here")));
+        view.apply(
+            &alice,
+            Body::Heartbeat {
+                slot: codex.clone(),
+            },
+        );
+        view.switch_to(codex.clone());
+        let now = Instant::now();
+        view.expire(now);
+        assert!(view.is_switching());
+        assert_eq!(view.agents().count(), 2);
+        view.expire(now + SWITCH_WAIT + Duration::from_secs(1));
+        assert!(!view.is_switching());
+        assert_eq!(view.agents().count(), 2);
+        view.apply(&alice, part(&claude, 2, 0, 1, &screen_of(b"claude again")));
+        assert_eq!(view.slot(), Some(&claude));
+        view.expire(now + HOST_SILENCE + Duration::from_secs(1));
+        assert_eq!(view.agents().count(), 0);
+    }
+
+    #[test]
+    fn at_most_32_agents_are_listed() {
+        let alice = name("alice");
+        let mut view = View::new(alice.clone());
+        for index in 0..40 {
+            view.apply(
+                &alice,
+                Body::Heartbeat {
+                    slot: slot("alice", &format!("agent{index}")),
+                },
+            );
+        }
+        assert_eq!(view.agents().count(), MOST_AGENTS);
     }
 
     #[test]

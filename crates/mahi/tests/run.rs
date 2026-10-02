@@ -2236,6 +2236,179 @@ if [ -e parser.rs ]; then echo "parser=present"; else echo "parser=absent"; fi
         assert!(!published.exists());
     }
 
+    fn watch_screens(
+        topic: &mahi_live::LiveTopic,
+        receiver: &mut mahi_live::FrameReceiver,
+        sender: &mut mahi_live::FrameSender,
+        seen: &mut std::collections::HashMap<String, String>,
+        asked_at: &mut Option<Instant>,
+    ) {
+        if asked_at.is_none_or(|at| at.elapsed() > Duration::from_secs(1)) {
+            let request = receiver.request_screen().unwrap();
+            let _ = topic.broadcast(sender.seal(&request).unwrap());
+            *asked_at = Some(Instant::now());
+        }
+        while let Ok(Some(frame)) = topic.receive(Duration::from_millis(100)) {
+            if let Ok(
+                mahi_live::Body::Screen { slot, bytes, .. }
+                | mahi_live::Body::Output { slot, bytes },
+            ) = receiver.open(&frame).map(|received| received.body)
+            {
+                seen.entry(slot.to_string())
+                    .or_default()
+                    .push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+    }
+
+    fn add_agent_with_live(
+        fixture: &Fixture,
+        thread: ThreadId,
+        agent: &Path,
+    ) -> thread::JoinHandle<(i32, String)> {
+        let mut adding = PtyCommand::new(
+            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            &fixture.repo,
+            WindowSize {
+                rows: 24,
+                cols: 200,
+            },
+        );
+        for argument in [
+            "agent",
+            "add",
+            &thread.to_string(),
+            "--",
+            agent.to_str().unwrap(),
+        ] {
+            adding = adding.arg(argument);
+        }
+        let adding = adding
+            .env("PATH", "/usr/bin:/bin:/usr")
+            .env("HOME", &fixture.home)
+            .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+            .env("SSH_AUTH_SOCK", &fixture.socket)
+            .env("USER", "tester")
+            .env("MAHI_LIVE", "local");
+        thread::spawn(move || in_terminal_with(adding, Some(PASSPHRASE)))
+    }
+
+    struct Watching {
+        topic: mahi_live::LiveTopic,
+        receiver: mahi_live::FrameReceiver,
+        sender: mahi_live::FrameSender,
+        seen: std::collections::HashMap<String, String>,
+        asked_at: Option<Instant>,
+    }
+
+    impl Watching {
+        fn join(
+            viewer: &mahi_live::LiveNode,
+            address: &mahi_live::HostAddress,
+            (key, thread): (&mahi_crypto::ThreadKey, ThreadId),
+            (bob, participants): (&NodeKey, Vec<(mahi_thread::NodeId, ParticipantName)>),
+        ) -> Self {
+            let keys = || mahi_live::LiveKeys::derive(key, thread).unwrap();
+            Self {
+                topic: viewer
+                    .join(
+                        keys().topic(),
+                        std::slice::from_ref(address),
+                        Some(Duration::from_secs(10)),
+                    )
+                    .unwrap(),
+                receiver: mahi_live::FrameReceiver::new(keys(), participants),
+                sender: mahi_live::FrameSender::new(keys(), bob.secret()).unwrap(),
+                seen: std::collections::HashMap::new(),
+                asked_at: None,
+            }
+        }
+
+        fn has(&mut self, slot: &str, text: &str) -> bool {
+            watch_screens(
+                &self.topic,
+                &mut self.receiver,
+                &mut self.sender,
+                &mut self.seen,
+                &mut self.asked_at,
+            );
+            self.seen.get(slot).is_some_and(|seen| seen.contains(text))
+        }
+    }
+
+    #[test]
+    fn the_users_agents_share_one_host_and_the_next_takes_over_when_it_ends() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let mut command = fixture.command(&["run", "sh", "-c", "printf 'first agent'; sleep 8"]);
+        let mut first = KillOnDrop(
+            command
+                .env("MAHI_LIVE", "local")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let (thread, key) = running_thread(&fixture);
+        let bob = invite_bob(&fixture, thread, &key);
+        let second_agent = script(
+            &fixture,
+            "second",
+            "codex",
+            "#!/bin/sh\nprintf 'second agent'; sleep 16; printf ' after takeover'; sleep 6\n",
+        );
+        let second = add_agent_with_live(&fixture, thread, &second_agent);
+        let address = local_host_address(&fixture);
+        let published = config_dir(&fixture.home)
+            .path()
+            .join("live")
+            .join(thread.to_string());
+        wait_until("the host to publish its address", || published.exists());
+        let viewer = mahi_live::LiveNode::bind_live(
+            bob.secret(),
+            mahi_live::Relays::Disabled,
+            Arc::new(AdmitsHost(*address.node())),
+        )
+        .unwrap();
+        let store = Store::open(&fixture.repo).unwrap();
+        let meta = load_meta(&store, thread, &fixture.owner, 0).unwrap();
+        let participants = || {
+            meta.participants()
+                .map(|listed| (*listed.node(), listed.name().clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut watching =
+            Watching::join(&viewer, &address, (&key, thread), (&bob, participants()));
+        wait_until("both agents' screens from one host", || {
+            watching.has("tester.sh", "first agent") && watching.has("tester.codex", "second agent")
+        });
+        let mut status = None;
+        wait_until("the first mahi to end with its agent", || {
+            status = first.0.try_wait().unwrap();
+            status.is_some()
+        });
+        assert!(status.unwrap().success());
+        wait_until("the second mahi to take over the hosting", || {
+            published.exists()
+        });
+        drop(watching);
+        let mut watching =
+            Watching::join(&viewer, &address, (&key, thread), (&bob, participants()));
+        wait_until("the second agent through its own mahi", || {
+            watching.has("tester.codex", "after takeover")
+        });
+        assert!(!watching.seen.contains_key("tester.sh"));
+        viewer.close().unwrap();
+        let (code, output) = second.join().unwrap();
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("teammates watch codex through your other mahi in this thread"),
+            "{output}"
+        );
+        assert!(!published.exists());
+    }
+
     #[test]
     fn mahi_ends_with_its_agent_when_teammates_can_watch_and_refuses_an_unknown_live_setting() {
         let fixture = fixture();

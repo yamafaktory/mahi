@@ -3282,6 +3282,7 @@ dependencies = [
  "mahi-tls",
  "n0-future",
  "postcard",
+ "proptest",
  "serde",
  "ssh-key",
  "thiserror 2.0.21",

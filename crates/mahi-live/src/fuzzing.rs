@@ -35,3 +35,22 @@ pub fn ticket(data: &[u8]) {
 pub fn frame_plaintext(data: &[u8]) {
     frame::fuzz_plaintext(data);
 }
+
+/// Decodes `data` as a message from another of the user's mahis, and checks that what decodes
+/// encodes and decodes again to the same.
+///
+/// # Panics
+///
+/// Panics if a decoded message does not survive encoding, the bug looked for.
+pub fn local_message(data: &[u8]) {
+    if let Ok(message) = crate::LocalMessage::decode(data) {
+        let mut frame = Vec::new();
+        message
+            .encode(&mut frame)
+            .expect("a decoded message encodes");
+        assert_eq!(
+            crate::LocalMessage::decode(frame.get(4..).unwrap_or_default()).ok(),
+            Some(message)
+        );
+    }
+}

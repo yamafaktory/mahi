@@ -7,6 +7,7 @@ mod end;
 mod environment;
 mod handoff;
 mod hook;
+mod hub;
 mod id;
 mod init;
 mod inject;

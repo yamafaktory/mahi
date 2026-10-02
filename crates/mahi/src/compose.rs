@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use mahi_core::AgentSlot;
 use mahi_live::{
     MAX_PROMPT_BYTES,
     PROMPT_ID_BYTES,
@@ -25,7 +26,7 @@ const QUIT_KEYS: [u8; 3] = [b'q', 0x03, 0x04];
 const MOST_SENT: usize = 32;
 const SHOWN_CHARS: usize = 200;
 const EMPTY: &str = "Type a prompt for the agent; Enter sends it to its host";
-const HINT: &str = "Enter sends · Esc closes";
+const HINT: &str = "Enter sends · ↑↓ and Enter on an empty line switch agents · Esc closes";
 const NOT_SENT: &str = "not sent";
 
 /// What a watching teammate writes to the followed agent: the palette they compose a prompt in,
@@ -38,6 +39,10 @@ pub(crate) struct Composer {
     text: String,
     sent: VecDeque<Sent>,
     title: String,
+    follows: String,
+    agents: Vec<AgentSlot>,
+    watching: Option<AgentSlot>,
+    selected: usize,
 }
 
 #[derive(Debug)]
@@ -56,6 +61,8 @@ pub(crate) struct Typed {
     pub(crate) changed: bool,
     /// Send this prompt.
     pub(crate) send: Option<String>,
+    /// Watch this agent instead.
+    pub(crate) switch: Option<AgentSlot>,
 }
 
 impl Composer {
@@ -68,7 +75,39 @@ impl Composer {
             text: String::new(),
             sent: VecDeque::new(),
             title: format!("Prompt for {follows}'s agent"),
+            follows: follows.to_owned(),
+            agents: Vec::new(),
+            watching: None,
+            selected: 0,
         }
+    }
+
+    /// Lists `agents`, the followed participant's agents the viewer heard from, with the one it
+    /// shows, `watching`; returns whether the list changed.
+    pub(crate) fn set_agents<'a>(
+        &mut self,
+        agents: impl Iterator<Item = &'a AgentSlot> + Clone,
+        watching: Option<&AgentSlot>,
+    ) -> bool {
+        if self.agents.iter().eq(agents.clone()) && watching == self.watching.as_ref() {
+            return false;
+        }
+        self.agents.clear();
+        self.agents.extend(agents.cloned());
+        self.watching = watching.cloned();
+        self.title = match &self.watching {
+            Some(slot) => format!("Prompt for {slot}"),
+            None => format!("Prompt for {}'s agent", self.follows),
+        };
+        if let Some(watched) = self
+            .watching
+            .as_ref()
+            .and_then(|slot| self.agents.iter().position(|agent| agent == slot))
+        {
+            self.selected = watched;
+        }
+        self.selected = self.selected.min(self.agents.len().saturating_sub(1));
+        true
     }
 
     /// Returns whether the palette is open.
@@ -84,6 +123,9 @@ impl Composer {
             keys,
             open,
             text,
+            agents,
+            watching,
+            selected,
             ..
         } = self;
         for segment in scanner.scan(chunk) {
@@ -110,12 +152,26 @@ impl Composer {
                                 typed.send = Some(std::mem::take(text));
                                 typed.changed = true;
                             }
+                            PaletteInput::Enter => {
+                                let chosen = agents.get(*selected);
+                                if chosen.is_some() && chosen != watching.as_ref() {
+                                    typed.switch = chosen.cloned();
+                                    typed.changed = true;
+                                }
+                            }
+                            PaletteInput::Up if *selected > 0 => {
+                                *selected -= 1;
+                                typed.changed = true;
+                            }
+                            PaletteInput::Down if *selected + 1 < agents.len() => {
+                                *selected += 1;
+                                typed.changed = true;
+                            }
                             PaletteInput::Escape => {
                                 *open = false;
                                 typed.changed = true;
                             }
                             PaletteInput::Text(_)
-                            | PaletteInput::Enter
                             | PaletteInput::Tab
                             | PaletteInput::Reject
                             | PaletteInput::Up
@@ -164,19 +220,24 @@ impl Composer {
         if !self.open {
             return Ok(());
         }
-        let items: Vec<PaletteItem<'_>> = self
-            .sent
-            .iter()
-            .map(|sent| PaletteItem {
-                label: status(sent),
-                detail: &sent.text,
-            })
-            .collect();
+        let agents = self.agents.iter().map(|agent| PaletteItem {
+            label: if Some(agent) == self.watching.as_ref() {
+                "watching"
+            } else {
+                "agent"
+            },
+            detail: agent.agent().as_str(),
+        });
+        let sent = self.sent.iter().map(|sent| PaletteItem {
+            label: status(sent),
+            detail: &sent.text,
+        });
+        let items: Vec<PaletteItem<'_>> = agents.chain(sent).collect();
         let view = PaletteView {
             title: &self.title,
             filter: &self.text,
             items: &items,
-            selected: 0,
+            selected: self.selected,
             empty: EMPTY,
             hint: HINT,
             preview: None,
@@ -199,6 +260,10 @@ fn status(sent: &Sent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slot(agent: &str) -> AgentSlot {
+        format!("alice.{agent}").parse().unwrap()
+    }
 
     fn composer() -> Composer {
         Composer::new(PaletteKey::CTRL_SPACE, "alice")
@@ -252,6 +317,34 @@ mod tests {
         composer.text.clear();
         composer.typed(&vec![b'x'; MAX_PROMPT_BYTES + 10]);
         assert_eq!(composer.text.len(), MAX_PROMPT_BYTES);
+    }
+
+    #[test]
+    fn the_agents_are_listed_and_enter_on_an_empty_line_switches_to_the_chosen_one() {
+        let mut composer = composer();
+        let (claude, codex) = (slot("claude"), slot("codex"));
+        let both = [claude.clone(), codex.clone()];
+        assert!(composer.set_agents(both.iter(), Some(&claude)));
+        assert!(!composer.set_agents(both.iter(), Some(&claude)));
+        composer.typed(b"\0");
+        assert_eq!(composer.typed(b"\r").switch, None);
+        assert!(composer.typed(b"\x1b[B").changed);
+        assert!(!composer.typed(b"\x1b[B").changed);
+        assert_eq!(composer.typed(b"\r").switch, Some(codex.clone()));
+        let typed = composer.typed(b"look\r");
+        assert_eq!(typed.send.as_deref(), Some("look"));
+        assert_eq!(typed.switch, None);
+        assert!(composer.set_agents(both.iter(), Some(&codex)));
+        assert_eq!(composer.selected, 1);
+        assert!(composer.typed(b"\x1b[A").changed);
+        let mut out = Vec::new();
+        composer.draw(24, 80, &mut out).unwrap();
+        let drawn = String::from_utf8_lossy(&out);
+        assert!(drawn.contains("Prompt for alice.codex"), "{drawn}");
+        assert!(drawn.contains("watching"), "{drawn}");
+        assert!(drawn.contains("claude"), "{drawn}");
+        assert!(composer.set_agents([claude.clone()].iter(), Some(&claude)));
+        assert_eq!(composer.selected, 0);
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod frame;
 #[cfg(fuzzing)]
 pub mod fuzzing;
 mod gossip;
+mod local;
 mod meta;
 #[cfg(test)]
 mod testing;
@@ -40,6 +41,11 @@ pub use frame::{
 pub use gossip::{
     LiveTopic,
     RECEIVED_FRAMES,
+};
+pub use local::{
+    LocalError,
+    LocalMessage,
+    MAX_LOCAL_FRAME_BYTES,
 };
 pub use meta::{
     META_ALPN,
