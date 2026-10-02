@@ -1499,7 +1499,7 @@ mod tests {
             symlink,
         };
 
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         let thread = ThreadId::random().unwrap();
         let socket = hub_socket(dir.path(), thread).unwrap();
         let private = socket.parent().unwrap();

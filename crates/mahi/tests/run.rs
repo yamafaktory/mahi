@@ -2109,6 +2109,21 @@ if [ -e parser.rs ]; then echo "parser=present"; else echo "parser=absent"; fi
         bob_node_key
     }
 
+    fn published_address(path: &Path) -> mahi_live::HostAddress {
+        let published = mahi_live::HostAddress::from_bytes(&fs::read(path).unwrap()).unwrap();
+        let mut direct: Vec<std::net::SocketAddr> = Vec::new();
+        let loopbacks = published
+            .direct()
+            .iter()
+            .map(|address| std::net::SocketAddr::from(([127, 0, 0, 1], address.port())));
+        for address in loopbacks.chain(published.direct().iter().copied()) {
+            if !direct.contains(&address) && direct.len() < mahi_live::MAX_DIRECT_ADDRESSES {
+                direct.push(address);
+            }
+        }
+        mahi_live::HostAddress::new(*published.node(), None, direct).unwrap()
+    }
+
     fn local_host_address(fixture: &Fixture) -> mahi_live::HostAddress {
         let host_node = mahi_thread::NodeId::from_bytes(
             NodeKey::load(&config_dir(&fixture.home).node_key_file())
@@ -2359,12 +2374,12 @@ if [ -e parser.rs ]; then echo "parser=present"; else echo "parser=absent"; fi
             "#!/bin/sh\nprintf 'second agent'; sleep 16; printf ' after takeover'; sleep 6\n",
         );
         let second = add_agent_with_live(&fixture, thread, &second_agent);
-        let address = local_host_address(&fixture);
         let published = config_dir(&fixture.home)
             .path()
             .join("live")
             .join(thread.to_string());
         wait_until("the host to publish its address", || published.exists());
+        let address = published_address(&published);
         let viewer = mahi_live::LiveNode::bind_live(
             bob.secret(),
             mahi_live::Relays::Disabled,
@@ -2393,6 +2408,7 @@ if [ -e parser.rs ]; then echo "parser=present"; else echo "parser=absent"; fi
             published.exists()
         });
         drop(watching);
+        let address = published_address(&published);
         let mut watching =
             Watching::join(&viewer, &address, (&key, thread), (&bob, participants()));
         wait_until("the second agent through its own mahi", || {
