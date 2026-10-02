@@ -20,13 +20,17 @@ pub use endpoint::{
 };
 pub use frame::{
     Body,
+    ClaimEntry,
     FrameError,
     FrameReceiver,
     FrameSender,
     LiveKeys,
     MAX_CHUNK_BYTES,
+    MAX_CLAIM_BYTES,
+    MAX_CLAIM_NOTE_BYTES,
     MAX_COLUMNS,
     MAX_FRAME_BYTES,
+    MAX_FRAME_CLAIMS,
     MAX_PROMPT_BYTES,
     MAX_PROMPTS_PER_RUN,
     MAX_ROWS,
@@ -45,6 +49,7 @@ pub use gossip::{
 pub use local::{
     LocalError,
     LocalMessage,
+    MAX_LOCAL_CLAIMS,
     MAX_LOCAL_FRAME_BYTES,
 };
 pub use meta::{

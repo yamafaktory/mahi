@@ -82,6 +82,7 @@ use rustix::fs::{
 use thiserror::Error;
 
 use crate::{
+    claims::Claims,
     profile,
     prompts::{
         Answer,
@@ -131,6 +132,8 @@ const PENDING_SCREENS: usize = 8;
 const LISTEN_PAUSE: Duration = Duration::from_millis(200);
 const UNASKED: [u8; 16] = [0; 16];
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+/// How often a host sends its claims again when they did not change.
+const CLAIMS_EVERY: Duration = Duration::from_secs(10);
 
 const PUBLISHED: &str = "live";
 #[cfg(target_os = "macos")]
@@ -494,6 +497,8 @@ pub(crate) struct LiveHost {
     thread: ThreadId,
     owner: ParticipantName,
     prompts: Arc<Prompts>,
+    claims: Arc<Claims>,
+    me: AgentSlot,
     registry: Arc<Mutex<Registry>>,
     queue: SyncSender<Tapped>,
     dropped: Arc<AtomicBool>,
@@ -516,7 +521,7 @@ impl LiveHost {
         git_dir: &Path,
         (slot, keys): (AgentSlot, &LiveKeys),
         (size, drawn): (WindowSize, &[u8]),
-        prompts: Arc<Prompts>,
+        (prompts, claims): (Arc<Prompts>, Arc<Claims>),
     ) -> Result<Self, HostError> {
         let thread = keys.thread();
         let hosting =
@@ -537,6 +542,7 @@ impl LiveHost {
         let sender = FrameSender::new(keys.clone(), setup.node_key.secret())?;
         let mut receiver = FrameReceiver::new(keys.clone(), peers.participants());
         let owner = slot.participant().clone();
+        let me = slot.clone();
         receiver.take_prompts_for(&sender, owner.clone());
         let registry = Arc::new(Mutex::new(Registry::default()));
         let (agent, screen) = registry
@@ -561,6 +567,7 @@ impl LiveHost {
             wanted: Arc::clone(&wanted),
             stop: Arc::clone(&stop_broadcast),
             sent_at: Instant::now(),
+            claims: (Arc::clone(&claims), me.clone(), None),
         };
         let listener = Listener {
             topic,
@@ -569,6 +576,7 @@ impl LiveHost {
             peers,
             wanted,
             stop: Arc::clone(&stop),
+            claims: Arc::clone(&claims),
         };
         let publisher = {
             let (node, stop, config) = (Arc::clone(&node), Arc::clone(&stop), setup.config.clone());
@@ -592,6 +600,8 @@ impl LiveHost {
             thread,
             owner,
             prompts,
+            claims,
+            me,
             registry,
             queue,
             dropped,
@@ -610,6 +620,8 @@ impl LiveHost {
             registry: Arc::clone(&self.registry),
             queue: self.queue.clone(),
             dropped: Arc::clone(&self.dropped),
+            claims: Arc::clone(&self.claims),
+            me: self.me.clone(),
         }
     }
 
@@ -636,6 +648,8 @@ pub(crate) struct HostHandle {
     registry: Arc<Mutex<Registry>>,
     queue: SyncSender<Tapped>,
     dropped: Arc<AtomicBool>,
+    claims: Arc<Claims>,
+    me: AgentSlot,
 }
 
 impl std::fmt::Debug for HostHandle {
@@ -652,10 +666,12 @@ impl HostHandle {
         let (queue, tapped) = mpsc::sync_channel(TAP_QUEUE);
         (
             Self {
+                me: AgentSlot::new(owner.clone(), mahi_core::AgentName::new("host").unwrap()),
                 owner,
                 registry: Arc::new(Mutex::new(Registry::default())),
                 queue,
                 dropped: Arc::new(AtomicBool::new(false)),
+                claims: Arc::new(Claims::default()),
             },
             tapped,
         )
@@ -718,6 +734,11 @@ impl HostHandle {
                     .count()
             })
             .unwrap_or_default()
+    }
+
+    /// Returns the claims this host keeps, and its own agent, whose claims they are first.
+    pub(crate) fn claims(&self) -> (&Arc<Claims>, &AgentSlot) {
+        (&self.claims, &self.me)
     }
 
     /// Starts serving `slot`'s agent, which another mahi of the user runs, with its terminal at
@@ -813,6 +834,7 @@ struct Broadcaster {
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
     sent_at: Instant,
+    claims: (Arc<Claims>, AgentSlot, Option<Instant>),
 }
 
 impl Broadcaster {
@@ -820,6 +842,7 @@ impl Broadcaster {
         while !self.stopping() {
             self.send_screens_if_needed();
             self.send_answers(None);
+            self.send_claims_if_needed();
             if self.sent_at.elapsed() >= HEARTBEAT_EVERY {
                 for slot in self.slots() {
                     self.send(&Body::Heartbeat { slot });
@@ -855,6 +878,23 @@ impl Broadcaster {
             }
         }
         self.send_answers(Some(Instant::now() + LAST_ANSWERS_WAIT));
+        self.send(&Body::Claims { claims: Vec::new() });
+    }
+
+    /// Sends the claims of the agents this host serves when they changed, and every
+    /// [`CLAIMS_EVERY`] so others keep them.
+    fn send_claims_if_needed(&mut self) {
+        let (claims, me, sent_at) = &self.claims;
+        let due = sent_at.is_none_or(|at| at.elapsed() >= CLAIMS_EVERY);
+        if !claims.take_hosted_changed() && !due {
+            return;
+        }
+        let body = Body::Claims {
+            claims: claims.hosted(me),
+        };
+        if self.send(&body) {
+            self.claims.2 = Some(Instant::now());
+        }
     }
 
     fn slots(&self) -> Vec<AgentSlot> {
@@ -988,6 +1028,7 @@ struct Listener {
     peers: Arc<HostPeers>,
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
+    claims: Arc<Claims>,
 }
 
 impl Listener {
@@ -1009,6 +1050,10 @@ impl Listener {
                 Body::ScreenRequest { challenge } => challenge,
                 Body::Prompt { slot, id, text, .. } => {
                     self.offer(&slot, received.participant, id, text);
+                    continue;
+                }
+                Body::Claims { claims } => {
+                    self.claims.hear(received.sender, claims);
                     continue;
                 }
                 _ => continue,

@@ -44,6 +44,7 @@ use mahi_live::{
 use mahi_sandbox::WindowSize;
 
 use crate::{
+    claims::Claims,
     live::{
         Guest,
         HostError,
@@ -300,7 +301,7 @@ fn serve_guest(mut stream: UnixStream, handle: &HostHandle) -> Result<(), LocalE
         rows,
         cols: columns,
     };
-    let Ok(mut guest) = handle.serve(slot, size) else {
+    let Ok(mut guest) = handle.serve(slot.clone(), size) else {
         return Ok(());
     };
     guest.tap.reset(size, &screen);
@@ -309,14 +310,18 @@ fn serve_guest(mut stream: UnixStream, handle: &HostHandle) -> Result<(), LocalE
     let forwarder = match guest.take_offers() {
         Some(offers) => {
             let (mut writer, done) = (stream.try_clone()?, Arc::clone(&done));
+            let (claims, me) = handle.claims();
+            let (claims, me) = (Arc::clone(claims), me.clone());
             Some(thread::spawn(move || {
-                forward_offers(&offers, &mut writer, &done);
+                forward_offers(&offers, &mut writer, &done, (&claims, &me));
                 offers
             }))
         }
         None => None,
     };
-    let read = read_guest(&mut stream, &guest);
+    let claims = Arc::clone(handle.claims().0);
+    let read = read_guest(&mut stream, &guest, (&claims, &slot));
+    claims.forget_guest(&slot);
     done.store(true, Ordering::SeqCst);
     let _ = stream.shutdown(Shutdown::Both);
     if let Some(Ok(offers)) = forwarder.map(JoinHandle::join) {
@@ -330,8 +335,26 @@ fn serve_guest(mut stream: UnixStream, handle: &HostHandle) -> Result<(), LocalE
     read
 }
 
-fn forward_offers(offers: &Receiver<Offer>, writer: &mut UnixStream, done: &AtomicBool) {
+/// Passes the prompts for a guest's agent on to its mahi, and every claim the host knows
+/// whenever they change.
+fn forward_offers(
+    offers: &Receiver<Offer>,
+    writer: &mut UnixStream,
+    done: &AtomicBool,
+    (claims, me): (&Claims, &AgentSlot),
+) {
+    let mut told = None;
     while !done.load(Ordering::SeqCst) {
+        let version = claims.version();
+        if told != Some(version) {
+            if LocalMessage::Claims(claims.known(me))
+                .write_to(writer)
+                .is_err()
+            {
+                return;
+            }
+            told = Some(version);
+        }
         match offers.recv_timeout(PAUSE) {
             Ok(Offer { from, id, text }) => {
                 if (LocalMessage::Offer { from, id, text })
@@ -347,7 +370,11 @@ fn forward_offers(offers: &Receiver<Offer>, writer: &mut UnixStream, done: &Atom
     }
 }
 
-fn read_guest(stream: &mut UnixStream, guest: &Guest) -> Result<(), LocalError> {
+fn read_guest(
+    stream: &mut UnixStream,
+    guest: &Guest,
+    (claims, slot): (&Claims, &AgentSlot),
+) -> Result<(), LocalError> {
     loop {
         match LocalMessage::read_from(stream)? {
             LocalMessage::Output(bytes) => guest.tap.output(&bytes),
@@ -367,6 +394,7 @@ fn read_guest(stream: &mut UnixStream, guest: &Guest) -> Result<(), LocalError> 
                 &screen,
             ),
             LocalMessage::Answer { id, outcome } => guest.answer(Answer { id, outcome }),
+            LocalMessage::Claims(held) => claims.hear_guest(slot, held),
             LocalMessage::Hello { .. } | LocalMessage::Welcome | LocalMessage::Offer { .. } => {
                 return Err(LocalError::Malformed);
             }
@@ -390,7 +418,7 @@ impl GuestLink {
         path: &Path,
         slot: &AgentSlot,
         tap: &OutputTap,
-        prompts: &Arc<Prompts>,
+        (prompts, claims): (&Arc<Prompts>, &Arc<Claims>),
     ) -> Result<Self, LocalError> {
         let mut stream = UnixStream::connect(path)?;
         let (size, screen) = tap.drawn();
@@ -413,20 +441,22 @@ impl GuestLink {
         let (queue, queued) = mpsc::sync_channel(GUEST_QUEUE);
         tap.point_at(Target::Guest(queue, Arc::clone(&resync)));
         let reader = {
-            let (mut stream, lost, prompts) =
-                (stream.try_clone()?, Arc::clone(&lost), Arc::clone(prompts));
+            let (mut stream, lost) = (stream.try_clone()?, Arc::clone(&lost));
+            let (prompts, claims) = (Arc::clone(prompts), Arc::clone(claims));
             thread::spawn(move || {
-                read_offers(&mut stream, &prompts);
+                read_offers(&mut stream, &prompts, &claims);
                 lost.store(true, Ordering::SeqCst);
             })
         };
         let writer = {
             let (mut stream, lost, closing) =
                 (stream.try_clone()?, Arc::clone(&lost), Arc::clone(&closing));
-            let (tap, prompts) = (tap.clone(), Arc::clone(prompts));
+            let (tap, prompts, claims) = (tap.clone(), Arc::clone(prompts), Arc::clone(claims));
+            let slot = slot.clone();
             thread::spawn(move || {
                 let ends = (&*lost, &*closing);
-                let _ = write_guest(&mut stream, &queued, (&tap, &resync), &prompts, ends);
+                let shared = (&*prompts, (&*claims, &slot));
+                let _ = write_guest(&mut stream, &queued, (&tap, &resync), shared, ends);
                 lost.store(true, Ordering::SeqCst);
             })
         };
@@ -452,9 +482,15 @@ impl GuestLink {
     }
 }
 
-fn read_offers(stream: &mut UnixStream, prompts: &Prompts) {
-    while let Ok(LocalMessage::Offer { from, id, text }) = LocalMessage::read_from(stream) {
-        prompts.offer(from, id, text);
+fn read_offers(stream: &mut UnixStream, prompts: &Prompts, claims: &Claims) {
+    loop {
+        match LocalMessage::read_from(stream) {
+            Ok(LocalMessage::Offer { from, id, text }) => {
+                prompts.offer(from, id, text);
+            }
+            Ok(LocalMessage::Claims(known)) => claims.hear_host(known),
+            _ => return,
+        }
     }
 }
 
@@ -462,12 +498,18 @@ fn write_guest(
     stream: &mut UnixStream,
     queued: &Receiver<LocalMessage>,
     (tap, resync): (&OutputTap, &AtomicBool),
-    prompts: &Prompts,
+    (prompts, (claims, slot)): (&Prompts, (&Claims, &AgentSlot)),
     (lost, closing): (&AtomicBool, &AtomicBool),
 ) -> Result<(), LocalError> {
     let mut answers = Vec::new();
+    let mut told = None;
     while !lost.load(Ordering::SeqCst) {
         let final_round = closing.load(Ordering::SeqCst);
+        let version = claims.held_version();
+        if told != Some(version) {
+            LocalMessage::Claims(claims.held(slot)).write_to(stream)?;
+            told = Some(version);
+        }
         if resync.swap(false, Ordering::SeqCst) {
             tap.resend_screen(queued, stream)?;
         }
@@ -500,6 +542,7 @@ enum Role {
 pub(crate) struct Link {
     tap: OutputTap,
     prompts: Arc<Prompts>,
+    claims: Arc<Claims>,
     stop: Arc<AtomicBool>,
     supervisor: JoinHandle<Role>,
 }
@@ -538,7 +581,8 @@ impl Link {
         };
         let tap = OutputTap::new(size);
         let prompts = Arc::new(Prompts::default());
-        let role = joining.settle(&tap, &prompts)?;
+        let claims = Arc::new(Claims::default());
+        let role = joining.settle(&tap, (&prompts, &claims))?;
         match &role {
             Role::Host(..) => {}
             Role::Guest(_) => eprintln!(
@@ -552,12 +596,14 @@ impl Link {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let supervisor = {
-            let (tap, prompts, stop) = (tap.clone(), Arc::clone(&prompts), Arc::clone(&stop));
-            thread::spawn(move || joining.supervise(role, &tap, &prompts, &stop))
+            let (tap, stop) = (tap.clone(), Arc::clone(&stop));
+            let (prompts, claims) = (Arc::clone(&prompts), Arc::clone(&claims));
+            thread::spawn(move || joining.supervise(role, &tap, (&prompts, &claims), &stop))
         };
         Ok(Self {
             tap,
             prompts,
+            claims,
             stop,
             supervisor,
         })
@@ -571,6 +617,11 @@ impl Link {
     /// Returns the prompts teammates sent the agent.
     pub(crate) fn prompts(&self) -> Arc<Prompts> {
         Arc::clone(&self.prompts)
+    }
+
+    /// Returns the claims the agent holds and knows of others.
+    pub(crate) fn claims(&self) -> Arc<Claims> {
+        Arc::clone(&self.claims)
     }
 
     /// Leaves the live layer once the agent is gone: a host stops serving, so the next of the
@@ -598,7 +649,7 @@ impl Joining {
         &self,
         mut role: Role,
         tap: &OutputTap,
-        prompts: &Arc<Prompts>,
+        shared: (&Arc<Prompts>, &Arc<Claims>),
         stop: &AtomicBool,
     ) -> Role {
         let mut wait = SUPERVISE_EVERY;
@@ -615,12 +666,13 @@ impl Joining {
                 Role::Guest(link) if link.lost() => {
                     tap.point_at(Target::Nobody);
                     link.close();
-                    self.settle(tap, prompts).unwrap_or_else(|_| {
+                    shared.1.host_lost();
+                    self.settle(tap, shared).unwrap_or_else(|_| {
                         wait = RETRY_AFTER_FAILURE;
                         Role::Alone
                     })
                 }
-                Role::Alone => self.settle(tap, prompts).unwrap_or_else(|_| {
+                Role::Alone => self.settle(tap, shared).unwrap_or_else(|_| {
                     wait = RETRY_AFTER_FAILURE;
                     Role::Alone
                 }),
@@ -636,23 +688,30 @@ impl Joining {
 
     /// Hosts the live layer, or else connects to the mahi that does; a failure to reach that
     /// one leaves this mahi alone, to try again, and any other failure is returned.
-    fn settle(&self, tap: &OutputTap, prompts: &Arc<Prompts>) -> Result<Role, HostError> {
+    fn settle(
+        &self,
+        tap: &OutputTap,
+        (prompts, claims): (&Arc<Prompts>, &Arc<Claims>),
+    ) -> Result<Role, HostError> {
         let (size, drawn) = tap.drawn();
         match LiveHost::start(
             &self.setup,
             &self.git_dir,
             (self.slot.clone(), &self.keys),
             (size, &drawn),
-            Arc::clone(prompts),
+            (Arc::clone(prompts), Arc::clone(claims)),
         ) {
             Ok(host) => {
+                claims.host_lost();
                 tap.attach(host.tap());
                 let hub = Hub::start(self.socket.clone(), host.handle()).ok();
                 Ok(Role::Host(Box::new(host), hub))
             }
             Err(HostError::AnotherHost) => {
-                Ok(GuestLink::connect(&self.socket, &self.slot, tap, prompts)
-                    .map_or(Role::Alone, Role::Guest))
+                Ok(
+                    GuestLink::connect(&self.socket, &self.slot, tap, (prompts, claims))
+                        .map_or(Role::Alone, Role::Guest),
+                )
             }
             Err(error) => Err(error),
         }
@@ -705,7 +764,13 @@ mod tests {
         let tap = OutputTap::new(WindowSize { rows: 24, cols: 80 });
         tap.output(b"before ");
         let prompts = Arc::new(Prompts::default());
-        let link = GuestLink::connect(&path, &codex, &tap, &prompts).unwrap();
+        let link = GuestLink::connect(
+            &path,
+            &codex,
+            &tap,
+            (&prompts, &Arc::new(Claims::default())),
+        )
+        .unwrap();
         eventually("hello", || {
             handle
                 .screen_of(&codex)
@@ -739,7 +804,13 @@ mod tests {
             cols: 5000,
         });
         let prompts = Arc::new(Prompts::default());
-        let link = GuestLink::connect(&path, &codex, &tap, &prompts).unwrap();
+        let link = GuestLink::connect(
+            &path,
+            &codex,
+            &tap,
+            (&prompts, &Arc::new(Claims::default())),
+        )
+        .unwrap();
         tap.resize(WindowSize {
             rows: 2000,
             cols: 0,
@@ -768,7 +839,13 @@ mod tests {
         let codex = slot("alice", "codex");
         let tap = OutputTap::new(WindowSize { rows: 24, cols: 80 });
         let prompts = Arc::new(Prompts::default());
-        let link = GuestLink::connect(&path, &codex, &tap, &prompts).unwrap();
+        let link = GuestLink::connect(
+            &path,
+            &codex,
+            &tap,
+            (&prompts, &Arc::new(Claims::default())),
+        )
+        .unwrap();
         eventually("served", || handle.served() == 1);
         let id = [3; 16];
         handle.offer(
@@ -803,7 +880,13 @@ mod tests {
         let codex = slot("alice", "codex");
         let tap = OutputTap::new(WindowSize { rows: 24, cols: 80 });
         let prompts = Arc::new(Prompts::default());
-        let link = GuestLink::connect(&path, &codex, &tap, &prompts).unwrap();
+        let link = GuestLink::connect(
+            &path,
+            &codex,
+            &tap,
+            (&prompts, &Arc::new(Claims::default())),
+        )
+        .unwrap();
         eventually("served", || handle.served() == 1);
         let id = [5; 16];
         handle.offer(
@@ -831,10 +914,32 @@ mod tests {
         let (_dir, path, hub, handle) = hub();
         let prompts = Arc::new(Prompts::default());
         let tap = OutputTap::new(WindowSize { rows: 24, cols: 80 });
-        assert!(GuestLink::connect(&path, &slot("bob", "codex"), &tap, &prompts).is_err());
-        let first = GuestLink::connect(&path, &slot("alice", "codex"), &tap, &prompts).unwrap();
+        assert!(
+            GuestLink::connect(
+                &path,
+                &slot("bob", "codex"),
+                &tap,
+                (&prompts, &Arc::new(Claims::default()))
+            )
+            .is_err()
+        );
+        let first = GuestLink::connect(
+            &path,
+            &slot("alice", "codex"),
+            &tap,
+            (&prompts, &Arc::new(Claims::default())),
+        )
+        .unwrap();
         let other = OutputTap::new(WindowSize { rows: 24, cols: 80 });
-        assert!(GuestLink::connect(&path, &slot("alice", "codex"), &other, &prompts).is_err());
+        assert!(
+            GuestLink::connect(
+                &path,
+                &slot("alice", "codex"),
+                &other,
+                (&prompts, &Arc::new(Claims::default()))
+            )
+            .is_err()
+        );
         assert_eq!(handle.served(), 1);
         first.close();
         hub.stop();
@@ -845,10 +950,60 @@ mod tests {
         let (_dir, path, hub, _handle) = hub();
         let tap = OutputTap::new(WindowSize { rows: 24, cols: 80 });
         let prompts = Arc::new(Prompts::default());
-        let link = GuestLink::connect(&path, &slot("alice", "codex"), &tap, &prompts).unwrap();
+        let link = GuestLink::connect(
+            &path,
+            &slot("alice", "codex"),
+            &tap,
+            (&prompts, &Arc::new(Claims::default())),
+        )
+        .unwrap();
         assert!(!link.lost());
         hub.stop();
         eventually("lost", || link.lost());
         link.close();
+    }
+
+    #[test]
+    fn a_guests_claims_reach_the_host_and_the_hosts_list_reaches_the_guest() {
+        let (_dir, path, hub, handle) = hub();
+        let codex = slot("alice", "codex");
+        let tap = OutputTap::new(WindowSize { rows: 24, cols: 80 });
+        let prompts = Arc::new(Prompts::default());
+        let guest_claims = Arc::new(Claims::default());
+        let link = GuestLink::connect(&path, &codex, &tap, (&prompts, &guest_claims)).unwrap();
+        let (host_claims, host) = handle.claims();
+        let (host_claims, host) = (Arc::clone(host_claims), host.clone());
+        guest_claims
+            .claim(&codex, "docs", Some("rewriting"))
+            .unwrap();
+        eventually("the guest's claim at the host", || {
+            host_claims
+                .all(&host)
+                .iter()
+                .any(|claim| claim.slot == codex && claim.what == "docs")
+        });
+        host_claims.claim(&host, "src/parser.rs", None).unwrap();
+        eventually("the host's claim at the guest", || {
+            guest_claims
+                .all(&codex)
+                .iter()
+                .any(|claim| claim.slot == host && claim.what == "src/parser.rs")
+        });
+        assert_eq!(
+            guest_claims
+                .all(&codex)
+                .iter()
+                .filter(|claim| claim.what == "docs")
+                .count(),
+            1
+        );
+        link.close();
+        eventually("the guest's claims forgotten", || {
+            !host_claims
+                .all(&host)
+                .iter()
+                .any(|claim| claim.slot == codex)
+        });
+        hub.stop();
     }
 }

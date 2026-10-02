@@ -82,6 +82,12 @@ use serde_json::{
 };
 
 use crate::{
+    claims::{
+        Claim,
+        Claims,
+        MAX_NOTE_BYTES,
+        MAX_WHAT_BYTES,
+    },
     handoff,
     merge::{
         self,
@@ -283,6 +289,7 @@ pub(crate) struct ThreadTools {
     key: Option<Arc<ThreadKey>>,
     me: AgentSlot,
     prompts: Option<Arc<Prompts>>,
+    claims: Arc<Claims>,
     meta: Mutex<Option<(Instant, MetaView)>>,
 }
 
@@ -301,11 +308,12 @@ fn failed(error: &dyn std::error::Error) -> ToolError {
 impl ThreadTools {
     /// Returns the tools of the agent `me` in `thread`, whose `meta` is `owner`'s and whose
     /// records `key` opens, in the repository at `git_dir`; the merges it asks for wait in
-    /// `prompts`, the palette's, when the user can accept them.
+    /// `prompts`, the palette's, when the user can accept them, and its claims are kept in
+    /// `claims`.
     pub(crate) fn new(
         git_dir: PathBuf,
         (thread, owner, key): (ThreadId, ParticipantKey, Option<Arc<ThreadKey>>),
-        (me, prompts): (AgentSlot, Option<Arc<Prompts>>),
+        (me, prompts, claims): (AgentSlot, Option<Arc<Prompts>>, Arc<Claims>),
     ) -> Self {
         Self {
             git_dir,
@@ -314,6 +322,7 @@ impl ThreadTools {
             key,
             me,
             prompts,
+            claims,
             meta: Mutex::new(None),
         }
     }
@@ -389,7 +398,46 @@ impl ThreadTools {
             }
             text.push('\n');
         }
+        push_claims(&mut text, &self.claims.all(&self.me));
         Ok(cleaned(&text))
+    }
+
+    fn claim(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
+        let what =
+            mcp::text_argument(arguments, "what", MAX_WHAT_BYTES)?.ok_or(ToolError::Arguments)?;
+        let note = mcp::text_argument(arguments, "note", MAX_NOTE_BYTES)?;
+        let others = self
+            .claims
+            .claim(&self.me, what, note)
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let mut text = format!("You claim {what:?}.");
+        if !others.is_empty() {
+            text.push_str(" Also claimed by:");
+            for other in &others {
+                let _ = write!(text, " {other}");
+            }
+            text.push_str("; agree with them before you change it.");
+        }
+        Ok(text)
+    }
+
+    fn release(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
+        let what =
+            mcp::text_argument(arguments, "what", MAX_WHAT_BYTES)?.ok_or(ToolError::Arguments)?;
+        Ok(if self.claims.release(what) {
+            format!("You released {what:?}.")
+        } else {
+            format!("You held no claim on {what:?}.")
+        })
+    }
+
+    fn list_claims(&self) -> String {
+        let mut text = String::new();
+        push_claims(&mut text, &self.claims.all(&self.me));
+        if text.is_empty() {
+            text.push_str("Nobody claims anything.\n");
+        }
+        cleaned(&text)
     }
 
     fn read_diff(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
@@ -615,6 +663,27 @@ fn listed_agent(arguments: &Map<String, Value>, view: &MetaView) -> Result<Agent
     Ok(slot)
 }
 
+/// Appends `claims`, one per line, under a heading, when there are any.
+fn push_claims(text: &mut String, claims: &[Claim]) {
+    if claims.is_empty() {
+        return;
+    }
+    text.push_str("Claims (advisory; look before you change what others claim):\n");
+    for claim in claims {
+        let _ = write!(
+            text,
+            "- {:?} by {}, for {} min",
+            claim.what,
+            claim.slot,
+            claim.age.as_secs() / 60
+        );
+        if let Some(note) = &claim.note {
+            let _ = write!(text, ": {note:?}");
+        }
+        text.push('\n');
+    }
+}
+
 fn cleaned(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_TOOL_TEXT));
     push_clean(&mut out, text);
@@ -650,6 +719,37 @@ impl Toolbox for ThreadTools {
                     },
                     "required": ["agent"]
                 }),
+            },
+            Tool {
+                name: "claim",
+                description: "Claims a file or a task, so the other agents in the thread know \
+                              you work on it. Claims are advisory: they stop nobody. Claim what \
+                              you start, and look at the claims before you change something.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "what": {
+                            "type": "string",
+                            "description": "A path from the thread's root, or a short task name."
+                        },
+                        "note": { "type": "string", "description": "What you are doing with it." }
+                    },
+                    "required": ["what"]
+                }),
+            },
+            Tool {
+                name: "release",
+                description: "Releases a claim you hold, once you are done with it.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "what": { "type": "string" } },
+                    "required": ["what"]
+                }),
+            },
+            Tool {
+                name: "list_claims",
+                description: "Lists what the thread's agents claim.",
+                input_schema: json!({ "type": "object", "properties": {} }),
             },
             Tool {
                 name: "merge_from",
@@ -689,6 +789,9 @@ impl Toolbox for ThreadTools {
             "read_diff" => self.read_diff(arguments),
             "read_transcript" => self.read_transcript(arguments),
             "merge_from" => self.merge_from(arguments),
+            "claim" => self.claim(arguments),
+            "release" => self.release(arguments),
+            "list_claims" => Ok(self.list_claims()),
             _ => Err(ToolError::Unknown),
         }
     }

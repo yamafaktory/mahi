@@ -1492,6 +1492,10 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_agents"}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"merge_from","arguments":{"agent":"tester.tooler"}}}' \
+  '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"claim","arguments":{"what":"src/parser.rs","note":"adding tests"}}}' \
+  '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_claims"}}' \
+  '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"release","arguments":{"what":"src/parser.rs"}}}' \
+  '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_claims"}}' \
   | "$MAHI_BIN" mcp
 "#;
 
@@ -1515,7 +1519,7 @@ printf '%s\n' \
             .filter(|line| line.starts_with('{'))
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(replies.len(), 3, "{stdout}");
+        assert_eq!(replies.len(), 7, "{stdout}");
         assert_eq!(replies[0]["result"]["serverInfo"]["name"], "mahi");
         let listed = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
@@ -1528,6 +1532,19 @@ printf '%s\n' \
             refused.contains("cannot accept merges in this run"),
             "{refused}"
         );
+        let text = |index: usize| {
+            replies[index]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+        };
+        assert_eq!(text(3), "You claim \"src/parser.rs\".");
+        assert!(
+            text(4).contains("- \"src/parser.rs\" by tester.tooler, for 0 min: \"adding tests\""),
+            "{}",
+            text(4)
+        );
+        assert_eq!(text(5), "You released \"src/parser.rs\".");
+        assert_eq!(text(6), "Nobody claims anything.\n");
 
         let outside = fixture.mahi(&["mcp"]);
         assert_eq!(outside.status.code(), Some(1));
@@ -3232,6 +3249,68 @@ cat parser.rs
             "{stderr}"
         );
         assert!(!stderr.contains("Passphrase"), "{stderr}");
+    }
+
+    const CLAIM_WATCHER: &str = r#"#!/bin/sh
+i=0
+while [ $i -lt 120 ]; do
+  out=$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_claims"}}' \
+    | "$MAHI_BIN" mcp)
+  case "$out" in *"by bob.sh"*) echo "saw bob's claim"; exit 0;; esac
+  sleep 0.25
+  i=$((i+1))
+done
+echo "never saw it"
+"#;
+
+    const CLAIMER: &str = r#"printf '%s\n' \
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"claim","arguments":{"what":"docs"}}}' \
+  | "$MAHI_BIN" mcp > /dev/null
+i=0
+until [ -e done ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done"#;
+
+    #[test]
+    fn a_teammates_claim_reaches_the_owners_agent_through_their_hosts() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let watcher = script(&fixture, "watching", "watcher", CLAIM_WATCHER);
+        let mut owner = fixture.command(&["run", watcher.to_str().unwrap()]);
+        let owner = owner
+            .env("MAHI_LIVE", "local")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (thread, _key) = running_thread(&fixture);
+        let bob = teammate(&fixture, "bob");
+        let ticket = invite_teammate(&fixture, thread, &bob);
+        let bob_thread = {
+            let bob = Teammate {
+                home: bob.home.clone(),
+                repo: bob.repo.clone(),
+                socket: bob.socket.clone(),
+                key: bob.key.clone(),
+            };
+            thread::spawn(move || {
+                teammate_in_terminal(&bob, "bob", &["join", &ticket, "--", "sh", "-c", CLAIMER])
+            })
+        };
+        let output = owner.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let bob_worktree = fs::read_dir(bob.home.join(".local/share/mahi/worktrees"))
+            .unwrap()
+            .flat_map(|repository| fs::read_dir(repository.unwrap().path()).unwrap())
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.ends_with(format!("{thread}.sh")))
+            .unwrap();
+        fs::write(bob_worktree.join("done"), "").unwrap();
+        let (code, text) = bob_thread.join().unwrap();
+        assert_eq!(code, 0, "{text}");
+        assert!(stdout.contains("saw bob's claim"), "{stdout}");
     }
 
     #[test]

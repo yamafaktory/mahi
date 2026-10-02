@@ -1,5 +1,6 @@
 //! The `mahi` binary.
 
+mod claims;
 mod cli;
 mod compose;
 mod credentials;

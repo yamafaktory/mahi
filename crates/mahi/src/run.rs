@@ -133,6 +133,7 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::{
+    claims::Claims,
     cli::{
         AgentAddCommand,
         HandoffCommand,
@@ -1384,6 +1385,7 @@ fn serve_tools(
 ) -> (Arc<AtomicBool>, Arc<Prompts>) {
     let serving = Arc::new(AtomicBool::new(true));
     let prompts = live.map_or_else(|| Arc::new(Prompts::default()), Link::prompts);
+    let claims = live.map_or_else(|| Arc::new(Claims::default()), Link::claims);
     let Some(owner) = owner else {
         eprintln!("mahi: the agent's tools are off, since the thread's owner is not known");
         return (serving, prompts);
@@ -1394,6 +1396,7 @@ fn serve_tools(
         (
             started.slot.clone(),
             can_merge.then(|| Arc::clone(&prompts)),
+            claims,
         ),
     );
     let flag = Arc::clone(&serving);

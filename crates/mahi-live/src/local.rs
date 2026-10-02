@@ -15,11 +15,14 @@ use mahi_core::{
 use thiserror::Error;
 
 use crate::frame::{
+    ClaimEntry,
+    MAX_CLAIM_BYTES,
     MAX_COLUMNS,
     MAX_ROWS,
     PROMPT_ID_BYTES,
     PromptOutcome,
     PromptText,
+    claim_fits,
 };
 
 /// The largest frame either side sends or reads, room for a whole screen.
@@ -33,6 +36,10 @@ const RESIZE: u8 = 4;
 const ANSWER: u8 = 5;
 const WELCOME: u8 = 6;
 const OFFER: u8 = 7;
+const CLAIMS: u8 = 8;
+
+/// The most claims one local message carries.
+pub const MAX_LOCAL_CLAIMS: usize = 512;
 
 /// A message between the host of a thread's live layer and another mahi of the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +91,9 @@ pub enum LocalMessage {
         /// Its text.
         text: PromptText,
     },
+    /// Claims: the ones a mahi's agent holds, sent to the host, or every claim the host knows,
+    /// sent to the user's other mahis; at most [`MAX_LOCAL_CLAIMS`].
+    Claims(Vec<ClaimEntry>),
 }
 
 /// A frame that cannot be read as a [`LocalMessage`].
@@ -159,6 +169,29 @@ impl LocalMessage {
                 out.extend_from_slice(id);
                 out.extend_from_slice(text.as_str().as_bytes());
             }
+            Self::Claims(claims) => {
+                out.push(CLAIMS);
+                if claims.len() > MAX_LOCAL_CLAIMS {
+                    return Err(LocalError::TooLarge);
+                }
+                let count = u16::try_from(claims.len()).map_err(|_| LocalError::TooLarge)?;
+                out.extend_from_slice(&count.to_be_bytes());
+                for claim in claims {
+                    if !claim_fits(&claim.what, claim.note.as_deref()) {
+                        return Err(LocalError::Malformed);
+                    }
+                    put_name(out, &claim.slot.to_string())?;
+                    put_text(out, &claim.what)?;
+                    match &claim.note {
+                        None => out.push(0),
+                        Some(note) => {
+                            out.push(1);
+                            put_text(out, note)?;
+                        }
+                    }
+                    out.extend_from_slice(&claim.age_secs.to_be_bytes());
+                }
+            }
         }
         let length = out.len() - start - 4;
         if length > MAX_LOCAL_FRAME_BYTES {
@@ -218,6 +251,7 @@ impl LocalMessage {
                 let text = PromptText::new(text.to_owned()).map_err(|_| LocalError::Malformed)?;
                 Self::Offer { from, id, text }
             }
+            CLAIMS => Self::Claims(reader.claims()?),
             _ => return Err(LocalError::Malformed),
         };
         reader.finish()?;
@@ -259,6 +293,13 @@ fn put_name(out: &mut Vec<u8>, name: &str) -> Result<(), LocalError> {
     let length = u8::try_from(name.len()).map_err(|_| LocalError::Malformed)?;
     out.push(length);
     out.extend_from_slice(name.as_bytes());
+    Ok(())
+}
+
+fn put_text(out: &mut Vec<u8>, text: &str) -> Result<(), LocalError> {
+    let length = u16::try_from(text.len()).map_err(|_| LocalError::Malformed)?;
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(text.as_bytes());
     Ok(())
 }
 
@@ -314,6 +355,54 @@ impl<'a> Reader<'a> {
             return Err(LocalError::Malformed);
         }
         Ok((rows, columns))
+    }
+
+    fn text(&mut self) -> Result<&'a str, LocalError> {
+        let length = usize::from(u16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| LocalError::Malformed)?,
+        ));
+        if length > MAX_CLAIM_BYTES {
+            return Err(LocalError::Malformed);
+        }
+        std::str::from_utf8(self.take(length)?).map_err(|_| LocalError::Malformed)
+    }
+
+    fn claims(&mut self) -> Result<Vec<ClaimEntry>, LocalError> {
+        let count = usize::from(u16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| LocalError::Malformed)?,
+        ));
+        if count > MAX_LOCAL_CLAIMS {
+            return Err(LocalError::Malformed);
+        }
+        let mut claims = Vec::with_capacity(count.min(self.0.len() / 8));
+        for _ in 0..count {
+            let slot = self.name()?.parse().map_err(|_| LocalError::Malformed)?;
+            let what = self.text()?;
+            let note = match self.byte()? {
+                0 => None,
+                1 => Some(self.text()?),
+                _ => return Err(LocalError::Malformed),
+            };
+            let age_secs = u32::from_be_bytes(
+                self.take(4)?
+                    .try_into()
+                    .map_err(|_| LocalError::Malformed)?,
+            );
+            if !claim_fits(what, note) {
+                return Err(LocalError::Malformed);
+            }
+            claims.push(ClaimEntry {
+                slot,
+                what: what.to_owned(),
+                note: note.map(str::to_owned),
+                age_secs,
+            });
+        }
+        Ok(claims)
     }
 
     fn id(&mut self) -> Result<[u8; PROMPT_ID_BYTES], LocalError> {
@@ -454,5 +543,62 @@ mod tests {
         fn decoding_any_bytes_never_panics(body in proptest::collection::vec(any::<u8>(), 0..300)) {
             let _ = LocalMessage::decode(&body);
         }
+    }
+
+    #[test]
+    fn claims_round_trip_and_odd_ones_are_refused() {
+        let claim = ClaimEntry {
+            slot: "alice.claude".parse().unwrap(),
+            what: "src/parser.rs".to_owned(),
+            note: Some("tests".to_owned()),
+            age_secs: 90,
+        };
+        let message = LocalMessage::Claims(vec![
+            claim.clone(),
+            ClaimEntry {
+                note: None,
+                ..claim.clone()
+            },
+        ]);
+        let mut frame = Vec::new();
+        message.encode(&mut frame).unwrap();
+        assert_eq!(LocalMessage::decode(&frame[4..]).unwrap(), message);
+        let odd = LocalMessage::Claims(vec![ClaimEntry {
+            what: "a\nb".to_owned(),
+            ..claim.clone()
+        }]);
+        assert!(matches!(
+            odd.encode(&mut Vec::new()),
+            Err(LocalError::Malformed)
+        ));
+        let many = LocalMessage::Claims(vec![claim.clone(); MAX_LOCAL_CLAIMS + 1]);
+        assert!(matches!(
+            many.encode(&mut Vec::new()),
+            Err(LocalError::TooLarge)
+        ));
+        let longest = LocalMessage::Claims(vec![ClaimEntry {
+            what: "w".repeat(MAX_CLAIM_BYTES),
+            note: Some("n".repeat(crate::frame::MAX_CLAIM_NOTE_BYTES)),
+            ..claim.clone()
+        }]);
+        let mut longest_frame = Vec::new();
+        longest.encode(&mut longest_frame).unwrap();
+        assert_eq!(LocalMessage::decode(&longest_frame[4..]).unwrap(), longest);
+        let mut forged = vec![CLAIMS];
+        forged.extend_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            LocalMessage::decode(&forged),
+            Err(LocalError::Malformed)
+        ));
+        let mut bad_what = frame[4..].to_vec();
+        let at = bad_what
+            .windows(3)
+            .position(|window| window == b"src")
+            .unwrap();
+        bad_what[at] = b'\n';
+        assert!(matches!(
+            LocalMessage::decode(&bad_what),
+            Err(LocalError::Malformed)
+        ));
     }
 }

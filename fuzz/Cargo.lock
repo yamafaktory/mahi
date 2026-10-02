@@ -3308,6 +3308,7 @@ name = "mahi-store"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "gix-imara-diff",
  "gix-pack",
  "gix-validate",
  "mahi-core",

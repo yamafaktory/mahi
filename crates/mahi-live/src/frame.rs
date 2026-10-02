@@ -26,6 +26,7 @@ use mahi_core::{
     AgentSlot,
     ParticipantName,
     ThreadId,
+    is_invisible,
 };
 use mahi_crypto::ThreadKey;
 use mahi_thread::NodeId;
@@ -62,6 +63,15 @@ pub const PROMPT_ID_BYTES: usize = 16;
 pub const RUN_BYTES: usize = EPOCH_BYTES;
 /// The most prompts a host takes from one node in one of its runs.
 pub const MAX_PROMPTS_PER_RUN: usize = 1024;
+/// How many runs of a sender a receiver remembers, refusing lists of claims no newer than
+/// the newest seen from the same run.
+const REMEMBERED_RUNS: usize = 8;
+/// The most claims one frame carries.
+pub const MAX_FRAME_CLAIMS: usize = 64;
+/// The longest a claimed path or task may be, in bytes.
+pub const MAX_CLAIM_BYTES: usize = 256;
+/// The longest a claim's note may be, in bytes.
+pub const MAX_CLAIM_NOTE_BYTES: usize = 200;
 
 /// The keys of a thread's live stream, derived from its thread key: the gossip topic, which
 /// only participants can find, and the key frames are sealed with.
@@ -138,6 +148,27 @@ pub enum Body {
         /// What became of it.
         outcome: PromptOutcome,
     },
+    /// A host's whole list of the claims its agents hold, at most [`MAX_FRAME_CLAIMS`].
+    Claims {
+        /// The claims, each of an agent of the sender.
+        claims: Vec<ClaimEntry>,
+    },
+}
+
+/// An advisory claim on a path or a task, as a host sends it: the agent that holds it, what
+/// it claims (1 to [`MAX_CLAIM_BYTES`] bytes), an optional note (at most
+/// [`MAX_CLAIM_NOTE_BYTES`]), neither with control or invisible characters, and how long ago it
+/// was taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimEntry {
+    /// The agent that holds the claim.
+    pub slot: AgentSlot,
+    /// What it claims.
+    pub what: String,
+    /// What it does with it.
+    pub note: Option<String>,
+    /// How long ago the claim was taken, in seconds.
+    pub age_secs: u32,
 }
 
 /// The text of a prompt a teammate sends an agent: not empty, and at most
@@ -323,6 +354,18 @@ enum WireBody<'a> {
         id: [u8; PROMPT_ID_BYTES],
         outcome: u8,
     },
+    Claims {
+        #[serde(borrow)]
+        claims: Vec<WireClaim<'a>>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireClaim<'a> {
+    slot: &'a str,
+    what: &'a str,
+    note: Option<&'a str>,
+    age_secs: u32,
 }
 
 mod signature_bytes {
@@ -475,6 +518,7 @@ impl FrameSender {
     /// [`FrameError::Random`] if no nonce can be drawn.
     pub fn seal(&mut self, body: &Body) -> Result<Vec<u8>, FrameError> {
         let slot;
+        let slots: Vec<String>;
         let wire = match body {
             Body::Output { slot: owner, bytes } => {
                 check_chunk(bytes)?;
@@ -550,6 +594,27 @@ impl FrameSender {
                     outcome: outcome.code(),
                 }
             }
+            Body::Claims { claims } => {
+                check_claims(
+                    claims.len(),
+                    claims
+                        .iter()
+                        .map(|claim| (claim.what.as_str(), claim.note.as_deref())),
+                )?;
+                slots = claims.iter().map(|claim| claim.slot.to_string()).collect();
+                WireBody::Claims {
+                    claims: claims
+                        .iter()
+                        .zip(&slots)
+                        .map(|(claim, slot)| WireClaim {
+                            slot,
+                            what: &claim.what,
+                            note: claim.note.as_deref(),
+                            age_secs: claim.age_secs,
+                        })
+                        .collect(),
+                }
+            }
         };
         self.seal_wire(wire)
     }
@@ -614,6 +679,13 @@ pub struct FrameReceiver {
     seen_requests: HashSet<[u8; CHALLENGE_BYTES]>,
     own_run: Option<OwnRun>,
     prompts: HashMap<NodeId, HashSet<[u8; PROMPT_ID_BYTES]>>,
+    claims: HashMap<NodeId, ClaimsSeen>,
+}
+
+/// The newest list of claims seen from each of a sender's latest runs, by its run's epoch.
+#[derive(Debug, Default)]
+struct ClaimsSeen {
+    runs: VecDeque<([u8; EPOCH_BYTES], u64)>,
 }
 
 #[derive(Debug)]
@@ -645,6 +717,7 @@ impl FrameReceiver {
             seen_requests: HashSet::with_capacity(REMEMBERED_CHALLENGES),
             own_run: None,
             prompts: HashMap::new(),
+            claims: HashMap::new(),
         }
     }
 
@@ -674,6 +747,8 @@ impl FrameReceiver {
         self.participants = participants.into_iter().collect();
         let participants = &self.participants;
         self.senders
+            .retain(|node, _| participants.contains_key(node));
+        self.claims
             .retain(|node, _| participants.contains_key(node));
     }
 
@@ -733,6 +808,13 @@ impl FrameReceiver {
         if drawn_slot(&body).is_some_and(|slot| slot.participant() != &participant) {
             return Err(FrameError::NotTheirSlot);
         }
+        if let Body::Claims { claims } = &body
+            && claims
+                .iter()
+                .any(|claim| claim.slot.participant() != &participant)
+        {
+            return Err(FrameError::NotTheirSlot);
+        }
         self.check_order(sender, &plain, &body)?;
         Ok(Received {
             sender,
@@ -752,6 +834,9 @@ impl FrameReceiver {
         }
         if let Body::Prompt { slot, run, id, .. } = body {
             return self.remember_prompt(sender, slot, *run, *id);
+        }
+        if let Body::Claims { .. } = body {
+            return self.remember_claims(sender, plain);
         }
         let state = self.senders.get(&sender).copied();
         if let Some(state) = state.filter(|state| state.epoch == plain.epoch) {
@@ -781,6 +866,29 @@ impl FrameReceiver {
             }
             _ => Err(FrameError::Unanchored),
         }
+    }
+
+    /// Takes a list of claims only when it is newer than every list seen from the same run of
+    /// its sender, remembering its latest runs; hosts do not anchor each other, so claims are
+    /// ordered on their own, and runs cannot be ordered among themselves.
+    fn remember_claims(&mut self, sender: NodeId, plain: &WirePlain<'_>) -> Result<(), FrameError> {
+        let seen = self.claims.entry(sender).or_default();
+        if let Some((_, sequence)) = seen
+            .runs
+            .iter_mut()
+            .find(|(epoch, _)| *epoch == plain.epoch)
+        {
+            if plain.sequence <= *sequence {
+                return Err(FrameError::Replayed);
+            }
+            *sequence = plain.sequence;
+            return Ok(());
+        }
+        if seen.runs.len() == REMEMBERED_RUNS {
+            seen.runs.pop_front();
+        }
+        seen.runs.push_back((plain.epoch, plain.sequence));
+        Ok(())
     }
 
     fn remember_prompt(
@@ -845,6 +953,36 @@ fn check_chunk(bytes: &[u8]) -> Result<(), FrameError> {
     Ok(())
 }
 
+fn check_claims<'a>(
+    count: usize,
+    claims: impl Iterator<Item = (&'a str, Option<&'a str>)>,
+) -> Result<(), FrameError> {
+    if count > MAX_FRAME_CLAIMS {
+        return Err(FrameError::TooLarge);
+    }
+    for (what, note) in claims {
+        if !claim_fits(what, note) {
+            return Err(FrameError::Malformed);
+        }
+    }
+    Ok(())
+}
+
+/// Says whether `what` and `note` may make a claim: plain text of 1 to [`MAX_CLAIM_BYTES`]
+/// bytes and at most [`MAX_CLAIM_NOTE_BYTES`], without control or invisible characters.
+pub(crate) fn claim_fits(what: &str, note: Option<&str>) -> bool {
+    let plain = |text: &str, most: usize| {
+        !text.is_empty()
+            && text.len() <= most
+            && !text
+                .chars()
+                .any(|character| character.is_control() || is_invisible(character))
+    };
+    plain(what, MAX_CLAIM_BYTES)
+        && what.trim() == what
+        && note.is_none_or(|note| plain(note, MAX_CLAIM_NOTE_BYTES))
+}
+
 fn check_parts(part: u16, parts: u16) -> Result<(), FrameError> {
     if parts == 0 || parts > MAX_SCREEN_PARTS || part >= parts {
         return Err(FrameError::Malformed);
@@ -859,7 +997,7 @@ fn drawn_slot(body: &Body) -> Option<&AgentSlot> {
         | Body::Screen { slot, .. }
         | Body::Heartbeat { slot }
         | Body::PromptAnswer { slot, .. } => Some(slot),
-        Body::ScreenRequest { .. } | Body::Prompt { .. } => None,
+        Body::ScreenRequest { .. } | Body::Prompt { .. } | Body::Claims { .. } => None,
     }
 }
 
@@ -940,6 +1078,25 @@ fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
             id,
             outcome: PromptOutcome::from_code(outcome).ok_or(FrameError::Malformed)?,
         },
+        WireBody::Claims { ref claims } => {
+            check_claims(
+                claims.len(),
+                claims.iter().map(|claim| (claim.what, claim.note)),
+            )?;
+            Body::Claims {
+                claims: claims
+                    .iter()
+                    .map(|claim| {
+                        Ok(ClaimEntry {
+                            slot: slot(claim.slot)?,
+                            what: claim.what.to_owned(),
+                            note: claim.note.map(str::to_owned),
+                            age_secs: claim.age_secs,
+                        })
+                    })
+                    .collect::<Result<_, FrameError>>()?,
+            }
+        }
     })
 }
 
@@ -1569,5 +1726,111 @@ mod tests {
             viewer.open(&mallory.seal(&beat).unwrap()),
             Err(FrameError::NotTheirSlot)
         );
+    }
+
+    fn claim(participant: &str, what: &str) -> ClaimEntry {
+        ClaimEntry {
+            slot: slot(participant),
+            what: what.to_owned(),
+            note: Some("adding tests".to_owned()),
+            age_secs: 60,
+        }
+    }
+
+    #[test]
+    fn a_hosts_claims_reach_others_without_a_screen_and_newer_lists_only() {
+        let thread = Thread::new();
+        let mut alice = thread.sender(1);
+        let mut receiver = thread.receiver();
+        let first = Body::Claims {
+            claims: vec![claim("alice", "src/parser.rs")],
+        };
+        let older = alice.seal(&first).unwrap();
+        let newer = alice.seal(&Body::Claims { claims: Vec::new() }).unwrap();
+        assert_eq!(
+            receiver.open(&newer).unwrap().body,
+            Body::Claims { claims: Vec::new() }
+        );
+        assert!(matches!(receiver.open(&older), Err(FrameError::Replayed)));
+        assert!(matches!(receiver.open(&newer), Err(FrameError::Replayed)));
+        let mut restarted = thread.sender(1);
+        let again = restarted.seal(&first).unwrap();
+        assert_eq!(receiver.open(&again).unwrap().body, first);
+        let later = restarted
+            .seal(&Body::Claims { claims: Vec::new() })
+            .unwrap();
+        assert!(matches!(receiver.open(&older), Err(FrameError::Replayed)));
+        assert!(receiver.open(&later).is_ok());
+        assert!(matches!(receiver.open(&older), Err(FrameError::Replayed)));
+    }
+
+    #[test]
+    fn claims_on_anothers_agents_too_many_or_odd_ones_are_refused() {
+        let thread = Thread::new();
+        let mut mallory = thread.sender(3);
+        let mut receiver = thread.receiver();
+        let forged = mallory
+            .seal(&Body::Claims {
+                claims: vec![claim("mallory", "a"), claim("alice", "b")],
+            })
+            .unwrap();
+        assert!(matches!(
+            receiver.open(&forged),
+            Err(FrameError::NotTheirSlot)
+        ));
+        let many = Body::Claims {
+            claims: (0..=MAX_FRAME_CLAIMS)
+                .map(|index| claim("mallory", &index.to_string()))
+                .collect(),
+        };
+        assert!(matches!(mallory.seal(&many), Err(FrameError::TooLarge)));
+        for what in [
+            "",
+            " padded",
+            "line\nbreak",
+            "\u{202e}flip",
+            &"x".repeat(MAX_CLAIM_BYTES + 1),
+        ] {
+            let odd = Body::Claims {
+                claims: vec![claim("mallory", what)],
+            };
+            assert!(
+                matches!(mallory.seal(&odd), Err(FrameError::Malformed)),
+                "{what:?}"
+            );
+            let wire = mallory
+                .seal_wire(WireBody::Claims {
+                    claims: vec![WireClaim {
+                        slot: "mallory.claude",
+                        what,
+                        note: None,
+                        age_secs: 0,
+                    }],
+                })
+                .unwrap();
+            assert!(
+                matches!(receiver.open(&wire), Err(FrameError::Malformed)),
+                "{what:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_list_from_an_unseen_run_does_not_block_the_current_run() {
+        let thread = Thread::new();
+        let mut receiver = thread.receiver();
+        let mut earlier = thread.sender(1);
+        let late = earlier.seal(&Body::Claims { claims: Vec::new() }).unwrap();
+        let mut current = thread.sender(1);
+        let first = current.seal(&Body::Claims { claims: Vec::new() }).unwrap();
+        let next = current
+            .seal(&Body::Claims {
+                claims: vec![claim("alice", "docs")],
+            })
+            .unwrap();
+        assert!(receiver.open(&first).is_ok());
+        assert!(receiver.open(&late).is_ok());
+        assert!(receiver.open(&next).is_ok());
+        assert!(matches!(receiver.open(&late), Err(FrameError::Replayed)));
     }
 }
