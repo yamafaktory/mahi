@@ -29,6 +29,9 @@ pub(crate) const PASSED_ON: [&str; 10] = [
 /// The variable that tells `mahi hook` where the `mahi run` that started the agent listens.
 pub(crate) const HOOK_SOCKET: &str = "MAHI_HOOK_SOCKET";
 
+/// The variable that tells `mahi mcp` where the mahi that started the agent serves its tools.
+pub(crate) const MCP_SOCKET: &str = "MAHI_MCP_SOCKET";
+
 /// The variable that tells the agent's hooks where the mahi binary is.
 pub(crate) const MAHI_BIN: &str = "MAHI_BIN";
 
@@ -36,10 +39,11 @@ pub(crate) const MAHI_BIN: &str = "MAHI_BIN";
 pub(crate) const PROXY_VARIABLES: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 
 const LONGEST_ENV_NAME: usize = 128;
-const RESERVED: [&str; 12] = [
+const RESERVED: [&str; 13] = [
     "HOME",
     "TMPDIR",
     HOOK_SOCKET,
+    MCP_SOCKET,
     MAHI_BIN,
     "HTTPS_PROXY",
     "https_proxy",
@@ -60,6 +64,7 @@ pub(crate) struct Environment {
     pub(crate) xdg_runtime_dir: Option<PathBuf>,
     pub(crate) ssh_auth_sock: Option<PathBuf>,
     pub(crate) hook_socket: Option<PathBuf>,
+    pub(crate) mcp_socket: Option<PathBuf>,
     pub(crate) mahi_exe: Option<PathBuf>,
     pub(crate) path: Option<OsString>,
     pub(crate) user: Option<String>,
@@ -118,6 +123,7 @@ impl fmt::Debug for Environment {
             .field("xdg_runtime_dir", &self.xdg_runtime_dir)
             .field("ssh_auth_sock", &self.ssh_auth_sock)
             .field("hook_socket", &self.hook_socket)
+            .field("mcp_socket", &self.mcp_socket)
             .field("mahi_exe", &self.mahi_exe)
             .field("user", &self.user)
             .field("temp_dir", &self.temp_dir)
@@ -192,6 +198,7 @@ impl Environment {
             xdg_runtime_dir: path("XDG_RUNTIME_DIR"),
             ssh_auth_sock: path("SSH_AUTH_SOCK"),
             hook_socket: path(HOOK_SOCKET),
+            mcp_socket: path(MCP_SOCKET),
             mahi_exe: env::current_exe().and_then(fs::canonicalize).ok(),
             path: value("PATH"),
             user: value("USER").and_then(|user| user.into_string().ok()),
@@ -283,6 +290,7 @@ mod tests {
             "https_proxy",
             "NO_PROXY",
             "MAHI_HOOK_SOCKET",
+            "MAHI_MCP_SOCKET",
             "MAHI_BIN",
         ] {
             assert!(

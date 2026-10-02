@@ -147,6 +147,7 @@ use crate::{
         HOOK_SOCKET,
         LiveMode,
         MAHI_BIN,
+        MCP_SOCKET,
         PASSED_ON,
         PROXY_VARIABLES,
         Passed,
@@ -170,6 +171,11 @@ use crate::{
         self,
         HostError,
         LiveSetup,
+    },
+    mcp::{
+        self,
+        ThreadTools,
+        Toolbox,
     },
     merge::MergeDone,
     merge_door::{
@@ -254,6 +260,7 @@ const PROGRAM_HEADERS: [&[u8]; 5] = [
     b"\xca\xfe\xba\xbe",
 ];
 const HOOK_SOCKET_NAME: &str = "mahi.sock";
+const MCP_SOCKET_NAME: &str = "mcp.sock";
 const HANDOFF_NOTES: &str = "mahi-handoff.md";
 const HANDOFF_ENV: &str = "MAHI_HANDOFF";
 const HOOK_QUEUE: usize = 16;
@@ -451,7 +458,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         credentials,
     )?;
     prepared.palette_key = settings.palette_key;
-    prepared.live = live;
+    prepared.set_thread(live, own_key(&signing)?);
     prepared.sync = SyncSetup::gather(&prepared.store, environment, true);
     let agent_name = session::agent_from(Path::new(command.agent()));
     let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
@@ -561,7 +568,7 @@ pub(crate) fn resume(
         credentials,
     )?;
     prepared.palette_key = settings.palette_key;
-    prepared.live = live_setup(environment, &config, owner.clone(), bootstrap)?;
+    prepared.join_thread(environment, &config, owner.clone(), bootstrap)?;
     prepared.sync = SyncSetup::gather(&prepared.store, environment, owns_meta);
     let commits = match listed_and_fetched(
         &prepared.store,
@@ -724,7 +731,7 @@ fn start_new_agent(
         credentials,
     )?;
     prepared.palette_key = settings.palette_key;
-    prepared.live = live_setup(environment, &config, owner.clone(), bootstrap)?;
+    prepared.join_thread(environment, &config, owner.clone(), bootstrap)?;
     prepared.sync = SyncSetup::gather(&prepared.store, environment, owner == own);
     let commits = match listed_and_fetched(
         &prepared.store,
@@ -963,7 +970,7 @@ pub(crate) fn join_run(
         credentials,
     )?;
     prepared.palette_key = settings.palette_key;
-    prepared.live = live_setup(
+    prepared.join_thread(
         environment,
         &config,
         joined.owner.clone(),
@@ -1104,6 +1111,9 @@ struct Prepared {
     scratch: PathBuf,
     hook_socket: PathBuf,
     hooks: UnixListener,
+    mcp_socket: PathBuf,
+    mcp: UnixListener,
+    owner: Option<ParticipantKey>,
     sandbox: Sandbox,
     network: Option<Network>,
     globals: GlobalPatterns,
@@ -1115,6 +1125,27 @@ struct Prepared {
 }
 
 impl Prepared {
+    /// Sets the thread's live layer, if any, and the owner of its `meta`, which the agent's
+    /// tools read.
+    fn set_thread(&mut self, live: Option<LiveSetup>, owner: ParticipantKey) {
+        self.live = live;
+        self.owner = Some(owner);
+    }
+
+    /// Sets up the live layer of a thread whose `meta` is `owner`'s, reaching its host at
+    /// `bootstrap`, as [`Prepared::set_thread`] does.
+    fn join_thread(
+        &mut self,
+        environment: &Environment,
+        config: &ConfigDir,
+        owner: ParticipantKey,
+        bootstrap: Vec<HostAddress>,
+    ) -> Result<(), RunError> {
+        let live = live_setup(environment, config, owner.clone(), bootstrap)?;
+        self.set_thread(live, owner);
+        Ok(())
+    }
+
     /// Writes the handoff notes into the agent's private temporary directory, readable by the
     /// user only, and hands them to the agent when it starts.
     fn write_handoff(&mut self, notes: &str) -> Result<(), RunError> {
@@ -1163,6 +1194,8 @@ impl Prepared {
         }
         let hook_socket = scratch.join(HOOK_SOCKET_NAME);
         let hooks = UnixListener::bind(&hook_socket).map_err(RunError::Scratch)?;
+        let mcp_socket = scratch.join(MCP_SOCKET_NAME);
+        let mcp = UnixListener::bind(&mcp_socket).map_err(RunError::Scratch)?;
         let sandbox = Sandbox::system()?;
         let network = Network::prepare(hosts)?;
         Ok(Self {
@@ -1176,6 +1209,9 @@ impl Prepared {
             scratch,
             hook_socket,
             hooks,
+            mcp_socket,
+            mcp,
+            owner: None,
             sandbox,
             network,
             globals: environment.git_patterns(),
@@ -1254,6 +1290,7 @@ impl Prepared {
             git_dir: &self.git_dir,
             scratch: &self.scratch,
             hook_socket: &self.hook_socket,
+            mcp_socket: &self.mcp_socket,
             host: &self.host,
             profile: self.profile,
             state: self.profile.map(|_| started.state_dir(&self.store)),
@@ -1287,6 +1324,7 @@ impl Prepared {
             pusher.as_ref().map(|(pusher, _)| pusher.poker()),
             session,
         );
+        let tools = serve_tools(self.mcp, self.owner, &self.git_dir, &started);
         let merging = door
             .zip(recorder.as_ref().map(Recorder::merger))
             .map(|(door, merger)| Merging {
@@ -1294,7 +1332,7 @@ impl Prepared {
                 merger,
                 own: started.slot.participant().clone(),
             });
-        finish_run(
+        let outcome = finish_run(
             child,
             raw,
             &UserSide {
@@ -1317,8 +1355,37 @@ impl Prepared {
             },
             proxy,
             live,
-        )
+        );
+        tools.store(false, Ordering::SeqCst);
+        outcome
     }
+}
+
+/// Serves the tools of `started`'s agent, in the thread whose `meta` is `owner`'s, to its
+/// `mahi mcp` at `listener` on a thread of its own, and returns the flag that stops it.
+fn serve_tools(
+    listener: UnixListener,
+    owner: Option<ParticipantKey>,
+    git_dir: &Path,
+    started: &Started,
+) -> Arc<AtomicBool> {
+    let serving = Arc::new(AtomicBool::new(true));
+    let Some(owner) = owner else {
+        eprintln!("mahi: the agent's tools are off, since the thread's owner is not known");
+        return serving;
+    };
+    let tools = ThreadTools::new(
+        git_dir.to_path_buf(),
+        started.thread,
+        owner,
+        started.slot.clone(),
+    );
+    let flag = Arc::clone(&serving);
+    thread::spawn(move || {
+        let toolbox: Arc<dyn Toolbox> = Arc::new(tools);
+        mcp::serve(&listener, &flag, &toolbox);
+    });
+    serving
 }
 
 /// Opens the door `mahi merge` reaches `started`'s running agent at; a failure is reported,
@@ -1819,10 +1886,23 @@ struct Launch<'a> {
     git_dir: &'a Path,
     scratch: &'a Path,
     hook_socket: &'a Path,
+    mcp_socket: &'a Path,
     host: &'a Host,
 }
 
 impl Launch<'_> {
+    /// Gives the agent the first prompt asking it to read the handoff `notes`, when its
+    /// profile takes one, or else tells the user to give it.
+    fn ask_to_read(&self, pty: PtyCommand, notes: &Path) -> PtyCommand {
+        let prompt = handoff::first_prompt(&notes.display().to_string());
+        let takes_prompt = self.profile.is_some_and(|profile| profile.takes_prompt);
+        if takes_prompt && notes.to_str().is_some() {
+            return pty.arg("--").arg(&prompt);
+        }
+        eprintln!("mahi: tell the agent: {prompt}");
+        pty
+    }
+
     fn restore_session(&self, state: &Path) {
         let Some(restore) = &self.restore else {
             return;
@@ -1892,6 +1972,7 @@ impl Launch<'_> {
             }
         }
         sandbox.allow_connect(self.hook_socket)?;
+        sandbox.allow_connect(self.mcp_socket)?;
         let state = self.prepare_state()?;
         if let Some(state) = &state {
             self.restore_session(state);
@@ -1905,13 +1986,7 @@ impl Launch<'_> {
             pty = pty.arg(argument);
         }
         if let Some(notes) = self.handoff {
-            let prompt = handoff::first_prompt(&notes.display().to_string());
-            let takes_prompt = self.profile.is_some_and(|profile| profile.takes_prompt);
-            if takes_prompt && notes.to_str().is_some() {
-                pty = pty.arg("--").arg(&prompt);
-            } else {
-                eprintln!("mahi: tell the agent: {prompt}");
-            }
+            pty = self.ask_to_read(pty, notes);
         }
         for (name, value) in &self.environment.passed_on {
             pty = pty.env(name, value);
@@ -1919,7 +1994,8 @@ impl Launch<'_> {
         let mut pty = pty
             .env("HOME", self.scratch.join(HOME))
             .env("TMPDIR", self.scratch.join(TMP))
-            .env(HOOK_SOCKET, self.hook_socket);
+            .env(HOOK_SOCKET, self.hook_socket)
+            .env(MCP_SOCKET, self.mcp_socket);
         if let Some(mahi) = &self.environment.mahi_exe {
             pty = pty.env(MAHI_BIN, mahi);
         }

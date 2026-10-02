@@ -14,6 +14,7 @@ mod inject;
 mod invite;
 mod join;
 mod live;
+mod mcp;
 mod merge;
 mod merge_door;
 mod merged;
@@ -125,6 +126,7 @@ fn main() {
             }
             0
         }
+        Command::Mcp => serve_mcp(&environment),
         Command::Merge(command) => match merge::merge(&command, &environment) {
             Ok(merge::Outcome::Done(report)) => {
                 eprint!("{report}");
@@ -199,6 +201,21 @@ fn report_with(context: &str, error: &dyn Error) {
 fn report_message(mut message: String, error: &dyn Error) {
     causes(&mut message, error);
     eprintln!("{message}");
+}
+
+/// Relays `mahi mcp` to the mahi that runs the agent, and returns its exit code.
+fn serve_mcp(environment: &Environment) -> i32 {
+    let Some(socket) = &environment.mcp_socket else {
+        eprintln!("mahi: mahi mcp serves an agent that mahi runs; it has none here");
+        return 1;
+    };
+    match mcp::relay(socket) {
+        Ok(()) => 0,
+        Err(error) => {
+            report(&error);
+            1
+        }
+    }
 }
 
 /// Returns `error` followed by its causes, each after a colon.

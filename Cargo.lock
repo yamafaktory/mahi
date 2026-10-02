@@ -3234,6 +3234,7 @@ dependencies = [
  "mahi-thread",
  "rustix",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "signature 2.2.0",
  "ssh-key",

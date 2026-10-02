@@ -1486,6 +1486,47 @@ cat parser.rs
         all_signed_by(&store, &snapshots_of(&thread, "codex"), &fixture.owner);
     }
 
+    const TOOL_USER: &str = r#"#!/bin/sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_agents"}}' \
+  | "$MAHI_BIN" mcp
+"#;
+
+    #[test]
+    fn the_agent_reaches_its_threads_tools_through_mahi_mcp_from_inside_its_sandbox() {
+        let fixture = fixture();
+        let tooler = script(&fixture, "tools", "tooler", TOOL_USER);
+        let output = fixture
+            .command(&["run", tooler.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let replies: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 2, "{stdout}");
+        assert_eq!(replies[0]["result"]["serverInfo"]["name"], "mahi");
+        let listed = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            listed.contains("- tester (owner): tester.tooler (you)"),
+            "{listed}"
+        );
+
+        let outside = fixture.mahi(&["mcp"]);
+        assert_eq!(outside.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&outside.stderr).contains("serves an agent"));
+    }
+
     #[test]
     fn a_merge_into_itself_into_an_unnamed_agent_of_several_or_from_an_unlisted_one_is_refused() {
         let fixture = fixture();

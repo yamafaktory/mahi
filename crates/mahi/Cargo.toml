@@ -28,6 +28,7 @@ mahi-term = { workspace = true }
 mahi-thread = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 ssh-key = { workspace = true }
 subtle = { workspace = true }

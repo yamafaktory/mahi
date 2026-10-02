@@ -86,6 +86,9 @@ pub(crate) enum Command {
     /// Reports an agent event, with its details on standard input, to the mahi run that
     /// started the agent. Agent hooks call it; it always exits with 0.
     Hook(HookCommand),
+    /// Serves the thread's tools to the agent, as a Model Context Protocol server on standard
+    /// input and output. The agent's profile starts it.
+    Mcp,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
