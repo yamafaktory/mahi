@@ -1528,7 +1528,7 @@ printf '%s\n' \
         );
         let replies: Vec<serde_json::Value> = stdout
             .lines()
-            .filter(|line| line.starts_with('{'))
+            .filter_map(|line| line.find("{\"jsonrpc\"").and_then(|at| line.get(at..)))
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(replies.len(), 7, "{stdout}");
@@ -1590,9 +1590,8 @@ call() {
         assert_eq!(code, 0, "{output}");
         let replies: std::collections::HashMap<i64, serde_json::Value> = output
             .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with('{'))
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|line| line.find("{\"jsonrpc\"").and_then(|at| line.get(at..)))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
             .filter_map(|reply| Some((reply["id"].as_i64()?, reply)))
             .collect();
         let text = |id: i64| {
