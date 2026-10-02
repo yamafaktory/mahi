@@ -177,7 +177,10 @@ use crate::{
         ThreadTools,
         Toolbox,
     },
-    merge::MergeDone,
+    merge::{
+        MergeDone,
+        MergeRequest,
+    },
     merge_door::{
         self,
         MergeDoor,
@@ -1326,14 +1329,14 @@ impl Prepared {
             session,
             key.clone(),
         );
-        let tools = serve_tools(self.mcp, (self.owner, key), &self.git_dir, &started);
-        let merging = door
-            .zip(recorder.as_ref().map(Recorder::merger))
-            .map(|(door, merger)| Merging {
-                door,
-                merger,
-                own: started.slot.participant().clone(),
-            });
+        let can_merge = raw.is_some() && terminal::is_interactive() && recorder.is_some();
+        let (tools, prompts) = serve_tools(
+            self.mcp,
+            (self.owner, key, live.as_ref(), can_merge),
+            &self.git_dir,
+            &started,
+        );
+        let merging = Merging::open(door, recorder.as_ref(), &started);
         let outcome = finish_run(
             child,
             raw,
@@ -1354,6 +1357,7 @@ impl Prepared {
                 turns,
                 pusher,
                 merging,
+                prompts,
             },
             proxy,
             live,
@@ -1364,30 +1368,40 @@ impl Prepared {
 }
 
 /// Serves the tools of `started`'s agent, in the thread whose `meta` is `owner`'s and whose
-/// records `key` opens, to its `mahi mcp` at `listener` on a thread of its own, and returns
-/// the flag that stops it.
+/// records `key` opens, to its `mahi mcp` at `listener` on a thread of its own; the agent may
+/// ask for merges when `can_merge`, as the user has a palette and the run takes snapshots.
+/// Returns the flag that stops it, and the palette's queue: `live`'s, or else this run's own.
 fn serve_tools(
     listener: UnixListener,
-    (owner, key): (Option<ParticipantKey>, Option<Arc<ThreadKey>>),
+    (owner, key, live, can_merge): (
+        Option<ParticipantKey>,
+        Option<Arc<ThreadKey>>,
+        Option<&Link>,
+        bool,
+    ),
     git_dir: &Path,
     started: &Started,
-) -> Arc<AtomicBool> {
+) -> (Arc<AtomicBool>, Arc<Prompts>) {
     let serving = Arc::new(AtomicBool::new(true));
+    let prompts = live.map_or_else(|| Arc::new(Prompts::default()), Link::prompts);
     let Some(owner) = owner else {
         eprintln!("mahi: the agent's tools are off, since the thread's owner is not known");
-        return serving;
+        return (serving, prompts);
     };
     let tools = ThreadTools::new(
         git_dir.to_path_buf(),
         (started.thread, owner, key),
-        started.slot.clone(),
+        (
+            started.slot.clone(),
+            can_merge.then(|| Arc::clone(&prompts)),
+        ),
     );
     let flag = Arc::clone(&serving);
     thread::spawn(move || {
         let toolbox: Arc<dyn Toolbox> = Arc::new(tools);
         mcp::serve(&listener, &flag, &toolbox);
     });
-    serving
+    (serving, prompts)
 }
 
 /// Opens the door `mahi merge` reaches `started`'s running agent at; a failure is reported,
@@ -1411,6 +1425,23 @@ struct Merging {
     door: MergeDoor,
     merger: Merger,
     own: ParticipantName,
+}
+
+impl Merging {
+    /// Returns what lets `mahi merge` reach `started`'s agent, when it has a door and a
+    /// recorder.
+    fn open(
+        door: Option<MergeDoor>,
+        recorder: Option<&Recorder>,
+        started: &Started,
+    ) -> Option<Self> {
+        door.zip(recorder.map(Recorder::merger))
+            .map(|(door, merger)| Self {
+                door,
+                merger,
+                own: started.slot.participant().clone(),
+            })
+    }
 }
 
 /// Merges what `mahi merge` asks at `merging`'s door while `serving` is set, each once the
@@ -1450,6 +1481,59 @@ impl MergeServer {
     }
 }
 
+/// Gives the agent the prompts the user accepts, on a thread of its own while `running` is
+/// set, merging with `merger` the merges the agent asked for once they are accepted.
+fn spawn_giver<A: AgentInput + Send + Sync + 'static, W: Write + Send + 'static>(
+    prompts: Arc<Prompts>,
+    (activity, agent, writer): (Arc<Activity>, Arc<A>, Arc<Mutex<W>>),
+    running: Arc<AtomicBool>,
+    merger: Option<Merger>,
+) {
+    thread::spawn(move || {
+        let merge = |request: MergeRequest| merged_for_agent(merger.as_ref(), request);
+        inject::give_accepted(
+            &prompts,
+            &activity,
+            (&*agent, &merge),
+            &writer,
+            (&running, Pace::default()),
+        );
+    });
+}
+
+/// Merges `request`, which the user accepted for the agent, and returns what to tell the agent
+/// of it, at most as long as a prompt may be.
+fn merged_for_agent(merger: Option<&Merger>, request: MergeRequest) -> String {
+    let from = request.from.clone();
+    let Some(merger) = merger else {
+        return format!("mahi could not merge the work of {from}: this run takes no snapshots");
+    };
+    let mut told = match merger.merge(request) {
+        Ok(MergeDone::Merged {
+            report,
+            prompt: Some(prompt),
+            ..
+        }) => format!("The user accepted merging the work of {from}. {report}{prompt}"),
+        Ok(done) => format!(
+            "The user accepted merging the work of {from}. {}",
+            done.report()
+        ),
+        Err(error) => format!(
+            "mahi could not merge the work of {from}: {}",
+            crate::describe(&error)
+        ),
+    };
+    if told.len() > mahi_live::MAX_PROMPT_BYTES {
+        let mut end = mahi_live::MAX_PROMPT_BYTES - 3;
+        while !told.is_char_boundary(end) {
+            end -= 1;
+        }
+        told.truncate(end);
+        told.push_str("...");
+    }
+    told
+}
+
 /// Serves merges at `merging`'s door on a thread of its own, if there is one.
 fn spawn_merges<A: AgentInput + Send + Sync + 'static, W: Write + Send + 'static>(
     merging: Option<Merging>,
@@ -1484,10 +1568,7 @@ fn after_merge(done: &MergeDone, prompts: Option<&Prompts>, own: &ParticipantNam
         return report;
     };
     let told = match prompts.map(|prompts| queue_own_prompt(prompts, own, prompt)) {
-        None => {
-            "the agent was not asked to resolve the conflicts: there is no palette to queue the \
-             prompt in (it or the live layer is off)\n"
-        }
+        None => "the agent was not asked to resolve the conflicts: its palette is off\n",
         Some(PromptOutcome::Queued) => {
             "a prompt asking the agent to resolve the conflicts waits in its palette\n"
         }
@@ -1580,6 +1661,7 @@ struct Background {
     turns: Option<TurnWorker>,
     pusher: Option<(Pusher, RemoteName)>,
     merging: Option<Merging>,
+    prompts: Arc<Prompts>,
 }
 
 fn finish_turns(turns: Option<TurnWorker>) {
@@ -1627,16 +1709,19 @@ fn finish_run(
         turns,
         pusher,
         merging,
+        prompts,
     } = background;
     let (code, received) = supervise(
         child,
         raw,
         user,
         termination,
-        (
-            live.as_ref().map(|live| (live.tap(), live.prompts())),
+        AgentSide {
+            tap: live.as_ref().map(Link::tap),
+            prompts,
             merging,
-        ),
+            merger: recorder.as_ref().map(Recorder::merger),
+        },
     );
     if let Some(live) = live {
         live.stop();
@@ -1677,12 +1762,22 @@ fn finish_run(
     }
 }
 
+/// What the run hands the agent's side of the terminal: where its output is copied for
+/// teammates, the palette's queue, the door `mahi merge` reaches it at, and the recorder's
+/// merges.
+struct AgentSide {
+    tap: Option<OutputTap>,
+    prompts: Arc<Prompts>,
+    merging: Option<Merging>,
+    merger: Option<Merger>,
+}
+
 fn supervise(
     child: PtyChild,
     raw: Option<RawMode>,
     user: &UserSide,
     termination: TerminationSignals,
-    (live, merging): (Option<(OutputTap, Arc<Prompts>)>, Option<Merging>),
+    side: AgentSide,
 ) -> (Result<Outcome, RunError>, Receiver<Event>) {
     let (events, received) = mpsc::channel();
     let stop_events = events.clone();
@@ -1692,14 +1787,19 @@ fn supervise(
         }
     });
     let interactive = raw.is_some() && terminal::is_interactive();
-    let (tap, prompts) = live.unzip();
+    let AgentSide {
+        tap,
+        prompts,
+        merging,
+        merger,
+    } = side;
     let code = relay(
         child,
         interactive.then_some((user.palette_key, user.notice)),
         &user.activity,
         (events, &received),
         tap,
-        (prompts, merging),
+        (Some(prompts), merging, merger),
     );
     drop(raw);
     (code, received)
@@ -2084,7 +2184,7 @@ fn relay(
     activity: &Arc<Activity>,
     (events, received): (mpsc::Sender<Event>, &Receiver<Event>),
     tap: Option<OutputTap>,
-    (prompts, merging): (Option<Arc<Prompts>>, Option<Merging>),
+    (prompts, merging, merger): (Option<Arc<Prompts>>, Option<Merging>, Option<Merger>),
 ) -> Result<Outcome, RunError> {
     let writer = Arc::new(Mutex::new(child.writer()?));
     let repainter = Repainter::new(child.resizer()?);
@@ -2119,7 +2219,7 @@ fn relay(
             }
         }
     });
-    let merges = spawn_merges(
+    let merge_server = spawn_merges(
         merging,
         (
             Arc::clone(activity),
@@ -2129,20 +2229,12 @@ fn relay(
         prompts.clone().filter(|_| palette.is_some()),
     );
     if let Some(prompts) = prompts.filter(|_| palette.is_some()) {
-        let (screen, activity, running) = (
-            Arc::clone(&screen),
-            Arc::clone(activity),
+        spawn_giver(
+            prompts,
+            (Arc::clone(activity), Arc::clone(&screen), writer),
             Arc::clone(&running),
+            merger,
         );
-        thread::spawn(move || {
-            inject::give_accepted(
-                &prompts,
-                &activity,
-                &*screen,
-                &writer,
-                (&running, Pace::default()),
-            );
-        });
     }
     let resize_tap = tap.clone();
     let resize_screen = Arc::clone(&screen);
@@ -2181,7 +2273,7 @@ fn relay(
     });
     let outcome = await_outcome(&child, received, &progress);
     running.store(false, Ordering::SeqCst);
-    merges.stop();
+    merge_server.stop();
     let _ = screen.close();
     outcome
 }
@@ -2808,9 +2900,7 @@ mod tests {
             waiting.push((prompt.from.clone(), prompt.text.as_str().to_owned()));
         });
         assert_eq!(waiting, [(own.clone(), resolve.clone().unwrap())]);
-        assert!(
-            after_merge(&merged(resolve), None, &own).ends_with("(it or the live layer is off)\n")
-        );
+        assert!(after_merge(&merged(resolve), None, &own).ends_with("its palette is off\n"));
         let huge = Some("x".repeat(mahi_live::MAX_PROMPT_BYTES + 1));
         assert!(
             after_merge(&merged(huge), Some(&prompts), &own).ends_with("could not be queued\n")

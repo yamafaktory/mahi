@@ -58,6 +58,11 @@ use mahi_core::{
     is_invisible,
 };
 use mahi_crypto::ThreadKey;
+use mahi_live::{
+    PromptOutcome,
+    PromptText,
+    prompt_id,
+};
 use mahi_store::{
     Change,
     FileDiff,
@@ -67,6 +72,7 @@ use mahi_store::{
 use mahi_thread::{
     ParticipantKey,
     load_meta,
+    signed_by,
     walk_turns,
 };
 use serde_json::{
@@ -75,7 +81,15 @@ use serde_json::{
     json,
 };
 
-use crate::handoff;
+use crate::{
+    handoff,
+    merge::{
+        self,
+        MergeRequest,
+    },
+    merged::MergedFrom,
+    prompts::Prompts,
+};
 
 const MOST_CONNECTIONS: usize = 4;
 const META_REREAD: Duration = Duration::from_secs(5);
@@ -268,14 +282,15 @@ pub(crate) struct ThreadTools {
     owner: ParticipantKey,
     key: Option<Arc<ThreadKey>>,
     me: AgentSlot,
+    prompts: Option<Arc<Prompts>>,
     meta: Mutex<Option<(Instant, MetaView)>>,
 }
 
-/// What the tools read of `meta`: the participants it lists, whether each owns the thread,
-/// and the thread's base.
+/// What the tools read of `meta`: the participants it lists, with their keys and whether each
+/// owns the thread, and the thread's base.
 #[derive(Debug, Clone)]
 struct MetaView {
-    listed: Vec<(ParticipantName, bool)>,
+    listed: Vec<(ParticipantName, ParticipantKey, bool)>,
     base: ObjectId,
 }
 
@@ -285,11 +300,12 @@ fn failed(error: &dyn std::error::Error) -> ToolError {
 
 impl ThreadTools {
     /// Returns the tools of the agent `me` in `thread`, whose `meta` is `owner`'s and whose
-    /// records `key` opens, in the repository at `git_dir`.
+    /// records `key` opens, in the repository at `git_dir`; the merges it asks for wait in
+    /// `prompts`, the palette's, when the user can accept them.
     pub(crate) fn new(
         git_dir: PathBuf,
         (thread, owner, key): (ThreadId, ParticipantKey, Option<Arc<ThreadKey>>),
-        me: AgentSlot,
+        (me, prompts): (AgentSlot, Option<Arc<Prompts>>),
     ) -> Self {
         Self {
             git_dir,
@@ -297,6 +313,7 @@ impl ThreadTools {
             owner,
             key,
             me,
+            prompts,
             meta: Mutex::new(None),
         }
     }
@@ -316,7 +333,13 @@ impl ThreadTools {
         let view = MetaView {
             listed: meta
                 .participants()
-                .map(|listed| (listed.name().clone(), listed.key() == &self.owner))
+                .map(|listed| {
+                    (
+                        listed.name().clone(),
+                        listed.key().clone(),
+                        listed.key() == &self.owner,
+                    )
+                })
                 .collect(),
             base: meta.base(),
         };
@@ -347,7 +370,7 @@ impl ThreadTools {
             "Thread {}. You are {}. Participants and their agents:\n",
             self.thread, self.me
         );
-        for (name, owner) in &view.listed {
+        for (name, _, owner) in &view.listed {
             let _ = write!(text, "- {name}");
             if *owner {
                 text.push_str(" (owner)");
@@ -415,6 +438,70 @@ impl ThreadTools {
             FileDiff::TooLarge => format!("{path:?} is too large to show"),
             FileDiff::NotAFile => format!("{path:?} is not a file"),
         })
+    }
+
+    fn merge_from(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
+        let Some(prompts) = &self.prompts else {
+            return Err(ToolError::Failed(
+                "the user cannot accept merges in this run; ask them to run mahi merge".to_owned(),
+            ));
+        };
+        let store = self.store()?;
+        let view = self.meta(&store)?;
+        let from = listed_agent(arguments, &view)?;
+        if from == self.me {
+            return Err(ToolError::Failed(
+                "an agent cannot merge its own work".to_owned(),
+            ));
+        }
+        let commit = store
+            .head(&ThreadRef::new(
+                self.thread,
+                RefKind::Snapshots(from.clone()),
+            ))
+            .map_err(|error| failed(&error))?
+            .ok_or_else(|| ToolError::Failed(format!("{from} has no snapshot here")))?;
+        let signed = view
+            .listed
+            .iter()
+            .find(|(name, ..)| name == from.participant())
+            .is_some_and(|(_, key, _)| signed_by(&store, commit, key).unwrap_or(false));
+        if !signed {
+            return Err(ToolError::Failed(format!(
+                "the latest snapshot of {from} is not signed by the key the thread lists for it"
+            )));
+        }
+        let request = MergeRequest {
+            from,
+            commit,
+            thread_base: view.base,
+        };
+        let own = ThreadRef::new(self.thread, RefKind::Snapshots(self.me.clone()));
+        let merged = MergedFrom::read(&store, &own).map_err(|error| failed(&error))?;
+        if merge::merge_base(&store, &merged, &request).map_err(|error| failed(&error))? == commit {
+            return Ok(format!(
+                "You already have the latest work of {}.",
+                request.from
+            ));
+        }
+        let asked = PromptText::new(format!(
+            "The agent asks to merge the latest work of {} into its worktree; accept to \
+             merge it once the agent is idle.",
+            request.from
+        ))
+        .map_err(|_| ToolError::Failed("the request cannot be written".to_owned()))?;
+        let answer = format!(
+            "Asked the user to accept merging the latest work of {}. If they accept, mahi \
+             merges it once you are idle and then tells you what changed; carry on meanwhile.",
+            request.from
+        );
+        let id = prompt_id().map_err(|error| failed(&error))?;
+        match prompts.offer_merge(self.me.participant().clone(), id, (asked, request)) {
+            PromptOutcome::Queued => Ok(answer),
+            _ => Err(ToolError::Failed(
+                "the user has too many requests waiting; ask again later".to_owned(),
+            )),
+        }
     }
 
     fn read_transcript(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
@@ -518,7 +605,7 @@ fn listed_agent(arguments: &Map<String, Value>, view: &MetaView) -> Result<Agent
     if !view
         .listed
         .iter()
-        .any(|(name, _)| name == slot.participant())
+        .any(|(name, ..)| name == slot.participant())
     {
         return Err(ToolError::Failed(format!(
             "the thread lists no participant called {}",
@@ -565,6 +652,17 @@ impl Toolbox for ThreadTools {
                 }),
             },
             Tool {
+                name: "merge_from",
+                description: "Asks the user to merge another agent's latest work into your \
+                              worktree. The user decides; if they accept, mahi merges once you \
+                              are idle and tells you what changed, conflicts included.",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "agent": agent },
+                    "required": ["agent"]
+                }),
+            },
+            Tool {
                 name: "read_transcript",
                 description: "Shows what an agent was asked and which tools it used, turn \
                               by turn, for its latest turns.",
@@ -590,6 +688,7 @@ impl Toolbox for ThreadTools {
             "list_agents" => self.list_agents(),
             "read_diff" => self.read_diff(arguments),
             "read_transcript" => self.read_transcript(arguments),
+            "merge_from" => self.merge_from(arguments),
             _ => Err(ToolError::Unknown),
         }
     }

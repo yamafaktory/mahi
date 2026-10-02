@@ -20,7 +20,10 @@ use std::{
 use mahi_agent::hook::HookKind;
 use mahi_core::is_invisible;
 
-use crate::prompts::Prompts;
+use crate::{
+    merge::MergeRequest,
+    prompts::Prompts,
+};
 
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -226,12 +229,13 @@ pub(crate) trait AgentInput {
 
 /// Gives the agent each accepted prompt when it is idle and the palette closed, while
 /// `running` is set: as a bracketed paste when the agent turned that on, then Enter on its
-/// own. It holds the agent's input while it looks and types, so neither the user's keys nor
+/// own; for an accepted merge, `merge` makes it and the agent is given what it returns. It
+/// holds the agent's input while it looks, merges and types, so neither the user's keys nor
 /// the palette come in between.
 pub(crate) fn give_accepted(
     prompts: &Prompts,
     activity: &Activity,
-    agent: &impl AgentInput,
+    (agent, merge): (&impl AgentInput, &dyn Fn(MergeRequest) -> String),
     writer: &Mutex<impl Write>,
     (running, pace): (&AtomicBool, Pace),
 ) {
@@ -248,7 +252,10 @@ pub(crate) fn give_accepted(
             continue;
         };
         typed.clear();
-        encode(accepted.text.as_str(), agent.bracketed_paste(), &mut typed);
+        match accepted.merge {
+            Some(request) => encode(&merge(request), agent.bracketed_paste(), &mut typed),
+            None => encode(accepted.text.as_str(), agent.bracketed_paste(), &mut typed),
+        }
         if type_in(&mut *input, &typed, pace.enter_after).is_err() {
             return;
         }
@@ -492,7 +499,13 @@ mod tests {
                 Arc::clone(&running),
             );
             thread::spawn(move || {
-                give_accepted(&prompts, &activity, &*agent, &writer, (&running, fast()));
+                give_accepted(
+                    &prompts,
+                    &activity,
+                    (&*agent, &|_| String::new()),
+                    &writer,
+                    (&running, fast()),
+                );
             })
         };
         thread::sleep(fast().quiet * 3);
@@ -557,5 +570,56 @@ mod tests {
         thread::sleep(fast().quiet * 3);
         running.store(false, Ordering::SeqCst);
         assert_eq!(worker.join().unwrap(), None);
+    }
+
+    #[test]
+    fn an_accepted_merge_is_made_and_the_agent_is_told_what_came_of_it() {
+        let prompts = Arc::new(Prompts::default());
+        let request = crate::merge::MergeRequest {
+            from: "bob.codex".parse().unwrap(),
+            commit: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
+            thread_base: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
+        };
+        prompts.offer_merge(
+            ParticipantName::new("alice").unwrap(),
+            [9; 16],
+            (PromptText::new("merge bob".to_owned()).unwrap(), request),
+        );
+        prompts.decide([9; 16], Decision::Accept);
+        let activity = Arc::new(Activity::default());
+        let agent = Arc::new(FakeAgent {
+            palette_open: AtomicBool::new(false),
+        });
+        let writer = Arc::new(Mutex::new(Vec::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        let worker = {
+            let (prompts, activity, agent, writer, running) = (
+                Arc::clone(&prompts),
+                Arc::clone(&activity),
+                Arc::clone(&agent),
+                Arc::clone(&writer),
+                Arc::clone(&running),
+            );
+            thread::spawn(move || {
+                let merge =
+                    |request: crate::merge::MergeRequest| format!("merged {}", request.from);
+                give_accepted(
+                    &prompts,
+                    &activity,
+                    (&*agent, &merge),
+                    &writer,
+                    (&running, fast()),
+                );
+            })
+        };
+        wait_until("the merge was never reported", || {
+            writer.lock().unwrap().ends_with(b"\r")
+        });
+        assert_eq!(
+            writer.lock().unwrap().as_slice(),
+            b"\x1b[200~merged bob.codex\x1b[201~\r"
+        );
+        running.store(false, Ordering::SeqCst);
+        worker.join().unwrap();
     }
 }

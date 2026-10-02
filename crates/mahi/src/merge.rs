@@ -343,7 +343,7 @@ pub(crate) fn merge_now(
 /// Returns the snapshot a merge of `request` starts from: the snapshot of `request.from` that
 /// `merged` says was merged last, when the requested one descends from it, or else the
 /// thread's base.
-fn merge_base(
+pub(crate) fn merge_base(
     store: &Store,
     merged: &MergedFrom,
     request: &MergeRequest,
