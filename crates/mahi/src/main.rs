@@ -14,6 +14,7 @@ mod init;
 mod inject;
 mod invite;
 mod join;
+mod land;
 mod live;
 mod mcp;
 mod merge;
@@ -128,23 +129,8 @@ fn main() {
             0
         }
         Command::Mcp => serve_mcp(&environment),
-        Command::Merge(command) => match merge::merge(&command, &environment) {
-            Ok(merge::Outcome::Done(report)) => {
-                eprint!("{report}");
-                0
-            }
-            Ok(merge::Outcome::Stopped(signal, report)) => {
-                if let Some(report) = report {
-                    eprint!("{report}");
-                }
-                signal.reraise();
-                128 + signal.number()
-            }
-            Err(error) => {
-                report(&error);
-                1
-            }
-        },
+        Command::Land(command) => landed(&command, &environment),
+        Command::Merge(command) => merged(&command, &environment),
         Command::Handoff(command) => outcome_code(run::handoff(&command, &environment)),
         Command::Agent(AgentCommand::Add(command)) => {
             outcome_code(run::agent_add(&command, &environment))
@@ -202,6 +188,46 @@ fn report_with(context: &str, error: &dyn Error) {
 fn report_message(mut message: String, error: &dyn Error) {
     causes(&mut message, error);
     eprintln!("{message}");
+}
+
+/// Runs `mahi merge`, prints its report, and returns its exit code.
+fn merged(command: &cli::MergeCommand, environment: &Environment) -> i32 {
+    match merge::merge(command, environment) {
+        Ok(merge::Outcome::Done(report)) => {
+            eprint!("{report}");
+            0
+        }
+        Ok(merge::Outcome::Stopped(signal, report)) => {
+            if let Some(report) = report {
+                eprint!("{report}");
+            }
+            signal.reraise();
+            128 + signal.number()
+        }
+        Err(error) => {
+            report(&error);
+            1
+        }
+    }
+}
+
+/// Runs `mahi land`, prints its report, and returns its exit code.
+fn landed(command: &cli::LandCommand, environment: &Environment) -> i32 {
+    match land::land(command, environment) {
+        Ok(land::Outcome::Done(report)) => {
+            eprint!("{report}");
+            0
+        }
+        Ok(land::Outcome::Stopped(signal, report)) => {
+            eprint!("{report}");
+            signal.reraise();
+            128 + signal.number()
+        }
+        Err(error) => {
+            report(&error);
+            1
+        }
+    }
 }
 
 /// Relays `mahi mcp` to the mahi that runs the agent, and returns its exit code.

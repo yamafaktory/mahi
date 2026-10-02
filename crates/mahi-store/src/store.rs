@@ -190,6 +190,12 @@ pub enum StoreError {
     /// Two tree entries have the same name.
     #[error("duplicate tree entry name {0:?}")]
     DuplicateEntryName(String),
+    /// A local branch does not exist.
+    #[error("branch {0:?} does not exist")]
+    NoBranch(String),
+    /// A branch name is not one git takes.
+    #[error("invalid branch name {0:?}")]
+    InvalidBranchName(String),
     /// A side of a merge changes more paths than mahi merges.
     #[error("tree {0} changes more paths than mahi merges")]
     MergeTooLarge(ObjectId),
@@ -266,6 +272,52 @@ impl Store {
         let text = std::str::from_utf8(short.as_ref())
             .map_err(|_| StoreError::NonUtf8Branch(short.to_owned()))?;
         Ok(Some(text.to_owned()))
+    }
+
+    /// Returns the commit the local branch `name` points to, or `None` if it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBranchName`] if `name` is not a branch name git takes, or
+    /// [`StoreError::Git`] if reading fails.
+    pub fn branch_tip(&self, name: &str) -> Result<Option<ObjectId>, StoreError> {
+        let full = branch_ref(name)?;
+        match self.repo.try_find_reference(full.as_ref())? {
+            Some(mut reference) => Ok(Some(reference.peel_to_id()?.detach())),
+            None => Ok(None),
+        }
+    }
+
+    /// Creates the local branch `name` at `commit` unless it exists, and returns where it
+    /// points.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBranchName`] if `name` is not a branch name git takes,
+    /// [`StoreError::WrongObject`] if `commit` is not a commit, or [`StoreError::Git`] if
+    /// writing fails.
+    pub fn ensure_branch(&self, name: &str, commit: ObjectId) -> Result<ObjectId, StoreError> {
+        if let Some(tip) = self.branch_tip(name)? {
+            return Ok(tip);
+        }
+        self.require_kind(commit, Kind::Commit)?;
+        let full = branch_ref(name)?;
+        self.repo.edit_references_as(
+            Some(RefEdit::new(
+                full,
+                Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: "mahi land".into(),
+                    },
+                    expected: PreviousValue::MustNotExist,
+                    new: Target::Object(commit),
+                },
+            )),
+            None,
+        )?;
+        Ok(commit)
     }
 
     /// Returns the commit `thread_ref` points to, or `None` if it does not exist.
@@ -785,6 +837,19 @@ fn validate_entry_name(name: &str, kind: EntryKind) -> Result<(), StoreError> {
     }
 }
 
+fn branch_ref(name: &str) -> Result<FullName, StoreError> {
+    let invalid = || StoreError::InvalidBranchName(name.to_owned());
+    if name.is_empty()
+        || name.starts_with('-')
+        || name.starts_with("refs/")
+        || name == "HEAD"
+        || name == "@"
+    {
+        return Err(invalid());
+    }
+    FullName::try_from(format!("refs/heads/{name}")).map_err(|_| invalid())
+}
+
 #[cfg(test)]
 mod tests {
     use mahi_core::{
@@ -865,6 +930,7 @@ mod tests {
         let commit = commit_on_main(&store);
         assert_eq!(store.head_commit().unwrap(), commit);
         assert_eq!(store.head_branch().unwrap().as_deref(), Some("main"));
+        assert!(store.branch_checked_out("main").unwrap());
 
         std::fs::write(store.common_dir().join("HEAD"), format!("{commit}\n")).unwrap();
         assert_eq!(store.head_branch().unwrap(), None);

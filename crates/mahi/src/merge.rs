@@ -204,7 +204,9 @@ pub(crate) fn merge(
     let lock = match AgentLock::acquire(&config, thread, into.agent()) {
         Ok(lock) => Some(lock),
         Err(LockError::AgentBusy(..)) => None,
-        Err(LockError::Busy(_)) => return Err(MergeError::ThreadBusy(thread)),
+        Err(LockError::Busy(_) | LockError::LandBusy(_)) => {
+            return Err(MergeError::ThreadBusy(thread));
+        }
         Err(LockError::Io(error)) => return Err(MergeError::Lock(error)),
     };
     let fetched = run::listed_and_fetched(
@@ -418,7 +420,7 @@ fn snapshot(
 /// Says what a merge did: the files written and removed, the conflicts and the paths left.
 pub(crate) fn report(
     from: &AgentSlot,
-    into: &AgentSlot,
+    into: &dyn std::fmt::Display,
     merged: &Merged,
     applied: &Applied,
 ) -> String {

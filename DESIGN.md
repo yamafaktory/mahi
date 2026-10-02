@@ -218,17 +218,18 @@ Milestone 2 lets teammates watch a thread live, and run their own agent in it, b
 
 ## Landing
 
-- A thread results in **one remote branch**. The remote serializes it: only fast-forward pushes; a rejected push → fetch, merge, retry.
-- The integrator (thread owner by default; needs push access) merges agent branches locally, curates them into clean commits, rebases onto main, and pushes.
-- Commit trailers link back to the thread:
+- A thread results in **one branch**, `mahi/<thread-id>` unless `--branch` names another, built on top of the thread's landing branch and pushed to the remote as a fast-forward only; a rejected push means fetch, merge, retry.
+- `mahi land <thread-id> [--from <participant>.<agent>]…` makes the landing worktree, `<thread-id>@land` beside the agents' worktrees, with `HEAD` on that branch, created at the landing branch's current tip. It merges into it, one after the other and as `mahi merge` does (gix's three-way merge from the thread's base, no program run, conflicts left between markers and listed), the latest signed snapshot of each agent named, or of every agent in the thread when none is; it fetches the thread first, like `mahi resume`. The worktree is not sandboxed and no agent runs in it: the integrator, the thread's owner by default, curates it into commits with plain git, or starts an agent in it. Run again, `mahi land` merges only what each agent did since the snapshot it last took, which the landing worktree records in its own state as `mahi merge` records in snapshots.
+- `mahi land <thread-id> --push` adds trailers that link each commit made on the branch since the landing branch's tip back to the thread, rewriting those commits (they are not pushed yet), and pushes the branch to the thread's remote with mahi's own push, fast-forward only:
 
   ```
-  Thread: 7f3a9c2e
-  Agent: claude-code (alice)
-  Session: 01J8...
+  Thread: 7f3a9c2e…
+  Agent: alice.claude
+  Agent: bob.codex
   ```
 
-- mahi generates the PR description from the thread: summary, key decisions and why, agents and people involved, link to the thread. The final look and approval happen in the forge.
+  A commit that already carries a `Thread:` trailer is left as it is.
+- mahi calls no model, so the pull request description starts as a draft written from the records: the thread's title, the first prompt of each agent (its goal), the agents and the people involved, the files changed from the landing branch, and the latest replies of agents whose profile can read them. `mahi land --push` writes it to `PR.md` in the landing worktree's state, outside the worktree, and prints it; `--with <agent>` instead starts that agent in the landing worktree, as a handoff does, with the draft and the briefing, to rewrite it with the key decisions and why. The pull request itself is opened in the forge, where its final look and approval happen.
 
 ## Compaction and cleanup
 

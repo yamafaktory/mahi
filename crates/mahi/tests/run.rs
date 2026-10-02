@@ -1655,6 +1655,99 @@ cat parser.rs
     }
 
     #[test]
+    fn landing_merges_every_agents_work_into_a_branch_worktree_once() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let codex = script(
+            &fixture,
+            "landing",
+            "codex",
+            "#!/bin/sh\nprintf 'from codex\\n' > codex.txt\n",
+        );
+        let (code, output) = in_terminal(
+            &fixture,
+            &["agent", "add", &thread, "--", codex.to_str().unwrap()],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        let (code, output) = in_terminal(
+            &fixture,
+            &["land", &thread, "--branch", "main"],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains("it is the thread's landing branch"),
+            "{output}"
+        );
+        let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("merged tester.claude into the landing worktree: 1 written"),
+            "{output}"
+        );
+        assert!(
+            output.contains("merged tester.codex into the landing worktree: 1 written"),
+            "{output}"
+        );
+        let landing = worktree_named(&fixture, &format!("{thread}@land"));
+        assert_eq!(
+            fs::read_to_string(landing.join("parser.rs")).unwrap(),
+            "fn parse() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(landing.join("codex.txt")).unwrap(),
+            "from codex\n"
+        );
+        let opened = gix::open(&landing).unwrap();
+        assert_eq!(
+            opened.head_name().unwrap().unwrap().as_bstr(),
+            format!("refs/heads/mahi/{thread}").as_str()
+        );
+        assert_eq!(opened.head_id().unwrap().detach(), fixture.base);
+
+        let (code, output) = in_terminal(&fixture, &["land", &thread], None);
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("the landing worktree already has the latest snapshot of tester.codex"),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("on branch mahi/{thread}")),
+            "{output}"
+        );
+        let (code, output) =
+            in_terminal(&fixture, &["land", &thread, "--branch", "elsewhere"], None);
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains(&format!("is on mahi/{thread}, not on elsewhere")),
+            "{output}"
+        );
+        fs::remove_dir_all(&landing).unwrap();
+        let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("merged tester.codex into the landing worktree: 1 written"),
+            "{output}"
+        );
+        assert_eq!(
+            fs::read_to_string(landing.join("codex.txt")).unwrap(),
+            "from codex\n"
+        );
+        let (code, output) = in_terminal(
+            &fixture,
+            &["land", &thread, "--from", "mallory.claude"],
+            None,
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains("lists no participant called mallory"),
+            "{output}"
+        );
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+    }
+
+    #[test]
     fn a_merge_into_itself_into_an_unnamed_agent_of_several_or_from_an_unlisted_one_is_refused() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);

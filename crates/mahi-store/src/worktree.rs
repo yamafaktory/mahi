@@ -57,7 +57,7 @@ impl Store {
         commit: ObjectId,
         interrupt: &AtomicBool,
     ) -> Result<PathBuf, StoreError> {
-        self.make_worktree(name, path, commit, None, interrupt)
+        self.make_worktree(name, path, (commit, None), None, interrupt)
     }
 
     /// Rebuilds a linked worktree like [`Store::add_worktree`], with a detached `HEAD` and an
@@ -77,14 +77,34 @@ impl Store {
         interrupt: &AtomicBool,
     ) -> Result<PathBuf, StoreError> {
         self.require_kind(contents, Kind::Tree)?;
-        self.make_worktree(name, path, commit, Some(contents), interrupt)
+        self.make_worktree(name, path, (commit, None), Some(contents), interrupt)
+    }
+
+    /// Adds a linked worktree like [`Store::add_worktree`], but with `HEAD` on the local branch
+    /// `branch`, checked out at its tip, so commits made there with git move the branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NoBranch`] if the branch does not exist, or the errors of
+    /// [`Store::add_worktree`].
+    pub fn add_branch_worktree(
+        &self,
+        name: &str,
+        path: &Path,
+        branch: &str,
+        interrupt: &AtomicBool,
+    ) -> Result<PathBuf, StoreError> {
+        let tip = self
+            .branch_tip(branch)?
+            .ok_or_else(|| StoreError::NoBranch(branch.to_owned()))?;
+        self.make_worktree(name, path, (tip, Some(branch)), None, interrupt)
     }
 
     fn make_worktree(
         &self,
         name: &str,
         path: &Path,
-        commit: ObjectId,
+        (commit, branch): (ObjectId, Option<&str>),
         contents: Option<ObjectId>,
         interrupt: &AtomicBool,
     ) -> Result<PathBuf, StoreError> {
@@ -122,7 +142,7 @@ impl Store {
             .map_err(StoreError::from)
             .and_then(|canonical| {
                 refuse_newline(&canonical)?;
-                self.populate_worktree(&admin, &canonical, commit, contents, interrupt)?;
+                self.populate_worktree(&admin, &canonical, (commit, branch), contents, interrupt)?;
                 Ok(canonical)
             });
         if populated.is_err() {
@@ -172,6 +192,55 @@ impl Store {
             }
         }
         Ok(names)
+    }
+
+    /// Returns the directory where the repository keeps the state of the linked worktree
+    /// `name`, which goes when the worktree is removed or pruned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotAWorktree`] if `name` is not a linked worktree whose recorded
+    /// directory is where it should be, or [`StoreError::Io`] if it cannot be resolved.
+    pub fn worktree_admin(&self, name: &str) -> Result<PathBuf, StoreError> {
+        self.worktree_dir(name)?;
+        Ok(fs::canonicalize(self.common_dir())?
+            .join(WORKTREES)
+            .join(name))
+    }
+
+    /// Returns the local branch the linked worktree `name` has `HEAD` on, or `None` when its
+    /// `HEAD` is detached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotAWorktree`] if `name` is not a linked worktree whose recorded
+    /// directory is where it should be, or [`StoreError::Git`] if `HEAD` cannot be read.
+    pub fn worktree_branch(&self, name: &str) -> Result<Option<String>, StoreError> {
+        let (repo, _) = self.open_worktree(name)?;
+        Ok(local_branch(repo.head_name()?))
+    }
+
+    /// Returns whether the local branch `branch` is checked out, in the main worktree or in a
+    /// linked one, whichever worktree this store was opened from, as git refuses to check one
+    /// branch out twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Io`] if the registered worktrees cannot be listed.
+    pub fn branch_checked_out(&self, branch: &str) -> Result<bool, StoreError> {
+        let wanted = format!("ref: refs/heads/{branch}");
+        let on_branch = |head: &Path| {
+            fs::read(head)
+                .is_ok_and(|head| head.strip_suffix(b"\n").unwrap_or(&head) == wanted.as_bytes())
+        };
+        if on_branch(&self.common_dir().join("HEAD")) {
+            return Ok(true);
+        }
+        let worktrees = self.common_dir().join(WORKTREES);
+        Ok(self
+            .worktree_names()?
+            .iter()
+            .any(|name| on_branch(&worktrees.join(name).join("HEAD"))))
     }
 
     /// Removes the registration of the linked worktree `name` when the directory it records
@@ -234,7 +303,7 @@ impl Store {
         &self,
         admin: &Path,
         path: &Path,
-        commit: ObjectId,
+        (commit, branch): (ObjectId, Option<&str>),
         contents: Option<ObjectId>,
         interrupt: &AtomicBool,
     ) -> Result<(), StoreError> {
@@ -292,7 +361,10 @@ impl Store {
         let mut file = gix::index::File::from_state(index, admin.join("index"));
         file.write(gix::index::write::Options::default())
             .map_err(gix::Error::from)?;
-        fs::write(admin.join("HEAD"), format!("{commit}\n"))?;
+        match branch {
+            Some(branch) => fs::write(admin.join("HEAD"), format!("ref: refs/heads/{branch}\n"))?,
+            None => fs::write(admin.join("HEAD"), format!("{commit}\n"))?,
+        }
         fs::write(admin.join("commondir"), "../..\n")?;
         fs::write(
             admin.join("gitdir"),
@@ -317,6 +389,12 @@ fn refuse_newline(path: &Path) -> Result<(), StoreError> {
         return Err(StoreError::InvalidWorktreePath(path.to_path_buf()));
     }
     Ok(())
+}
+
+fn local_branch(head: Option<gix::refs::FullName>) -> Option<String> {
+    let head = head?;
+    let short = head.as_bstr().strip_prefix(b"refs/heads/")?;
+    std::str::from_utf8(short).ok().map(str::to_owned)
 }
 
 fn validate_name(name: &str) -> Result<(), StoreError> {
@@ -358,7 +436,7 @@ mod tests {
 
     use super::*;
 
-    fn store() -> (TempDir, Store) {
+    pub(super) fn store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
         gix::init(dir.path().join("repo")).unwrap();
         let store = Store::open(&dir.path().join("repo")).unwrap();
@@ -370,7 +448,7 @@ mod tests {
         store.append(&r, None, tree, "base").unwrap()
     }
 
-    fn sample_commit(store: &Store) -> ObjectId {
+    pub(super) fn sample_commit(store: &Store) -> ObjectId {
         let readme = store.write_blob(b"hello\n").unwrap();
         let script = store.write_blob(b"#!/bin/sh\necho hi\n").unwrap();
         let target = store.write_blob(b"README.md").unwrap();
@@ -867,5 +945,123 @@ mod tests {
         ));
         assert!(!path.exists());
         assert!(!store.common_dir().join(WORKTREES).join("a").exists());
+    }
+
+    #[test]
+    fn a_branch_worktree_has_head_on_the_branch_at_its_tip() {
+        let (dir, store) = store();
+        let first = sample_commit(&store);
+        assert_eq!(store.branch_tip("mahi/land").unwrap(), None);
+        assert_eq!(store.ensure_branch("mahi/land", first).unwrap(), first);
+        let blob = store.write_blob(b"x").unwrap();
+        let other = commit(
+            &store,
+            store
+                .write_tree(&[("other", EntryKind::Blob, blob)])
+                .unwrap(),
+        );
+        assert_eq!(store.ensure_branch("mahi/land", other).unwrap(), first);
+        assert!(matches!(
+            store.add_branch_worktree(
+                "missing",
+                &dir.path().join("missing"),
+                "nope",
+                &AtomicBool::new(false)
+            ),
+            Err(StoreError::NoBranch(_))
+        ));
+        for bad in ["", "-x", "a..b", "a b", "bad~", "HEAD", "@", "refs/heads/x"] {
+            assert!(
+                matches!(store.branch_tip(bad), Err(StoreError::InvalidBranchName(_))),
+                "{bad}"
+            );
+        }
+        let path = store
+            .add_branch_worktree(
+                "land",
+                &dir.path().join("land"),
+                "mahi/land",
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(path.join("README.md").exists());
+        let admin = fs::canonicalize(store.common_dir())
+            .unwrap()
+            .join("worktrees/land");
+        assert_eq!(
+            fs::read_to_string(admin.join("HEAD")).unwrap(),
+            "ref: refs/heads/mahi/land\n"
+        );
+        let opened = gix::open(&path).unwrap();
+        assert_eq!(
+            opened.head_name().unwrap().unwrap().as_bstr(),
+            "refs/heads/mahi/land"
+        );
+        assert_eq!(opened.head_id().unwrap().detach(), first);
+        assert_eq!(
+            store.worktree_branch("land").unwrap().as_deref(),
+            Some("mahi/land")
+        );
+        assert!(store.branch_checked_out("mahi/land").unwrap());
+        assert!(!store.branch_checked_out("mahi/other").unwrap());
+        let from_linked = Store::discover(&path).unwrap();
+        assert!(from_linked.branch_checked_out("mahi/land").unwrap());
+        assert!(from_linked.branch_checked_out("main").unwrap());
+        let admin_state = store.worktree_admin("land").unwrap();
+        assert_eq!(admin_state, admin);
+        fs::write(admin.join("HEAD"), format!("{first}\n")).unwrap();
+        assert_eq!(store.worktree_branch("land").unwrap(), None);
+        assert!(!store.branch_checked_out("mahi/land").unwrap());
+        assert!(matches!(
+            store.worktree_admin("missing"),
+            Err(StoreError::NotAWorktree(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod git_tests {
+    use std::process::Command;
+
+    use super::{
+        tests::*,
+        *,
+    };
+
+    #[test]
+    fn git_commits_in_a_branch_worktree_move_the_branch() {
+        let (dir, store) = store();
+        let commit = sample_commit(&store);
+        store.ensure_branch("mahi/land", commit).unwrap();
+        let path = store
+            .add_branch_worktree(
+                "land",
+                &dir.path().join("land"),
+                "mahi/land",
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        fs::write(path.join("README.md"), "changed\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+                .arg(&path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        assert!(git(&["status", "--porcelain"]).contains("README.md"));
+        git(&["commit", "-qam", "curated"]);
+        let tip = store.branch_tip("mahi/land").unwrap().unwrap();
+        assert_ne!(tip, commit);
+        assert_eq!(store.parent(tip).unwrap(), Some(commit));
     }
 }

@@ -63,6 +63,9 @@ pub(crate) enum Command {
     /// Merges another agent's latest snapshot into the worktree of one of your agents in a
     /// thread; lines both changed differently are left between conflict markers.
     Merge(MergeCommand),
+    /// Merges a thread's agents' work into its landing worktree, on a branch from the
+    /// thread's landing branch, for you to curate into commits there with git.
+    Land(LandCommand),
     /// Ends a thread you started that is not running: records its worktree in a last
     /// snapshot, then removes the worktree and the agent's state. Its history stays.
     End(EndCommand),
@@ -323,6 +326,18 @@ pub(crate) struct AgentAddCommand {
     /// The agent to start, and its arguments, after `--`.
     #[arg(last = true, required = true, value_name = "COMMAND")]
     pub(crate) command: Vec<OsString>,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct LandCommand {
+    /// The thread, as `mahi threads` lists it.
+    pub(crate) thread: ThreadId,
+    /// An agent whose work to land, as `<participant>.<agent>`; every agent when left out.
+    #[arg(long, value_name = "PARTICIPANT.AGENT")]
+    pub(crate) from: Vec<AgentSlot>,
+    /// The branch to land on, `mahi/<thread>` when left out.
+    #[arg(long, value_name = "BRANCH")]
+    pub(crate) branch: Option<String>,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]

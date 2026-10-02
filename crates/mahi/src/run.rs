@@ -402,7 +402,7 @@ pub(crate) enum RunError {
 }
 
 #[derive(Debug)]
-struct Host {
+pub(crate) struct Host {
     holders: Vec<PathBuf>,
     private: Vec<PathBuf>,
 }
@@ -868,7 +868,7 @@ pub(crate) fn source_snapshot(
 }
 
 /// Asks for the passphrase of the user's mahi key and opens `meta`'s thread key with it.
-fn unlock_thread_key(
+pub(crate) fn unlock_thread_key(
     meta: &VerifiedMeta,
     participant: &ParticipantName,
     config: &ConfigDir,
@@ -1866,7 +1866,7 @@ fn check_profile(
 /// Returns the directory that holds this repository's thread worktrees, under the user's
 /// worktree root, after checking that it is not a private place and making sure it is a
 /// directory of the user's that only the user can use.
-fn worktree_dir(
+pub(crate) fn worktree_dir(
     environment: &Environment,
     host: &Host,
     git_dir: &Path,
@@ -2191,7 +2191,7 @@ impl Launch<'_> {
 }
 
 impl Host {
-    fn from_environment(environment: &Environment) -> Result<Self, RunError> {
+    pub(crate) fn from_environment(environment: &Environment) -> Result<Self, RunError> {
         let canonical = |path: Option<&Path>| path.and_then(|path| fs::canonicalize(path).ok());
         let home = canonical(environment.home.as_deref()).ok_or(RunError::NoHome)?;
         let mut holders = vec![home.clone()];

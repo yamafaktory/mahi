@@ -138,7 +138,7 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
         .map_err(|error| EndError::ThreadOwner(thread, error))?;
     let lock = match ThreadLock::acquire(&config, thread) {
         Ok(lock) => lock,
-        Err(LockError::Busy(_) | LockError::AgentBusy(..)) => {
+        Err(LockError::Busy(_) | LockError::AgentBusy(..) | LockError::LandBusy(_)) => {
             return Err(EndError::Running(thread));
         }
         Err(LockError::Io(error)) => return Err(EndError::Lock(error)),
