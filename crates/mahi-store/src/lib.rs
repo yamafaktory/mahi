@@ -7,6 +7,7 @@ mod changes;
 mod fetch;
 #[cfg(fuzzing)]
 pub mod fuzzing;
+mod merge;
 mod push;
 mod snapshot;
 mod store;
@@ -25,6 +26,14 @@ pub use gix::{
     ObjectId,
     objs::tree::EntryKind,
     protocol::transport::client::blocking_io::Transport,
+};
+pub use merge::{
+    Applied,
+    Conflict,
+    Left,
+    MAX_MERGE_WRITE_BYTES,
+    MAX_MERGED_PATHS,
+    Merged,
 };
 pub use push::Pushed;
 pub use snapshot::{

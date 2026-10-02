@@ -86,6 +86,7 @@ use sha2::{
 use crate::{
     Store,
     StoreError,
+    merge::TEMPORARY_PREFIX,
     store::open_options,
 };
 
@@ -523,6 +524,7 @@ impl<'a> Walk<'a> {
                 && entry_name != b".."
                 && entry_name != b".git"
                 && !entry_name.starts_with(STAMP_PREFIX.as_bytes())
+                && !entry_name.starts_with(TEMPORARY_PREFIX.as_bytes())
             {
                 names.push(entry_name.to_vec());
             }

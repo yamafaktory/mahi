@@ -190,6 +190,9 @@ pub enum StoreError {
     /// Two tree entries have the same name.
     #[error("duplicate tree entry name {0:?}")]
     DuplicateEntryName(String),
+    /// A side of a merge changes more paths than mahi merges.
+    #[error("tree {0} changes more paths than mahi merges")]
+    MergeTooLarge(ObjectId),
 }
 
 impl Store {
