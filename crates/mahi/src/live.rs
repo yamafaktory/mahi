@@ -757,23 +757,29 @@ impl HostHandle {
 /// Returns the path of the socket the host of `thread`'s live layer serves the user's other
 /// mahis on, in mahi's private directory in `runtime`, creating that directory.
 pub(crate) fn hub_socket(runtime: &Path, thread: ThreadId) -> io::Result<PathBuf> {
+    private_socket(runtime, &format!("{thread}.sock"))
+}
+
+/// Returns the path of the socket `name` in mahi's private directory in `runtime`, creating
+/// that directory, or an error when the path is too long for a socket.
+pub(crate) fn private_socket(runtime: &Path, name: &str) -> io::Result<PathBuf> {
     let parent = rustix::fs::open(
         runtime,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    let name = format!("mahi-{}", rustix::process::geteuid().as_raw());
-    profile::open_private_dir(&parent, &name)?.ok_or_else(|| {
+    let directory = format!("mahi-{}", rustix::process::geteuid().as_raw());
+    profile::open_private_dir(&parent, &directory)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             "mahi's runtime directory is not a private directory",
         )
     })?;
-    let socket = runtime.join(name).join(format!("{thread}.sock"));
+    let socket = runtime.join(directory).join(name);
     if socket.as_os_str().len() > MAX_SOCKET_PATH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the path of the socket for the user's other mahis is too long",
+            "the path of mahi's socket is too long",
         ));
     }
     Ok(socket)

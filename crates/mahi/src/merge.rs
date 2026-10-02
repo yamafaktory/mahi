@@ -7,7 +7,6 @@ use std::{
 };
 
 use mahi_core::{
-    AgentName,
     AgentSlot,
     NameError,
     ParticipantName,
@@ -50,6 +49,10 @@ use thiserror::Error;
 use crate::{
     cli::MergeCommand,
     environment::Environment,
+    merge_door::{
+        self,
+        DoorError,
+    },
     merged::MergedFrom,
     run::{
         self,
@@ -69,6 +72,8 @@ use crate::{
 
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const LISTED: usize = 20;
+const LISTED_IN_PROMPT: usize = 10;
+const LONGEST_LISTED: usize = 200;
 
 #[derive(Debug, Error)]
 pub(crate) enum MergeError {
@@ -94,8 +99,12 @@ pub(crate) enum MergeError {
     Meta(ThreadId, #[source] Box<ThreadError>),
     #[error("{0} cannot be merged into itself")]
     SameAgent(AgentSlot),
-    #[error("{1} is running; merging into a running agent is not supported yet")]
-    Running(ThreadId, AgentName),
+    #[error("thread {0} is locked by another mahi command; try again once it is done")]
+    ThreadBusy(ThreadId),
+    #[error("cannot find the socket of the mahi running the agent")]
+    Door(#[source] io::Error),
+    #[error(transparent)]
+    Ask(#[from] DoorError),
     #[error("cannot lock the agent")]
     Lock(#[source] io::Error),
     #[error("thread {0} does not list {1}")]
@@ -108,6 +117,8 @@ pub(crate) enum MergeError {
     TooManySources(AgentSlot),
     #[error("cannot catch the signals that stop mahi")]
     Signals(#[source] SignalError),
+    #[error("the agent's mahi stopped recording before it could merge")]
+    RecorderGone,
 }
 
 /// What `mahi merge` did: its report, or the signal that stopped it, with the report of a
@@ -118,22 +129,53 @@ pub(crate) enum Outcome {
     Stopped(Termination, Option<String>),
 }
 
-/// The agent whose work is merged: its slot and its latest snapshot's tree.
-struct Source<'a> {
-    slot: &'a AgentSlot,
-    tree: ObjectId,
+/// What a merge brings into an agent's worktree: the latest snapshot of the agent `from`,
+/// already checked to be signed by the key the thread lists for it, and the thread's base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MergeRequest {
+    pub(crate) from: AgentSlot,
+    pub(crate) commit: ObjectId,
+    pub(crate) thread_base: ObjectId,
 }
 
-/// The agent merged into: its slot, worktree name and snapshots, and what it merged so far.
-struct Target<'a> {
-    slot: &'a AgentSlot,
-    worktree: &'a str,
-    snapshots: &'a ThreadRef,
-    merged: MergedFrom,
+/// Where a merge writes: the agent's slot, worktree and snapshots, and how its snapshots are
+/// taken and signed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Recording<'a> {
+    pub(crate) slot: &'a AgentSlot,
+    pub(crate) worktree: &'a str,
+    pub(crate) snapshots: &'a ThreadRef,
+    pub(crate) globals: &'a GlobalPatterns,
+    pub(crate) commits: &'a CommitKey,
+}
+
+/// What a merge did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MergeDone {
+    /// The agent already has the requested snapshot; nothing changed.
+    Already(String),
+    /// The merge was written and recorded in the snapshot `commit` of the tree `tree`.
+    Merged {
+        report: String,
+        commit: ObjectId,
+        tree: ObjectId,
+        /// What to ask the agent when the merge left conflicts.
+        prompt: Option<String>,
+    },
+}
+
+impl MergeDone {
+    /// Returns what to tell the user.
+    pub(crate) fn report(&self) -> &str {
+        match self {
+            Self::Already(report) | Self::Merged { report, .. } => report,
+        }
+    }
 }
 
 /// Merges the latest snapshot of `command.from` into the worktree of one of the user's agents
-/// in `command.thread`, which must not be running, and records the merge in a snapshot.
+/// in `command.thread` and records the merge in a snapshot; when the agent runs, its mahi
+/// merges, once the agent is idle.
 pub(crate) fn merge(
     command: &MergeCommand,
     environment: &Environment,
@@ -159,11 +201,10 @@ pub(crate) fn merge(
     if into == command.from {
         return Err(MergeError::SameAgent(into));
     }
-    let _lock = match AgentLock::acquire(&config, thread, into.agent()) {
-        Ok(lock) => lock,
-        Err(LockError::Busy(_) | LockError::AgentBusy(..)) => {
-            return Err(MergeError::Running(thread, into.agent().clone()));
-        }
+    let lock = match AgentLock::acquire(&config, thread, into.agent()) {
+        Ok(lock) => Some(lock),
+        Err(LockError::AgentBusy(..)) => None,
+        Err(LockError::Busy(_)) => return Err(MergeError::ThreadBusy(thread)),
         Err(LockError::Io(error)) => return Err(MergeError::Lock(error)),
     };
     let fetched = run::listed_and_fetched(
@@ -187,7 +228,7 @@ pub(crate) fn merge(
         .find(|listed| listed.name() == command.from.participant())
         .map(|listed| listed.key().clone())
         .ok_or_else(|| MergeError::SourceNotListed(thread, command.from.participant().clone()))?;
-    let (commit, tree) = run::source_snapshot(&store, &meta, &command.from).map_err(Box::new)?;
+    let (commit, _) = run::source_snapshot(&store, &meta, &command.from).map_err(Box::new)?;
     if !signed_by(&store, commit, &source_key).unwrap_or(false) {
         return Err(MergeError::NotSigned(command.from.clone()));
     }
@@ -198,79 +239,164 @@ pub(crate) fn merge(
         Err(error) => return Err(error.into()),
     }
     let snapshots = ThreadRef::new(thread, RefKind::Snapshots(into.clone()));
-    let mut merged = MergedFrom::read(&store, &snapshots)?;
-    let base = match merged.of(&command.from) {
-        Some(last) if store.descends_from(commit, last)? => last,
-        _ => meta.base(),
+    let request = MergeRequest {
+        from: command.from.clone(),
+        commit,
+        thread_base: meta.base(),
     };
-    if base == commit {
-        return Ok(Outcome::Done(format!(
-            "{into} already has the latest snapshot of {}\n",
-            command.from
-        )));
+    if lock.is_none() {
+        return ask_running(&store, environment, (&into, &snapshots), &request);
     }
-    if !merged.record(command.from.clone(), commit) {
-        return Err(MergeError::TooManySources(into));
-    }
-    let base_tree = store.commit_tree(base)?;
     let termination = TerminationSignals::listen().map_err(MergeError::Signals)?;
     let globals = environment.git_patterns();
-    let source = Source {
-        slot: &command.from,
-        tree,
-    };
-    let target = Target {
+    let recording = Recording {
         slot: &into,
         worktree: &worktree,
         snapshots: &snapshots,
-        merged,
+        globals: &globals,
+        commits: &commits,
     };
-    let (report, caught) = until_stopped(&termination, |interrupt| {
-        merge_into(
+    let (done, caught) = until_stopped(&termination, |interrupt| {
+        let head = store.head(&snapshots)?;
+        merge_now(
             &store,
-            (source, target),
-            base_tree,
-            (&globals, &commits),
+            recording,
+            &request,
+            (&mut SnapshotCache::default(), head),
             interrupt,
         )
     });
+    let report = done.map(|done| done.report().to_owned());
     if let Some(signal) = caught {
         return Ok(Outcome::Stopped(signal, report.ok()));
     }
     Ok(Outcome::Done(report?))
 }
 
-/// Merges `source` into `target`'s worktree from `base`, then records the result in a
-/// snapshot carrying `target`'s trailers, which already name `source`'s snapshot, and returns
-/// the report. Once the worktree is written, the snapshot is taken even if `interrupt` is set,
-/// so a merge is never left unrecorded.
-fn merge_into(
+/// Asks the mahi running `into`, whose snapshots are `snapshots`, to merge `request` once the
+/// agent is idle, unless it already has that snapshot.
+fn ask_running(
     store: &Store,
-    (source, target): (Source<'_>, Target<'_>),
-    base: ObjectId,
-    (globals, commits): (&GlobalPatterns, &CommitKey),
+    environment: &Environment,
+    (into, snapshots): (&AgentSlot, &ThreadRef),
+    request: &MergeRequest,
+) -> Result<Outcome, MergeError> {
+    let merged = MergedFrom::read(store, snapshots)?;
+    if merge_base(store, &merged, request)? == request.commit {
+        return Ok(Outcome::Done(already(into, request).report().to_owned()));
+    }
+    let door = merge_door::door_path(&environment.runtime_dir(), snapshots.thread(), into.agent())
+        .map_err(MergeError::Door)?;
+    eprintln!(
+        "mahi: {} is in use by another mahi; asking it to merge once the agent is idle",
+        into.agent()
+    );
+    Ok(Outcome::Done(merge_door::ask(&door, request)?))
+}
+
+/// Merges `request` into `into`'s worktree, whose snapshots are at `head` and remembered in
+/// `cache`, from the snapshot of `request.from` it last merged, or else the thread's base; then
+/// records the result in a snapshot whose trailers name `request.commit`. Once the worktree is
+/// written, the snapshot is taken even if `interrupt` is set, so a merge is never left
+/// unrecorded.
+pub(crate) fn merge_now(
+    store: &Store,
+    into: Recording<'_>,
+    request: &MergeRequest,
+    (cache, head): (&mut SnapshotCache, Option<ObjectId>),
     interrupt: &AtomicBool,
-) -> Result<String, MergeError> {
-    let mut cache = SnapshotCache::default();
-    let ours = snapshot(store, target.worktree, (globals, &mut cache), interrupt)?;
-    let labels = (target.slot.to_string(), source.slot.to_string());
-    let merged = store.merge_trees(base, ours, source.tree, (&labels.0, &labels.1))?;
-    let applied = store.apply_merge(target.worktree, ours, merged.tree, interrupt)?;
-    let after = snapshot(
+) -> Result<MergeDone, MergeError> {
+    let mut merged_from = MergedFrom::read(store, into.snapshots)?;
+    let base = merge_base(store, &merged_from, request)?;
+    if base == request.commit {
+        return Ok(already(into.slot, request));
+    }
+    if !merged_from.record(request.from.clone(), request.commit) {
+        return Err(MergeError::TooManySources(into.slot.clone()));
+    }
+    let (base, theirs) = (store.commit_tree(base)?, store.commit_tree(request.commit)?);
+    let ours = snapshot(store, into.worktree, (into.globals, cache), interrupt)?;
+    let labels = (into.slot.to_string(), request.from.to_string());
+    let merged = store.merge_trees(base, ours, theirs, (&labels.0, &labels.1))?;
+    let applied = store.apply_merge(into.worktree, ours, merged.tree, interrupt)?;
+    let tree = snapshot(
         store,
-        target.worktree,
-        (globals, &mut cache),
+        into.worktree,
+        (into.globals, cache),
         &AtomicBool::new(false),
     )?;
-    let head = store.head(target.snapshots)?;
-    store.append_signed(
-        target.snapshots,
+    let commit = store.append_signed(
+        into.snapshots,
         head,
-        after,
-        &target.merged.message(),
-        commits.signer(),
+        tree,
+        &merged_from.message(),
+        into.commits.signer(),
     )?;
-    Ok(report(source.slot, target.slot, &merged, &applied))
+    Ok(MergeDone::Merged {
+        report: report(&request.from, into.slot, &merged, &applied),
+        commit,
+        tree,
+        prompt: conflict_prompt(&request.from, &merged),
+    })
+}
+
+/// Returns the snapshot a merge of `request` starts from: the snapshot of `request.from` that
+/// `merged` says was merged last, when the requested one descends from it, or else the
+/// thread's base.
+fn merge_base(
+    store: &Store,
+    merged: &MergedFrom,
+    request: &MergeRequest,
+) -> Result<ObjectId, StoreError> {
+    Ok(match merged.of(&request.from) {
+        Some(last) if store.descends_from(request.commit, last)? => last,
+        _ => request.thread_base,
+    })
+}
+
+fn already(into: &AgentSlot, request: &MergeRequest) -> MergeDone {
+    MergeDone::Already(format!(
+        "{into} already has the latest snapshot of {}\n",
+        request.from
+    ))
+}
+
+/// Returns what to ask the agent after a merge that left conflicts: to resolve the markers,
+/// and to look at the files where its side was kept.
+fn conflict_prompt(from: &AgentSlot, merged: &Merged) -> Option<String> {
+    if merged.conflicts.is_empty() {
+        return None;
+    }
+    let mut prompt = format!(
+        "mahi merged the latest work of {from} into this worktree, and some changes conflict.\n"
+    );
+    let markers = merged
+        .conflicts
+        .iter()
+        .filter(|(_, conflict)| *conflict == Conflict::Markers)
+        .map(|(path, _)| path);
+    list(
+        &mut prompt,
+        (
+            format_args!("Resolve the conflict markers in"),
+            LISTED_IN_PROMPT,
+        ),
+        markers,
+    );
+    let kept = merged
+        .conflicts
+        .iter()
+        .filter(|(_, conflict)| *conflict == Conflict::KeptOurs)
+        .map(|(path, _)| path);
+    list(
+        &mut prompt,
+        (
+            format_args!("Your version was kept, but {from} changed these too; check them"),
+            LISTED_IN_PROMPT,
+        ),
+        kept,
+    );
+    Some(prompt)
 }
 
 fn snapshot(
@@ -307,7 +433,7 @@ pub(crate) fn report(
         .map(|(path, _)| path);
     list(
         &mut report,
-        format_args!("conflict markers to resolve in"),
+        (format_args!("conflict markers to resolve in"), LISTED),
         markers,
     );
     let kept = merged
@@ -315,7 +441,11 @@ pub(crate) fn report(
         .iter()
         .filter(|(_, conflict)| *conflict == Conflict::KeptOurs)
         .map(|(path, _)| path);
-    list(&mut report, format_args!("kept {into}'s side of"), kept);
+    list(
+        &mut report,
+        (format_args!("kept {into}'s side of"), LISTED),
+        kept,
+    );
     for (why, label) in [
         (Left::UnsafeName, "names git refuses to check out"),
         (Left::TooDeep, "nested too deep"),
@@ -330,7 +460,7 @@ pub(crate) fn report(
             .map(|(path, _)| path);
         list(
             &mut report,
-            format_args!("left as they were ({label})"),
+            (format_args!("left as they were ({label})"), LISTED),
             paths,
         );
     }
@@ -339,7 +469,7 @@ pub(crate) fn report(
 
 fn list<'a, T: std::fmt::Debug + 'a>(
     report: &mut String,
-    heading: std::fmt::Arguments<'_>,
+    (heading, most): (std::fmt::Arguments<'_>, usize),
     paths: impl Iterator<Item = &'a T>,
 ) {
     let mut count = 0;
@@ -347,13 +477,22 @@ fn list<'a, T: std::fmt::Debug + 'a>(
         if count == 0 {
             let _ = write!(report, "{heading}:");
         }
-        if count < LISTED {
+        if count < most {
+            let start = report.len();
             let _ = write!(report, " {path:?}");
+            if report.len() - start > LONGEST_LISTED {
+                let mut end = start + LONGEST_LISTED;
+                while !report.is_char_boundary(end) {
+                    end -= 1;
+                }
+                report.truncate(end);
+                report.push_str("...");
+            }
         }
         count += 1;
     }
-    if count > LISTED {
-        let _ = write!(report, " and {} more", count - LISTED);
+    if count > most {
+        let _ = write!(report, " and {} more", count - most);
     }
     if count > 0 {
         report.push('\n');
@@ -401,5 +540,47 @@ mod tests {
         );
         assert!(report.contains("\"p19\" and 5 more\n"), "{report}");
         assert!(!report.contains('\x1b'));
+    }
+
+    #[test]
+    fn the_prompt_after_a_merge_names_the_files_to_resolve_and_to_check_or_is_not_asked() {
+        let from: AgentSlot = "bob.codex".parse().unwrap();
+        let mut merged = Merged {
+            tree: ObjectId::empty_tree(gix::hash::Kind::Sha1),
+            conflicts: Vec::new(),
+        };
+        assert_eq!(conflict_prompt(&from, &merged), None);
+        merged.conflicts = vec![
+            (BString::from("a.txt"), Conflict::Markers),
+            (BString::from("image.bin"), Conflict::KeptOurs),
+        ];
+        let prompt = conflict_prompt(&from, &merged).unwrap();
+        assert!(
+            prompt.starts_with("mahi merged the latest work of bob.codex"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Resolve the conflict markers in: \"a.txt\"\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("bob.codex changed these too; check them: \"image.bin\"\n"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_long_path_is_cut_short_in_the_report() {
+        let from: AgentSlot = "bob.codex".parse().unwrap();
+        let into: AgentSlot = "alice.claude".parse().unwrap();
+        let long = "\u{e9}".repeat(400);
+        let merged = Merged {
+            tree: ObjectId::empty_tree(gix::hash::Kind::Sha1),
+            conflicts: vec![(BString::from(long.as_str()), Conflict::Markers)],
+        };
+        let report = report(&from, &into, &merged, &Applied::default());
+        let line = report.lines().nth(1).unwrap();
+        assert!(line.ends_with("..."), "{line}");
+        assert!(line.len() < "conflict markers to resolve in:".len() + LONGEST_LISTED + 4);
     }
 }

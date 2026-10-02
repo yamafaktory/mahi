@@ -78,6 +78,8 @@ use mahi_identity::{
 use mahi_live::{
     HostAddress,
     LiveKeys,
+    PromptOutcome,
+    PromptText,
     Relays,
 };
 use mahi_proxy::HostName;
@@ -161,12 +163,18 @@ use crate::{
     inject::{
         self,
         Activity,
+        AgentInput,
         Pace,
     },
     live::{
         self,
         HostError,
         LiveSetup,
+    },
+    merge::MergeDone,
+    merge_door::{
+        self,
+        MergeDoor,
     },
     merged::MergedFrom,
     network::{
@@ -191,6 +199,7 @@ use crate::{
         Prompts,
     },
     recorder::{
+        Merger,
         RecordError,
         Recorder,
         Target,
@@ -878,10 +887,7 @@ fn live_setup(
     };
     Ok(Some(LiveSetup {
         config: config.clone(),
-        runtime: environment
-            .xdg_runtime_dir
-            .clone()
-            .unwrap_or_else(|| environment.temp_dir.clone()),
+        runtime: environment.runtime_dir(),
         node_key: NodeKey::load(&config.node_key_file()).map_err(RunError::NotInitialised)?,
         owner,
         relays,
@@ -1254,6 +1260,7 @@ impl Prepared {
             credentials: &self.credentials,
         };
         let (sandbox, network) = (self.sandbox, self.network);
+        let door = open_door(environment, &started);
         let live = start_live(self.live.take(), &self.git_dir, &started);
         let launched = started.launch(&self.store, || launch.spawn(sandbox, network));
         let (child, raw, proxy) = match launched {
@@ -1280,6 +1287,13 @@ impl Prepared {
             pusher.as_ref().map(|(pusher, _)| pusher.poker()),
             session,
         );
+        let merging = door
+            .zip(recorder.as_ref().map(Recorder::merger))
+            .map(|(door, merger)| Merging {
+                door,
+                merger,
+                own: started.slot.participant().clone(),
+            });
         finish_run(
             child,
             raw,
@@ -1299,11 +1313,129 @@ impl Prepared {
                 recorder,
                 turns,
                 pusher,
+                merging,
             },
             proxy,
             live,
         )
     }
+}
+
+/// Opens the door `mahi merge` reaches `started`'s running agent at; a failure is reported,
+/// and the agent runs without it.
+fn open_door(environment: &Environment, started: &Started) -> Option<MergeDoor> {
+    merge_door::door_path(
+        &environment.runtime_dir(),
+        started.thread,
+        started.slot.agent(),
+    )
+    .and_then(MergeDoor::open)
+    .inspect_err(|error| {
+        eprintln!("mahi: work cannot be merged into this agent while it runs: {error}");
+    })
+    .ok()
+}
+
+/// What lets `mahi merge` reach the running agent: the door it asks at, the recorder that
+/// merges between its snapshots, and the user, whose name a prompt about conflicts carries.
+struct Merging {
+    door: MergeDoor,
+    merger: Merger,
+    own: ParticipantName,
+}
+
+/// Merges what `mahi merge` asks at `merging`'s door while `serving` is set, each once the
+/// agent is idle and with its input held, and queues a prompt about conflicts in `prompts`.
+fn serve_merges(
+    merging: &Merging,
+    (activity, agent, writer): (&Activity, &impl AgentInput, &Mutex<impl Write>),
+    serving: &AtomicBool,
+    prompts: Option<&Prompts>,
+) {
+    merging.door.serve(serving, |request, waiting| {
+        let done = inject::when_idle(activity, agent, writer, (serving, Pace::default()), || {
+            waiting().then(|| merging.merger.merge(request))
+        });
+        match done {
+            None => Err("the agent ended before it was idle".to_owned()),
+            Some(None) => Err("the merge was called off".to_owned()),
+            Some(Some(Err(error))) => Err(crate::describe(&error)),
+            Some(Some(Ok(done))) => Ok(after_merge(&done, prompts, &merging.own)),
+        }
+    });
+}
+
+/// The thread serving merges at the running agent's door, if there is one.
+struct MergeServer {
+    serving: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl MergeServer {
+    /// Stops serving and waits for the thread, which removes the door.
+    fn stop(self) {
+        self.serving.store(false, Ordering::SeqCst);
+        if let Some(thread) = self.thread {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Serves merges at `merging`'s door on a thread of its own, if there is one.
+fn spawn_merges<A: AgentInput + Send + Sync + 'static, W: Write + Send + 'static>(
+    merging: Option<Merging>,
+    (activity, agent, writer): (Arc<Activity>, Arc<A>, Arc<Mutex<W>>),
+    prompts: Option<Arc<Prompts>>,
+) -> MergeServer {
+    let serving = Arc::new(AtomicBool::new(true));
+    let thread = merging.map(|merging| {
+        let flag = Arc::clone(&serving);
+        thread::spawn(move || {
+            serve_merges(
+                &merging,
+                (&activity, &*agent, &writer),
+                &flag,
+                prompts.as_deref(),
+            );
+        })
+    });
+    MergeServer { serving, thread }
+}
+
+/// Returns the report of a merge made while the agent runs, after queueing in `prompts`, the
+/// palette's, the prompt asking the agent to resolve the conflicts it left, saying whether it
+/// waits there.
+fn after_merge(done: &MergeDone, prompts: Option<&Prompts>, own: &ParticipantName) -> String {
+    let mut report = done.report().to_owned();
+    let MergeDone::Merged {
+        prompt: Some(prompt),
+        ..
+    } = done
+    else {
+        return report;
+    };
+    let told = match prompts.map(|prompts| queue_own_prompt(prompts, own, prompt)) {
+        None => {
+            "the agent was not asked to resolve the conflicts: there is no palette to queue the \
+             prompt in (it or the live layer is off)\n"
+        }
+        Some(PromptOutcome::Queued) => {
+            "a prompt asking the agent to resolve the conflicts waits in its palette\n"
+        }
+        Some(PromptOutcome::Accepted) => {
+            "a prompt asking the agent to resolve the conflicts goes to it once it is idle\n"
+        }
+        Some(_) => "the prompt asking the agent to resolve the conflicts could not be queued\n",
+    };
+    report.push_str(told);
+    report
+}
+
+fn queue_own_prompt(prompts: &Prompts, own: &ParticipantName, prompt: &str) -> PromptOutcome {
+    let (Ok(id), Ok(text)) = (mahi_live::prompt_id(), PromptText::new(prompt.to_owned())) else {
+        return PromptOutcome::Dropped;
+    };
+    prompts.offer(own.clone(), id, text)
 }
 
 /// Joins the live layer for `started`'s agent, unless it is off; a failure is reported, and the
@@ -1336,6 +1468,7 @@ fn start_background(
         Recorder::start(
             Target {
                 git_dir: git_dir.to_path_buf(),
+                slot: started.slot.clone(),
                 worktree: session::worktree_name(started.thread, started.slot.agent()),
                 snapshots: started.snapshots.clone(),
                 globals,
@@ -1376,6 +1509,7 @@ struct Background {
     recorder: Option<Recorder>,
     turns: Option<TurnWorker>,
     pusher: Option<(Pusher, RemoteName)>,
+    merging: Option<Merging>,
 }
 
 fn finish_turns(turns: Option<TurnWorker>) {
@@ -1422,13 +1556,17 @@ fn finish_run(
         recorder,
         turns,
         pusher,
+        merging,
     } = background;
     let (code, received) = supervise(
         child,
         raw,
         user,
         termination,
-        live.as_ref().map(|live| (live.tap(), live.prompts())),
+        (
+            live.as_ref().map(|live| (live.tap(), live.prompts())),
+            merging,
+        ),
     );
     if let Some(live) = live {
         live.stop();
@@ -1474,7 +1612,7 @@ fn supervise(
     raw: Option<RawMode>,
     user: &UserSide,
     termination: TerminationSignals,
-    live: Option<(OutputTap, Arc<Prompts>)>,
+    (live, merging): (Option<(OutputTap, Arc<Prompts>)>, Option<Merging>),
 ) -> (Result<Outcome, RunError>, Receiver<Event>) {
     let (events, received) = mpsc::channel();
     let stop_events = events.clone();
@@ -1491,7 +1629,7 @@ fn supervise(
         &user.activity,
         (events, &received),
         tap,
-        prompts,
+        (prompts, merging),
     );
     drop(raw);
     (code, received)
@@ -1867,7 +2005,7 @@ fn relay(
     activity: &Arc<Activity>,
     (events, received): (mpsc::Sender<Event>, &Receiver<Event>),
     tap: Option<OutputTap>,
-    prompts: Option<Arc<Prompts>>,
+    (prompts, merging): (Option<Arc<Prompts>>, Option<Merging>),
 ) -> Result<Outcome, RunError> {
     let writer = Arc::new(Mutex::new(child.writer()?));
     let repainter = Repainter::new(child.resizer()?);
@@ -1902,6 +2040,15 @@ fn relay(
             }
         }
     });
+    let merges = spawn_merges(
+        merging,
+        (
+            Arc::clone(activity),
+            Arc::clone(&screen),
+            Arc::clone(&writer),
+        ),
+        prompts.clone().filter(|_| palette.is_some()),
+    );
     if let Some(prompts) = prompts.filter(|_| palette.is_some()) {
         let (screen, activity, running) = (
             Arc::clone(&screen),
@@ -1955,6 +2102,7 @@ fn relay(
     });
     let outcome = await_outcome(&child, received, &progress);
     running.store(false, Ordering::SeqCst);
+    merges.stop();
     let _ = screen.close();
     outcome
 }
@@ -2558,5 +2706,38 @@ mod tests {
         )
         .unwrap();
         assert!(binds.contains(&(project.join(".git"), Access::ReadOnly)));
+    }
+
+    #[test]
+    fn a_merge_with_conflicts_queues_a_prompt_from_the_user_and_says_so() {
+        let own = ParticipantName::new("tester").unwrap();
+        let merged = |prompt: Option<String>| MergeDone::Merged {
+            report: "merged\n".to_owned(),
+            commit: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
+            tree: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
+            prompt,
+        };
+        let prompts = Prompts::default();
+        let resolve = Some("resolve the markers in a.txt".to_owned());
+        let report = after_merge(&merged(resolve.clone()), Some(&prompts), &own);
+        assert_eq!(
+            report,
+            "merged\na prompt asking the agent to resolve the conflicts waits in its palette\n"
+        );
+        let mut waiting = Vec::new();
+        prompts.each_waiting(|prompt| {
+            waiting.push((prompt.from.clone(), prompt.text.as_str().to_owned()));
+        });
+        assert_eq!(waiting, [(own.clone(), resolve.clone().unwrap())]);
+        assert!(
+            after_merge(&merged(resolve), None, &own).ends_with("(it or the live layer is off)\n")
+        );
+        let huge = Some("x".repeat(mahi_live::MAX_PROMPT_BYTES + 1));
+        assert!(
+            after_merge(&merged(huge), Some(&prompts), &own).ends_with("could not be queued\n")
+        );
+        assert_eq!(after_merge(&merged(None), Some(&prompts), &own), "merged\n");
+        let already = MergeDone::Already("already\n".to_owned());
+        assert_eq!(after_merge(&already, Some(&prompts), &own), "already\n");
     }
 }

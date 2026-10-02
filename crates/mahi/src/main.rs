@@ -15,6 +15,7 @@ mod invite;
 mod join;
 mod live;
 mod merge;
+mod merge_door;
 mod merged;
 mod network;
 mod palette;
@@ -196,10 +197,21 @@ fn report_with(context: &str, error: &dyn Error) {
 }
 
 fn report_message(mut message: String, error: &dyn Error) {
+    causes(&mut message, error);
+    eprintln!("{message}");
+}
+
+/// Returns `error` followed by its causes, each after a colon.
+pub(crate) fn describe(error: &dyn Error) -> String {
+    let mut message = error.to_string();
+    causes(&mut message, error);
+    message
+}
+
+fn causes(message: &mut String, error: &dyn Error) {
     let mut source = error.source();
     while let Some(cause) = source {
         let _ = write!(message, ": {cause}");
         source = cause.source();
     }
-    eprintln!("{message}");
 }

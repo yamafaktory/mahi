@@ -3,6 +3,11 @@ use std::{
     sync::{
         Arc,
         atomic::AtomicBool,
+        mpsc::{
+            self,
+            Receiver,
+            Sender,
+        },
     },
     thread::{
         self,
@@ -10,7 +15,10 @@ use std::{
     },
 };
 
-use mahi_core::ThreadRef;
+use mahi_core::{
+    AgentSlot,
+    ThreadRef,
+};
 use mahi_schedule::{
     Poker,
     Schedule,
@@ -24,10 +32,19 @@ use mahi_store::{
 };
 use thiserror::Error;
 
-use crate::session::{
-    CommitKey,
-    Recorded,
-    SNAPSHOT_MESSAGE,
+use crate::{
+    merge::{
+        self,
+        MergeDone,
+        MergeError,
+        MergeRequest,
+        Recording,
+    },
+    session::{
+        CommitKey,
+        Recorded,
+        SNAPSHOT_MESSAGE,
+    },
 };
 
 const FINAL_ATTEMPTS: usize = 3;
@@ -38,12 +55,41 @@ pub(crate) struct Recorder {
     poker: Poker,
     worker: JoinHandle<Result<usize, RecordError>>,
     abandon: Arc<AtomicBool>,
+    merges: Sender<MergeJob>,
+}
+
+/// A merge the recorder makes between its snapshots, and where it says what came of it.
+#[derive(Debug)]
+struct MergeJob {
+    request: MergeRequest,
+    done: mpsc::SyncSender<Result<MergeDone, MergeError>>,
+}
+
+/// Asks the recorder to merge another agent's snapshot into the worktree it records, so the
+/// merge and its snapshot come between the recorder's own snapshots.
+#[derive(Debug, Clone)]
+pub(crate) struct Merger {
+    poker: Poker,
+    merges: Sender<MergeJob>,
+}
+
+impl Merger {
+    /// Merges `request` and waits for what came of it.
+    pub(crate) fn merge(&self, request: MergeRequest) -> Result<MergeDone, MergeError> {
+        let (done, outcome) = mpsc::sync_channel(1);
+        self.merges
+            .send(MergeJob { request, done })
+            .map_err(|_| MergeError::RecorderGone)?;
+        self.poker.poke();
+        outcome.recv().map_err(|_| MergeError::RecorderGone)?
+    }
 }
 
 /// Where a [`Recorder`] reads and writes.
 #[derive(Debug)]
 pub(crate) struct Target {
     pub(crate) git_dir: PathBuf,
+    pub(crate) slot: AgentSlot,
     pub(crate) worktree: String,
     pub(crate) snapshots: ThreadRef,
     pub(crate) globals: GlobalPatterns,
@@ -64,17 +110,27 @@ impl Recorder {
         let (scheduler, poker) = Scheduler::new(schedule);
         let abandon = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&abandon);
-        let worker = thread::spawn(move || record(&target, first, scheduler, &stop));
+        let (merges, jobs) = mpsc::channel();
+        let worker = thread::spawn(move || record(&target, first, (scheduler, &jobs), &stop));
         Self {
             poker,
             worker,
             abandon,
+            merges,
         }
     }
 
     /// Returns a handle that asks for a snapshot soon, as when the agent used a tool.
     pub(crate) fn poker(&self) -> Poker {
         self.poker.clone()
+    }
+
+    /// Returns a handle that has the recorder merge another agent's work into the worktree.
+    pub(crate) fn merger(&self) -> Merger {
+        Merger {
+            poker: self.poker.clone(),
+            merges: self.merges.clone(),
+        }
     }
 
     /// Returns a flag that, once set, stops the snapshot in progress, including the last one.
@@ -93,7 +149,7 @@ impl Recorder {
 fn record(
     target: &Target,
     mut last: Recorded,
-    mut scheduler: Scheduler,
+    (mut scheduler, jobs): (Scheduler, &Receiver<MergeJob>),
     abandon: &AtomicBool,
 ) -> Result<usize, RecordError> {
     let store = Store::open(&target.git_dir)?;
@@ -101,6 +157,15 @@ fn record(
     let mut skipped = 0;
     loop {
         let trigger = scheduler.wait();
+        while let Ok(job) = jobs.try_recv() {
+            let _ = job.done.send(merge_between(
+                &store,
+                target,
+                &mut last,
+                &job.request,
+                abandon,
+            ));
+        }
         let closing = trigger == Trigger::Closed;
         let attempts = if closing { FINAL_ATTEMPTS } else { 1 };
         let outcome = snapshot(&store, target, &mut last, attempts, abandon);
@@ -116,6 +181,34 @@ fn record(
             return first_error.map_or(Ok(skipped), |error| Err(error.into()));
         }
     }
+}
+
+fn merge_between(
+    store: &Store,
+    target: &Target,
+    last: &mut Recorded,
+    request: &MergeRequest,
+    abandon: &AtomicBool,
+) -> Result<MergeDone, MergeError> {
+    let recording = Recording {
+        slot: &target.slot,
+        worktree: &target.worktree,
+        snapshots: &target.snapshots,
+        globals: &target.globals,
+        commits: &target.commits,
+    };
+    let done = merge::merge_now(
+        store,
+        recording,
+        request,
+        (&mut last.cache, Some(last.commit)),
+        abandon,
+    )?;
+    if let MergeDone::Merged { commit, tree, .. } = &done {
+        last.commit = *commit;
+        last.tree = *tree;
+    }
+    Ok(done)
 }
 
 fn settle(outcome: Result<bool, StoreError>, closing: bool) -> (bool, Option<StoreError>) {
@@ -228,6 +321,7 @@ mod tests {
         let recorder = Recorder::start(
             Target {
                 git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
                 worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
@@ -290,6 +384,7 @@ mod tests {
         let recorder = Recorder::start(
             Target {
                 git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
                 worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
@@ -312,6 +407,7 @@ mod tests {
         let recorder = Recorder::start(
             Target {
                 git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
                 worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
@@ -344,6 +440,7 @@ mod tests {
         let recorder = Recorder::start(
             Target {
                 git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
                 worktree: "not-a-worktree".to_owned(),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
@@ -355,6 +452,75 @@ mod tests {
         assert!(matches!(
             recorder.finish(),
             Err(RecordError::Store(StoreError::NotAWorktree(_)))
+        ));
+    }
+
+    #[test]
+    fn a_merge_comes_between_snapshots_and_the_next_one_follows_it() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut started = start_with(&store, &signer).unwrap();
+        let readme = store.write_blob(b"hello\n").unwrap();
+        let notes = store.write_blob(b"from bob\n").unwrap();
+        let theirs = store
+            .write_tree(&[
+                ("README", mahi_store::EntryKind::Blob, readme),
+                ("notes.txt", mahi_store::EntryKind::Blob, notes),
+            ])
+            .unwrap();
+        let bob: mahi_core::AgentSlot = "bob.codex".parse().unwrap();
+        let commit = store
+            .append(
+                &ThreadRef::new(started.thread, mahi_core::RefKind::Snapshots(bob.clone())),
+                None,
+                theirs,
+                SNAPSHOT_MESSAGE,
+            )
+            .unwrap();
+        let recorder = Recorder::start(
+            Target {
+                git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
+                snapshots: started.snapshots.clone(),
+                globals: GlobalPatterns::default(),
+                commits: CommitKey::new(signer.clone()).unwrap(),
+            },
+            started.first_snapshot.take().unwrap(),
+            fast(),
+        );
+        let merger = recorder.merger();
+        let request = MergeRequest {
+            from: bob,
+            commit,
+            thread_base: store.head_commit().unwrap(),
+        };
+        let MergeDone::Merged {
+            commit: merge_commit,
+            prompt,
+            ..
+        } = merger.merge(request.clone()).unwrap()
+        else {
+            panic!("nothing was merged");
+        };
+        assert_eq!(prompt, None);
+        assert_eq!(store.head(&started.snapshots).unwrap(), Some(merge_commit));
+        assert_eq!(
+            fs::read_to_string(started.worktree.join("notes.txt")).unwrap(),
+            "from bob\n"
+        );
+        assert!(matches!(
+            merger.merge(request.clone()).unwrap(),
+            MergeDone::Already(_)
+        ));
+        fs::write(started.worktree.join("later"), "after the merge").unwrap();
+        recorder.finish().unwrap();
+        let last = store.head(&started.snapshots).unwrap().unwrap();
+        assert_ne!(last, merge_commit);
+        assert_eq!(store.parent(last).unwrap(), Some(merge_commit));
+        assert!(matches!(
+            merger.merge(request),
+            Err(MergeError::RecorderGone)
         ));
     }
 }

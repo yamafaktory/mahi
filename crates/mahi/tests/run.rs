@@ -1422,6 +1422,70 @@ printf 'fn parse() { codex }\n' > parser.rs
         );
     }
 
+    const WAITER: &str = r"#!/bin/sh
+printf 'waiting\n'
+touch started
+i=0
+until [ -e done ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done
+cat parser.rs
+";
+
+    #[test]
+    fn a_running_agents_mahi_merges_once_the_agent_is_idle() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let waiter = script(&fixture, "waiting", "codex", WAITER);
+        let running = add_agent_in_background(&fixture, thread.parse().unwrap(), &waiter, "off");
+        let mut codex_tree = PathBuf::new();
+        wait_until("the agent to start", || {
+            fixture
+                .thread_worktrees()
+                .into_iter()
+                .find(|path| path.ends_with(format!("{thread}.codex")))
+                .is_some_and(|path| {
+                    codex_tree = path;
+                    codex_tree.join("started").exists()
+                })
+        });
+        assert!(!codex_tree.join("parser.rs").exists());
+        let merged = merge_report(&fixture, &thread, "tester.claude", "codex");
+        assert!(
+            merged.contains(
+                "codex is in use by another mahi; asking it to merge once the agent is idle"
+            ),
+            "{merged}"
+        );
+        assert!(
+            merged.contains("merged tester.claude into tester.codex: 1 written, 0 removed"),
+            "{merged}"
+        );
+        assert!(codex_tree.join("parser.rs").exists());
+        fs::write(codex_tree.join("done"), "").unwrap();
+        let (code, output) = running.join().unwrap();
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("fn parse() {}"), "{output}");
+
+        let store = Store::open(&fixture.repo).unwrap();
+        let claude_head = store
+            .head(&snapshots_of(&thread, "claude"))
+            .unwrap()
+            .unwrap();
+        let trailer = format!("Mahi-Merged: tester.claude {claude_head}");
+        let recorded = std::iter::successors(
+            store.head(&snapshots_of(&thread, "codex")).unwrap(),
+            |commit| store.parent(*commit).unwrap(),
+        )
+        .any(|commit| {
+            store
+                .commit_message(commit)
+                .unwrap()
+                .to_string()
+                .contains(&trailer)
+        });
+        assert!(recorded);
+        all_signed_by(&store, &snapshots_of(&thread, "codex"), &fixture.owner);
+    }
+
     #[test]
     fn a_merge_into_itself_into_an_unnamed_agent_of_several_or_from_an_unlisted_one_is_refused() {
         let fixture = fixture();
@@ -2489,6 +2553,15 @@ printf 'fn parse() { codex }\n' > parser.rs
         thread: ThreadId,
         agent: &Path,
     ) -> thread::JoinHandle<(i32, String)> {
+        add_agent_in_background(fixture, thread, agent, "local")
+    }
+
+    fn add_agent_in_background(
+        fixture: &Fixture,
+        thread: ThreadId,
+        agent: &Path,
+        live: &str,
+    ) -> thread::JoinHandle<(i32, String)> {
         let mut adding = PtyCommand::new(
             Path::new(env!("CARGO_BIN_EXE_mahi")),
             &fixture.repo,
@@ -2512,7 +2585,7 @@ printf 'fn parse() { codex }\n' > parser.rs
             .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
             .env("SSH_AUTH_SOCK", &fixture.socket)
             .env("USER", "tester")
-            .env("MAHI_LIVE", "local");
+            .env("MAHI_LIVE", live);
         thread::spawn(move || in_terminal_with(adding, Some(PASSPHRASE)))
     }
 

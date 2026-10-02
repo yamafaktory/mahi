@@ -256,6 +256,31 @@ pub(crate) fn give_accepted(
     }
 }
 
+/// Runs `act` once the agent is idle and the palette closed, holding the agent's input while
+/// it runs, so neither the user's keys nor an accepted prompt come in between; returns `None`
+/// if `running` is cleared first.
+pub(crate) fn when_idle<T>(
+    activity: &Activity,
+    agent: &impl AgentInput,
+    writer: &Mutex<impl Write>,
+    (running, pace): (&AtomicBool, Pace),
+    act: impl FnOnce() -> T,
+) -> Option<T> {
+    while running.load(Ordering::SeqCst) {
+        thread::sleep(pace.look_every);
+        let Ok(input) = writer.lock() else {
+            return None;
+        };
+        if agent.palette_open() || !activity.is_idle(&pace) {
+            continue;
+        }
+        let done = act();
+        drop(input);
+        return Some(done);
+    }
+    None
+}
+
 fn type_in(input: &mut impl Write, typed: &[u8], enter_after: Duration) -> io::Result<()> {
     input.write_all(typed)?;
     input.flush()?;
@@ -489,5 +514,48 @@ mod tests {
         });
         running.store(false, Ordering::SeqCst);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn work_waits_for_the_idle_agent_and_holds_its_input_or_gives_up_when_the_run_ends() {
+        let activity = Arc::new(Activity::default());
+        let agent = Arc::new(FakeAgent {
+            palette_open: AtomicBool::new(false),
+        });
+        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let running = Arc::new(AtomicBool::new(true));
+        activity.keys(b"typing");
+        let worker = {
+            let (activity, agent, writer, running) = (
+                Arc::clone(&activity),
+                Arc::clone(&agent),
+                Arc::clone(&writer),
+                Arc::clone(&running),
+            );
+            thread::spawn(move || {
+                let held = Arc::clone(&writer);
+                when_idle(&activity, &*agent, &writer, (&running, fast()), move || {
+                    held.try_lock().is_err()
+                })
+            })
+        };
+        thread::sleep(fast().quiet * 3);
+        assert!(!worker.is_finished());
+        activity.keys(b"\r");
+        assert_eq!(worker.join().unwrap(), Some(true));
+
+        agent.palette_open.store(true, Ordering::SeqCst);
+        let worker = {
+            let (activity, agent, writer, running) = (
+                Arc::clone(&activity),
+                Arc::clone(&agent),
+                Arc::clone(&writer),
+                Arc::clone(&running),
+            );
+            thread::spawn(move || when_idle(&activity, &*agent, &writer, (&running, fast()), || ()))
+        };
+        thread::sleep(fast().quiet * 3);
+        running.store(false, Ordering::SeqCst);
+        assert_eq!(worker.join().unwrap(), None);
     }
 }

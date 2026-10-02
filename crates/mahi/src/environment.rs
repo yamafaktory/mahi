@@ -235,6 +235,14 @@ impl Environment {
             .map(|data| data.join("mahi").join("worktrees"))
     }
 
+    /// Returns the directory mahi keeps its sockets in: `XDG_RUNTIME_DIR`, or else the
+    /// temporary directory.
+    pub(crate) fn runtime_dir(&self) -> PathBuf {
+        self.xdg_runtime_dir
+            .clone()
+            .unwrap_or_else(|| self.temp_dir.clone())
+    }
+
     /// Returns the user's git ignore and attributes files, where git looks for them.
     pub(crate) fn git_patterns(&self) -> GlobalPatterns {
         let git = self
