@@ -70,6 +70,8 @@ use sha2::{
 };
 use thiserror::Error;
 
+use crate::merged::MergedFrom;
+
 const STATE: [&str; 2] = ["mahi", "state"];
 const LONGEST_REPOSITORY_NAME: usize = 64;
 pub(crate) const SNAPSHOT_MESSAGE: &str = "snapshot";
@@ -223,10 +225,9 @@ pub(crate) fn start(
             };
             let recorded = take_first_snapshot(
                 store,
-                &name,
-                &started.snapshots,
+                (&name, &started.snapshots),
                 globals,
-                commits,
+                (commits, SNAPSHOT_MESSAGE),
                 interrupt,
             );
             match recorded {
@@ -313,7 +314,13 @@ pub(crate) fn resume(
             tree: store.commit_tree(commit)?,
             cache: SnapshotCache::default(),
         },
-        None => take_first_snapshot(store, &name, &snapshots, globals, reopen.commits, interrupt)?,
+        None => take_first_snapshot(
+            store,
+            (&name, &snapshots),
+            globals,
+            (reopen.commits, SNAPSHOT_MESSAGE),
+            interrupt,
+        )?,
     };
     let tip = read_tip(store, &key, thread, &slot)
         .map_err(|error| ResumeError::Transcript(Box::new(error)))?;
@@ -418,7 +425,13 @@ pub(crate) fn enter(
             tree: store.commit_tree(commit)?,
             cache: SnapshotCache::default(),
         },
-        None => take_first_snapshot(store, &name, &snapshots, globals, commits, interrupt)?,
+        None => take_first_snapshot(
+            store,
+            (&name, &snapshots),
+            globals,
+            (commits, SNAPSHOT_MESSAGE),
+            interrupt,
+        )?,
     };
     let tip = read_tip(store, &key, thread, &slot)
         .map_err(|error| EnterError::Transcript(Box::new(error)))?;
@@ -443,13 +456,15 @@ pub(crate) struct HandOver<'a> {
     pub(crate) key: ThreadKey,
     pub(crate) slot: AgentSlot,
     pub(crate) contents: ObjectId,
+    pub(crate) merged: MergedFrom,
     pub(crate) worktrees: &'a Path,
     pub(crate) commits: &'a CommitKey,
 }
 
 /// Starts the user's new agent in `thread` on another agent's work: a worktree at the thread's
 /// base holding `contents`, the other agent's latest snapshot, and the new agent's snapshots
-/// started with it. The thread must have no worktree here.
+/// started with it, recording `merged` as what the agent took from others. The thread must
+/// have no worktree here.
 pub(crate) fn hand_over(
     store: &Store,
     hand: HandOver<'_>,
@@ -462,6 +477,7 @@ pub(crate) fn hand_over(
         key,
         slot,
         contents,
+        merged,
         worktrees,
         commits,
     } = hand;
@@ -473,8 +489,14 @@ pub(crate) fn hand_over(
     let worktree =
         store.restore_worktree(&name, &worktrees.join(&name), base, contents, interrupt)?;
     let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
-    let first = take_first_snapshot(store, &name, &snapshots, globals, commits, interrupt)
-        .inspect_err(|_| remove_worktree_or_report(store, &name))?;
+    let first = take_first_snapshot(
+        store,
+        (&name, &snapshots),
+        globals,
+        (commits, &merged.message()),
+        interrupt,
+    )
+    .inspect_err(|_| remove_worktree_or_report(store, &name))?;
     Ok(Started {
         thread,
         worktree,
@@ -543,15 +565,14 @@ pub(crate) fn pick_slot(
 
 fn take_first_snapshot(
     store: &Store,
-    name: &str,
-    snapshots: &ThreadRef,
+    (name, snapshots): (&str, &ThreadRef),
     globals: &GlobalPatterns,
-    commits: &CommitKey,
+    (commits, message): (&CommitKey, &str),
     interrupt: &AtomicBool,
 ) -> Result<Recorded, StoreError> {
     let mut cache = SnapshotCache::default();
     let tree = store.snapshot(name, globals, &mut cache, interrupt)?.tree;
-    let commit = store.append_signed(snapshots, None, tree, SNAPSHOT_MESSAGE, commits.signer())?;
+    let commit = store.append_signed(snapshots, None, tree, message, commits.signer())?;
     Ok(Recorded {
         commit,
         tree,
@@ -1154,6 +1175,8 @@ pub(crate) mod tests {
             ParticipantName::new("alice").unwrap(),
             AgentName::new("codex").unwrap(),
         );
+        let mut merged = MergedFrom::default();
+        merged.record(started.slot.clone(), first.commit);
         let handed = hand_over(
             &store,
             HandOver {
@@ -1162,6 +1185,7 @@ pub(crate) mod tests {
                 key: ThreadKey::generate(),
                 slot: slot.clone(),
                 contents: first.tree,
+                merged: merged.clone(),
                 worktrees: &worktrees(&store),
                 commits: &started.commits,
             },
@@ -1171,6 +1195,7 @@ pub(crate) mod tests {
         .unwrap();
         let snapshots = ThreadRef::new(started.thread, RefKind::Snapshots(slot));
         assert!(store.head(&snapshots).unwrap().is_some());
+        assert_eq!(MergedFrom::read(&store, &snapshots).unwrap(), merged);
         assert!(handed.worktree.join("README").exists());
         let state = handed.state_dir(&store);
         std::fs::create_dir_all(&state).unwrap();

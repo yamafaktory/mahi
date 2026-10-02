@@ -486,6 +486,20 @@ impl Store {
         Ok(first)
     }
 
+    /// Returns the message of `commit`, whose size is checked before it is loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `commit` is not a commit,
+    /// [`StoreError::TooLarge`] if it is larger than 64 KiB, or [`StoreError::Git`] if reading
+    /// fails.
+    pub fn commit_message(&self, commit: ObjectId) -> Result<gix::bstr::BString, StoreError> {
+        self.require_bounded(commit, Kind::Commit, MAX_COMMIT_BYTES)?;
+        let commit_object = self.repo.find_commit(commit)?;
+        let decoded = commit_object.decode().map_err(gix::Error::from)?;
+        Ok(decoded.message.to_owned())
+    }
+
     /// Writes `bytes` as a blob.
     ///
     /// # Errors
@@ -1154,6 +1168,29 @@ mod tests {
         assert!(matches!(
             store.read_entry(commit, "meta", 100),
             Err(StoreError::TooLarge { id, .. }) if id == commit
+        ));
+    }
+
+    #[test]
+    fn a_commit_message_reads_back_and_an_oversized_commit_or_a_blob_is_refused() {
+        let (_dir, store) = store();
+        let message = "snapshot\n\nMahi-Merged: alice.claude 0123\n";
+        let commit = store
+            .append(&transcript_ref(), None, empty_tree(&store), message)
+            .unwrap();
+        assert_eq!(store.commit_message(commit).unwrap(), message);
+        let huge_message = "m".repeat(usize::try_from(MAX_COMMIT_BYTES).unwrap());
+        let huge = store
+            .append(&transcript_ref(), None, empty_tree(&store), &huge_message)
+            .unwrap();
+        assert!(matches!(
+            store.commit_message(huge),
+            Err(StoreError::TooLarge { id, .. }) if id == huge
+        ));
+        let blob = store.write_blob(b"not a commit").unwrap();
+        assert!(matches!(
+            store.commit_message(blob),
+            Err(StoreError::WrongObject { .. })
         ));
     }
 

@@ -14,6 +14,8 @@ mod inject;
 mod invite;
 mod join;
 mod live;
+mod merge;
+mod merged;
 mod network;
 mod palette;
 mod profile;
@@ -122,6 +124,23 @@ fn main() {
             }
             0
         }
+        Command::Merge(command) => match merge::merge(&command, &environment) {
+            Ok(merge::Outcome::Done(report)) => {
+                eprint!("{report}");
+                0
+            }
+            Ok(merge::Outcome::Stopped(signal, report)) => {
+                if let Some(report) = report {
+                    eprint!("{report}");
+                }
+                signal.reraise();
+                128 + signal.number()
+            }
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
         Command::Handoff(command) => outcome_code(run::handoff(&command, &environment)),
         Command::Agent(AgentCommand::Add(command)) => {
             outcome_code(run::agent_add(&command, &environment))

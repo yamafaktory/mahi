@@ -168,6 +168,7 @@ use crate::{
         HostError,
         LiveSetup,
     },
+    merged::MergedFrom,
     network::{
         Network,
         NetworkError,
@@ -596,7 +597,7 @@ pub(crate) fn resume(
 /// fetches the thread as that participant when `fetch` is set, and
 /// returns the key that signs the user's commits: `signer`, or one made from `signing`. The
 /// inner `Err` is the signal that stopped the fetch.
-fn listed_and_fetched(
+pub(crate) fn listed_and_fetched(
     store: &Store,
     environment: &Environment,
     (thread, fetch): (ThreadId, bool),
@@ -730,7 +731,7 @@ fn start_new_agent(
     };
     let meta = load_meta(&prepared.store, thread, &owner, 0)
         .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
-    let (key, contents) = starting_point(
+    let (key, contents, merged) = starting_point(
         start,
         &mut prepared,
         &meta,
@@ -749,6 +750,7 @@ fn start_new_agent(
                 key,
                 slot,
                 contents,
+                merged,
                 worktrees: &worktrees,
                 commits: &commits,
             },
@@ -771,8 +773,8 @@ fn start_new_agent(
     prepared.launch(environment, started, termination)
 }
 
-/// Returns the thread key and the tree a new agent's worktree starts from, writing its
-/// briefing first for a handoff.
+/// Returns the thread key, the tree a new agent's worktree starts from and the snapshot it
+/// takes from another agent, if any, writing its briefing first for a handoff.
 fn starting_point(
     start: Start<'_>,
     prepared: &mut Prepared,
@@ -780,48 +782,55 @@ fn starting_point(
     participant: &ParticipantName,
     config: &ConfigDir,
     agent_name: &AgentName,
-) -> Result<(ThreadKey, ObjectId), RunError> {
+) -> Result<(ThreadKey, ObjectId, MergedFrom), RunError> {
+    let mut merged = MergedFrom::default();
     match start {
         Start::Handoff(from) => {
-            let briefed = brief(prepared, meta, from, participant, config)?;
+            let (key, (commit, contents)) = brief(prepared, meta, from, participant, config)?;
             eprintln!("mahi: handing {from}'s work over to {agent_name}");
-            Ok(briefed)
+            merged.record(from.clone(), commit);
+            Ok((key, contents, merged))
         }
         Start::Fresh(Some(from)) => {
-            let contents = source_tree(&prepared.store, meta, from)?;
+            let (commit, contents) = source_snapshot(&prepared.store, meta, from)?;
             let key = unlock_thread_key(meta, participant, config)?;
             eprintln!("mahi: starting {agent_name} from {from}'s latest snapshot");
-            Ok((key, contents))
+            merged.record(from.clone(), commit);
+            Ok((key, contents, merged))
         }
         Start::Fresh(None) => {
             let contents = prepared.store.commit_tree(meta.base())?;
             let key = unlock_thread_key(meta, participant, config)?;
             eprintln!("mahi: starting {agent_name} from the thread's base");
-            Ok((key, contents))
+            Ok((key, contents, merged))
         }
     }
 }
 
 /// Checks that `meta` lists `from`'s participant and that `from` has a snapshot, then asks for
 /// the passphrase and writes the briefing of `from`'s work for the agent. Returns the thread
-/// key and the tree of `from`'s latest snapshot.
+/// key, and `from`'s latest snapshot with its tree.
 fn brief(
     prepared: &mut Prepared,
     meta: &VerifiedMeta,
     from: &AgentSlot,
     participant: &ParticipantName,
     config: &ConfigDir,
-) -> Result<(ThreadKey, ObjectId), RunError> {
-    let contents = source_tree(&prepared.store, meta, from)?;
+) -> Result<(ThreadKey, (ObjectId, ObjectId)), RunError> {
+    let (commit, contents) = source_snapshot(&prepared.store, meta, from)?;
     let key = unlock_thread_key(meta, participant, config)?;
     let notes =
         handoff::briefing(&prepared.store, &key, meta, from, (meta.base(), contents))?.render();
     prepared.write_handoff(&notes)?;
-    Ok((key, contents))
+    Ok((key, (commit, contents)))
 }
 
-/// Returns the tree of `from`'s latest snapshot, once `meta` lists `from`'s participant.
-fn source_tree(store: &Store, meta: &VerifiedMeta, from: &AgentSlot) -> Result<ObjectId, RunError> {
+/// Returns `from`'s latest snapshot and its tree, once `meta` lists `from`'s participant.
+pub(crate) fn source_snapshot(
+    store: &Store,
+    meta: &VerifiedMeta,
+    from: &AgentSlot,
+) -> Result<(ObjectId, ObjectId), RunError> {
     let thread = meta.thread();
     if !meta
         .participants()
@@ -835,7 +844,7 @@ fn source_tree(store: &Store, meta: &VerifiedMeta, from: &AgentSlot) -> Result<O
     let source = store
         .head(&ThreadRef::new(thread, RefKind::Snapshots(from.clone())))?
         .ok_or_else(|| RunError::NoSourceSnapshot(from.clone()))?;
-    Ok(store.commit_tree(source)?)
+    Ok((source, store.commit_tree(source)?))
 }
 
 /// Asks for the passphrase of the user's mahi key and opens `meta`'s thread key with it.

@@ -60,6 +60,9 @@ pub(crate) enum Command {
     /// Runs more of your agents in a thread, each in its own terminal.
     #[command(subcommand)]
     Agent(AgentCommand),
+    /// Merges another agent's latest snapshot into the worktree of one of your agents in a
+    /// thread; lines both changed differently are left between conflict markers.
+    Merge(MergeCommand),
     /// Ends a thread you started that is not running: records its worktree in a last
     /// snapshot, then removes the worktree and the agent's state. Its history stays.
     End(EndCommand),
@@ -317,6 +320,18 @@ pub(crate) struct AgentAddCommand {
     /// The agent to start, and its arguments, after `--`.
     #[arg(last = true, required = true, value_name = "COMMAND")]
     pub(crate) command: Vec<OsString>,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct MergeCommand {
+    /// The thread, as `mahi threads` lists it.
+    pub(crate) thread: ThreadId,
+    /// The agent whose work to merge, as `<participant>.<agent>`.
+    #[arg(long, value_name = "PARTICIPANT.AGENT")]
+    pub(crate) from: AgentSlot,
+    /// Your agent to merge into; needed when you have several in the thread.
+    #[arg(long, value_name = "AGENT", value_parser = parse_agent)]
+    pub(crate) into: Option<AgentName>,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
