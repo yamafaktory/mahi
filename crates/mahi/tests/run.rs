@@ -2537,7 +2537,7 @@ printf 'fn parse() { codex }\n' > parser.rs
                     .join(
                         keys().topic(),
                         std::slice::from_ref(address),
-                        Some(Duration::from_secs(10)),
+                        Some(Duration::from_secs(30)),
                     )
                     .unwrap(),
                 receiver: mahi_live::FrameReceiver::new(keys(), participants),
@@ -2563,7 +2563,12 @@ printf 'fn parse() { codex }\n' > parser.rs
     fn the_users_agents_share_one_host_and_the_next_takes_over_when_it_ends() {
         let fixture = fixture();
         save_identity(&fixture);
-        let mut command = fixture.command(&["run", "sh", "-c", "printf 'first agent'; sleep 8"]);
+        let mut command = fixture.command(&[
+            "run",
+            "sh",
+            "-c",
+            "printf 'first agent'; i=0; until [ -e first.done ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done",
+        ]);
         let mut first = KillOnDrop(
             command
                 .env("MAHI_LIVE", "local")
@@ -2579,7 +2584,7 @@ printf 'fn parse() { codex }\n' > parser.rs
             &fixture,
             "second",
             "codex",
-            "#!/bin/sh\nprintf 'second agent'; sleep 16; printf ' after takeover'; sleep 6\n",
+            "#!/bin/sh\nwait_for() {\n  i=0\n  until [ -e \"$1\" ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done\n}\nprintf 'second agent'\nwait_for takeover\nprintf ' after takeover'\nwait_for second.done\n",
         );
         let second = add_agent_with_live(&fixture, thread, &second_agent);
         let published = config_dir(&fixture.home)
@@ -2606,6 +2611,11 @@ printf 'fn parse() { codex }\n' > parser.rs
         wait_until("both agents' screens from one host", || {
             watching.has("tester.sh", "first agent") && watching.has("tester.codex", "second agent")
         });
+        fs::write(
+            worktree_named(&fixture, &format!("{thread}.sh")).join("first.done"),
+            "",
+        )
+        .unwrap();
         let mut status = None;
         wait_until("the first mahi to end with its agent", || {
             status = first.0.try_wait().unwrap();
@@ -2619,11 +2629,14 @@ printf 'fn parse() { codex }\n' > parser.rs
         let address = published_address(&published);
         let mut watching =
             Watching::join(&viewer, &address, (&key, thread), (&bob, participants()));
+        let codex_tree = worktree_named(&fixture, &format!("{thread}.codex"));
+        fs::write(codex_tree.join("takeover"), "").unwrap();
         wait_until("the second agent through its own mahi", || {
             watching.has("tester.codex", "after takeover")
         });
         assert!(!watching.seen.contains_key("tester.sh"));
         viewer.close().unwrap();
+        fs::write(codex_tree.join("second.done"), "").unwrap();
         let (code, output) = second.join().unwrap();
         assert_eq!(code, 0, "{output}");
         assert!(
