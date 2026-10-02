@@ -2604,6 +2604,13 @@ cat parser.rs
             (key, thread): (&mahi_crypto::ThreadKey, ThreadId),
             (bob, participants): (&NodeKey, Vec<(mahi_thread::NodeId, ParticipantName)>),
         ) -> Self {
+            wait_until("the host to admit bob", || {
+                let admitted = viewer.fetch_meta(address, thread).is_ok();
+                if !admitted {
+                    thread::sleep(Duration::from_millis(500));
+                }
+                admitted
+            });
             let keys = || mahi_live::LiveKeys::derive(key, thread).unwrap();
             Self {
                 topic: viewer
