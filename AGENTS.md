@@ -32,7 +32,8 @@ just build
 just run -- …   # run the mahi binary
 just test-git   # the tests that run the git program (not part of just test)
 just deny       # cargo-deny: advisories, licenses, banned crates, unknown sources
-just check      # fmt-check + clippy + test + deny
+just check      # sweep + fmt-check + clippy + test + deny
+just sweep [g]  # remove target/ or fuzz/target/ once either passes g GiB (40 by default)
 just fuzz <t> [s] # run one fuzz target (nightly, cargo-fuzz) for s seconds
 just fuzz-all [s]  # run every fuzz target in turn
 just mutants <crate> [args] # cargo-mutants on one crate, e.g. -f 'crates/mahi-ssh/src/proto/*'

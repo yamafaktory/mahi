@@ -27,7 +27,23 @@ build:
 run *args:
     cargo run --locked -p mahi -- {{args}}
 
-check: fmt-check clippy test deny
+sweep max_gib="40":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! [[ "{{max_gib}}" =~ ^[0-9]+$ ]]; then
+        echo "sweep takes a whole number of GiB, not {{max_gib}}" >&2
+        exit 2
+    fi
+    for dir in target fuzz/target; do
+        test -d "$dir" || continue
+        used=$(du -sk "$dir" | cut -f1)
+        if [ "$used" -gt $(( {{max_gib}} * 1024 * 1024 )) ]; then
+            echo "removing $dir: $(( used / 1024 / 1024 )) GiB is over {{max_gib}} GiB"
+            rm -rf "$dir"
+        fi
+    done
+
+check: sweep fmt-check clippy test deny
 
 [positional-arguments]
 mutants crate *args:
