@@ -147,9 +147,11 @@ fn answer(
     stream: &UnixStream,
     merge: &mut impl FnMut(MergeRequest, &dyn Fn() -> bool) -> Result<String, String>,
 ) -> io::Result<()> {
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(REQUEST_WAIT))?;
-    stream.set_write_timeout(Some(REQUEST_WAIT))?;
+    let timed = stream
+        .set_read_timeout(Some(REQUEST_WAIT))
+        .and_then(|()| stream.set_write_timeout(Some(REQUEST_WAIT)))
+        .is_ok();
+    stream.set_nonblocking(!timed)?;
     let mut line = String::new();
     BufReader::new(stream.take(MAX_REQUEST_BYTES)).read_line(&mut line)?;
     let outcome = match MergeRequest::decode(&line) {
@@ -316,7 +318,7 @@ mod tests {
         let mut stream = UnixStream::connect(&path).unwrap();
         stream.write_all(request().encode().as_bytes()).unwrap();
         drop(stream);
-        assert!(!waiting.recv().unwrap());
+        assert!(!waiting.recv_timeout(Duration::from_secs(10)).unwrap());
         serving.store(false, Ordering::SeqCst);
         server.join().unwrap();
     }
