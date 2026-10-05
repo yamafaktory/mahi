@@ -70,6 +70,7 @@ use thiserror::Error;
 
 use crate::{
     environment::Environment,
+    landed_branch::BranchRecord,
     remote::{
         self,
         RemoteError,
@@ -82,6 +83,7 @@ use crate::{
 };
 
 const MAX_CAUSE_CHARS: usize = 300;
+const BRANCH_CHECK_BYTES: u64 = 64 << 20;
 const HTTPS_CREDENTIAL: &str = "https-";
 const SYSTEM_KNOWN_HOSTS: [&str; 2] = ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"];
 
@@ -412,6 +414,41 @@ pub(crate) fn fetch_thread(
         );
     } else if let Some(told) = fetch_report(&outcome, &name) {
         eprint!("{told}");
+    }
+    let answered = matches!(outcome, Ok(_) | Err(FetchError::Accept(_))) && !budget.exceeded();
+    if chosen && answered && !interrupt.load(Ordering::SeqCst) {
+        check_branch(store, thread, (&access, &url, &name), interrupt);
+    }
+}
+
+/// Notes, and says, when the thread branch `mahi land --push` pushed is gone from the remote.
+fn check_branch(
+    store: &Store,
+    thread: ThreadId,
+    (access, url, name): (&Access, &RemoteUrl, &RemoteName),
+    interrupt: &Arc<AtomicBool>,
+) {
+    let Some(mut record) = BranchRecord::read(store, thread)
+        .filter(|record| !record.gone && record.remote == name.as_str())
+    else {
+        return;
+    };
+    let found = access
+        .connect(url, interrupt, ReadBudget::new(BRANCH_CHECK_BYTES))
+        .map_err(|_| ())
+        .and_then(|transport| {
+            store
+                .remote_branch_tip(transport, &record.branch)
+                .map_err(|_| ())
+        });
+    if let Ok(None) = found {
+        record.gone = true;
+        let _ = record.write(store, thread);
+        eprintln!(
+            "mahi: the branch {} is gone from {name}, merged or closed; mahi purge {thread} \
+             removes the thread",
+            record.branch
+        );
     }
 }
 

@@ -15,6 +15,7 @@ mod inject;
 mod invite;
 mod join;
 mod land;
+mod landed_branch;
 mod live;
 mod mcp;
 mod merge;

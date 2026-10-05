@@ -348,6 +348,44 @@ impl Store {
             .collect())
     }
 
+    /// Returns the commit the branch `branch` points to on the remote `transport` reaches, or
+    /// `None` when the remote has no such branch, from the whole ref listing it gives for a
+    /// push.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBranchName`] if `branch` is not a valid branch name,
+    /// [`StoreError::PushFailed`] if the remote does not speak the protocol mahi needs or lists
+    /// more refs than mahi reads, or [`StoreError::Git`] if the transport fails.
+    pub fn remote_branch_tip<T: Transport>(
+        &self,
+        mut transport: T,
+        branch: &str,
+    ) -> Result<Option<ObjectId>, StoreError> {
+        let name = branch_ref(branch)?.as_bstr().to_string();
+        let advertised = advertisement(&mut transport, &|other| other == name, &|_| false)?;
+        finish_without_commands(&mut transport)?;
+        Ok(advertised.wanted.get(&name).copied())
+    }
+
+    /// Returns whether `ancestor` is `commit` or one of its ancestors through any parent, as
+    /// a fast-forward check of a branch does, walking newest first and not below a day before
+    /// `ancestor` was committed, through at most a million commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::TooManyCommits`] if the walk passes its limit,
+    /// [`StoreError::Interrupted`] if `interrupt` is set, or [`StoreError::Git`] if a commit
+    /// cannot be read.
+    pub fn contains_commit(
+        &self,
+        commit: ObjectId,
+        ancestor: ObjectId,
+        interrupt: &AtomicBool,
+    ) -> Result<bool, StoreError> {
+        self.reaches(commit, ancestor, interrupt)
+    }
+
     fn decide(
         &self,
         name: &str,

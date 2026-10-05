@@ -4019,10 +4019,26 @@ exit 3
             );
         }
 
+        fn notice_gone_branch(fixture: &Fixture, thread: &str, remote: &Path) {
+            git(remote, &["branch", "-D", &format!("mahi/{thread}")]);
+            let (code, output) = in_terminal(fixture, &["land", thread], None);
+            assert_eq!(code, 0, "{output}");
+            assert!(
+                output.contains(&format!("the branch mahi/{thread} is gone from up")),
+                "{output}"
+            );
+            let listed = fixture.mahi(&["threads"]);
+            assert!(
+                String::from_utf8_lossy(&listed.stdout).contains("gone from the remote"),
+                "{listed:?}"
+            );
+        }
+
         fn purge_on_remote(fixture: &Fixture, thread: &str, remote: &Path) {
             let purged = fixture.mahi(&["purge", thread, "--yes"]);
             let stderr = String::from_utf8_lossy(&purged.stderr);
             assert!(purged.status.success(), "{stderr}");
+            assert!(stderr.contains("may hold the only copy"), "{stderr}");
             assert!(
                 stderr.contains(&format!("ended thread {thread} on up")),
                 "{stderr}"
@@ -4137,6 +4153,7 @@ exit 3
                 "{output}"
             );
             fs::remove_file(config_dir(&fixture.home).settings_file()).unwrap();
+            notice_gone_branch(&fixture, &thread, &remote);
             purge_on_remote(&fixture, &thread, &remote);
         }
     }

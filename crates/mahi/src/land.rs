@@ -62,6 +62,7 @@ use crate::{
     },
     environment::Environment,
     handoff,
+    landed_branch::BranchRecord,
     merge::{
         self,
         MergeRequest,
@@ -327,6 +328,12 @@ fn push(
     Ok(match done {
         Ok(true) => {
             drop(termination);
+            remember_branch(
+                store,
+                thread,
+                (setup.name.as_str(), &branch, &landing),
+                &mut report,
+            );
             let path = admin.join(DRAFT_FILE);
             let text = match draft(store, (&meta, &key), &landed, (base, &branch)) {
                 Ok(text) => text,
@@ -398,6 +405,27 @@ fn rewrite_draft(
         }
     }
     Ok(Outcome::Done(report))
+}
+
+fn remember_branch(
+    store: &Store,
+    thread: ThreadId,
+    (remote, branch, landing): (&str, &str, &str),
+    report: &mut String,
+) {
+    let Ok(Some(tip)) = store.branch_tip(branch) else {
+        return;
+    };
+    let record = BranchRecord {
+        remote: remote.to_owned(),
+        branch: branch.to_owned(),
+        tip,
+        landing: landing.to_owned(),
+        gone: false,
+    };
+    if let Err(error) = record.write(store, thread) {
+        let _ = writeln!(report, "cannot remember the pushed branch: {error}");
+    }
 }
 
 fn keep_draft(path: &Path, text: &str, report: &mut String) {

@@ -51,6 +51,7 @@ use thiserror::Error;
 use crate::{
     cli::PurgeCommand,
     environment::Environment,
+    landed_branch::BranchRecord,
     prompt::{
         Prompt,
         TerminalPrompt,
@@ -163,7 +164,8 @@ pub(crate) fn purge(
         Err(LockError::Io(error)) => return Err(PurgeError::Lock(error)),
     };
     let setup = SyncSetup::chosen(&store, environment, false).map_err(PurgeError::Remote)?;
-    if !command.yes && !confirmed(thread, setup.as_ref())? {
+    let unmerged = unmerged_work(&store, thread);
+    if !command.yes && !confirmed(thread, setup.as_ref(), unmerged.as_deref())? {
         return Ok(Purged::Kept);
     }
     let signer = if is_owner {
@@ -178,6 +180,9 @@ pub(crate) fn purge(
         None
     };
     let mut report = String::new();
+    if let Some(warning) = &unmerged {
+        let _ = writeln!(report, "{warning}");
+    }
     let termination = TerminationSignals::listen().map_err(PurgeError::Signals)?;
     let (done, caught) = until_stopped(&termination, |interrupt| {
         purge_here_and_there(
@@ -197,6 +202,9 @@ pub(crate) fn purge(
     let keep_meta = signer.is_some() || ended_here(&store, thread, &owner);
     if let Err(error) = forget_here(&store, (thread, &participant), keep_meta, &mut report) {
         return Ok(Purged::Failed(report, error));
+    }
+    if let Err(error) = BranchRecord::remove(&store, thread) {
+        let _ = writeln!(report, "cannot forget the pushed branch's record: {error}");
     }
     lock.remove().map_err(PurgeError::Remove)?;
     let _ = writeln!(report, "purged thread {thread}");
@@ -333,8 +341,37 @@ fn describe(outcome: &Pushed) -> String {
     }
 }
 
-fn confirmed(thread: ThreadId, setup: Option<&SyncSetup>) -> Result<bool, PurgeError> {
+/// Says, when `mahi land --push` pushed the thread branch, whether the work it last pushed is
+/// missing from the landing branch here; a squash merge looks like that too.
+fn unmerged_work(store: &Store, thread: ThreadId) -> Option<String> {
+    let record = BranchRecord::read(store, thread)?;
+    let merged = store
+        .branch_tip(&record.landing)
+        .ok()
+        .flatten()
+        .is_some_and(|landing| {
+            store
+                .contains_commit(landing, record.tip, &AtomicBool::new(false))
+                .unwrap_or(false)
+        });
+    (!merged).then(|| {
+        format!(
+            "warning: the work last pushed on {} is not in {} here (a squash merge looks like \
+             this too), so this thread may hold the only copy of it",
+            record.branch, record.landing
+        )
+    })
+}
+
+fn confirmed(
+    thread: ThreadId,
+    setup: Option<&SyncSetup>,
+    unmerged: Option<&str>,
+) -> Result<bool, PurgeError> {
     let mut prompt = TerminalPrompt::open().map_err(PurgeError::Prompt)?;
+    if let Some(warning) = unmerged {
+        prompt.say(warning).map_err(PurgeError::Prompt)?;
+    }
     let where_ = match setup {
         Some(setup) => format!("here and on {}", setup.name),
         None => "here only, since no remote is chosen".to_owned(),
@@ -435,5 +472,35 @@ mod tests {
         let all_but_meta: Vec<&str> = names[1..].iter().map(String::as_str).collect();
         assert_eq!(pick(true), all_but_meta);
         assert_eq!(pick(false), [names[2].as_str()]);
+    }
+
+    #[test]
+    fn purge_warns_only_when_the_pushed_work_is_not_in_the_landing_branch_here() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let thread = ThreadId::random().unwrap();
+        assert_eq!(unmerged_work(&store, thread), None);
+        let scratch = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
+        let tree = store.write_tree(&[]).unwrap();
+        let landed = store.append(&scratch, None, tree, "landed").unwrap();
+        let later = store.append(&scratch, Some(landed), tree, "later").unwrap();
+        store.ensure_branch("main", landed).unwrap();
+        let mut record = BranchRecord {
+            remote: "up".to_owned(),
+            branch: format!("mahi/{thread}"),
+            tip: landed,
+            landing: "main".to_owned(),
+            gone: true,
+        };
+        record.write(&store, thread).unwrap();
+        assert_eq!(unmerged_work(&store, thread), None);
+        record.tip = later;
+        record.write(&store, thread).unwrap();
+        assert!(
+            unmerged_work(&store, thread)
+                .unwrap()
+                .contains("may hold the only copy")
+        );
     }
 }

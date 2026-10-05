@@ -20,7 +20,10 @@ use mahi_store::{
 };
 use thiserror::Error;
 
-use crate::session;
+use crate::{
+    landed_branch::BranchRecord,
+    session,
+};
 
 #[derive(Debug, Error)]
 pub(crate) enum ThreadsError {
@@ -61,7 +64,16 @@ pub(crate) fn threads() -> Result<String, ThreadsError> {
         } else {
             "no worktree"
         };
-        let _ = writeln!(listing, "{thread}  {agents}  {worktree}");
+        let _ = write!(listing, "{thread}  {agents}  {worktree}");
+        if let Some(record) = BranchRecord::read(&store, thread).filter(|record| record.gone) {
+            let _ = write!(
+                listing,
+                "  branch {} gone from the remote, merged or closed; mahi purge {thread} removes \
+                 the thread",
+                record.branch
+            );
+        }
+        listing.push('\n');
     }
     Ok(listing)
 }

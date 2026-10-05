@@ -588,4 +588,47 @@ mod tests {
         assert!(git(&setup.remote, &["for-each-ref"]).is_empty());
         assert!(setup.store.head(&setup.snapshots).unwrap().is_some());
     }
+
+    #[test]
+    fn the_remotes_branch_tip_is_read_from_its_ref_listing() {
+        let setup = setup();
+        let local = &setup.local;
+        std::fs::write(local.join("a"), "a\n").unwrap();
+        git(local, &["add", "a"]);
+        git(local, &["commit", "-qm", "a", "--no-gpg-sign"]);
+        let branch = git(local, &["symbolic-ref", "--short", "HEAD"]);
+        let tip = |store: &Store| {
+            store
+                .remote_branch_tip(
+                    file::connect(
+                        setup.remote.as_os_str().as_encoded_bytes(),
+                        Protocol::V1,
+                        false,
+                    )
+                    .unwrap(),
+                    &branch,
+                )
+                .unwrap()
+        };
+        assert_eq!(tip(&setup.store), None);
+        push_branch(&setup.store, &setup.remote, &branch);
+        assert_eq!(
+            tip(&setup.store).map(|id| id.to_string()),
+            Some(git(local, &["rev-parse", "HEAD"]))
+        );
+        git(&setup.remote, &["branch", "-D", &branch]);
+        assert_eq!(tip(&setup.store), None);
+        assert!(matches!(
+            setup.store.remote_branch_tip(
+                file::connect(
+                    setup.remote.as_os_str().as_encoded_bytes(),
+                    Protocol::V1,
+                    false
+                )
+                .unwrap(),
+                "-bad",
+            ),
+            Err(mahi_store::StoreError::InvalidBranchName(_))
+        ));
+    }
 }
