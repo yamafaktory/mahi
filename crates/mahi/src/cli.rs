@@ -342,6 +342,15 @@ pub(crate) struct LandCommand {
     /// remote, fast-forward only, instead of merging.
     #[arg(long, conflicts_with = "from")]
     pub(crate) push: bool,
+    /// After the push, starts this agent, sandboxed, with the landing worktree read-only and
+    /// the pull request draft to rewrite.
+    #[arg(long = "with", value_name = "AGENT", requires = "push")]
+    pub(crate) with: Option<OsString>,
+    #[command(flatten)]
+    pub(crate) options: LaunchOptions,
+    /// Arguments passed to the `--with` agent unchanged, after `--`.
+    #[arg(last = true, value_name = "ARGUMENT", requires = "with")]
+    pub(crate) arguments: Vec<OsString>,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]

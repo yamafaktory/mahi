@@ -4,7 +4,10 @@ use std::{
         OsStr,
         OsString,
     },
-    fmt::Write as _,
+    fmt::{
+        self,
+        Write as _,
+    },
     fs::{
         self,
         File,
@@ -14,12 +17,14 @@ use std::{
         Read,
         Write,
     },
+    mem,
     os::unix::{
         ffi::OsStrExt,
         fs::{
             OpenOptionsExt,
             PermissionsExt,
         },
+        io::OwnedFd,
         net::UnixListener,
     },
     path::{
@@ -266,6 +271,8 @@ const PROGRAM_HEADERS: [&[u8]; 5] = [
 const HOOK_SOCKET_NAME: &str = "mahi.sock";
 const MCP_SOCKET_NAME: &str = "mcp.sock";
 const HANDOFF_NOTES: &str = "mahi-handoff.md";
+const DRAFT_NAME: &str = "PR.md";
+const MAX_DRAFT_BYTES: u64 = 256 * 1024;
 const HANDOFF_ENV: &str = "MAHI_HANDOFF";
 const HOOK_QUEUE: usize = 16;
 const HOME: &str = "home";
@@ -399,6 +406,8 @@ pub(crate) enum RunError {
     Handoff(#[from] HandoffError),
     #[error("cannot write the handoff notes")]
     HandoffNotes(#[source] io::Error),
+    #[error("cannot give the agent the pull request draft")]
+    Draft(#[source] io::Error),
 }
 
 #[derive(Debug)]
@@ -1287,6 +1296,9 @@ impl Prepared {
         let launch = Launch {
             restore,
             handoff: self.handoff.as_deref(),
+            worktree_access: Access::ReadWrite,
+            tools: true,
+            first_prompt: handoff::first_prompt,
             arguments: &self.arguments,
             environment,
             agent: &self.agent,
@@ -1344,13 +1356,7 @@ impl Prepared {
             &UserSide {
                 palette_key: self.palette_key,
                 activity,
-                notice: Notice::for_terminal(TerminalHints {
-                    term: environment.term.as_deref(),
-                    term_program: environment.term_program.as_deref(),
-                    kitty: environment.kitty,
-                    vte: environment.vte,
-                    tmux: environment.tmux,
-                }),
+                notice: notice(environment),
             },
             termination,
             Background {
@@ -1992,6 +1998,9 @@ struct Restore<'a> {
 struct Launch<'a> {
     restore: Option<Restore<'a>>,
     handoff: Option<&'a Path>,
+    worktree_access: Access,
+    tools: bool,
+    first_prompt: fn(&str) -> String,
     credentials: &'a [Handed],
     profile: Option<&'static Profile>,
     state: Option<PathBuf>,
@@ -2034,6 +2043,9 @@ impl Launch<'_> {
     /// Returns the mahi binary and the socket the agent's tools are served at, as text a
     /// profile's configuration can hold, when both are known and are UTF-8.
     fn tools_config(&self) -> Option<(&str, &str)> {
+        if !self.tools {
+            return None;
+        }
         let mahi = self.environment.mahi_exe.as_deref()?.to_str()?;
         Some((mahi, self.mcp_socket.to_str()?))
     }
@@ -2041,7 +2053,7 @@ impl Launch<'_> {
     /// Gives the agent the first prompt asking it to read the handoff `notes`, when its
     /// profile takes one, or else tells the user to give it.
     fn ask_to_read(&self, pty: PtyCommand, notes: &Path) -> PtyCommand {
-        let prompt = handoff::first_prompt(&notes.display().to_string());
+        let prompt = (self.first_prompt)(&notes.display().to_string());
         let takes_prompt = self.profile.is_some_and(|profile| profile.takes_prompt);
         if takes_prompt && notes.to_str().is_some() {
             return pty.arg("--").arg(&prompt);
@@ -2099,7 +2111,7 @@ impl Launch<'_> {
     ) -> Result<(PtyChild, Option<RawMode>, Option<Running>), RunError> {
         let git_file = self.worktree.join(".git");
         for (path, access) in binds(
-            self.worktree,
+            (self.worktree, self.worktree_access),
             self.git_dir,
             self.agent,
             self.scratch,
@@ -2613,7 +2625,7 @@ fn require_program(path: &Path) -> Result<(), RunError> {
 }
 
 fn binds(
-    cwd: &Path,
+    (cwd, cwd_access): (&Path, Access),
     git_dir: &Path,
     agent: &Agent,
     scratch: &Path,
@@ -2627,9 +2639,9 @@ fn binds(
     let covered = |binds: &[(PathBuf, Access)], path: &Path| {
         binds.iter().any(|(bound, _)| path.starts_with(bound))
     };
-    for writable in [cwd, scratch] {
-        if !covered(&binds, writable) {
-            binds.push((writable.to_path_buf(), Access::ReadWrite));
+    for (path, access) in [(cwd, cwd_access), (scratch, Access::ReadWrite)] {
+        if !covered(&binds, path) {
+            binds.push((path.to_path_buf(), access));
         }
     }
     let git = cwd.join(".git");
@@ -2657,6 +2669,186 @@ fn binds(
         }
     }
     Ok(binds)
+}
+
+fn notice(environment: &Environment) -> Notice {
+    Notice::for_terminal(TerminalHints {
+        term: environment.term.as_deref(),
+        term_program: environment.term_program.as_deref(),
+        kitty: environment.kitty,
+        vte: environment.vte,
+        tmux: environment.tmux,
+    })
+}
+
+/// An agent set up to rewrite a pull request draft: sandboxed as any other, with a worktree it
+/// can only read, and no snapshots, transcript, tools or teammates.
+pub(crate) struct DraftWriter {
+    prepared: Prepared,
+}
+
+impl fmt::Debug for DraftWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DraftWriter").finish_non_exhaustive()
+    }
+}
+
+impl DraftWriter {
+    /// Sets up the agent `program` with `arguments` and what `options` let it reach, for the
+    /// repository around the current directory, checking everything a launch needs before any
+    /// change is made.
+    pub(crate) fn prepare(
+        (program, arguments): (&OsStr, &[OsString]),
+        options: &LaunchOptions,
+        environment: &Environment,
+    ) -> Result<Self, RunError> {
+        let cwd = env::current_dir()
+            .and_then(fs::canonicalize)
+            .map_err(RunError::CurrentDirectory)?;
+        let host = Host::from_environment(environment)?;
+        let config = ConfigDir::resolve(
+            environment.home.as_deref(),
+            environment.xdg_config_home.as_deref(),
+        )?;
+        let profile = options.profile_for(program);
+        let hosts = allowed_hosts(options.allow_hosts(), profile);
+        let settings = Settings::load(&config)?;
+        let credentials = gather_credentials(&config, options, profile, environment)?;
+        let store = Store::discover(&cwd)?;
+        let mut prepared = Prepared::new(
+            environment,
+            host,
+            &cwd,
+            store,
+            &AgentRequest {
+                program,
+                arguments,
+                profile,
+                hosts: &hosts,
+            },
+            credentials,
+        )?;
+        prepared.palette_key = settings.palette_key;
+        Ok(Self { prepared })
+    }
+
+    /// Runs the agent in `worktree`, which it can only read, with the draft `draft` in its
+    /// private temporary directory and the notes `notes` writes for that path, keeping its
+    /// profile's state in `state`. Returns how it ended and the draft it left, or `None` if it
+    /// left no readable one.
+    pub(crate) fn rewrite(
+        mut self,
+        environment: &Environment,
+        (worktree, state): (&Path, PathBuf),
+        draft: &str,
+        notes: &dyn Fn(&Path) -> String,
+    ) -> Result<(Outcome, Option<String>), RunError> {
+        let prepared = &mut self.prepared;
+        let draft_path = prepared.scratch.join(TMP).join(DRAFT_NAME);
+        write_private(&draft_path, draft.as_bytes()).map_err(RunError::Draft)?;
+        let tmp = rustix::fs::open(
+            prepared.scratch.join(TMP),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| RunError::Draft(error.into()))?;
+        prepared.write_handoff(&notes(&draft_path))?;
+        let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
+        let launch = Launch {
+            restore: None,
+            handoff: prepared.handoff.as_deref(),
+            worktree_access: Access::ReadOnly,
+            tools: false,
+            first_prompt: draft_prompt,
+            arguments: &prepared.arguments,
+            environment,
+            agent: &prepared.agent,
+            worktree,
+            git_dir: &prepared.git_dir,
+            scratch: &prepared.scratch,
+            hook_socket: &prepared.hook_socket,
+            mcp_socket: &prepared.mcp_socket,
+            host: &prepared.host,
+            profile: prepared.profile,
+            state: prepared.profile.map(|_| state),
+            credentials: &prepared.credentials,
+        };
+        let sandbox = mem::take(&mut prepared.sandbox);
+        let (child, raw, proxy) = launch.spawn(sandbox, prepared.network.take())?;
+        let activity = Arc::new(Activity::default());
+        let closing = Arc::new(AtomicBool::new(false));
+        let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
+        let hooks = prepared.hooks.try_clone().map_err(RunError::Scratch)?;
+        let (flag, seen) = (Arc::clone(&closing), Arc::clone(&activity));
+        thread::spawn(move || hook::serve(&hooks, &flag, &messages, &seen));
+        thread::spawn(move || for _ in inputs {});
+        let (code, received) = supervise(
+            child,
+            raw,
+            &UserSide {
+                palette_key: prepared.palette_key,
+                activity,
+                notice: notice(environment),
+            },
+            termination,
+            AgentSide {
+                tap: None,
+                prompts: Arc::new(Prompts::default()),
+                merging: None,
+                merger: None,
+            },
+        );
+        closing.store(true, Ordering::SeqCst);
+        if matches!(code, Ok(Outcome::Stopped(_))) {
+            while received.try_recv().is_ok() {}
+        }
+        let (caught, _) = mpsc::channel();
+        thread::spawn(move || stop_on_signal(&received, &[], &caught));
+        for error in proxy.into_iter().flat_map(Running::stopped) {
+            eprintln!("mahi: the proxy stopped serving the agent: {error}");
+        }
+        let code = code?;
+        let left = matches!(code, Outcome::Exited(0))
+            .then(|| read_draft(&tmp))
+            .flatten();
+        Ok((code, left))
+    }
+}
+
+fn draft_prompt(notes: &str) -> String {
+    format!("Read the notes at {notes} and rewrite the pull request description they point to.")
+}
+
+fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)
+}
+
+fn read_draft(directory: &OwnedFd) -> Option<String> {
+    let file = rustix::fs::openat(
+        directory,
+        DRAFT_NAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .ok()?;
+    let stat = rustix::fs::fstat(&file).ok()?;
+    if !FileType::from_raw_mode(stat.st_mode).is_file() {
+        return None;
+    }
+    let mut text = Vec::new();
+    File::from(file)
+        .take(MAX_DRAFT_BYTES + 1)
+        .read_to_end(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_DRAFT_BYTES {
+        return None;
+    }
+    String::from_utf8(text).ok()
 }
 
 #[cfg(test)]
@@ -2793,7 +2985,7 @@ mod tests {
         for cwd in [&home, &root.join("home"), &root, &home.join(".ssh/keys")] {
             assert!(matches!(
                 binds(
-                    cwd,
+                    (cwd, Access::ReadWrite),
                     Path::new("/repo/.git"),
                     &agent,
                     Path::new("/scratch"),
@@ -2805,7 +2997,7 @@ mod tests {
         }
         assert!(
             binds(
-                &home.join("project"),
+                (&home.join("project"), Access::ReadWrite),
                 Path::new("/repo/.git"),
                 &agent,
                 Path::new("/scratch"),
@@ -2840,7 +3032,7 @@ mod tests {
         .unwrap();
         let agent = agent_at(&tools.join("agent"));
         let binds = binds(
-            &project,
+            (&project, Access::ReadWrite),
             Path::new("/repo/.git"),
             &agent,
             &root.join("scratch"),
@@ -2871,7 +3063,7 @@ mod tests {
             canonical: package.join("cli.js"),
         };
         let binds = binds(
-            &home.join("project"),
+            (&home.join("project"), Access::ReadWrite),
             Path::new("/repo/.git"),
             &agent,
             &root.join("scratch"),
@@ -2889,7 +3081,7 @@ mod tests {
         fs::create_dir_all(home.join("project")).unwrap();
         let agent = agent_at(&home.join("agent.sh"));
         let binds = binds(
-            &home.join("project"),
+            (&home.join("project"), Access::ReadWrite),
             Path::new("/repo/.git"),
             &agent,
             &root.join("scratch"),
@@ -2909,7 +3101,7 @@ mod tests {
         fs::create_dir_all(project.join(".git")).unwrap();
         let agent = agent_at(Path::new("/usr/bin/true"));
         let binds = binds(
-            &project,
+            (&project, Access::ReadWrite),
             Path::new("/repo/.git"),
             &agent,
             Path::new("/scratch"),

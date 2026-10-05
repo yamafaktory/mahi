@@ -1,6 +1,11 @@
 //! Runs the `mahi` binary and checks what `mahi run` gives the agent.
 
 #[cfg(test)]
+#[path = "../../mahi-ssh/tests/openssh/mod.rs"]
+#[expect(dead_code, reason = "mahi-ssh's own tests use the rest of this helper")]
+mod openssh;
+
+#[cfg(test)]
 mod tests {
     use std::{
         ffi::OsStr,
@@ -1785,6 +1790,15 @@ cat parser.rs
             output.contains("cannot land on main: it is the thread's landing branch"),
             "{output}"
         );
+        let (code, output) = in_terminal(
+            &fixture,
+            &["land", &thread, "--push", "--allow-host", "example.com"],
+            None,
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("agent options need --with"), "{output}");
+        let without_push = fixture.mahi(&["land", &thread, "--with", "claude"]);
+        assert_eq!(without_push.status.code(), Some(2));
         let refused = fixture.mahi(&["land", &thread, "--push", "--from", "tester.claude"]);
         assert_eq!(refused.status.code(), Some(2));
         assert!(fixture.mahi(&["end", &thread]).status.success());
@@ -3806,5 +3820,203 @@ until [ -e done ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done"#;
         );
         let version = fixture.mahi(&["--version"]);
         assert!(String::from_utf8_lossy(&version.stdout).starts_with("mahi "));
+    }
+
+    mod git_tests {
+        use std::fmt::Write as _;
+
+        use super::*;
+        use crate::openssh;
+
+        const WRITER: &str = r#"#!/bin/sh
+if touch probe 2>/dev/null; then echo worktree-writable; else echo worktree-read-only; fi
+grep -q 'Rewrite that file' "$MAHI_HANDOFF" && echo notes-read
+echo "secret=$MAHI_TEST_SECRET"
+printf 'Rewritten by the writer\n' > "$TMPDIR/PR.md"
+"#;
+
+        const REDIRECTING: &str = r#"#!/bin/sh
+rm -rf "$TMPDIR"
+ln -s "$ELSEWHERE" "$TMPDIR"
+"#;
+
+        const FAILING: &str = r#"#!/bin/sh
+printf 'half a draft' > "$TMPDIR/PR.md"
+exit 3
+"#;
+
+        fn land_with(
+            fixture: &Fixture,
+            thread: &str,
+            writer: &Path,
+            extra: &[(&str, &Path)],
+        ) -> (i32, String) {
+            let mut command = PtyCommand::new(
+                Path::new(env!("CARGO_BIN_EXE_mahi")),
+                &fixture.repo,
+                WindowSize {
+                    rows: 24,
+                    cols: 200,
+                },
+            )
+            .arg("land")
+            .arg(thread)
+            .arg("--push")
+            .arg("--with")
+            .arg(writer)
+            .arg("--pass-env")
+            .arg("MAHI_TEST_SECRET")
+            .env("PATH", "/usr/bin:/bin:/usr")
+            .env("HOME", &fixture.home)
+            .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+            .env("SSH_AUTH_SOCK", &fixture.socket)
+            .env("USER", "tester")
+            .env("MAHI_LIVE", "off")
+            .env("MAHI_TEST_SECRET", "secret-value");
+            for (name, value) in extra {
+                command = command.arg("--pass-env").arg(name).env(name, value);
+            }
+            in_terminal_with(command, Some(PASSPHRASE))
+        }
+
+        fn git(repository: &Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .expect("git is installed");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        fn serve_remote(fixture: &Fixture) -> (openssh::OpenSsh, PathBuf) {
+            let server = openssh::start("ssh-ed25519", &[]);
+            let forced = server.dir.path().join("forced.sh");
+            let mut authorized =
+                fs::read_to_string(server.dir.path().join("authorized_keys")).unwrap();
+            let public = fixture.owner.to_openssh();
+            writeln!(authorized, "command=\"{}\" {public}", forced.display()).unwrap();
+            fs::write(server.dir.path().join("authorized_keys"), authorized).unwrap();
+            let host = fs::read_to_string(server.dir.path().join("host_key.pub")).unwrap();
+            fs::create_dir_all(fixture.home.join(".ssh")).unwrap();
+            fs::write(
+                fixture.home.join(".ssh/known_hosts"),
+                format!("[127.0.0.1]:{} {host}", server.port),
+            )
+            .unwrap();
+            let remote = fixture.root.join("remote.git");
+            fs::create_dir(&remote).unwrap();
+            git(&remote, &["init", "-q", "--bare"]);
+            let config = fixture.repo.join(".git/config");
+            let mut text = fs::read_to_string(&config).unwrap();
+            writeln!(
+                text,
+                "[remote \"up\"]
+	url = {}",
+                server.url(&remote)
+            )
+            .unwrap();
+            fs::write(&config, text).unwrap();
+            assert!(
+                fixture
+                    .mahi(&["remote", "up", "--private"])
+                    .status
+                    .success()
+            );
+            (server, remote)
+        }
+
+        #[test]
+        fn a_landed_branch_is_pushed_with_its_trailers_and_its_draft_rewritten_read_only() {
+            let fixture = fixture();
+            let (thread, _claude) = worked_thread(&fixture);
+            let (server, remote) = serve_remote(&fixture);
+            let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
+            assert_eq!(code, 0, "{output}");
+            let landing = worktree_named(&fixture, &format!("{thread}@land"));
+            git(&landing, &["add", "-A"]);
+            git(&landing, &["commit", "-qm", "Add the parser"]);
+            let writer = script(&fixture, "writing", "writer", WRITER);
+            let (code, output) = land_with(&fixture, &thread, &writer, &[]);
+            assert_eq!(code, 0, "{output}\n{}", server.log());
+            let branch = format!("mahi/{thread}");
+            assert!(
+                output.contains("added the thread's trailers to 1 commit"),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!("pushed {branch} to up")),
+                "{output}"
+            );
+            assert!(output.contains("## Thread"), "{output}");
+            assert!(output.contains("worktree-read-only"), "{output}");
+            assert!(output.contains("notes-read"), "{output}");
+            assert!(output.contains("secret=secret-value"), "{output}");
+            assert!(output.contains("Rewritten by the writer"), "{output}");
+            assert!(!landing.join("probe").exists());
+            let message = git(&remote, &["log", "-1", "--format=%B", &branch]);
+            assert!(
+                message.starts_with(&format!(
+                    "Add the parser\n\nThread: {thread}\nAgent: tester.claude"
+                )),
+                "{message}"
+            );
+            assert_eq!(
+                git(&remote, &["rev-parse", &branch]),
+                git(&landing, &["rev-parse", "HEAD"])
+            );
+            let kept = fs::read_to_string(
+                fixture
+                    .repo
+                    .join(".git/worktrees")
+                    .join(format!("{thread}@land"))
+                    .join("PR.md"),
+            )
+            .unwrap();
+            assert_eq!(kept, "Rewritten by the writer\n");
+            let (code, output) =
+                in_terminal(&fixture, &["land", &thread, "--push"], Some(PASSPHRASE));
+            assert_eq!(code, 0, "{output}");
+            assert!(
+                output.contains(&format!("{branch} on up is up to date")),
+                "{output}"
+            );
+            let draft = fixture
+                .repo
+                .join(".git/worktrees")
+                .join(format!("{thread}@land"))
+                .join("PR.md");
+            let elsewhere = fixture.root.join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            fs::write(elsewhere.join("PR.md"), "outside the sandbox\n").unwrap();
+            let redirecting = script(&fixture, "redirecting", "writer", REDIRECTING);
+            let (code, output) = land_with(
+                &fixture,
+                &thread,
+                &redirecting,
+                &[("ELSEWHERE", &elsewhere)],
+            );
+            assert_eq!(code, 0, "{output}");
+            assert!(
+                output.contains("left no readable pull request draft"),
+                "{output}"
+            );
+            assert!(!output.contains("outside the sandbox"), "{output}");
+            assert!(fs::read_to_string(&draft).unwrap().contains("## Thread"));
+            let failing = script(&fixture, "failing", "writer", FAILING);
+            let (code, output) = land_with(&fixture, &thread, &failing, &[]);
+            assert_eq!(code, 1, "{output}");
+            assert!(output.contains("the agent exited with 3"), "{output}");
+            assert!(fs::read_to_string(&draft).unwrap().contains("## Thread"));
+        }
     }
 }

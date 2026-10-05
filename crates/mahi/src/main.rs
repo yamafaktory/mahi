@@ -70,6 +70,7 @@ fn main() {
         Command::Resume(command) => command.options.pass_env().to_vec(),
         Command::Handoff(command) => command.options.pass_env().to_vec(),
         Command::Agent(AgentCommand::Add(command)) => command.options.pass_env().to_vec(),
+        Command::Land(command) => command.options.pass_env().to_vec(),
         Command::Join(command) if command.agent().is_some() => command.options.pass_env().to_vec(),
         _ => Vec::new(),
     };
@@ -218,7 +219,7 @@ fn landed(command: &cli::LandCommand, environment: &Environment) -> i32 {
             eprint!("{report}");
             0
         }
-        Ok(land::Outcome::NotPushed(report)) => {
+        Ok(land::Outcome::Incomplete(report)) => {
             eprint!("{report}");
             1
         }
