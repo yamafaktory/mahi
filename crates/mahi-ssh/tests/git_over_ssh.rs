@@ -153,4 +153,43 @@ mod tests {
         assert!(chain.contains("the remote said: "), "{chain}");
         assert!(chain.contains("missing"), "{chain}");
     }
+
+    #[test]
+    fn a_spent_read_budget_stops_a_fetch_and_nothing_is_fetched() {
+        let server = openssh::start("ssh-ed25519", &[]);
+        let (source, head) = source(&server);
+        let local = server.dir.path().join("local");
+        gix::init(&local).unwrap();
+        let store = mahi_store::Store::open(&local).unwrap();
+        let thread: mahi_core::ThreadId = "00000000000000000000000000000001".parse().unwrap();
+        git(
+            &source,
+            &["update-ref", &format!("refs/threads/{thread}/meta"), &head],
+        );
+        let connect = |budget: &mahi_core::ReadBudget| {
+            SshTransport::connect(
+                server.remote(&source),
+                &server.known_hosts,
+                &server.agent,
+                "nobody",
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{error}: {}", server.log()))
+            .with_read_budget(budget.clone())
+        };
+        let small = mahi_core::ReadBudget::new(200);
+        assert!(
+            store
+                .fetch_thread(connect(&small), thread, &AtomicBool::new(false))
+                .is_err()
+        );
+        assert!(small.exceeded());
+        assert!(store.fetched_refs(thread).unwrap().is_empty());
+        let enough = mahi_core::ReadBudget::new(1 << 20);
+        store
+            .fetch_thread(connect(&enough), thread, &AtomicBool::new(false))
+            .unwrap_or_else(|error| panic!("{error}: {}", server.log()));
+        assert!(!enough.exceeded());
+        assert_eq!(store.fetched_refs(thread).unwrap().len(), 1);
+    }
 }

@@ -1,10 +1,16 @@
 //! Identifiers, names and ref layout of mahi threads.
 
+mod budget;
 mod id;
 mod name;
 mod refs;
 mod text;
 
+pub use budget::{
+    BudgetedRead,
+    OverBudget,
+    ReadBudget,
+};
 pub use id::{
     ParseThreadIdError,
     RandomError,

@@ -24,6 +24,7 @@ mod tests {
     };
 
     use mahi_core::{
+        ReadBudget,
         RefKind,
         ThreadId,
         ThreadRef,
@@ -34,6 +35,7 @@ mod tests {
         Roots,
         Token,
         connect,
+        connect_within,
     };
     use mahi_store::{
         EntryKind,
@@ -199,5 +201,19 @@ mod tests {
         assert_eq!(other.fetched_refs(thread).unwrap(), [(meta, commit)]);
         let last = backend.requests.lock().unwrap().last().cloned().unwrap();
         assert_eq!(last.header("authorization"), Some(TOKEN));
+
+        let budget = ReadBudget::new(100);
+        let starved = store_at(&root.join("starved"));
+        assert!(
+            starved
+                .fetch_thread(
+                    connect_within(&url, &access(Some("secret")), budget.clone()).unwrap(),
+                    thread,
+                    &AtomicBool::new(false),
+                )
+                .is_err()
+        );
+        assert!(budget.exceeded());
+        assert!(starved.fetched_refs(thread).unwrap().is_empty());
     }
 }

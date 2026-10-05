@@ -13,6 +13,7 @@ pub use client::{
     Token,
     client,
     connect,
+    connect_within,
 };
 pub use proxy::{
     ProxyError,

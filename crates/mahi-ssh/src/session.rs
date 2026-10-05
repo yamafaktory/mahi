@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc,
         Mutex,
+        OnceLock,
         PoisonError,
         atomic::AtomicBool,
     },
@@ -15,6 +16,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use mahi_core::ReadBudget;
 use mahi_identity::{
     AgentError,
     SshAgent,
@@ -101,6 +103,7 @@ const GOODBYE_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct SshSession {
     commands: mpsc::Sender<Command>,
     failure: Arc<Mutex<Option<String>>>,
+    budget: Arc<OnceLock<ReadBudget>>,
     exec_timeout: Duration,
     interrupt: Option<Arc<AtomicBool>>,
 }
@@ -267,6 +270,7 @@ impl SshSession {
             .map_err(|_| SshError::Timeout(remote.host().to_owned()))??;
         let (commands, receiver) = mpsc::channel(QUEUED_COMMANDS);
         let failure = Arc::new(Mutex::new(None));
+        let budget = Arc::new(OnceLock::new());
         tokio::spawn(
             Driver {
                 wire,
@@ -274,6 +278,7 @@ impl SshSession {
                 slots: HashMap::new(),
                 commands: receiver,
                 failure: failure.clone(),
+                budget: Arc::clone(&budget),
                 ids: Vec::new(),
                 payload: Vec::new(),
             }
@@ -282,9 +287,16 @@ impl SshSession {
         Ok(Self {
             commands,
             failure,
+            budget,
             exec_timeout: DEFAULT_EXEC_TIMEOUT,
             interrupt,
         })
+    }
+
+    /// Counts every byte the host sends from now on, whatever it carries, against `budget`,
+    /// and ends the connection once it is spent; a budget set earlier stays.
+    pub fn set_read_budget(&self, budget: ReadBudget) {
+        let _ = self.budget.set(budget);
     }
 
     fn ended(&self) -> SshError {
@@ -493,6 +505,7 @@ struct Driver {
     slots: HashMap<ChannelId, Slot>,
     commands: mpsc::Receiver<Command>,
     failure: Arc<Mutex<Option<String>>>,
+    budget: Arc<OnceLock<ReadBudget>>,
     ids: Vec<ChannelId>,
     payload: Vec<u8>,
 }
@@ -543,7 +556,12 @@ impl Driver {
                 Step::Read(Ok(0)) => Err("the host closed the connection".to_owned()),
                 Step::Read(Err(error)) | Step::Wrote(Err(error)) => Err(reason(error)),
                 Step::Read(Ok(read)) => match self.wire.buffer.get(..read) {
-                    Some(bytes) => self.wire.transport.receive(bytes).map_err(reason),
+                    Some(bytes) => self
+                        .budget
+                        .get()
+                        .map_or(Ok(()), |budget| budget.charge(read))
+                        .map_err(reason)
+                        .and_then(|()| self.wire.transport.receive(bytes).map_err(reason)),
                     None => Ok(()),
                 },
                 Step::Wrote(Ok(written)) => {
@@ -1113,6 +1131,18 @@ mod tests {
                     });
                 }
                 server.send_message(success);
+            } else if command == b"noise" {
+                server.send_message(success);
+                let noise = vec![b'n'; 32 << 10];
+                for _ in 0..64 {
+                    server.send_message(Message::Ignore(&noise));
+                }
+                server.send_message(Message::ChannelExtendedData {
+                    recipient: channel,
+                    code: 1,
+                    data: &noise,
+                });
+                return true;
             } else if command == b"eof-cut" {
                 server.send_message(success);
                 server.send_message(Message::ChannelData {
@@ -1616,6 +1646,23 @@ mod tests {
             RemoteFailure::Signal("KILL out of ?memory".to_owned())
         );
         assert_eq!(failure("cut"), RemoteFailure::Cut);
+    }
+
+    #[test]
+    fn a_read_budget_counts_what_the_host_sends_besides_the_command_output() {
+        let (key, public) = user();
+        let fixture = fixture(&public, key);
+        let session = fixture.session();
+        let budget = ReadBudget::new(256 << 10);
+        session.set_read_budget(budget.clone());
+        if let Ok(exec) = fixture.exec(&session, "noise") {
+            let (mut output, _input) = exec.split();
+            assert!(output.read_to_end(&mut Vec::new()).is_err());
+        }
+        assert!(budget.exceeded());
+        let unlimited = fixture.session();
+        let (mut output, _input) = fixture.exec(&unlimited, "exit 3").unwrap().split();
+        assert!(output.read_to_end(&mut Vec::new()).is_err());
     }
 
     #[test]

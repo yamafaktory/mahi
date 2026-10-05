@@ -4021,6 +4021,17 @@ exit 3
             assert_eq!(code, 1, "{output}");
             assert!(output.contains("the agent exited with 3"), "{output}");
             assert!(fs::read_to_string(&draft).unwrap().contains("## Thread"));
+            fs::write(
+                config_dir(&fixture.home).settings_file(),
+                "fetch-limit = \"100 B\"\n",
+            )
+            .unwrap();
+            let (code, output) = in_terminal(&fixture, &["land", &thread], None);
+            assert_eq!(code, 0, "{output}");
+            assert!(
+                output.contains("it sent more than 100 bytes; raise fetch-limit in config.toml"),
+                "{output}"
+            );
         }
     }
 }

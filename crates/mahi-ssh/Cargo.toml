@@ -19,6 +19,7 @@ ghash = { workspace = true }
 getrandom = { workspace = true }
 gix = { workspace = true }
 hmac = { workspace = true }
+mahi-core = { workspace = true }
 mahi-identity = { workspace = true }
 ml-kem = { workspace = true }
 poly1305 = { workspace = true }
@@ -33,7 +34,6 @@ x25519-dalek = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-mahi-core = { workspace = true }
 mahi-store = { workspace = true }
 ml-kem = { workspace = true, features = ["hazmat"] }
 proptest = { workspace = true }

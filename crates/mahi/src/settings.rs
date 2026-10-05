@@ -19,17 +19,47 @@ use serde::Deserialize;
 use thiserror::Error;
 
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+/// How much one fetch reads, or one push sends, when `config.toml` does not say.
+pub(crate) const DEFAULT_TRANSFER_LIMIT: u64 = 1 << 30;
+const UNITS: [(&str, u64); 5] = [
+    ("TiB", 1 << 40),
+    ("GiB", 1 << 30),
+    ("MiB", 1 << 20),
+    ("KiB", 1 << 10),
+    ("B", 1),
+];
 
 /// What the user set in `config.toml`, in mahi's configuration directory.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Settings {
     pub(crate) palette_key: PaletteKey,
+    pub(crate) fetch_limit: u64,
+    pub(crate) push_limit: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            palette_key: PaletteKey::default(),
+            fetch_limit: DEFAULT_TRANSFER_LIMIT,
+            push_limit: DEFAULT_TRANSFER_LIMIT,
+        }
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct SettingsFile {
     palette_key: Option<String>,
+    fetch_limit: Option<Size>,
+    push_limit: Option<Size>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Size {
+    Bytes(u64),
+    Text(String),
 }
 
 /// `config.toml` cannot be used.
@@ -43,6 +73,8 @@ pub(crate) enum SettingsError {
     Invalid(PathBuf, String),
     #[error("palette-key in {0}: {1}")]
     PaletteKey(PathBuf, #[source] PaletteKeyError),
+    #[error("{1} in {0} is not a size such as 1073741824 or \"1 GiB\"")]
+    Size(PathBuf, &'static str),
 }
 
 impl Settings {
@@ -74,7 +106,34 @@ impl Settings {
             .transpose()
             .map_err(|error| SettingsError::PaletteKey(path.to_path_buf(), error))?
             .unwrap_or_default();
-        Ok(Self { palette_key })
+        let limit = |size: Option<Size>, name: &'static str| {
+            size.map_or(Ok(DEFAULT_TRANSFER_LIMIT), |size| {
+                size.bytes()
+                    .ok_or_else(|| SettingsError::Size(path.to_path_buf(), name))
+            })
+        };
+        Ok(Self {
+            palette_key,
+            fetch_limit: limit(file.fetch_limit, "fetch-limit")?,
+            push_limit: limit(file.push_limit, "push-limit")?,
+        })
+    }
+}
+
+impl Size {
+    fn bytes(&self) -> Option<u64> {
+        let bytes = match self {
+            Self::Bytes(bytes) => *bytes,
+            Self::Text(text) => {
+                let text = text.trim();
+                let (number, unit) = UNITS.iter().find_map(|(name, unit)| {
+                    text.strip_suffix(name)
+                        .map(|number| (number.trim_end(), *unit))
+                })?;
+                number.parse::<u64>().ok()?.checked_mul(unit)?
+            }
+        };
+        (bytes > 0).then_some(bytes)
     }
 }
 
@@ -110,6 +169,46 @@ mod tests {
             Settings::read(&path).unwrap().palette_key,
             "f5".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn transfer_limits_take_bytes_or_sizes_and_default_to_one_gib() {
+        let (_dir, path) = written("");
+        let defaults = Settings::read(&path).unwrap();
+        assert_eq!(
+            (defaults.fetch_limit, defaults.push_limit),
+            (1 << 30, 1 << 30)
+        );
+        let (_dir, path) = written("fetch-limit = \"2 GiB\"\npush-limit = 4096\n");
+        let set = Settings::read(&path).unwrap();
+        assert_eq!((set.fetch_limit, set.push_limit), (2 << 30, 4096));
+        for (text, bytes) in [
+            ("\"512MiB\"", 512 << 20),
+            ("\" 3 KiB \"", 3 << 10),
+            ("\"7 B\"", 7),
+            ("\"1 TiB\"", 1 << 40),
+        ] {
+            let (_dir, path) = written(&format!("fetch-limit = {text}\n"));
+            assert_eq!(Settings::read(&path).unwrap().fetch_limit, bytes, "{text}");
+        }
+        for text in [
+            "0",
+            "\"0 GiB\"",
+            "\"1 GB\"",
+            "\"lots\"",
+            "\"99999999999 TiB\"",
+            "-1",
+        ] {
+            let (_dir, path) = written(&format!("push-limit = {text}\n"));
+            let error = Settings::read(&path).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    SettingsError::Size(_, "push-limit") | SettingsError::Invalid(..)
+                ),
+                "{text}: {error:?}"
+            );
+        }
     }
 
     #[test]

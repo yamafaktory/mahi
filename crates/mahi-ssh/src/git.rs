@@ -32,6 +32,7 @@ use gix::protocol::transport::{
         },
     },
 };
+use mahi_core::ReadBudget;
 use tokio::runtime::{
     Builder,
     Runtime,
@@ -111,6 +112,17 @@ impl SshTransport {
             remote,
             url,
         })
+    }
+}
+
+impl SshTransport {
+    /// Counts every byte the host sends from now on against `budget`, whatever it carries
+    /// (data, errors, keepalives, ignored messages), and ends the connection once it is spent,
+    /// so every read fails and `budget` says it was exceeded.
+    #[must_use]
+    pub fn with_read_budget(self, budget: ReadBudget) -> Self {
+        self.session.set_read_budget(budget);
+        self
     }
 }
 

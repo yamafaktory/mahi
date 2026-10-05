@@ -34,6 +34,7 @@ use gix_transport::client::{
         PostResponse,
     },
 };
+use mahi_core::ReadBudget;
 use thiserror::Error;
 use ureq::{
     Agent,
@@ -134,7 +135,22 @@ pub type HttpsTransport = http::Transport<Client>;
 /// Returns [`ConnectError::Proxy`] if the proxy URL cannot be used, or
 /// [`ConnectError::Credentials`] if the token cannot be set.
 pub fn connect(remote: &HttpsRemote, access: &HttpsAccess) -> Result<HttpsTransport, ConnectError> {
-    let client = client(remote.host(), access)?;
+    connect_within(remote, access, ReadBudget::unlimited())
+}
+
+/// Returns a transport as [`connect`] does, whose response bodies are read from `budget`: once
+/// it is spent, every read fails with [`mahi_core::OverBudget`] and `budget` says so.
+///
+/// # Errors
+///
+/// Returns the errors of [`connect`].
+pub fn connect_within(
+    remote: &HttpsRemote,
+    access: &HttpsAccess,
+    budget: ReadBudget,
+) -> Result<HttpsTransport, ConnectError> {
+    let mut client = client(remote.host(), access)?;
+    client.budget = budget;
     let mut transport = http::connect_http(client, remote.url().clone(), Protocol::V2, false);
     if let Some(token) = &access.token {
         let (username, password) = match token.0.split_once(':') {
@@ -193,6 +209,7 @@ pub fn client(host: &str, access: &HttpsAccess) -> Result<Client, ConnectError> 
     let connector = DefaultConnector::new().chain(StallBound);
     Ok(Client {
         agent: Agent::with_parts(config, connector, DefaultResolver::default()),
+        budget: ReadBudget::unlimited(),
     })
 }
 
@@ -254,6 +271,7 @@ fn capped(timeout: NextTimeout) -> NextTimeout {
 /// The HTTP client gix's smart HTTP transport sends its requests through.
 pub struct Client {
     agent: Agent,
+    budget: ReadBudget,
 }
 
 impl fmt::Debug for Client {
@@ -288,7 +306,7 @@ impl Http for Client {
         let (headers, body) = accepted(response).or_raise(|| Message::new("the remote refused"))?;
         Ok(GetResponse {
             headers: Box::new(Cursor::new(headers)),
-            body: Box::new(BufReader::new(body)),
+            body: Box::new(BufReader::new(self.budget.reader(body))),
         })
     }
 
@@ -309,6 +327,7 @@ impl Http for Client {
         let (mut headers_writer, headers_reader) = pipe::unidirectional(1);
         let (mut body_writer, body_reader) = pipe::unidirectional(PIPE_WRITES);
         let worker = thread::Builder::new().name("mahi-http-post".to_owned());
+        let budget = self.budget.clone();
         let spawned = worker.spawn(move || {
             let sent = request
                 .send(SendBody::from_owned_reader(post_reader))
@@ -318,7 +337,7 @@ impl Http for Client {
                 Ok((headers, body)) => {
                     let _ = io::Write::write_all(&mut headers_writer, &headers);
                     drop(headers_writer);
-                    if let Err(error) = io::copy(&mut { body }, &mut body_writer) {
+                    if let Err(error) = io::copy(&mut budget.reader(body), &mut body_writer) {
                         let _ = body_writer.channel.send(Err(error));
                     }
                 }

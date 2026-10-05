@@ -26,6 +26,7 @@ use std::{
 use mahi_core::{
     AgentSlot,
     ParticipantName,
+    ReadBudget,
     RefKind,
     ThreadId,
     ThreadRef,
@@ -77,6 +78,7 @@ use crate::{
         Visibility,
     },
     run::until_stopped,
+    settings::Settings,
 };
 
 const MAX_CAUSE_CHARS: usize = 300;
@@ -201,7 +203,9 @@ impl SyncSetup {
     /// Connects to the remote. Over SSH, connecting stops once `interrupt` is set; over HTTPS,
     /// each wait is bounded instead.
     pub(crate) fn connect(&self, interrupt: &Arc<AtomicBool>) -> Result<AnyTransport, PushError> {
-        Ok(self.access.connect(&self.remote, interrupt)?)
+        Ok(self
+            .access
+            .connect(&self.remote, interrupt, ReadBudget::unlimited())?)
     }
 }
 
@@ -220,13 +224,14 @@ impl Access {
         &self,
         remote: &RemoteUrl,
         interrupt: &Arc<AtomicBool>,
+        budget: ReadBudget,
     ) -> Result<AnyTransport, ConnectError> {
         match (self, remote) {
-            (Self::Ssh(access), RemoteUrl::Ssh(url)) => {
-                Ok(Box::new(access.connect(url, interrupt)?))
-            }
+            (Self::Ssh(access), RemoteUrl::Ssh(url)) => Ok(Box::new(
+                access.connect(url, interrupt)?.with_read_budget(budget),
+            )),
             (Self::Https(access), RemoteUrl::Https(url)) => {
-                Ok(Box::new(mahi_http::connect(url, access)?))
+                Ok(Box::new(mahi_http::connect_within(url, access, budget)?))
             }
             _ => Err(ConnectError::Mismatch),
         }
@@ -390,13 +395,35 @@ pub(crate) fn fetch_thread(
         }
     };
     eprintln!("mahi: fetching the thread from {name}");
+    let budget = ReadBudget::new(transfer_limits(environment).fetch_limit);
     let outcome = access
-        .connect(&url, interrupt)
+        .connect(&url, interrupt, budget.clone())
         .map_err(FetchError::from)
         .and_then(|transport| fetch_and_accept(store, transport, thread, owner, local, interrupt));
-    if let Some(told) = fetch_report(&outcome, &name) {
+    if budget.exceeded() {
+        eprintln!(
+            "mahi: the thread is not fetched from {name}: it sent more than {} bytes; raise \
+             fetch-limit in config.toml to fetch it",
+            budget.limit()
+        );
+    } else if let Some(told) = fetch_report(&outcome, &name) {
         eprint!("{told}");
     }
+}
+
+/// Returns the transfer limits `config.toml` sets, or the defaults when it cannot be read,
+/// which is reported.
+pub(crate) fn transfer_limits(environment: &Environment) -> Settings {
+    let loaded = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|config| Settings::load(&config).map_err(|error| error.to_string()));
+    loaded.unwrap_or_else(|error| {
+        eprintln!("mahi: the default transfer limits apply: {error}");
+        Settings::default()
+    })
 }
 
 /// Returns the remote to fetch from and its URL, and whether it was chosen: the chosen remote
