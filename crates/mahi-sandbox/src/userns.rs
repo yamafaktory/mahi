@@ -283,6 +283,10 @@ mod tests {
                 .file_name,
             "usr.bin.mahi"
         );
+        assert_eq!(
+            apparmor_profile(Path::new("/usr/bin/mahi")).unwrap().text,
+            include_str!("../../../packaging/deb/usr.bin.mahi")
+        );
         for refused in [
             "relative/mahi",
             "/",

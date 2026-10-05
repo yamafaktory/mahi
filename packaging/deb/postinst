@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+case "$1" in
+configure | abort-remove | abort-deconfigure | abort-upgrade)
+    if [ -d /sys/kernel/security/apparmor ] && command -v apparmor_parser >/dev/null 2>&1; then
+        apparmor_parser -r -T -W /etc/apparmor.d/usr.bin.mahi || true
+    fi
+    ;;
+esac

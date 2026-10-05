@@ -21,6 +21,18 @@ test-git *args:
 apparmor-parse:
     cargo run --locked -q -p mahi -- apparmor | sudo apparmor_parser --skip-kernel-load
 
+deb:
+    cargo deb --locked -p mahi
+
+deb-check:
+    test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+    sudo apt-get install -y ./target/debian/mahi_*.deb
+    sudo grep -qx 'usr.bin.mahi (unconfined)' /sys/kernel/security/apparmor/profiles
+    MAHI_TEST_BINARY=/usr/bin/mahi cargo nextest run --locked -p mahi -E 'test(run_starts_a_thread_and_the_agent_in_its_own_worktree)'
+    cp /usr/bin/mahi "$RUNNER_TEMP/mahi"
+    ! MAHI_TEST_BINARY="$RUNNER_TEMP/mahi" cargo nextest run --locked -p mahi -E 'test(run_starts_a_thread_and_the_agent_in_its_own_worktree)' > "$RUNNER_TEMP/refused.log" 2>&1
+    grep -q 'AppArmor stops mahi' "$RUNNER_TEMP/refused.log"
+
 deny:
     cargo deny --locked check
 

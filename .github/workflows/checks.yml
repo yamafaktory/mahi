@@ -61,6 +61,18 @@ jobs:
       - if: runner.os == 'Linux'
         run: just apparmor-parse
 
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest,cargo-deb
+      - run: just deb
+      - run: just deb-check
+
   deny:
     runs-on: ubuntu-latest
     steps:

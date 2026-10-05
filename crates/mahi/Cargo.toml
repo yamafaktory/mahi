@@ -1,6 +1,6 @@
 [package]
 authors.workspace = true
-description = "Real-time, peer-to-peer collaboration around any terminal coding agent."
+description = "Real-time, peer-to-peer collaboration around any terminal coding agent"
 edition.workspace = true
 license.workspace = true
 name = "mahi"
@@ -8,6 +8,19 @@ publish.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
+
+[package.metadata.deb]
+assets = [
+  ["target/release/mahi", "usr/bin/", "755"],
+  ["../../packaging/deb/usr.bin.mahi", "etc/apparmor.d/", "644"],
+]
+conf-files = ["/etc/apparmor.d/usr.bin.mahi"]
+breaks = "apparmor (<< 4.0~)"
+depends = "$auto"
+extended-description = "mahi runs a terminal coding agent in a sandbox and shares its thread with teammates in real time. The package installs an AppArmor profile that lets /usr/bin/mahi create the user namespaces its sandbox needs and confines it in no other way."
+maintainer-scripts = "../../packaging/deb/"
+priority = "optional"
+section = "devel"
 
 [dependencies]
 age = { workspace = true }

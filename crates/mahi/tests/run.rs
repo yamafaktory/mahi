@@ -99,6 +99,13 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    fn mahi_binary() -> PathBuf {
+        std::env::var_os("MAHI_TEST_BINARY")
+            .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mahi")), PathBuf::from)
+            .canonicalize()
+            .expect("MAHI_TEST_BINARY names a binary that exists")
+    }
+
     const SIGN_REQUEST: u8 = 13;
     const SIGN_RESPONSE: u8 = 14;
     const IDENTITIES_REQUEST: u8 = 11;
@@ -261,7 +268,7 @@ mod tests {
 
     impl Fixture {
         fn command(&self, arguments: &[&str]) -> Command {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_mahi"));
+            let mut command = Command::new(mahi_binary());
             command
                 .args(arguments)
                 .current_dir(&self.repo)
@@ -724,7 +731,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         passphrase: Option<&str>,
     ) -> (i32, String) {
         let mut command = PtyCommand::new(
-            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            mahi_binary().as_path(),
             &fixture.repo,
             WindowSize {
                 rows: 24,
@@ -802,7 +809,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
 
         fn start_with(fixture: &Fixture, arguments: &[&str], live: &str) -> Self {
             let mut command = PtyCommand::new(
-                Path::new(env!("CARGO_BIN_EXE_mahi")),
+                mahi_binary().as_path(),
                 &fixture.repo,
                 WindowSize { rows: 24, cols: 80 },
             );
@@ -1514,7 +1521,7 @@ cat parser.rs
 
     #[test]
     fn mahi_apparmor_prints_a_userns_profile_named_after_its_own_path() {
-        let binary = std::fs::canonicalize(env!("CARGO_BIN_EXE_mahi")).unwrap();
+        let binary = std::fs::canonicalize(mahi_binary()).unwrap();
         let output = Command::new(&binary).arg("apparmor").output().unwrap();
         assert_eq!(output.status.code(), Some(0));
         let profile = String::from_utf8(output.stdout).unwrap();
@@ -1831,7 +1838,7 @@ cat parser.rs
 
     fn terminal_command(fixture: &Fixture, arguments: &[&str]) -> PtyCommand {
         let mut command = PtyCommand::new(
-            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            mahi_binary().as_path(),
             &fixture.repo,
             WindowSize {
                 rows: 24,
@@ -2039,7 +2046,7 @@ cat parser.rs
 
         let tools = claude.parent().unwrap().display().to_string();
         let command = PtyCommand::new(
-            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            mahi_binary().as_path(),
             &fixture.repo,
             WindowSize {
                 rows: 24,
@@ -2963,7 +2970,7 @@ cat parser.rs
         live: &str,
     ) -> thread::JoinHandle<(i32, String)> {
         let mut adding = PtyCommand::new(
-            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            mahi_binary().as_path(),
             &fixture.repo,
             WindowSize {
                 rows: 24,
@@ -3198,7 +3205,7 @@ cat parser.rs
 
     fn mahi_in_terminal(cwd: &Path, arguments: &[&str], env: &[(&str, &OsStr)]) -> PtyChild {
         let mut command = PtyCommand::new(
-            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            mahi_binary().as_path(),
             cwd,
             WindowSize {
                 rows: 24,
@@ -3375,7 +3382,7 @@ cat parser.rs
     }
 
     fn invite_teammate(fixture: &Fixture, thread: ThreadId, teammate: &Teammate) -> String {
-        let mut id = Command::new(env!("CARGO_BIN_EXE_mahi"));
+        let mut id = Command::new(mahi_binary());
         id.arg("id");
         teammate_env(&mut id, teammate, "bob");
         let card = String::from_utf8(id.output().unwrap().stdout).unwrap();
@@ -3451,7 +3458,7 @@ cat parser.rs
         let bob = teammate(&fixture, "bob");
         let ticket = invite_teammate(&fixture, thread, &bob);
         let join = |socket: &Path| {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_mahi"));
+            let mut command = Command::new(mahi_binary());
             command
                 .args(["join", &ticket, "--", "true"])
                 .current_dir(&bob.repo);
@@ -3644,7 +3651,7 @@ until [ -e done ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done"#;
         );
         all_signed_by(&store, &snapshots, &bob.key);
 
-        let mut end = Command::new(env!("CARGO_BIN_EXE_mahi"));
+        let mut end = Command::new(mahi_binary());
         end.args(["end", &thread_text]).current_dir(&bob.repo);
         teammate_env(&mut end, &bob, "bob");
         let ended = end.output().unwrap();
@@ -3802,7 +3809,7 @@ until [ -e done ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done"#;
     fn a_stop_signal_ends_the_agent_and_restores_the_terminal() {
         let fixture = fixture();
         let mut mahi = PtyCommand::new(
-            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            mahi_binary().as_path(),
             &fixture.repo,
             WindowSize { rows: 24, cols: 80 },
         )
@@ -3936,7 +3943,7 @@ exit 3
             extra: &[(&str, &Path)],
         ) -> (i32, String) {
             let mut command = PtyCommand::new(
-                Path::new(env!("CARGO_BIN_EXE_mahi")),
+                mahi_binary().as_path(),
                 &fixture.repo,
                 WindowSize {
                     rows: 24,
