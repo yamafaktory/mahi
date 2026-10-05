@@ -92,6 +92,8 @@ use crate::{
 
 /// Files larger than this are left out of snapshots and reported instead.
 pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+/// The most content, in bytes of the files read, that one snapshot adds to the repository.
+pub(crate) const MAX_SNAPSHOT_NEW_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Directories nested deeper than this are left out of snapshots and reported instead.
 pub const MAX_SNAPSHOT_DEPTH: usize = 256;
@@ -130,6 +132,9 @@ pub enum Skipped {
     NotAFile,
     /// The directory is nested deeper than [`MAX_SNAPSHOT_DEPTH`].
     TooDeep,
+    /// The file's content is not in the repository yet, and the snapshot already added as much
+    /// new content as it may.
+    NewContentLimit,
 }
 
 /// The result of snapshotting a worktree.
@@ -173,6 +178,14 @@ struct Cached {
     index_id: Option<ObjectId>,
     recorded_at: (i64, i64),
     id: ObjectId,
+    bytes: u64,
+    left_out: Option<Skipped>,
+}
+
+struct Hashed {
+    id: ObjectId,
+    bytes: u64,
+    written: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +273,25 @@ impl Store {
         cache: &mut SnapshotCache,
         interrupt: &AtomicBool,
     ) -> Result<Snapshot, StoreError> {
+        self.snapshot_within(name, globals, (cache, MAX_SNAPSHOT_NEW_BYTES), interrupt)
+    }
+
+    /// Snapshots `name` as [`Store::snapshot`] does, adding at most `max_new_bytes` of new
+    /// content: a file read whose blob is neither the one its index entry nor its previous
+    /// snapshot gave is new, and counts its size; once the budget is spent, a new file is
+    /// hashed without being written and left out as [`Skipped::NewContentLimit`], unless the
+    /// repository already holds its blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Store::snapshot`].
+    pub(crate) fn snapshot_within(
+        &self,
+        name: &str,
+        globals: &GlobalPatterns,
+        (cache, max_new_bytes): (&mut SnapshotCache, u64),
+        interrupt: &AtomicBool,
+    ) -> Result<Snapshot, StoreError> {
         let (repo, workdir) = self.open_worktree(name)?;
         let index = repo.index_or_empty()?;
         let case = if repo.config_snapshot().boolean("core.ignoreCase") == Some(true) {
@@ -304,6 +336,7 @@ impl Store {
             started,
             stamp_dev,
             read: 0,
+            new_left: max_new_bytes,
             ignore: global_ignore(&repo, globals)?,
             attributes,
             collection,
@@ -403,6 +436,7 @@ struct Walk<'a> {
     started: (i64, i64),
     stamp_dev: u64,
     read: usize,
+    new_left: u64,
     ignore: gix::ignore::Search,
     attributes: gix::attrs::Search,
     collection: MetadataCollection,
@@ -660,7 +694,12 @@ impl<'a> Walk<'a> {
             return Ok(None);
         }
         let stamp_dev = self.stamp_dev;
-        let cached = self.cache_in.remove(&rela).filter(|cached| {
+        let earlier = self.cache_in.remove(&rela);
+        let previous = earlier
+            .as_ref()
+            .filter(|cached| cached.left_out.is_none())
+            .map(|cached| cached.id);
+        let unchanged = earlier.filter(|cached| {
             cached.stat == stat
                 && cached.attributes == attributes
                 && cached.index_id == index_id
@@ -668,16 +707,38 @@ impl<'a> Walk<'a> {
                 && stat.mtime < cached.recorded_at
                 && stat.ctime < cached.recorded_at
         });
-        let id = if let Some(cached) = cached {
-            cached.id
+        let retry = unchanged.as_ref().is_some_and(|cached| {
+            cached.left_out == Some(Skipped::NewContentLimit) && cached.bytes <= self.new_left
+        });
+        let (id, bytes, left_out) = if let Some(cached) = unchanged.filter(|_| !retry) {
+            let left_out = match cached.left_out {
+                Some(Skipped::NewContentLimit) if self.repo.has_object(cached.id) => None,
+                other => other,
+            };
+            (cached.id, cached.bytes, left_out)
         } else {
             self.read += 1;
-            let Some(id) = self.hash_file(&rela, file, stat.size)? else {
+            let Some(hashed) = self.hash_file(&rela, file, stat.size, self.new_left)? else {
                 self.skipped.push((rela, Skipped::Unconvertible));
                 return Ok(None);
             };
-            id
+            let left_out = if hashed.bytes > MAX_SNAPSHOT_FILE_BYTES {
+                Some(Skipped::TooLarge)
+            } else if hashed.written {
+                if Some(hashed.id) != index_id && Some(hashed.id) != previous {
+                    self.new_left = self.new_left.saturating_sub(hashed.bytes);
+                }
+                None
+            } else if self.repo.has_object(hashed.id) {
+                None
+            } else {
+                Some(Skipped::NewContentLimit)
+            };
+            (hashed.id, hashed.bytes, left_out)
         };
+        if let Some(reason) = left_out {
+            self.skipped.push((rela.clone(), reason));
+        }
         self.cache_out.insert(
             rela,
             Cached {
@@ -686,9 +747,11 @@ impl<'a> Walk<'a> {
                 index_id,
                 recorded_at: self.started,
                 id,
+                bytes,
+                left_out,
             },
         );
-        Ok(Some(id))
+        Ok(left_out.is_none().then_some(id))
     }
 
     fn tracked(&self, rela: &BStr) -> Option<&'a index::Entry> {
@@ -732,7 +795,8 @@ impl<'a> Walk<'a> {
         rela: &BString,
         file: File,
         size: u64,
-    ) -> Result<Option<ObjectId>, StoreError> {
+        writable: u64,
+    ) -> Result<Option<Hashed>, StoreError> {
         let short = Rc::new(Cell::new(false));
         let exact = ExactReader {
             inner: file.take(size),
@@ -764,24 +828,58 @@ impl<'a> Walk<'a> {
             }
             Err(_) => return Ok(None),
         };
-        let id = match outcome {
-            ToGitOutcome::Unchanged(mut reader) => {
-                match self
+        let failed = |error: gix::Error, interrupt: &AtomicBool| {
+            if short.get() {
+                StoreError::ChangedDuringSnapshot(rela.clone())
+            } else if interrupt.load(Ordering::Relaxed) {
+                StoreError::Interrupted
+            } else {
+                StoreError::Git(error)
+            }
+        };
+        let hashed = match outcome {
+            ToGitOutcome::Unchanged(mut reader) if size > writable => Hashed {
+                id: gix::objs::compute_stream_hash(
+                    self.repo.object_hash(),
+                    Kind::Blob,
+                    &mut reader,
+                    size,
+                    &mut gix::progress::Discard,
+                    self.interrupt,
+                )
+                .map_err(|error| failed(error.into(), self.interrupt))?,
+                bytes: size,
+                written: false,
+            },
+            ToGitOutcome::Unchanged(mut reader) => Hashed {
+                id: self
                     .repo
                     .objects
                     .write_stream(Kind::Blob, size, &mut reader)
-                {
-                    Ok(id) => id,
-                    Err(_) if short.get() => {
-                        return Err(StoreError::ChangedDuringSnapshot(rela.clone()));
+                    .map_err(|error| failed(error.into(), self.interrupt))?,
+                bytes: size,
+                written: true,
+            },
+            ToGitOutcome::Buffer(buffer) => {
+                let bytes = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
+                if bytes > writable || bytes > MAX_SNAPSHOT_FILE_BYTES {
+                    Hashed {
+                        id: gix::objs::compute_hash(self.repo.object_hash(), Kind::Blob, buffer)
+                            .map_err(gix::Error::from)?,
+                        bytes,
+                        written: false,
                     }
-                    Err(error) => return Err(StoreError::Git(error.into())),
+                } else {
+                    Hashed {
+                        id: self.repo.write_blob(buffer)?.detach(),
+                        bytes,
+                        written: true,
+                    }
                 }
             }
-            ToGitOutcome::Buffer(buffer) => self.repo.write_blob(buffer)?.detach(),
             ToGitOutcome::Process(_) => return Ok(None),
         };
-        Ok(Some(id))
+        Ok(Some(hashed))
     }
 }
 
@@ -1149,6 +1247,89 @@ mod tests {
         let snapshot = snapshot(&setup);
         assert_eq!(snapshot.tree, tree_of(&setup.store, commit));
         assert!(snapshot.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_adds_new_content_only_up_to_its_limit() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let noise = |seed: u32| -> Vec<u8> {
+            (0..40_000_u32)
+                .map(|index| u8::try_from((index * 7 + seed) % 251).unwrap())
+                .collect()
+        };
+        let take = |cache: &mut SnapshotCache, budget: u64| {
+            setup
+                .store
+                .snapshot_within(
+                    "agent",
+                    &GlobalPatterns::default(),
+                    (cache, budget),
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+        };
+        let left_out = |name: &str| vec![(BString::from(name), Skipped::NewContentLimit)];
+        fs::write(path.join("a.bin"), noise(1)).unwrap();
+        fs::write(path.join("b.bin"), noise(2)).unwrap();
+        let mut cache = SnapshotCache::default();
+        let first = take(&mut cache, 50_000);
+        assert!(
+            first.skipped == left_out("a.bin") || first.skipped == left_out("b.bin"),
+            "{:?}",
+            first.skipped
+        );
+        let second = take(&mut cache, 50_000);
+        assert!(second.skipped.is_empty(), "{:?}", second.skipped);
+        fs::write(path.join("c.bin"), noise(1)).unwrap();
+        fs::write(path.join("h.bin"), noise(8)).unwrap();
+        let third = take(&mut cache, 0);
+        assert_eq!(third.skipped, left_out("h.bin"));
+        let kept: Vec<String> = names(&setup.store, third.tree)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for name in ["README.md", "a.bin", "b.bin", "c.bin"] {
+            assert!(kept.contains(&name.to_owned()), "{name}: {kept:?}");
+        }
+        let fourth = take(&mut cache, 0);
+        assert_eq!(fourth.skipped, left_out("h.bin"));
+        let fresh = take(&mut SnapshotCache::default(), 0);
+        assert_eq!(fresh.skipped, left_out("h.bin"));
+        assert_eq!(fresh.tree, third.tree);
+    }
+
+    #[test]
+    fn content_that_grows_when_converted_is_counted_at_its_converted_size() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        fs::write(
+            path.join(".gitattributes"),
+            "u.txt working-tree-encoding=UTF-16LE text\n",
+        )
+        .unwrap();
+        let text: Vec<u8> = "\u{20ac}"
+            .repeat(1000)
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        fs::write(path.join("u.txt"), &text).unwrap();
+        let taken = setup
+            .store
+            .snapshot_within(
+                "agent",
+                &GlobalPatterns::default(),
+                (&mut SnapshotCache::default(), 2_600),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(
+            taken
+                .skipped
+                .contains(&(BString::from("u.txt"), Skipped::NewContentLimit)),
+            "{:?}",
+            taken.skipped
+        );
     }
 
     #[test]
