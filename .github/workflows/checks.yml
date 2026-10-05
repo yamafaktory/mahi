@@ -51,11 +51,15 @@ jobs:
         with:
           tool: just,cargo-nextest
       - if: runner.os == 'Linux'
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        run: |
+          printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile mahi-tests %s/target/** flags=(unconfined) {\n  userns,\n}\n' "$GITHUB_WORKSPACE" | sudo tee /etc/apparmor.d/mahi-tests
+          sudo apparmor_parser -r /etc/apparmor.d/mahi-tests
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends openssh-server
       - run: just test --profile ci
       - run: just test-git --profile ci
+      - if: runner.os == 'Linux'
+        run: just apparmor-parse
 
   deny:
     runs-on: ubuntu-latest

@@ -31,6 +31,7 @@ just test       # cargo nextest run; extra args pass through, e.g. just test -p 
 just build
 just run -- …   # run the mahi binary
 just test-git   # the tests that run the git program (not part of just test)
+just apparmor-parse # parse mahi apparmor's profile (needs apparmor_parser and sudo)
 just deny       # cargo-deny: advisories, licenses, banned crates, unknown sources
 just check      # sweep + fmt-check + clippy + test + deny
 just sweep [g]  # remove target/ or fuzz/target/ once either passes g GiB (40 by default)

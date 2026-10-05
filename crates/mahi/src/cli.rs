@@ -77,6 +77,10 @@ pub(crate) enum Command {
     Threads,
     /// Prints your participant card: the line a thread's owner needs to invite you.
     Id,
+    /// Prints an AppArmor profile that lets this mahi create the user namespaces its sandbox
+    /// needs and confines it in no other way, for /etc/apparmor.d on Ubuntu, in the file
+    /// named after this mahi's path (/usr/bin/mahi's is usr.bin.mahi).
+    Apparmor,
     /// Adds a teammate to a thread you own, from their participant card, and prints the
     /// ticket they join with.
     Invite(InviteCommand),

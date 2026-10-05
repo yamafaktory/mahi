@@ -302,6 +302,8 @@ const BROKEN_PIPE_CODE: i32 = 128 + 13;
 #[derive(Debug, Error)]
 pub(crate) enum RunError {
     #[error(transparent)]
+    UserNamespaces(#[from] mahi_sandbox::UsernsBlocked),
+    #[error(transparent)]
     Settings(#[from] SettingsError),
     #[error("cannot find the current directory")]
     CurrentDirectory(#[source] io::Error),
@@ -1193,6 +1195,7 @@ impl Prepared {
         require_program(&agent.canonical)?;
         check_profile(profile, environment)?;
         require_passed(environment)?;
+        mahi_sandbox::check_user_namespaces(environment.mahi_exe.as_deref())?;
         let git_dir = fs::canonicalize(store.common_dir()).map_err(RunError::GitDirectory)?;
         if host.is_private(&git_dir) {
             return Err(RunError::PrivateDirectory(git_dir));

@@ -15,6 +15,7 @@ compile_error!("the Linux sandbox supports little-endian x86_64 and aarch64 only
 
 mod pty;
 mod sandbox;
+mod userns;
 mod window;
 
 pub use pty::{
@@ -30,6 +31,12 @@ pub use sandbox::{
     Access,
     Sandbox,
     SandboxError,
+};
+pub use userns::{
+    AppArmorProfile,
+    UsernsBlocked,
+    apparmor_profile,
+    check_user_namespaces,
 };
 pub use window::{
     SignalError,

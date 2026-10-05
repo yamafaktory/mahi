@@ -18,6 +18,9 @@ test *args:
 test-git *args:
     cargo nextest run --workspace --locked --ignore-default-filter -E 'binary(/^git_/) | test(/(^|::)git_tests::/)' {{args}}
 
+apparmor-parse:
+    cargo run --locked -q -p mahi -- apparmor | sudo apparmor_parser --skip-kernel-load
+
 deny:
     cargo deny --locked check
 

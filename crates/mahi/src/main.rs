@@ -105,30 +105,7 @@ fn main() {
                 1
             }
         },
-        Command::Purge(command) => match purge::purge(&command, &environment) {
-            Ok(purge::Purged::Done(done)) => {
-                eprint!("{done}");
-                0
-            }
-            Ok(purge::Purged::Kept) => {
-                eprintln!("mahi: nothing was purged");
-                1
-            }
-            Ok(purge::Purged::Failed(done, error)) => {
-                eprint!("{done}");
-                report(&error);
-                1
-            }
-            Ok(purge::Purged::Stopped(signal, done)) => {
-                eprint!("{done}");
-                signal.reraise();
-                128 + signal.number()
-            }
-            Err(error) => {
-                report(&error);
-                1
-            }
-        },
+        Command::Purge(command) => purged(&command, &environment),
         Command::Credential(command) => match credentials::credential(&command, &environment) {
             Ok(done) if command == CredentialCommand::List => print_out(&done),
             Ok(done) => {
@@ -148,6 +125,7 @@ fn main() {
             exit_code(remote::remote(&command).map(|done| print_out(&done)))
         }
         Command::Id => exit_code(id::id(&environment).map(|card| print_out(&card))),
+        Command::Apparmor => apparmor(&environment),
         Command::Threads => exit_code(threads::threads().map(|listing| print_out(&listing))),
         Command::Hook(hook) => {
             if let Some(socket) = &environment.hook_socket {
@@ -192,6 +170,22 @@ fn exit_code<E: Error>(result: Result<i32, E>) -> i32 {
     })
 }
 
+/// Prints the AppArmor profile for this mahi's own path, and returns the exit code.
+fn apparmor(environment: &Environment) -> i32 {
+    let profile = environment
+        .mahi_exe
+        .as_deref()
+        .and_then(mahi_sandbox::apparmor_profile);
+    if let Some(profile) = profile {
+        return print_out(&profile.text);
+    }
+    eprintln!(
+        "mahi: cannot write a profile for this mahi: its path is unknown or holds a character \
+         AppArmor reads as a pattern"
+    );
+    1
+}
+
 /// Writes `text` to standard output, where a reader that stopped early is not an error.
 fn print_out(text: &str) -> i32 {
     match io::stdout().lock().write_all(text.as_bytes()) {
@@ -228,6 +222,34 @@ fn merged(command: &cli::MergeCommand, environment: &Environment) -> i32 {
             if let Some(report) = report {
                 eprint!("{report}");
             }
+            signal.reraise();
+            128 + signal.number()
+        }
+        Err(error) => {
+            report(&error);
+            1
+        }
+    }
+}
+
+/// Runs `mahi purge`, prints its report, and returns its exit code.
+fn purged(command: &cli::PurgeCommand, environment: &Environment) -> i32 {
+    match purge::purge(command, environment) {
+        Ok(purge::Purged::Done(done)) => {
+            eprint!("{done}");
+            0
+        }
+        Ok(purge::Purged::Kept) => {
+            eprintln!("mahi: nothing was purged");
+            1
+        }
+        Ok(purge::Purged::Failed(done, error)) => {
+            eprint!("{done}");
+            report(&error);
+            1
+        }
+        Ok(purge::Purged::Stopped(signal, done)) => {
+            eprint!("{done}");
             signal.reraise();
             128 + signal.number()
         }

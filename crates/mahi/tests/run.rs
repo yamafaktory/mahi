@@ -1512,6 +1512,22 @@ cat parser.rs
         all_signed_by(&store, &snapshots_of(&thread, "codex"), &fixture.owner);
     }
 
+    #[test]
+    fn mahi_apparmor_prints_a_userns_profile_named_after_its_own_path() {
+        let binary = std::fs::canonicalize(env!("CARGO_BIN_EXE_mahi")).unwrap();
+        let output = Command::new(&binary).arg("apparmor").output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let profile = String::from_utf8(output.stdout).unwrap();
+        let path = binary.to_str().unwrap();
+        let name = path.trim_start_matches('/').replace('/', ".");
+        assert!(
+            profile.contains(&format!(
+                "profile {name} {path} flags=(unconfined) {{\n  userns,\n"
+            )),
+            "{profile}"
+        );
+    }
+
     const TOOL_USER: &str = r#"#!/bin/sh
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
