@@ -8,6 +8,7 @@ mod diff;
 mod fetch;
 #[cfg(fuzzing)]
 pub mod fuzzing;
+mod history;
 mod merge;
 mod push;
 mod snapshot;

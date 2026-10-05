@@ -190,6 +190,9 @@ pub enum StoreError {
     /// Two tree entries have the same name.
     #[error("duplicate tree entry name {0:?}")]
     DuplicateEntryName(String),
+    /// More commits would be walked than mahi allows.
+    #[error("more than {0} commits to walk")]
+    TooManyCommits(usize),
     /// A local branch does not exist.
     #[error("branch {0:?} does not exist")]
     NoBranch(String),
@@ -837,7 +840,7 @@ fn validate_entry_name(name: &str, kind: EntryKind) -> Result<(), StoreError> {
     }
 }
 
-fn branch_ref(name: &str) -> Result<FullName, StoreError> {
+pub(crate) fn branch_ref(name: &str) -> Result<FullName, StoreError> {
     let invalid = || StoreError::InvalidBranchName(name.to_owned());
     if name.is_empty()
         || name.starts_with('-')

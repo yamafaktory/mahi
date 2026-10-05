@@ -43,9 +43,13 @@ use mahi_core::{
     ThreadRef,
 };
 
-use crate::store::{
-    Store,
-    StoreError,
+use crate::{
+    history::NewCommits,
+    store::{
+        Store,
+        StoreError,
+        branch_ref,
+    },
 };
 
 const MAX_ADVERTISED_REFS: usize = 65536;
@@ -76,8 +80,9 @@ struct Advertisement {
     atomic: bool,
 }
 
-type Command = (ThreadRef, Option<ObjectId>, ObjectId);
+type Command = (String, Option<ObjectId>, ObjectId);
 type Plan = (Vec<(ThreadRef, Pushed)>, Vec<Command>);
+type Report = HashMap<String, Option<String>>;
 
 impl Store {
     /// Pushes `refs` to the remote `transport` reaches, each to where it points here, and only
@@ -105,8 +110,87 @@ impl Store {
                 unique.push(thread_ref.clone());
             }
         }
-        let advertised = advertisement(&mut transport, &unique)?;
+        let names: HashSet<String> = unique.iter().map(ToString::to_string).collect();
+        let threads: HashSet<String> = unique
+            .iter()
+            .map(|thread_ref| format!("{THREADS_PREFIX}{}/", thread_ref.thread()))
+            .collect();
+        let advertised = advertisement(&mut transport, &names, &|name| {
+            threads
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str()))
+        })?;
         let (mut outcomes, commands) = self.plan(&unique, &advertised)?;
+        if commands.is_empty() {
+            finish_without_commands(&mut transport)?;
+            return Ok(outcomes);
+        }
+        let objects = self.objects_to_send(&commands, &advertised.tips, interrupt)?;
+        let report = self.send(
+            &mut transport,
+            &commands,
+            (advertised.atomic, &objects),
+            interrupt,
+        )?;
+        for (thread_ref, outcome) in &mut outcomes {
+            if *outcome == Pushed::Updated {
+                settle(outcome, &report, &thread_ref.to_string());
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// Pushes the local branch `branch` to the same branch of the remote `transport` reaches,
+    /// as a fast-forward only, sending every commit the remote's branches, tags and `HEAD` do
+    /// not reach, merges included.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBranchName`] or [`StoreError::NoBranch`] if `branch` is
+    /// not a local branch, [`StoreError::PushFailed`] if the remote does not speak the protocol
+    /// mahi needs, cannot unpack what was sent, or the branch has more new commits than mahi
+    /// sends, [`StoreError::Interrupted`] if `interrupt` is set, or [`StoreError::Git`] if the
+    /// transport or building the pack fails.
+    pub fn push_branch<T: Transport>(
+        &self,
+        mut transport: T,
+        branch: &str,
+        interrupt: &AtomicBool,
+    ) -> Result<Pushed, StoreError> {
+        let name = branch_ref(branch)?.as_bstr().to_string();
+        let local = self
+            .branch_tip(branch)?
+            .ok_or_else(|| StoreError::NoBranch(branch.to_owned()))?;
+        let names = HashSet::from([name.clone()]);
+        let advertised = advertisement(&mut transport, &names, &|other| {
+            other.starts_with("refs/heads/") || other.starts_with("refs/tags/")
+        })?;
+        let remote = advertised.wanted.get(&name).copied();
+        let (mut outcome, command) = self.decide(&name, (local, remote), &|local, remote| {
+            self.reaches(local, remote, interrupt)
+        })?;
+        let Some(command) = command else {
+            finish_without_commands(&mut transport)?;
+            return Ok(outcome);
+        };
+        let objects = self.branch_objects(local, &advertised.tips, interrupt)?;
+        let report = self.send(
+            &mut transport,
+            std::slice::from_ref(&command),
+            (advertised.atomic, &objects),
+            interrupt,
+        )?;
+        settle(&mut outcome, &report, &name);
+        Ok(outcome)
+    }
+
+    fn send<T: Transport>(
+        &self,
+        transport: &mut T,
+        commands: &[Command],
+        (atomic, objects): (bool, &[ObjectId]),
+        interrupt: &AtomicBool,
+    ) -> Result<Report, StoreError> {
         let mut writer = transport
             .request(
                 WriteMode::OneLfTerminatedLinePerWriteCall,
@@ -114,18 +198,13 @@ impl Store {
                 false,
             )
             .map_err(gix::Error::from_error)?;
-        if commands.is_empty() {
-            writer.into_read()?;
-            return Ok(outcomes);
-        }
-        let objects = self.objects_to_send(&commands, &advertised.tips, interrupt)?;
-        for (index, (thread_ref, old, new)) in commands.iter().enumerate() {
+        for (index, (name, old, new)) in commands.iter().enumerate() {
             let old = old.unwrap_or_else(|| ObjectId::null(gix::hash::Kind::Sha1));
-            let mut line = format!("{old} {new} {thread_ref}");
+            let mut line = format!("{old} {new} {name}");
             if index == 0 {
                 line.push('\0');
                 line.push_str("report-status ");
-                if advertised.atomic {
+                if atomic {
                     line.push_str("atomic ");
                 }
                 line.push_str(AGENT);
@@ -135,25 +214,59 @@ impl Store {
         writer.write_message(MessageKind::Flush)?;
         let (raw, mut reader) = writer.into_parts();
         let mut raw = BufWriter::with_capacity(PACK_BUFFER_BYTES, raw);
-        self.write_pack(&objects, &mut raw, interrupt)?;
+        self.write_pack(objects, &mut raw, interrupt)?;
         raw.flush()?;
         drop(raw);
-        let sent: HashSet<String> = commands
-            .iter()
-            .map(|(thread_ref, _, _)| thread_ref.to_string())
-            .collect();
-        let report = read_report(&mut |line| reader.readline_str(line), &sent)?;
-        for (thread_ref, outcome) in &mut outcomes {
-            if *outcome != Pushed::Updated {
-                continue;
-            }
-            match report.get(&thread_ref.to_string()) {
-                Some(None) => {}
-                Some(Some(reason)) => *outcome = Pushed::Refused(reason.clone()),
-                None => *outcome = Pushed::Refused("no report".to_owned()),
+        let sent: HashSet<String> = commands.iter().map(|(name, _, _)| name.clone()).collect();
+        read_report(&mut |line| reader.readline_str(line), &sent)
+    }
+
+    fn decide(
+        &self,
+        name: &str,
+        (local, remote): (ObjectId, Option<ObjectId>),
+        reaches: &dyn Fn(ObjectId, ObjectId) -> Result<bool, StoreError>,
+    ) -> Result<(Pushed, Option<Command>), StoreError> {
+        Ok(match remote {
+            Some(remote) if remote == local => (Pushed::UpToDate, None),
+            Some(remote) if !self.has_commit(remote) => (Pushed::Behind, None),
+            Some(remote) => match reaches(local, remote) {
+                Ok(true) => (
+                    Pushed::Updated,
+                    Some((name.to_owned(), Some(remote), local)),
+                ),
+                Ok(false) => (Pushed::Behind, None),
+                Err(StoreError::Interrupted) => return Err(StoreError::Interrupted),
+                Err(error) => (Pushed::Unchecked(error.to_string()), None),
+            },
+            None => (Pushed::Updated, Some((name.to_owned(), None, local))),
+        })
+    }
+
+    fn branch_objects(
+        &self,
+        tip: ObjectId,
+        remote_tips: &HashSet<ObjectId>,
+        interrupt: &AtomicBool,
+    ) -> Result<Vec<ObjectId>, StoreError> {
+        let NewCommits { commits, boundary } = self.new_commits(tip, remote_tips, interrupt)?;
+        let mut known = HashSet::new();
+        for parent in boundary {
+            if self.has_commit(parent) {
+                self.mark_known(self.commit_tree(parent)?, &mut known, interrupt)?;
             }
         }
-        Ok(outcomes)
+        let mut objects = Vec::new();
+        for commit in commits.into_iter().rev() {
+            objects.push(commit);
+            self.collect_new(
+                self.commit_tree(commit)?,
+                &mut known,
+                &mut objects,
+                interrupt,
+            )?;
+        }
+        Ok(objects)
     }
 
     fn plan(&self, refs: &[ThreadRef], advertised: &Advertisement) -> Result<Plan, StoreError> {
@@ -163,29 +276,18 @@ impl Store {
             let Some(local) = self.head(thread_ref)? else {
                 continue;
             };
-            let remote = advertised.wanted.get(&thread_ref.to_string()).copied();
-            let outcome = match remote {
-                Some(remote) if remote == local => Pushed::UpToDate,
-                Some(remote) if !self.has_commit(remote) => Pushed::Behind,
-                Some(remote) => match self.descends_from(local, remote) {
-                    Ok(true) => {
-                        commands.push((thread_ref.clone(), Some(remote), local));
-                        Pushed::Updated
-                    }
-                    Ok(false) => Pushed::Behind,
-                    Err(error) => Pushed::Unchecked(error.to_string()),
-                },
-                None => {
-                    commands.push((thread_ref.clone(), None, local));
-                    Pushed::Updated
-                }
-            };
+            let name = thread_ref.to_string();
+            let remote = advertised.wanted.get(&name).copied();
+            let (outcome, command) = self.decide(&name, (local, remote), &|local, remote| {
+                self.descends_from(local, remote)
+            })?;
+            commands.extend(command);
             outcomes.push((thread_ref.clone(), outcome));
         }
         Ok((outcomes, commands))
     }
 
-    fn has_commit(&self, id: ObjectId) -> bool {
+    pub(crate) fn has_commit(&self, id: ObjectId) -> bool {
         self.require_kind(id, Kind::Commit).is_ok()
     }
 
@@ -331,9 +433,30 @@ fn check(interrupt: &AtomicBool) -> Result<(), StoreError> {
     }
 }
 
+fn finish_without_commands<T: Transport>(transport: &mut T) -> Result<(), StoreError> {
+    let writer = transport
+        .request(
+            WriteMode::OneLfTerminatedLinePerWriteCall,
+            MessageKind::Flush,
+            false,
+        )
+        .map_err(gix::Error::from_error)?;
+    writer.into_read()?;
+    Ok(())
+}
+
+fn settle(outcome: &mut Pushed, report: &Report, name: &str) {
+    match report.get(name) {
+        Some(None) => {}
+        Some(Some(reason)) => *outcome = Pushed::Refused(reason.clone()),
+        None => *outcome = Pushed::Refused("no report".to_owned()),
+    }
+}
+
 fn advertisement<T: Transport>(
     transport: &mut T,
-    refs: &[ThreadRef],
+    names: &HashSet<String>,
+    is_tip: &dyn Fn(&str) -> bool,
 ) -> Result<Advertisement, StoreError> {
     let response = transport
         .handshake(Service::ReceivePack, &[])
@@ -353,7 +476,7 @@ fn advertisement<T: Transport>(
             atomic,
         });
     };
-    let (wanted, tips) = parse_advertisement(&mut |line| lines.readline_str(line), refs)?;
+    let (wanted, tips) = parse_advertisement(&mut |line| lines.readline_str(line), names, is_tip)?;
     Ok(Advertisement {
         wanted,
         tips,
@@ -363,13 +486,9 @@ fn advertisement<T: Transport>(
 
 pub(crate) fn parse_advertisement(
     next_line: &mut dyn FnMut(&mut String) -> io::Result<usize>,
-    refs: &[ThreadRef],
+    names: &HashSet<String>,
+    is_tip: &dyn Fn(&str) -> bool,
 ) -> Result<(HashMap<String, ObjectId>, HashSet<ObjectId>), StoreError> {
-    let names: HashSet<String> = refs.iter().map(ToString::to_string).collect();
-    let threads: HashSet<String> = refs
-        .iter()
-        .map(|thread_ref| format!("{THREADS_PREFIX}{}/", thread_ref.thread()))
-        .collect();
     let mut wanted = HashMap::new();
     let mut tips = HashSet::new();
     let mut line = String::new();
@@ -389,11 +508,7 @@ pub(crate) fn parse_advertisement(
         if names.contains(name) {
             wanted.insert(name.to_owned(), id);
             tips.insert(id);
-        } else if name == "HEAD"
-            || threads
-                .iter()
-                .any(|prefix| name.starts_with(prefix.as_str()))
-        {
+        } else if name == "HEAD" || is_tip(name) {
             tips.insert(id);
         }
     }
@@ -484,6 +599,9 @@ mod tests {
     fn only_the_pushed_refs_their_threads_and_head_are_kept_from_the_advertisement() {
         let thread = ThreadId::random().unwrap();
         let meta = ThreadRef::new(thread, RefKind::Meta);
+        let names = HashSet::from([meta.to_string()]);
+        let prefix = format!("refs/threads/{thread}/");
+        let is_tip = |name: &str| name.starts_with(&prefix);
         let (wanted, tips) = parse_advertisement(
             &mut lines(&[
                 &format!("{ONE} {meta}\0report-status"),
@@ -492,7 +610,8 @@ mod tests {
                 &format!("{ONE} HEAD"),
                 &format!("{TWO} refs/threads/{}/meta", ThreadId::random().unwrap()),
             ]),
-            std::slice::from_ref(&meta),
+            &names,
+            &is_tip,
         )
         .unwrap();
         assert_eq!(
@@ -504,7 +623,7 @@ mod tests {
         );
         assert_eq!(tips.len(), 2);
         assert!(matches!(
-            parse_advertisement(&mut lines(&["not a ref line"]), std::slice::from_ref(&meta)),
+            parse_advertisement(&mut lines(&["not a ref line"]), &names, &is_tip),
             Err(StoreError::PushFailed(_))
         ));
         let many: Vec<String> = (0..=MAX_ADVERTISED_REFS)
@@ -512,7 +631,7 @@ mod tests {
             .collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         assert!(matches!(
-            parse_advertisement(&mut lines(&many), &[meta]),
+            parse_advertisement(&mut lines(&many), &names, &is_tip),
             Err(StoreError::PushFailed(reason)) if reason.contains("too many")
         ));
     }

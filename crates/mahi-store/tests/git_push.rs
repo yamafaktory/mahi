@@ -250,4 +250,95 @@ mod tests {
         );
         git(&setup.remote, &["rev-parse", &setup.meta.to_string()]);
     }
+
+    fn push_branch(store: &Store, remote: &Path, branch: &str) -> Pushed {
+        store
+            .push_branch(
+                file::connect(remote.as_os_str().as_encoded_bytes(), Protocol::V1, false).unwrap(),
+                branch,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_branch_with_merges_is_pushed_with_only_what_the_remote_lacks() {
+        let setup = setup();
+        let local = &setup.local;
+        std::fs::write(local.join("a"), "a\n").unwrap();
+        git(local, &["add", "a"]);
+        git(local, &["commit", "-qm", "base", "--no-gpg-sign"]);
+        let main = git(local, &["symbolic-ref", "--short", "HEAD"]);
+        assert_eq!(
+            push_branch(&setup.store, &setup.remote, &main),
+            Pushed::Updated
+        );
+        git(local, &["checkout", "-qb", "land"]);
+        std::fs::write(local.join("b"), "b\n").unwrap();
+        git(local, &["add", "b"]);
+        git(local, &["commit", "-qm", "one", "--no-gpg-sign"]);
+        git(local, &["checkout", "-qb", "side", &main]);
+        std::fs::create_dir(local.join("dir")).unwrap();
+        std::fs::write(local.join("dir/c"), "c\n").unwrap();
+        git(local, &["add", "dir"]);
+        git(local, &["commit", "-qm", "side", "--no-gpg-sign"]);
+        git(local, &["checkout", "-q", "land"]);
+        git(
+            local,
+            &["merge", "-q", "--no-edit", "--no-gpg-sign", "side"],
+        );
+        git(local, &["repack", "-adq"]);
+        assert_eq!(
+            push_branch(&setup.store, &setup.remote, "land"),
+            Pushed::Updated
+        );
+        git(&setup.remote, &["fsck", "--strict", "--no-dangling"]);
+        assert_eq!(
+            git(&setup.remote, &["rev-parse", "refs/heads/land"]),
+            git(local, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            push_branch(&setup.store, &setup.remote, "land"),
+            Pushed::UpToDate
+        );
+        git(local, &["checkout", "-q", "side"]);
+        std::fs::write(local.join("dir/e"), "e\n").unwrap();
+        git(local, &["add", "dir"]);
+        git(local, &["commit", "-qm", "side again", "--no-gpg-sign"]);
+        git(local, &["checkout", "-q", "land"]);
+        git(
+            local,
+            &["merge", "-q", "--no-edit", "--no-gpg-sign", "side"],
+        );
+        assert_eq!(
+            push_branch(&setup.store, &setup.remote, "land"),
+            Pushed::Updated
+        );
+        git(&setup.remote, &["fsck", "--strict", "--no-dangling"]);
+        assert_eq!(
+            git(&setup.remote, &["rev-parse", "refs/heads/land"]),
+            git(local, &["rev-parse", "HEAD"])
+        );
+        git(local, &["reset", "-q", "--hard", "HEAD~1"]);
+        std::fs::write(local.join("d"), "d\n").unwrap();
+        git(local, &["add", "d"]);
+        git(local, &["commit", "-qm", "rewritten", "--no-gpg-sign"]);
+        assert_eq!(
+            push_branch(&setup.store, &setup.remote, "land"),
+            Pushed::Behind
+        );
+        assert!(matches!(
+            setup.store.push_branch(
+                file::connect(
+                    setup.remote.as_os_str().as_encoded_bytes(),
+                    Protocol::V1,
+                    false
+                )
+                .unwrap(),
+                "missing",
+                &AtomicBool::new(false),
+            ),
+            Err(mahi_store::StoreError::NoBranch(_))
+        ));
+    }
 }
