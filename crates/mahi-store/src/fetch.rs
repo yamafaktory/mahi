@@ -23,6 +23,7 @@ use gix::{
     },
 };
 use mahi_core::{
+    RefKind,
     THREADS_PREFIX,
     ThreadId,
     ThreadRef,
@@ -227,14 +228,58 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes every ref under `thread`'s prefix here, with its reflog, whatever its name,
+    /// except `meta` when `keep_meta` is set, and every ref a fetch left waiting for it.
+    /// Returns how many thread refs were deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Git`] if the refs cannot be listed or deleted, including when one
+    /// moved while they were deleted.
+    pub fn forget_thread(&self, thread: ThreadId, keep_meta: bool) -> Result<usize, StoreError> {
+        let meta = ThreadRef::new(thread, RefKind::Meta).to_string();
+        let mut edits = Vec::new();
+        let mut deleted = 0;
+        for prefix in [
+            format!("{THREADS_PREFIX}{thread}/"),
+            format!("{FETCHED_PREFIX}{thread}/"),
+        ] {
+            let platform = self.repo.references().map_err(gix::Error::from_error)?;
+            for reference in platform
+                .prefixed(prefix.as_str())
+                .map_err(gix::Error::from_error)?
+            {
+                let reference = reference.map_err(gix::Error::from_error)?;
+                let name = reference.name().to_owned();
+                if keep_meta && name.as_bstr() == meta.as_str() {
+                    continue;
+                }
+                if prefix.starts_with(THREADS_PREFIX) {
+                    deleted += 1;
+                }
+                edits.push(RefEdit::new(
+                    name,
+                    Change::Delete {
+                        expected: PreviousValue::MustExistAndMatch(reference.target().into_owned()),
+                        log: RefLog::AndReference,
+                    },
+                ));
+            }
+        }
+        if !edits.is_empty() {
+            self.repo.edit_references_as(edits, None)?;
+        }
+        Ok(deleted)
+    }
+
     fn fetched(&self, thread: ThreadId) -> Result<Vec<(String, Target)>, StoreError> {
-        let prefix = format!("{FETCHED_PREFIX}{thread}/");
+        self.prefixed(&format!("{FETCHED_PREFIX}{thread}/"))
+    }
+
+    fn prefixed(&self, prefix: &str) -> Result<Vec<(String, Target)>, StoreError> {
         let platform = self.repo.references().map_err(gix::Error::from_error)?;
         let mut refs = Vec::new();
-        for reference in platform
-            .prefixed(prefix.as_str())
-            .map_err(gix::Error::from_error)?
-        {
+        for reference in platform.prefixed(prefix).map_err(gix::Error::from_error)? {
             let reference = reference.map_err(gix::Error::from_error)?;
             let Ok(name) = std::str::from_utf8(reference.name().as_bstr()) else {
                 continue;
@@ -404,5 +449,54 @@ mod tests {
         assert!(store.fetched(thread).unwrap().is_empty());
         assert_eq!(store.fetched(other).unwrap().len(), 1);
         assert_eq!(store.fetched_refs(other).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forgetting_a_thread_deletes_its_refs_whatever_their_names_and_can_keep_meta() {
+        let (_dir, store) = store();
+        let thread = ThreadId::random().unwrap();
+        let other = ThreadId::random().unwrap();
+        let meta = ThreadRef::new(thread, RefKind::Meta);
+        let state = ThreadRef::new(thread, RefKind::State);
+        let kept = ThreadRef::new(other, RefKind::Meta);
+        let first = commit(&store, &meta, None);
+        commit(&store, &state, None);
+        commit(&store, &kept, None);
+        store
+            .repo
+            .reference(
+                format!("{THREADS_PREFIX}{thread}/odd/name").as_str(),
+                first,
+                PreviousValue::Any,
+                "test",
+            )
+            .unwrap();
+        store
+            .repo
+            .reference(
+                format!("{FETCHED_PREFIX}{thread}/meta").as_str(),
+                first,
+                PreviousValue::Any,
+                "test",
+            )
+            .unwrap();
+        assert_eq!(store.forget_thread(thread, true).unwrap(), 2);
+        let left: Vec<ThreadRef> = store
+            .thread_refs()
+            .unwrap()
+            .into_iter()
+            .map(|(thread_ref, _)| thread_ref)
+            .collect();
+        assert!(left.contains(&meta) && left.contains(&kept) && left.len() == 2);
+        assert!(
+            store
+                .prefixed(&format!("{THREADS_PREFIX}{thread}/odd"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.fetched(thread).unwrap().is_empty());
+        assert_eq!(store.forget_thread(thread, false).unwrap(), 1);
+        assert_eq!(store.head(&meta).unwrap(), None);
+        assert!(store.head(&kept).unwrap().is_some());
     }
 }

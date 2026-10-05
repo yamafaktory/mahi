@@ -94,6 +94,7 @@ pub use thread::{
     load_meta,
     load_meta_document,
     record_meta,
+    tombstone_thread,
 };
 pub use transcript::{
     Event,

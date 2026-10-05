@@ -93,6 +93,25 @@ impl Pins {
         self.accept_hash(meta.thread(), meta.generation(), meta.body_hash())
     }
 
+    /// Checks `meta` as [`Pins::accept`] does and runs `then` under the pin's lock, moving the
+    /// pin only once `then` succeeded.
+    pub(crate) fn accept_then<E: From<PinError>>(
+        &self,
+        meta: &VerifiedMeta,
+        then: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.accept_hash_then(meta.thread(), meta.generation(), meta.body_hash(), then)
+    }
+
+    /// Pins `document`, live or a tombstone, as [`Pins::accept`] does a live one.
+    pub(crate) fn accept_document(&self, document: &MetaDocument) -> Result<(), PinError> {
+        self.accept_hash(
+            document.thread(),
+            document.generation(),
+            document.body_hash(),
+        )
+    }
+
     /// Checks `document`, live or a tombstone, as [`Pins::accept`] does and runs `then` under
     /// the pin's lock, moving the pin only once `then` succeeded, so a refused document or a
     /// failed `then` leaves the pin where it was.

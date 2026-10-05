@@ -14,12 +14,14 @@ use thiserror::Error;
 
 use crate::{
     MAX_META_BYTES,
+    MetaDocument,
     MetaDraft,
     MetaError,
     Participant,
     ParticipantKey,
     PinError,
     SshSigner,
+    Tombstone,
     VerifiedMeta,
     pins::Pins,
 };
@@ -227,10 +229,14 @@ pub fn record_meta(
             .into());
         }
     }
-    Pins::new(store).accept(&verified)?;
     let blob = store.write_blob(encoded)?;
     let tree = store.write_tree(&[(META_ENTRY, EntryKind::Blob, blob)])?;
-    store.append(&meta_ref, head, tree, META_MESSAGE)?;
+    Pins::new(store).accept_then(&verified, || {
+        store
+            .append(&meta_ref, head, tree, META_MESSAGE)
+            .map(drop)
+            .map_err(ThreadError::from)
+    })?;
     Ok(verified)
 }
 
@@ -287,6 +293,58 @@ pub fn add_participant(
     )?;
     pins.accept(&verified)?;
     Ok(verified)
+}
+
+/// Ends `thread`, which `owner_key` owns, here: signs the tombstone that follows its current
+/// meta document, commits it on top of the `meta` commit and pins it. A thread whose `meta` is
+/// already a tombstone is left as it is.
+///
+/// Returns the `meta` commit and the tombstone.
+///
+/// # Errors
+///
+/// Returns [`ThreadError::NotFound`] if the thread has no `meta` ref, [`ThreadError::Meta`] if
+/// the current document is not signed by `owner_key` or cannot be followed, [`ThreadError::Pin`]
+/// if the pin refuses the document, or [`ThreadError::Store`] if reading or writing fails,
+/// including with [`StoreError::Conflict`] when the ref moved meanwhile.
+pub fn tombstone_thread(
+    store: &Store,
+    thread: ThreadId,
+    owner_key: &dyn SshSigner,
+) -> Result<(ObjectId, Tombstone), ThreadError> {
+    let owner = ParticipantKey::from_public_key(owner_key.public_key()).map_err(MetaError::from)?;
+    let meta_ref = ThreadRef::new(thread, RefKind::Meta);
+    let commit = store
+        .head(&meta_ref)?
+        .ok_or(ThreadError::NotFound(thread))?;
+    let encoded = store
+        .read_entry(commit, META_ENTRY, MAX_META_BYTES as u64)?
+        .ok_or(ThreadError::MissingMetaEntry(thread))?;
+    let pins = Pins::new(store);
+    let current = match MetaDocument::decode(&encoded, thread, &owner)? {
+        document @ MetaDocument::Purged(_) => {
+            pins.accept_document(&document)?;
+            let MetaDocument::Purged(tombstone) = document else {
+                return Err(MetaError::Malformed.into());
+            };
+            return Ok((commit, tombstone));
+        }
+        MetaDocument::Live(current) => current,
+    };
+    pins.accept(&current)?;
+    let signed = Tombstone::sign(&current, owner_key)?;
+    let document = MetaDocument::decode(&signed, thread, &owner)?;
+    let blob = store.write_blob(&signed)?;
+    let tree = store.write_tree(&[(META_ENTRY, EntryKind::Blob, blob)])?;
+    let mut ended = commit;
+    pins.accept_document_then(&document, || {
+        ended = store.append(&meta_ref, Some(commit), tree, META_MESSAGE)?;
+        Ok::<(), ThreadError>(())
+    })?;
+    let MetaDocument::Purged(tombstone) = document else {
+        return Err(MetaError::Malformed.into());
+    };
+    Ok((ended, tombstone))
 }
 
 fn read_meta(
@@ -974,5 +1032,45 @@ pub(crate) mod tests {
         ));
         assert_eq!(Pins::new(&setup.store).get(setup.thread).unwrap(), pinned);
         load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
+    }
+
+    #[test]
+    fn a_tombstoned_thread_stays_ended_and_only_its_owner_can_end_it() {
+        let setup = setup();
+        let first = create_thread(
+            &setup.store,
+            &draft(&setup, 0, "t"),
+            &ThreadKey::generate(),
+            &setup.owner,
+        )
+        .unwrap();
+        let stranger = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        assert!(matches!(
+            tombstone_thread(&setup.store, setup.thread, &stranger),
+            Err(ThreadError::Meta(MetaError::BadSignature))
+        ));
+        let (ended, tombstone) =
+            tombstone_thread(&setup.store, setup.thread, &setup.owner).unwrap();
+        assert_eq!(tombstone.generation(), 1);
+        let meta = ThreadRef::new(setup.thread, RefKind::Meta);
+        assert_eq!(setup.store.head(&meta).unwrap(), Some(ended));
+        assert!(setup.store.descends_from(ended, first).unwrap());
+        assert!(matches!(
+            load_meta(&setup.store, setup.thread, &setup.owner_key, 0),
+            Err(ThreadError::Meta(MetaError::Purged(1)))
+        ));
+        assert!(matches!(
+            tombstone_thread(&setup.store, setup.thread, &stranger),
+            Err(ThreadError::Meta(MetaError::BadSignature))
+        ));
+        let (again, same) = tombstone_thread(&setup.store, setup.thread, &setup.owner).unwrap();
+        assert_eq!((again, same), (ended, tombstone));
+        assert_eq!(
+            Pins::new(&setup.store)
+                .get(setup.thread)
+                .unwrap()
+                .map(|(generation, _)| generation),
+            Some(1)
+        );
     }
 }
