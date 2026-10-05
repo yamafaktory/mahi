@@ -241,7 +241,7 @@ impl Slot {
     fn take(proxy: &Arc<Proxy>) -> Option<Self> {
         proxy
             .open
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
                 (open < proxy.limits.max_connections).then_some(open + 1)
             })
             .ok()
