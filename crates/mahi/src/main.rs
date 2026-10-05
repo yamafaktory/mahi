@@ -218,6 +218,15 @@ fn landed(command: &cli::LandCommand, environment: &Environment) -> i32 {
             eprint!("{report}");
             0
         }
+        Ok(land::Outcome::NotPushed(report)) => {
+            eprint!("{report}");
+            1
+        }
+        Ok(land::Outcome::Failed(told, error)) => {
+            eprint!("{told}");
+            report(&error);
+            1
+        }
         Ok(land::Outcome::Stopped(signal, report)) => {
             eprint!("{report}");
             signal.reraise();

@@ -1748,6 +1748,49 @@ cat parser.rs
     }
 
     #[test]
+    fn pushing_a_landing_branch_needs_a_chosen_remote_and_a_landing_worktree() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let (code, output) = in_terminal(&fixture, &["land", &thread, "--push"], None);
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("no remote is chosen"), "{output}");
+        let config = fixture.repo.join(".git/config");
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str("[remote \"up\"]\n\turl = ssh://git@example.invalid/x.git\n");
+        fs::write(&config, text).unwrap();
+        assert!(
+            fixture
+                .mahi(&["remote", "up", "--private"])
+                .status
+                .success()
+        );
+        let (code, output) = in_terminal(&fixture, &["land", &thread, "--push"], None);
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains(&format!(
+                "has no landing worktree here; run mahi land {thread} first"
+            )),
+            "{output}"
+        );
+        let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        let admin = fixture
+            .repo
+            .join(".git/worktrees")
+            .join(format!("{thread}@land"));
+        fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let (code, output) = in_terminal(&fixture, &["land", &thread, "--push"], Some(PASSPHRASE));
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains("cannot land on main: it is the thread's landing branch"),
+            "{output}"
+        );
+        let refused = fixture.mahi(&["land", &thread, "--push", "--from", "tester.claude"]);
+        assert_eq!(refused.status.code(), Some(2));
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+    }
+
+    #[test]
     fn a_merge_into_itself_into_an_unnamed_agent_of_several_or_from_an_unlisted_one_is_refused() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);

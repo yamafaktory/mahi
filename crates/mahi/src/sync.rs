@@ -112,6 +112,14 @@ struct SshAccess {
 }
 
 #[derive(Debug, Error)]
+pub(crate) enum SetupError {
+    #[error(transparent)]
+    Remote(#[from] RemoteError),
+    #[error("{0}")]
+    Access(String),
+}
+
+#[derive(Debug, Error)]
 pub(crate) enum PushError {
     #[error("cannot open the repository")]
     Open(#[source] StoreError),
@@ -151,25 +159,38 @@ impl SyncSetup {
         environment: &Environment,
         owns_meta: bool,
     ) -> Option<Self> {
-        let chosen = remote::sync_remote(store)
-            .and_then(|chosen| {
-                chosen
-                    .map(|chosen| remote::push_url(store, &chosen.name).map(|url| (chosen, url)))
-                    .transpose()
-            })
-            .inspect_err(|error| crate::report_with("threads are not pushed", error))
-            .ok()??;
-        let (chosen, remote) = chosen;
-        let access = Access::gather(environment, &remote)
-            .inspect_err(|missing| eprintln!("mahi: threads are not pushed: {missing}"))
-            .ok()?;
-        Some(Self {
+        match Self::chosen(store, environment, owns_meta) {
+            Ok(setup) => setup,
+            Err(SetupError::Remote(error)) => {
+                crate::report_with("threads are not pushed", &error);
+                None
+            }
+            Err(SetupError::Access(missing)) => {
+                eprintln!("mahi: threads are not pushed: {missing}");
+                None
+            }
+        }
+    }
+
+    /// Returns how the clone around `store` pushes, `None` if no remote was chosen, or why the
+    /// chosen remote cannot be used.
+    pub(crate) fn chosen(
+        store: &Store,
+        environment: &Environment,
+        owns_meta: bool,
+    ) -> Result<Option<Self>, SetupError> {
+        let Some(chosen) = remote::sync_remote(store)? else {
+            return Ok(None);
+        };
+        let remote = remote::push_url(store, &chosen.name)?;
+        let access = Access::gather(environment, &remote).map_err(SetupError::Access)?;
+        Ok(Some(Self {
             name: chosen.name,
             remote,
             visibility: chosen.visibility,
             owns_meta,
             access,
-        })
+        }))
     }
 
     /// Returns the thread refs a run of `slot` in `thread` pushes.

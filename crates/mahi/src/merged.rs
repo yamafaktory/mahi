@@ -52,6 +52,11 @@ impl MergedFrom {
         Self(merged)
     }
 
+    /// Returns the agents whose work was merged.
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &AgentSlot> {
+        self.0.keys()
+    }
+
     /// Returns the snapshot of `source` last merged, if any.
     pub(crate) fn of(&self, source: &AgentSlot) -> Option<ObjectId> {
         self.0.get(source).copied()

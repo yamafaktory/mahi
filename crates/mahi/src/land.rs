@@ -31,9 +31,12 @@ use mahi_sandbox::{
     TerminationSignals,
 };
 use mahi_store::{
+    ObjectId,
+    Pushed,
     SnapshotCache,
     Store,
     StoreError,
+    Transport,
 };
 use mahi_thread::{
     KeyError,
@@ -62,6 +65,11 @@ use crate::{
         until_stopped,
     },
     session,
+    sync::{
+        PushError,
+        SetupError,
+        SyncSetup,
+    },
     thread_lock::{
         LandLock,
         LockError,
@@ -127,12 +135,26 @@ pub(crate) enum LandError {
     State(#[source] io::Error),
     #[error("cannot catch the signals that stop mahi")]
     Signals(#[source] SignalError),
+    #[error(
+        "no remote is chosen for this clone; choose one with mahi remote <name> --private or --public"
+    )]
+    NoRemote,
+    #[error("cannot push to the chosen remote")]
+    Remote(#[source] SetupError),
+    #[error("thread {0} has no landing worktree here; run mahi land {0} first")]
+    NoLandingWorktree(ThreadId),
+    #[error("cannot add the thread's trailers")]
+    Trailers(#[source] StoreError),
+    #[error("cannot push the landing branch")]
+    Push(#[source] PushError),
 }
 
 /// What `mahi land` did.
 #[derive(Debug)]
 pub(crate) enum Outcome {
     Done(String),
+    NotPushed(String),
+    Failed(String, LandError),
     Stopped(Termination, String),
 }
 
@@ -156,6 +178,13 @@ pub(crate) fn land(command: &LandCommand, environment: &Environment) -> Result<O
     let owner = session::thread_owner(&store, thread, own.clone())
         .map_err(|error| LandError::ThreadOwner(thread, error))?;
     let _lock = LandLock::acquire(&config, thread)?;
+    if command.push {
+        return push(
+            (&store, environment),
+            command,
+            (&owner, &participant, &config),
+        );
+    }
     let fetched = run::listed_and_fetched(
         &store,
         environment,
@@ -211,6 +240,144 @@ pub(crate) fn land(command: &LandCommand, environment: &Environment) -> Result<O
         "commit there with git on branch {branch}, then run mahi land {thread} --push"
     );
     Ok(Outcome::Done(report))
+}
+
+/// Adds the thread's trailers to the unpushed commits of the landing worktree's branch and
+/// pushes it to the chosen remote.
+fn push(
+    (store, environment): (&Store, &Environment),
+    command: &LandCommand,
+    (owner, participant, config): (&ParticipantKey, &ParticipantName, &ConfigDir),
+) -> Result<Outcome, LandError> {
+    let thread = command.thread;
+    let setup = SyncSetup::chosen(store, environment, false)
+        .map_err(LandError::Remote)?
+        .ok_or(LandError::NoRemote)?;
+    let name = format!("{thread}@{LAND}");
+    store.prune_worktree(&name).map_err(LandError::Worktree)?;
+    let branch = existing_branch(store, &name, command.branch.as_deref())?
+        .ok_or(LandError::NoLandingWorktree(thread))?;
+    let meta = load_meta(store, thread, owner, 0)
+        .map_err(|error| LandError::Meta(thread, Box::new(error)))?;
+    let key = run::unlock_thread_key(&meta, participant, config).map_err(Box::new)?;
+    let landing = meta
+        .private(&key)
+        .map_err(LandError::Private)?
+        .landing_branch()
+        .to_owned();
+    if branch == landing {
+        return Err(LandError::OntoLandingBranch(branch));
+    }
+    let base = store
+        .branch_tip(&landing)
+        .map_err(LandError::Worktree)?
+        .ok_or(LandError::NoLandingBranch(landing))?;
+    let state = store
+        .worktree_admin(&name)
+        .map_err(LandError::Worktree)?
+        .join(LANDED_FILE);
+    let trailers = trailers(thread, &read_landed(&state)?);
+    let termination = TerminationSignals::listen().map_err(LandError::Signals)?;
+    let mut report = String::new();
+    let (done, caught) = until_stopped(&termination, |interrupt| {
+        trail_and_push(
+            store,
+            (&branch, base),
+            (thread, &trailers),
+            (setup.name.as_str(), || setup.connect(interrupt)),
+            interrupt,
+            &mut report,
+        )
+    });
+    if let Some(signal) = caught {
+        return Ok(Outcome::Stopped(signal, report));
+    }
+    Ok(match done {
+        Ok(true) => Outcome::Done(report),
+        Ok(false) => Outcome::NotPushed(report),
+        Err(error) => Outcome::Failed(report, error),
+    })
+}
+
+fn trailers(thread: ThreadId, landed: &MergedFrom) -> String {
+    let mut trailers = format!("Thread: {thread}\n");
+    for slot in landed.sources() {
+        let _ = writeln!(trailers, "Agent: {slot}");
+    }
+    trailers
+}
+
+/// Connects, adds `trailers` to the commits of `branch` that `base` and no remote-tracking
+/// branch reaches, unless they already name `thread`, and pushes `branch`. Returns whether
+/// the remote has it now.
+fn trail_and_push<T: Transport>(
+    store: &Store,
+    (branch, base): (&str, ObjectId),
+    (thread, trailers): (ThreadId, &str),
+    (remote, connect): (&str, impl FnOnce() -> Result<T, PushError>),
+    interrupt: &AtomicBool,
+    report: &mut String,
+) -> Result<bool, LandError> {
+    let transport = connect().map_err(LandError::Push)?;
+    let marker = thread.to_string();
+    let trailed = store
+        .add_trailers(branch, base, (("Thread", &marker), trailers), interrupt)
+        .map_err(LandError::Trailers)?;
+    match trailed.rewritten {
+        0 => {}
+        1 => {
+            let _ = writeln!(
+                report,
+                "added the thread's trailers to 1 commit on {branch}"
+            );
+        }
+        count => {
+            let _ = writeln!(
+                report,
+                "added the thread's trailers to {count} commits on {branch}"
+            );
+        }
+    }
+    if !trailed.left_signed.is_empty() {
+        let _ = writeln!(
+            report,
+            "left without the thread's trailers, since rewriting would drop a signature:"
+        );
+        for commit in &trailed.left_signed {
+            let _ = writeln!(report, "  {}", commit.to_hex_with_len(12));
+        }
+    }
+    let pushed = store
+        .push_branch(transport, branch, interrupt)
+        .map_err(|error| LandError::Push(PushError::Push(error)))?;
+    match pushed {
+        Pushed::Updated => {
+            let _ = writeln!(report, "pushed {branch} to {remote}");
+        }
+        Pushed::UpToDate => {
+            let _ = writeln!(report, "{branch} on {remote} is up to date");
+        }
+        Pushed::Behind => {
+            let _ = writeln!(
+                report,
+                "{branch} on {remote} has commits this one does not; fetch and merge them, \
+                 then push again"
+            );
+            return Ok(false);
+        }
+        Pushed::Unchecked(reason) => {
+            let _ = writeln!(
+                report,
+                "cannot tell whether {branch} moves forward on {remote}: {reason}"
+            );
+            return Ok(false);
+        }
+        Pushed::Refused(reason) => {
+            let _ = writeln!(report, "{remote} refused {branch}: {reason}");
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Returns the agents to land: those `from` names, each of a participant `meta` lists, or
@@ -444,4 +611,127 @@ fn write_landed(state: &Path, landed: &MergedFrom) -> Result<(), LandError> {
     let staged = directory.join(format!(".{LANDED_FILE}.mahi"));
     fs::write(&staged, landed.message()).map_err(LandError::State)?;
     fs::rename(&staged, state).map_err(LandError::State)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trailers_name_the_thread_and_each_landed_agent() {
+        let thread = ThreadId::random().unwrap();
+        let mut landed = MergedFrom::default();
+        let commit = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        assert_eq!(trailers(thread, &landed), format!("Thread: {thread}\n"));
+        landed.record("bob.codex".parse().unwrap(), commit);
+        landed.record("alice.claude".parse().unwrap(), commit);
+        assert_eq!(
+            trailers(thread, &landed),
+            format!("Thread: {thread}\nAgent: alice.claude\nAgent: bob.codex\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod git_tests {
+    use std::process::Command;
+
+    use gix::protocol::transport::{
+        Protocol,
+        client::blocking_io::file,
+    };
+
+    use super::*;
+
+    fn git(repository: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git is installed");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn push(store: &Store, remote: &Path, thread: ThreadId, base: ObjectId) -> (bool, String) {
+        let trailers = format!("Thread: {thread}\nAgent: tester.claude\n");
+        let connect = || {
+            Ok::<_, PushError>(
+                file::connect(remote.as_os_str().as_encoded_bytes(), Protocol::V1, false)
+                    .unwrap_or_else(|never| match never {}),
+            )
+        };
+        let mut report = String::new();
+        let pushed = trail_and_push(
+            store,
+            ("mahi/x", base),
+            (thread, &trailers),
+            ("up", connect),
+            &AtomicBool::new(false),
+            &mut report,
+        )
+        .unwrap();
+        (pushed, report)
+    }
+
+    #[test]
+    fn the_landing_branch_gets_its_trailers_and_is_pushed_fast_forward_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, remote) = (dir.path().join("local"), dir.path().join("remote.git"));
+        fs::create_dir(&local).unwrap();
+        fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]);
+        git(&local, &["init", "-q", "-b", "main"]);
+        fs::write(local.join("a"), "a\n").unwrap();
+        git(&local, &["add", "a"]);
+        git(&local, &["commit", "-qm", "base"]);
+        let base = ObjectId::from_hex(git(&local, &["rev-parse", "HEAD"]).as_bytes()).unwrap();
+        git(&local, &["checkout", "-qb", "mahi/x"]);
+        fs::write(local.join("b"), "b\n").unwrap();
+        git(&local, &["add", "b"]);
+        git(&local, &["commit", "-qm", "work"]);
+        let store = Store::open(&local).unwrap();
+        let thread = ThreadId::random().unwrap();
+
+        let (pushed, report) = push(&store, &remote, thread, base);
+        assert!(pushed, "{report}");
+        assert!(
+            report.contains("added the thread's trailers to 1 commit on mahi/x"),
+            "{report}"
+        );
+        assert!(report.contains("pushed mahi/x to up"), "{report}");
+        assert_eq!(
+            git(&remote, &["log", "-1", "--format=%B", "mahi/x"]),
+            format!("work\n\nThread: {thread}\nAgent: tester.claude")
+        );
+        assert_eq!(
+            git(&remote, &["rev-parse", "mahi/x"]),
+            git(&local, &["rev-parse", "HEAD"])
+        );
+
+        let (pushed, report) = push(&store, &remote, thread, base);
+        assert!(pushed, "{report}");
+        assert_eq!(report, "mahi/x on up is up to date\n");
+
+        git(&local, &["checkout", "-qb", "other", "main"]);
+        fs::write(local.join("c"), "c\n").unwrap();
+        git(&local, &["add", "c"]);
+        git(&local, &["commit", "-qm", "elsewhere"]);
+        git(
+            &local,
+            &["push", "-qf", remote.to_str().unwrap(), "other:mahi/x"],
+        );
+        let (pushed, report) = push(&store, &remote, thread, base);
+        assert!(!pushed, "{report}");
+        assert!(report.contains("fetch and merge them"), "{report}");
+    }
 }

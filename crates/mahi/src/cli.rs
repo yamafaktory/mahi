@@ -338,6 +338,10 @@ pub(crate) struct LandCommand {
     /// The branch to land on, `mahi/<thread>` when left out.
     #[arg(long, value_name = "BRANCH")]
     pub(crate) branch: Option<String>,
+    /// Add the thread's trailers to the branch's unpushed commits and push it to the chosen
+    /// remote, fast-forward only, instead of merging.
+    #[arg(long, conflicts_with = "from")]
+    pub(crate) push: bool,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
