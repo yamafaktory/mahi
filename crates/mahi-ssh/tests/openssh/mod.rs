@@ -128,6 +128,7 @@ fn write_config(dir: &Path, port: u16, options: &[(&str, &str)]) {
         ("PasswordAuthentication", "no"),
         ("KbdInteractiveAuthentication", "no"),
         ("AcceptEnv", "GIT_PROTOCOL"),
+        ("SetEnv", "SSH_AUTH_SOCK=/nonexistent/mahi-test"),
         ("LogLevel", "VERBOSE"),
     ]) {
         writeln!(config, "{name} {value}").unwrap();
