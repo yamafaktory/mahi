@@ -750,6 +750,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         let output = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&output);
         let mut reader = mahi.reader().unwrap();
+        let (ended, output_end) = mpsc::channel();
         thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
             while let Ok(read) = reader.read(&mut buffer) {
@@ -758,6 +759,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
                 }
                 collected.lock().unwrap().extend_from_slice(&buffer[..read]);
             }
+            let _ = ended.send(());
         });
         if let Some(passphrase) = passphrase {
             wait_until("the passphrase question", || {
@@ -774,7 +776,7 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             status = mahi.try_wait().unwrap();
             thread::sleep(Duration::from_millis(20));
         }
-        thread::sleep(Duration::from_millis(100));
+        let _ = output_end.recv_timeout(Duration::from_secs(10));
         let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
         (exit_code(status.unwrap()), text)
     }
@@ -3132,10 +3134,11 @@ cat parser.rs
         command.spawn().unwrap()
     }
 
-    fn collect(child: &PtyChild) -> Arc<Mutex<Vec<u8>>> {
+    fn collect(child: &PtyChild) -> (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>) {
         let output = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&output);
         let mut reader = child.reader().unwrap();
+        let (ended, output_end) = mpsc::channel();
         thread::spawn(move || {
             let mut buffer = [0_u8; 4096];
             while let Ok(read) = reader.read(&mut buffer) {
@@ -3144,8 +3147,9 @@ cat parser.rs
                 }
                 collected.lock().unwrap().extend_from_slice(&buffer[..read]);
             }
+            let _ = ended.send(());
         });
-        output
+        (output, output_end)
     }
 
     fn exit_of(child: &mut PtyChild) -> i32 {
@@ -3189,7 +3193,7 @@ cat parser.rs
             ("MAHI_LIVE", OsStr::new("local")),
         ];
         let mut join = mahi_in_terminal(&bob.repo, &["join", &ticket], &bob_env);
-        let watched = collect(&join);
+        let (watched, _) = collect(&join);
         let mut keys = join.writer().unwrap();
         wait_until("bob's passphrase question", || {
             String::from_utf8_lossy(&watched.lock().unwrap()).contains("Passphrase")
@@ -3249,7 +3253,7 @@ cat parser.rs
             ("MAHI_LIVE", OsStr::new("local")),
         ];
         let mut join = mahi_in_terminal(&bob.repo, &["join", &ticket], &bob_env);
-        let watched = collect(&join);
+        let (watched, _) = collect(&join);
         let seen = |text: &str| String::from_utf8_lossy(&watched.lock().unwrap()).contains(text);
         let mut keys = join.writer().unwrap();
         wait_until("bob's passphrase question", || seen("Passphrase"));
@@ -3310,7 +3314,7 @@ cat parser.rs
             &["invite", &thread_text, card.trim()],
             &owner_env,
         );
-        let invited = collect(&invite);
+        let (invited, _) = collect(&invite);
         let mut answer = invite.writer().unwrap();
         wait_until("the owner's passphrase question", || {
             String::from_utf8_lossy(&invited.lock().unwrap()).contains("Passphrase")
@@ -3337,7 +3341,7 @@ cat parser.rs
             ("MAHI_LIVE", OsStr::new("local")),
         ];
         let mut mahi = mahi_in_terminal(&teammate.repo, arguments, &env);
-        let output = collect(&mahi);
+        let (output, output_end) = collect(&mahi);
         let mut keys = mahi.writer().unwrap();
         wait_until("the passphrase question", || {
             String::from_utf8_lossy(&output.lock().unwrap()).contains("Passphrase")
@@ -3345,7 +3349,7 @@ cat parser.rs
         keys.write_all(format!("{PASSPHRASE}\n").as_bytes())
             .unwrap();
         let code = exit_of(&mut mahi);
-        thread::sleep(Duration::from_millis(100));
+        let _ = output_end.recv_timeout(Duration::from_secs(10));
         let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
         (code, text)
     }
