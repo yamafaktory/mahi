@@ -13,6 +13,7 @@ mod merge;
 mod push;
 mod snapshot;
 mod store;
+mod trailers;
 mod worktree;
 
 pub use changes::{
@@ -58,3 +59,4 @@ pub use store::{
     Store,
     StoreError,
 };
+pub use trailers::Trailed;

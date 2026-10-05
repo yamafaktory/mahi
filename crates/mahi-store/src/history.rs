@@ -150,7 +150,14 @@ impl Store {
         }
         painter.mark(self, tip, VISIBLE)?;
         let mut popped = Vec::new();
-        while painter.pending > 0 {
+        let mut floor = i64::MAX;
+        while painter.pending > 0
+            || painter
+                .queue
+                .heap
+                .peek()
+                .is_some_and(|next| next.time >= floor)
+        {
             let Some(next) = painter.queue.pop(interrupt)? else {
                 break;
             };
@@ -161,6 +168,7 @@ impl Store {
             let colour = *flags & (VISIBLE | HIDDEN);
             if colour == VISIBLE {
                 painter.pending -= 1;
+                floor = floor.min(next.time.saturating_sub(CLOCK_SKEW_SECONDS));
                 popped.push((next.id, next.parents.clone()));
             }
             for at in next.parents {
@@ -353,5 +361,19 @@ mod tests {
             assert_eq!(found.boundary, HashSet::from([shared]), "salt {salt}");
         }
         assert_eq!(orders.len(), 2);
+    }
+
+    #[test]
+    fn a_hidden_commit_dated_before_its_child_still_hides_what_it_reaches() {
+        let (_dir, store) = store();
+        let none = AtomicBool::new(false);
+        let shared = commit(&store, &[], 100 * DAY);
+        let remote = commit(&store, &[shared], 100 * DAY - 3600);
+        let tip = commit(&store, &[shared], 150 * DAY);
+        let found = store
+            .new_commits(tip, &HashSet::from([remote]), &none)
+            .unwrap();
+        assert_eq!(found.commits, [tip]);
+        assert_eq!(found.boundary, HashSet::from([shared]));
     }
 }

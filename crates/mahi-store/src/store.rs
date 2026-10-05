@@ -178,8 +178,8 @@ pub enum StoreError {
     /// A push failed as a whole, for the reason given.
     #[error("push failed: {0}")]
     PushFailed(String),
-    /// More refs were fetched than mahi accepts at once.
-    #[error("{0} refs were fetched, more than mahi accepts")]
+    /// More refs were found than mahi reads at once.
+    #[error("{0} refs, more than mahi reads at once")]
     TooManyRefs(usize),
     /// A history is longer than mahi walks.
     #[error("the history of {0} is longer than mahi walks")]
