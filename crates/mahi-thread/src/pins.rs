@@ -19,7 +19,10 @@ use mahi_core::ThreadId;
 use mahi_store::Store;
 use thiserror::Error;
 
-use crate::VerifiedMeta;
+use crate::{
+    MetaDocument,
+    VerifiedMeta,
+};
 
 const PIN_BYTES: usize = 8 + 32;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -90,15 +93,20 @@ impl Pins {
         self.accept_hash(meta.thread(), meta.generation(), meta.body_hash())
     }
 
-    /// Checks `meta` as [`Pins::accept`] does and runs `then` under the pin's lock, moving the
-    /// pin only once `then` succeeded, so a refused document or a failed `then` leaves the pin
-    /// where it was.
-    pub(crate) fn accept_then<E: From<PinError>>(
+    /// Checks `document`, live or a tombstone, as [`Pins::accept`] does and runs `then` under
+    /// the pin's lock, moving the pin only once `then` succeeded, so a refused document or a
+    /// failed `then` leaves the pin where it was.
+    pub(crate) fn accept_document_then<E: From<PinError>>(
         &self,
-        meta: &VerifiedMeta,
+        document: &MetaDocument,
         then: impl FnOnce() -> Result<(), E>,
     ) -> Result<(), E> {
-        self.accept_hash_then(meta.thread(), meta.generation(), meta.body_hash(), then)
+        self.accept_hash_then(
+            document.thread(),
+            document.generation(),
+            document.body_hash(),
+            then,
+        )
     }
 
     /// Runs `remove_thread` and then removes `thread`'s pin, all under the pin's lock, but only

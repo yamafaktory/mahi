@@ -14,10 +14,10 @@ use thiserror::Error;
 
 use crate::{
     MAX_META_BYTES,
+    MetaDocument,
     ParticipantKey,
     PinError,
     ThreadError,
-    VerifiedMeta,
     commits::signed_by,
     pins::Pins,
     thread::META_ENTRY,
@@ -48,6 +48,9 @@ pub struct Accepted {
     /// The fetched refs that could not be checked or moved, or that add a commit their
     /// participant did not sign, with why.
     pub refused: Vec<(ThreadRef, Refusal)>,
+    /// Whether the thread's `meta` is now the tombstone its owner signed when they purged it;
+    /// no agent ref is accepted then.
+    pub purged: bool,
 }
 
 enum Advance {
@@ -79,7 +82,11 @@ enum Advance {
 /// signed by `trusted_owner`, [`ThreadError::Pin`] if the pin refuses it, or
 /// [`ThreadError::Store`] if the fetched refs or the local `meta` cannot be read, or `meta`
 /// cannot be moved. In all these cases no ref moves, except that `meta` may have moved when
-/// only writing the pin failed; the next [`crate::load_meta`] then pins it.
+/// only writing the pin failed; the next [`crate::load_meta`] then pins it, or, for a
+/// tombstone, the local `meta` itself keeps any other document from being accepted.
+///
+/// Once the local `meta` is a tombstone, no other document replaces it, whatever its
+/// generation, so a purged thread is never brought back.
 pub fn accept_fetched(
     store: &Store,
     thread: ThreadId,
@@ -99,6 +106,13 @@ pub fn accept_fetched(
     if moved {
         accepted.updated.push(meta_ref.clone());
     }
+    let current = match current {
+        MetaDocument::Live(current) => Some(current),
+        MetaDocument::Purged(_) => {
+            accepted.purged = true;
+            None
+        }
+    };
     for (thread_ref, commit) in fetched {
         let slot = match thread_ref.kind() {
             RefKind::Meta => continue,
@@ -111,6 +125,7 @@ pub fn accept_fetched(
             .filter(|slot| Some(slot.participant()) != local)
             .and_then(|slot| {
                 current
+                    .as_ref()?
                     .participants()
                     .find(|listed| listed.name() == slot.participant())
             });
@@ -133,7 +148,7 @@ fn accept_meta(
     thread: ThreadId,
     commit: ObjectId,
     trusted_owner: &ParticipantKey,
-) -> Result<(bool, VerifiedMeta), ThreadError> {
+) -> Result<(bool, MetaDocument), ThreadError> {
     let fetched =
         read_document(store, thread, commit, trusted_owner).map_err(|error| match error {
             ThreadError::Meta(source) => ThreadError::FetchedMetaRefused {
@@ -149,6 +164,10 @@ fn accept_meta(
     }
     if let Some(local) = local {
         let current = read_document(store, thread, local, trusted_owner)?;
+        if matches!(current, MetaDocument::Purged(_)) && current.body_hash() != fetched.body_hash()
+        {
+            return Ok((false, current));
+        }
         if current.generation() > fetched.generation() {
             return Ok((false, current));
         }
@@ -161,7 +180,7 @@ fn accept_meta(
             .into());
         }
     }
-    Pins::new(store).accept_then(&fetched, || {
+    Pins::new(store).accept_document_then(&fetched, || {
         store
             .set_head(&meta_ref, local, commit)
             .map_err(ThreadError::from)
@@ -174,11 +193,11 @@ fn read_document(
     thread: ThreadId,
     commit: ObjectId,
     trusted_owner: &ParticipantKey,
-) -> Result<VerifiedMeta, ThreadError> {
+) -> Result<MetaDocument, ThreadError> {
     let encoded = store
         .read_entry(commit, META_ENTRY, MAX_META_BYTES as u64)?
         .ok_or(ThreadError::MissingMetaEntry(thread))?;
-    Ok(VerifiedMeta::decode(&encoded, thread, trusted_owner)?)
+    Ok(MetaDocument::decode(&encoded, thread, trusted_owner)?)
 }
 
 fn advance(
@@ -246,7 +265,10 @@ mod tests {
     use super::*;
     use crate::{
         GitSigner,
+        MetaError,
         PinError,
+        Tombstone,
+        VerifiedMeta,
         create_thread,
         load_meta,
         record_meta,
@@ -335,6 +357,56 @@ mod tests {
             &setup.owner_key,
             Some(&ParticipantName::new("bob").unwrap()),
         )
+    }
+
+    #[test]
+    fn a_fetched_tombstone_ends_the_thread_and_no_agent_ref_moves_after_it() {
+        let setup = setup();
+        let (key, first) = created(&setup);
+        let live = load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
+        let tombstone = Tombstone::sign(&live, &setup.owner).unwrap();
+        let ended = commit(&setup, Some(first), META_ENTRY, &tombstone);
+        let meta = ThreadRef::new(setup.thread, RefKind::Meta);
+        stage(&setup, &meta, ended);
+        let alice = snapshots(&setup, "alice", "claude");
+        stage(&setup, &alice, commit(&setup, None, "f", b"late work"));
+
+        let accepted = accept(&setup).unwrap();
+
+        assert!(accepted.purged);
+        assert_eq!(accepted.updated, std::slice::from_ref(&meta));
+        assert_eq!(accepted.skipped, std::slice::from_ref(&alice));
+        assert_eq!(setup.store.head(&meta).unwrap(), Some(ended));
+        assert_eq!(setup.store.head(&alice).unwrap(), None);
+        assert!(matches!(
+            load_meta(&setup.store, setup.thread, &setup.owner_key, 0),
+            Err(ThreadError::Meta(MetaError::Purged(1)))
+        ));
+
+        stage(&setup, &meta, first);
+        let older = accept(&setup).unwrap();
+        assert!(older.purged && older.updated.is_empty());
+        assert_eq!(setup.store.head(&meta).unwrap(), Some(ended));
+        let revived = draft(&setup, 1, "t").sign(&key, &setup.owner).unwrap();
+        stage(
+            &setup,
+            &meta,
+            commit(&setup, Some(first), META_ENTRY, &revived),
+        );
+        let same = accept(&setup).unwrap();
+        assert!(same.purged && same.updated.is_empty());
+        assert_eq!(setup.store.head(&meta).unwrap(), Some(ended));
+        let later = draft(&setup, 2, "t").sign(&key, &setup.owner).unwrap();
+        stage(
+            &setup,
+            &meta,
+            commit(&setup, Some(first), META_ENTRY, &later),
+        );
+        stage(&setup, &alice, commit(&setup, None, "f", b"later work"));
+        let newer = accept(&setup).unwrap();
+        assert!(newer.purged && newer.updated.is_empty());
+        assert_eq!(setup.store.head(&meta).unwrap(), Some(ended));
+        assert_eq!(setup.store.head(&alice).unwrap(), None);
     }
 
     #[test]
