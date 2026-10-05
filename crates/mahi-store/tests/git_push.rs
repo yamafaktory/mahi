@@ -341,4 +341,170 @@ mod tests {
             Err(mahi_store::StoreError::NoBranch(_))
         ));
     }
+
+    fn push_within(
+        store: &Store,
+        remote: &Path,
+        refs: &[ThreadRef],
+        max_bytes: u64,
+    ) -> Vec<(ThreadRef, Pushed)> {
+        store
+            .push_refs_within(
+                file::connect(remote.as_os_str().as_encoded_bytes(), Protocol::V1, false).unwrap(),
+                refs,
+                max_bytes,
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_push_sends_the_refs_that_fit_and_leaves_the_rest_for_later() {
+        let setup = setup();
+        let alice = ThreadRef::new(
+            setup.meta.thread(),
+            RefKind::Snapshots(AgentSlot::new(
+                ParticipantName::new("alice").unwrap(),
+                AgentName::new("codex").unwrap(),
+            )),
+        );
+        commit(&setup.store, &setup.meta, None, "meta");
+        let bob = commit(&setup.store, &setup.snapshots, None, &"b".repeat(15 << 10));
+        let alice_tip = commit(&setup.store, &alice, None, &"a".repeat(15 << 10));
+        let refs = [setup.meta.clone(), setup.snapshots.clone(), alice.clone()];
+        assert_eq!(
+            push_within(&setup.store, &setup.remote, &refs, 4 << 10),
+            [
+                (setup.meta.clone(), Pushed::Updated),
+                (setup.snapshots.clone(), Pushed::TooLarge(4 << 10)),
+                (alice.clone(), Pushed::TooLarge(4 << 10)),
+            ]
+        );
+        git(&setup.remote, &["rev-parse", &setup.meta.to_string()]);
+        assert_eq!(
+            push_within(&setup.store, &setup.remote, &refs, 20 << 10),
+            [
+                (setup.meta.clone(), Pushed::UpToDate),
+                (setup.snapshots.clone(), Pushed::Updated),
+                (alice.clone(), Pushed::Deferred),
+            ]
+        );
+        assert_eq!(
+            git(&setup.remote, &["rev-parse", &setup.snapshots.to_string()]),
+            bob.to_string()
+        );
+        assert_eq!(
+            push_within(&setup.store, &setup.remote, &refs, 20 << 10),
+            [
+                (setup.meta.clone(), Pushed::UpToDate),
+                (setup.snapshots.clone(), Pushed::UpToDate),
+                (alice.clone(), Pushed::Updated),
+            ]
+        );
+        assert_eq!(
+            git(&setup.remote, &["rev-parse", &alice.to_string()]),
+            alice_tip.to_string()
+        );
+        git(&setup.remote, &["fsck", "--strict", "--no-dangling"]);
+    }
+
+    #[test]
+    fn a_branch_larger_than_the_limit_is_not_pushed() {
+        let setup = setup();
+        let local = &setup.local;
+        std::fs::write(local.join("big"), "x".repeat(32 << 10)).unwrap();
+        git(local, &["add", "big"]);
+        git(local, &["commit", "-qm", "big", "--no-gpg-sign"]);
+        let branch = git(local, &["symbolic-ref", "--short", "HEAD"]);
+        let pushed = setup
+            .store
+            .push_branch_within(
+                file::connect(
+                    setup.remote.as_os_str().as_encoded_bytes(),
+                    Protocol::V1,
+                    false,
+                )
+                .unwrap(),
+                &branch,
+                16 << 10,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(pushed, Pushed::TooLarge(16 << 10));
+        assert!(git(&setup.remote, &["for-each-ref"]).is_empty());
+        assert_eq!(
+            push_branch(&setup.store, &setup.remote, &branch),
+            Pushed::Updated
+        );
+    }
+
+    fn snapshots_of(thread: ThreadId, participant: &str) -> ThreadRef {
+        ThreadRef::new(
+            thread,
+            RefKind::Snapshots(AgentSlot::new(
+                ParticipantName::new(participant).unwrap(),
+                AgentName::new("sh").unwrap(),
+            )),
+        )
+    }
+
+    #[test]
+    fn refs_after_a_deferred_one_wait_and_a_too_large_ref_holds_none_back() {
+        let setup = setup();
+        let thread = setup.meta.thread();
+        let (carol, dave, erin) = (
+            snapshots_of(thread, "carol"),
+            snapshots_of(thread, "dave"),
+            snapshots_of(thread, "erin"),
+        );
+        let bob = commit(&setup.store, &setup.snapshots, None, &"b".repeat(15 << 10));
+        commit(&setup.store, &carol, None, &"c".repeat(15 << 10));
+        commit(&setup.store, &dave, None, "small");
+        let refs = [setup.snapshots.clone(), carol.clone(), dave.clone()];
+        assert_eq!(
+            push_within(&setup.store, &setup.remote, &refs, 20 << 10),
+            [
+                (setup.snapshots.clone(), Pushed::Updated),
+                (carol.clone(), Pushed::Deferred),
+                (dave.clone(), Pushed::Deferred),
+            ]
+        );
+        assert_eq!(
+            git(&setup.remote, &["rev-parse", &setup.snapshots.to_string()]),
+            bob.to_string()
+        );
+        let shared = setup.store.write_blob(&[b's'; 10 << 10]).unwrap();
+        let other = setup.store.write_blob(&[b'o'; 10 << 10]).unwrap();
+        let big_tree = setup
+            .store
+            .write_tree(&[
+                ("other", EntryKind::Blob, other),
+                ("shared", EntryKind::Blob, shared),
+            ])
+            .unwrap();
+        let small_tree = setup
+            .store
+            .write_tree(&[("shared", EntryKind::Blob, shared)])
+            .unwrap();
+        let big = ThreadRef::new(thread, RefKind::Meta);
+        setup.store.append(&big, None, big_tree, "big").unwrap();
+        let erin_tip = setup.store.append(&erin, None, small_tree, "erin").unwrap();
+        assert_eq!(
+            push_within(
+                &setup.store,
+                &setup.remote,
+                &[big.clone(), erin.clone()],
+                15 << 10
+            ),
+            [
+                (big, Pushed::TooLarge(15 << 10)),
+                (erin.clone(), Pushed::Updated)
+            ]
+        );
+        assert_eq!(
+            git(&setup.remote, &["rev-parse", &erin.to_string()]),
+            erin_tip.to_string()
+        );
+        git(&setup.remote, &["fsck", "--strict", "--no-dangling"]);
+    }
 }

@@ -312,7 +312,11 @@ fn push(
             store,
             (&branch, base),
             (thread, &trailers),
-            (setup.name.as_str(), || setup.connect(interrupt)),
+            (
+                setup.name.as_str(),
+                || setup.connect(interrupt),
+                setup.push_limit,
+            ),
             interrupt,
             &mut report,
         )
@@ -529,7 +533,7 @@ fn trail_and_push<T: Transport>(
     store: &Store,
     (branch, base): (&str, ObjectId),
     (thread, trailers): (ThreadId, &str),
-    (remote, connect): (&str, impl FnOnce() -> Result<T, PushError>),
+    (remote, connect, push_limit): (&str, impl FnOnce() -> Result<T, PushError>, u64),
     interrupt: &AtomicBool,
     report: &mut String,
 ) -> Result<bool, LandError> {
@@ -563,7 +567,7 @@ fn trail_and_push<T: Transport>(
         }
     }
     let pushed = store
-        .push_branch(transport, branch, interrupt)
+        .push_branch_within(transport, branch, push_limit, interrupt)
         .map_err(|error| LandError::Push(PushError::Push(error)))?;
     match pushed {
         Pushed::Updated => {
@@ -589,6 +593,18 @@ fn trail_and_push<T: Transport>(
         }
         Pushed::Refused(reason) => {
             let _ = writeln!(report, "{remote} refused {branch}: {reason}");
+            return Ok(false);
+        }
+        Pushed::TooLarge(limit) => {
+            let _ = writeln!(
+                report,
+                "{branch} was not pushed: its new commits are larger than push-limit ({limit} \
+                 bytes); raise push-limit in config.toml"
+            );
+            return Ok(false);
+        }
+        Pushed::Deferred => {
+            let _ = writeln!(report, "{branch} was not pushed; push again");
             return Ok(false);
         }
     }
@@ -894,7 +910,7 @@ mod git_tests {
             store,
             ("mahi/x", base),
             (thread, &trailers),
-            ("up", connect),
+            ("up", connect, u64::MAX),
             &AtomicBool::new(false),
             &mut report,
         )

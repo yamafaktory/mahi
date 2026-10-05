@@ -1328,7 +1328,10 @@ impl Prepared {
         let pusher = self.sync.map(|setup| {
             let refs = setup.refs(started.thread, &started.slot);
             let name = setup.name.clone();
-            let pusher = Pusher::start(self.git_dir.clone(), refs, move |flag| setup.connect(flag));
+            let limit = setup.push_limit;
+            let pusher = Pusher::start(self.git_dir.clone(), (refs, limit), move |flag| {
+                setup.connect(flag)
+            });
             (pusher, name)
         });
         let activity = Arc::new(Activity::default());

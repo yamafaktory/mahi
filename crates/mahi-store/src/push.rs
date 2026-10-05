@@ -57,6 +57,8 @@ const MAX_REPORT_LINES: usize = 65536;
 const MAX_REASON_CHARS: usize = 200;
 const PACK_BUFFER_BYTES: usize = 64 << 10;
 const AGENT: &str = "agent=mahi";
+const ENTRY_FRAMING_BYTES: u64 = 64;
+const PACK_FRAMING_BYTES: u64 = 32;
 
 /// What pushing one thread ref did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,12 @@ pub enum Pushed {
     Unchecked(String),
     /// The remote refused the update, for the reason it gave, escaped.
     Refused(String),
+    /// The ref was not sent, since it did not fit beside the others within the push's limit;
+    /// it fits on its own, so a later push sends it.
+    Deferred,
+    /// The ref was not sent, since its new objects alone are larger than the push's limit,
+    /// in bytes.
+    TooLarge(u64),
 }
 
 struct Advertisement {
@@ -81,7 +89,7 @@ struct Advertisement {
 }
 
 type Command = (String, Option<ObjectId>, ObjectId);
-type Plan = (Vec<(ThreadRef, Pushed)>, Vec<Command>);
+type Plan = (Vec<(ThreadRef, Pushed)>, Vec<(usize, Command)>);
 type Report = HashMap<String, Option<String>>;
 
 impl Store {
@@ -100,8 +108,28 @@ impl Store {
     /// [`StoreError::Git`] if the transport or building the pack fails.
     pub fn push_refs<T: Transport>(
         &self,
+        transport: T,
+        refs: &[ThreadRef],
+        interrupt: &AtomicBool,
+    ) -> Result<Vec<(ThreadRef, Pushed)>, StoreError> {
+        self.push_refs_within(transport, refs, u64::MAX, interrupt)
+    }
+
+    /// Pushes `refs` as [`Store::push_refs`] does, sending, in the order given, those whose
+    /// new objects fit within `max_bytes` together, each counted at its full size plus a
+    /// 1024th of it and 64 bytes, more than zlib and the pack's entry header add to data that
+    /// does not compress, and the pack's own 32. From the first ref that does not fit beside those before
+    /// it, every later ref is [`Pushed::Deferred`], so refs never go out of order; a ref whose
+    /// new objects alone are larger is [`Pushed::TooLarge`] and holds no other back.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Store::push_refs`].
+    pub fn push_refs_within<T: Transport>(
+        &self,
         mut transport: T,
         refs: &[ThreadRef],
+        max_bytes: u64,
         interrupt: &AtomicBool,
     ) -> Result<Vec<(ThreadRef, Pushed)>, StoreError> {
         let mut unique = Vec::new();
@@ -120,12 +148,21 @@ impl Store {
                 .iter()
                 .any(|prefix| name.starts_with(prefix.as_str()))
         })?;
-        let (mut outcomes, commands) = self.plan(&unique, &advertised)?;
+        let (mut outcomes, planned) = self.plan(&unique, &advertised)?;
+        let (objects, fits) =
+            self.objects_to_send(&planned, &advertised.tips, max_bytes, interrupt)?;
+        let mut commands = Vec::with_capacity(planned.len());
+        for ((index, command), fit) in planned.into_iter().zip(fits) {
+            if fit == Pushed::Updated {
+                commands.push(command);
+            } else if let Some((_, outcome)) = outcomes.get_mut(index) {
+                *outcome = fit;
+            }
+        }
         if commands.is_empty() {
             finish_without_commands(&mut transport)?;
             return Ok(outcomes);
         }
-        let objects = self.objects_to_send(&commands, &advertised.tips, interrupt)?;
         let report = self.send(
             &mut transport,
             &commands,
@@ -153,8 +190,25 @@ impl Store {
     /// transport or building the pack fails.
     pub fn push_branch<T: Transport>(
         &self,
+        transport: T,
+        branch: &str,
+        interrupt: &AtomicBool,
+    ) -> Result<Pushed, StoreError> {
+        self.push_branch_within(transport, branch, u64::MAX, interrupt)
+    }
+
+    /// Pushes `branch` as [`Store::push_branch`] does, unless its new objects are larger than
+    /// `max_bytes`, counted as [`Store::push_refs_within`] counts them; it is then not sent,
+    /// and is [`Pushed::TooLarge`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Store::push_branch`].
+    pub fn push_branch_within<T: Transport>(
+        &self,
         mut transport: T,
         branch: &str,
+        max_bytes: u64,
         interrupt: &AtomicBool,
     ) -> Result<Pushed, StoreError> {
         let name = branch_ref(branch)?.as_bstr().to_string();
@@ -174,6 +228,14 @@ impl Store {
             return Ok(outcome);
         };
         let objects = self.branch_objects(local, &advertised.tips, interrupt)?;
+        if self
+            .objects_size(&objects)?
+            .saturating_add(PACK_FRAMING_BYTES)
+            > max_bytes
+        {
+            finish_without_commands(&mut transport)?;
+            return Ok(Pushed::TooLarge(max_bytes));
+        }
         let report = self.send(
             &mut transport,
             std::slice::from_ref(&command),
@@ -281,7 +343,7 @@ impl Store {
             let (outcome, command) = self.decide(&name, (local, remote), &|local, remote| {
                 self.descends_from(local, remote)
             })?;
-            commands.extend(command);
+            commands.extend(command.map(|command| (outcomes.len(), command)));
             outcomes.push((thread_ref.clone(), outcome));
         }
         Ok((outcomes, commands))
@@ -293,10 +355,11 @@ impl Store {
 
     fn objects_to_send(
         &self,
-        commands: &[Command],
+        commands: &[(usize, Command)],
         remote_tips: &HashSet<ObjectId>,
+        max_bytes: u64,
         interrupt: &AtomicBool,
-    ) -> Result<Vec<ObjectId>, StoreError> {
+    ) -> Result<(Vec<ObjectId>, Vec<Pushed>), StoreError> {
         let mut known = HashSet::new();
         let mut remote_commits = HashSet::new();
         for tip in remote_tips {
@@ -306,7 +369,11 @@ impl Store {
             }
         }
         let mut objects = Vec::new();
-        for (_, _, new) in commands {
+        let mut fits = Vec::with_capacity(commands.len());
+        let mut total = PACK_FRAMING_BYTES;
+        let mut deferring = false;
+        for (_, (_, _, new)) in commands {
+            let start = objects.len();
             let mut commits = Vec::new();
             let mut current = Some(*new);
             while let Some(commit) = current {
@@ -327,8 +394,36 @@ impl Store {
                     interrupt,
                 )?;
             }
+            let size = self.objects_size(objects.get(start..).unwrap_or_default())?;
+            let fit = if size.saturating_add(PACK_FRAMING_BYTES) > max_bytes {
+                Pushed::TooLarge(max_bytes)
+            } else if deferring || total.saturating_add(size) > max_bytes {
+                deferring = true;
+                Pushed::Deferred
+            } else {
+                total = total.saturating_add(size);
+                Pushed::Updated
+            };
+            if fit != Pushed::Updated {
+                for object in objects.drain(start..) {
+                    known.remove(&object);
+                }
+            }
+            fits.push(fit);
         }
-        Ok(objects)
+        Ok((objects, fits))
+    }
+
+    fn objects_size(&self, objects: &[ObjectId]) -> Result<u64, StoreError> {
+        let mut size: u64 = 0;
+        for object in objects {
+            let full = self.repo.find_header(*object)?.size();
+            size = size
+                .saturating_add(full)
+                .saturating_add(full >> 10)
+                .saturating_add(ENTRY_FRAMING_BYTES);
+        }
+        Ok(size)
     }
 
     fn mark_known(

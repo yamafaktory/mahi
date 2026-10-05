@@ -89,6 +89,7 @@ const SYSTEM_KNOWN_HOSTS: [&str; 2] = ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh
 #[derive(Debug, Clone)]
 pub(crate) struct SyncSetup {
     pub(crate) name: RemoteName,
+    pub(crate) push_limit: u64,
     remote: RemoteUrl,
     visibility: Visibility,
     owns_meta: bool,
@@ -188,6 +189,7 @@ impl SyncSetup {
         let access = Access::gather(environment, &remote).map_err(SetupError::Access)?;
         Ok(Some(Self {
             name: chosen.name,
+            push_limit: transfer_limits(environment).push_limit,
             remote,
             visibility: chosen.visibility,
             owns_meta,
@@ -556,7 +558,11 @@ fn pushed_refs(
 impl Pusher {
     /// Starts the pushing thread for `refs` of the repository at `git_dir`, reaching the remote
     /// with `connect`.
-    pub(crate) fn start<T, C>(git_dir: PathBuf, refs: Vec<ThreadRef>, connect: C) -> Self
+    pub(crate) fn start<T, C>(
+        git_dir: PathBuf,
+        (refs, max_bytes): (Vec<ThreadRef>, u64),
+        connect: C,
+    ) -> Self
     where
         T: Transport,
         C: Fn(&Arc<AtomicBool>) -> Result<T, PushError> + Send + 'static,
@@ -565,7 +571,13 @@ impl Pusher {
         let interrupt = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&interrupt);
         let worker = thread::spawn(move || {
-            push_on_pokes(&git_dir, &refs, &|| connect(&flag), &received, &flag)
+            push_on_pokes(
+                &git_dir,
+                (&refs, max_bytes),
+                &|| connect(&flag),
+                &received,
+                &flag,
+            )
         });
         Self {
             pokes,
@@ -606,22 +618,36 @@ impl PushPoker {
 
 fn push_on_pokes<T: Transport>(
     git_dir: &Path,
-    refs: &[ThreadRef],
+    refs: (&[ThreadRef], u64),
     connect: &dyn Fn() -> Result<T, PushError>,
     pokes: &Receiver<()>,
     interrupt: &AtomicBool,
 ) -> Pushes {
     let mut pushes = Pushes::default();
     while pokes.recv().is_ok() {
-        pushes.count += 1;
-        pushes.last = Some(push_once(git_dir, refs, connect, interrupt));
+        loop {
+            pushes.count += 1;
+            let last = push_once(git_dir, refs, connect, interrupt);
+            let more = last.as_ref().is_ok_and(|outcomes| {
+                outcomes
+                    .iter()
+                    .any(|(_, outcome)| *outcome == Pushed::Deferred)
+                    && outcomes
+                        .iter()
+                        .any(|(_, outcome)| *outcome == Pushed::Updated)
+            });
+            pushes.last = Some(last);
+            if !more {
+                break;
+            }
+        }
     }
     pushes
 }
 
 fn push_once<T: Transport>(
     git_dir: &Path,
-    refs: &[ThreadRef],
+    (refs, max_bytes): (&[ThreadRef], u64),
     connect: &dyn Fn() -> Result<T, PushError>,
     interrupt: &AtomicBool,
 ) -> Result<Vec<(ThreadRef, Pushed)>, PushError> {
@@ -637,7 +663,7 @@ fn push_once<T: Transport>(
     let pushed = connect().and_then(|transport| {
         interrupted()?;
         store
-            .push_refs(transport, refs, interrupt)
+            .push_refs_within(transport, refs, max_bytes, interrupt)
             .map_err(PushError::Push)
     });
     interrupted()?;
@@ -680,6 +706,21 @@ impl Pushes {
                         }
                         Pushed::Refused(reason) => {
                             let _ = writeln!(text, "mahi: {name} refused {thread_ref}: {reason}");
+                        }
+                        Pushed::Deferred => {
+                            let _ = writeln!(
+                                text,
+                                "mahi: {thread_ref} waits for a later push to {name}: it did not \
+                                 fit beside the others within push-limit"
+                            );
+                        }
+                        Pushed::TooLarge(limit) => {
+                            let _ = writeln!(
+                                text,
+                                "mahi: {thread_ref} was not pushed to {name}: its new commits are \
+                                 larger than push-limit ({limit} bytes); raise push-limit in \
+                                 config.toml"
+                            );
                         }
                     }
                 }
@@ -932,6 +973,11 @@ mod tests {
         assert_eq!(report(Pushed::Updated), "mahi: pushed to origin\n");
         assert!(report(Pushed::Behind).contains("moved on origin"));
         assert!(report(Pushed::Refused("hook declined".to_owned())).contains("hook declined"));
+        assert!(report(Pushed::Deferred).contains("waits for a later push to origin"));
+        assert!(
+            report(Pushed::TooLarge(4096))
+                .contains("larger than push-limit (4096 bytes); raise push-limit in config.toml")
+        );
         assert_eq!(Pushes::default().report(&name), None);
         let failed = Pushes {
             count: 1,
@@ -986,6 +1032,42 @@ mod git_tests {
     }
 
     #[test]
+    fn refs_that_did_not_fit_go_in_the_next_pack_of_the_same_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let (local, remote) = (dir.path().join("local"), dir.path().join("remote.git"));
+        gix::init(&local).unwrap();
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]);
+        let store = Store::open(&local).unwrap();
+        let thread = ThreadId::random().unwrap();
+        let refs = vec![
+            ThreadRef::new(thread, RefKind::Meta),
+            ThreadRef::new(thread, RefKind::State),
+        ];
+        let mut tips = Vec::new();
+        for (thread_ref, fill) in refs.iter().zip(*b"ms") {
+            let blob = store.write_blob(&[fill; 15 << 10]).unwrap();
+            let tree = store.write_tree(&[("m", EntryKind::Blob, blob)]).unwrap();
+            tips.push(store.append(thread_ref, None, tree, "m").unwrap());
+        }
+        let target = remote.clone();
+        let pusher = Pusher::start(local.clone(), (refs.clone(), 20 << 10), move |_| {
+            Ok(
+                file::connect(target.as_os_str().as_encoded_bytes(), Protocol::V1, false)
+                    .unwrap_or_else(|never| match never {}),
+            )
+        });
+        let finished = pusher.finish();
+        assert_eq!(finished.count, 2);
+        for (thread_ref, tip) in refs.iter().zip(&tips) {
+            assert_eq!(
+                git(&remote, &["rev-parse", &thread_ref.to_string()]),
+                tip.to_string()
+            );
+        }
+    }
+
+    #[test]
     fn pokes_push_the_refs_and_finishing_pushes_the_last_state() {
         let dir = tempfile::tempdir().unwrap();
         let (local, remote) = (dir.path().join("local"), dir.path().join("remote.git"));
@@ -1001,7 +1083,7 @@ mod git_tests {
         };
         let first = append(None);
         let target = remote.clone();
-        let pusher = Pusher::start(local.clone(), vec![meta.clone()], move |_| {
+        let pusher = Pusher::start(local.clone(), (vec![meta.clone()], u64::MAX), move |_| {
             Ok(
                 file::connect(target.as_os_str().as_encoded_bytes(), Protocol::V1, false)
                     .unwrap_or_else(|never| match never {}),
@@ -1017,18 +1099,19 @@ mod git_tests {
             second.to_string()
         );
 
-        let unreachable = Pusher::start(local.clone(), vec![meta.clone()], |_| {
+        let unreachable = Pusher::start(local.clone(), (vec![meta.clone()], u64::MAX), |_| {
             Err::<file::SpawnProcessOnDemand, _>(PushError::Connect(ConnectError::Ssh(
                 SshError::Timeout("example.org".to_owned()),
             )))
         });
         let failed = unreachable.finish();
         assert!(matches!(failed.last, Some(Err(PushError::Connect(_)))));
-        let stopped_while_connecting = Pusher::start(local.clone(), vec![meta.clone()], |_| {
-            Err::<file::SpawnProcessOnDemand, _>(PushError::Connect(ConnectError::Ssh(
-                SshError::Timeout("example.org".to_owned()),
-            )))
-        });
+        let stopped_while_connecting =
+            Pusher::start(local.clone(), (vec![meta.clone()], u64::MAX), |_| {
+                Err::<file::SpawnProcessOnDemand, _>(PushError::Connect(ConnectError::Ssh(
+                    SshError::Timeout("example.org".to_owned()),
+                )))
+            });
         stopped_while_connecting
             .interrupt_flag()
             .store(true, Ordering::SeqCst);
@@ -1037,7 +1120,7 @@ mod git_tests {
             Some(Err(PushError::Push(StoreError::Interrupted)))
         ));
         let target = remote.clone();
-        let stopped = Pusher::start(local.clone(), vec![meta.clone()], move |_| {
+        let stopped = Pusher::start(local.clone(), (vec![meta.clone()], u64::MAX), move |_| {
             Ok(
                 file::connect(target.as_os_str().as_encoded_bytes(), Protocol::V1, false)
                     .unwrap_or_else(|never| match never {}),
