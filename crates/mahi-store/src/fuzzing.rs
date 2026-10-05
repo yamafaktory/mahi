@@ -33,10 +33,12 @@ pub fn send_pack(data: &[u8]) {
         return;
     };
     let meta = ThreadRef::new(ThreadId::from_bytes([1; 16]), RefKind::Meta);
+    let names: HashSet<String> = HashSet::from([meta.to_string()]);
     if selector.is_multiple_of(2) {
-        let _ = push::parse_advertisement(&mut lines(rest), std::slice::from_ref(&meta));
+        let _ = push::parse_advertisement(&mut lines(rest), &names, &|name| {
+            name.starts_with("refs/threads/")
+        });
     } else {
-        let sent: HashSet<String> = HashSet::from([meta.to_string()]);
-        let _ = push::read_report(&mut lines(rest), &sent);
+        let _ = push::read_report(&mut lines(rest), &names);
     }
 }
