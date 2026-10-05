@@ -40,6 +40,7 @@ use gix::{
 };
 use mahi_core::{
     THREADS_PREFIX,
+    ThreadId,
     ThreadRef,
 };
 
@@ -86,6 +87,7 @@ struct Advertisement {
     wanted: HashMap<String, ObjectId>,
     tips: HashSet<ObjectId>,
     atomic: bool,
+    delete_refs: bool,
 }
 
 type Command = (String, Option<ObjectId>, ObjectId);
@@ -143,7 +145,7 @@ impl Store {
             .iter()
             .map(|thread_ref| format!("{THREADS_PREFIX}{}/", thread_ref.thread()))
             .collect();
-        let advertised = advertisement(&mut transport, &names, &|name| {
+        let advertised = advertisement(&mut transport, &|name| names.contains(name), &|name| {
             threads
                 .iter()
                 .any(|prefix| name.starts_with(prefix.as_str()))
@@ -215,8 +217,7 @@ impl Store {
         let local = self
             .branch_tip(branch)?
             .ok_or_else(|| StoreError::NoBranch(branch.to_owned()))?;
-        let names = HashSet::from([name.clone()]);
-        let advertised = advertisement(&mut transport, &names, &|other| {
+        let advertised = advertisement(&mut transport, &|other| other == name, &|other| {
             other.starts_with("refs/heads/") || other.starts_with("refs/tags/")
         })?;
         let remote = advertised.wanted.get(&name).copied();
@@ -275,12 +276,76 @@ impl Store {
         }
         writer.write_message(MessageKind::Flush)?;
         let (raw, mut reader) = writer.into_parts();
-        let mut raw = BufWriter::with_capacity(PACK_BUFFER_BYTES, raw);
-        self.write_pack(objects, &mut raw, interrupt)?;
-        raw.flush()?;
-        drop(raw);
+        let only_deletes = commands.iter().all(|(_, _, new)| new.is_null());
+        if !only_deletes {
+            let mut raw = BufWriter::with_capacity(PACK_BUFFER_BYTES, raw);
+            self.write_pack(objects, &mut raw, interrupt)?;
+            raw.flush()?;
+        }
         let sent: HashSet<String> = commands.iter().map(|(name, _, _)| name.clone()).collect();
         read_report(&mut |line| reader.readline_str(line), &sent)
+    }
+
+    /// Deletes on the remote `transport` reaches each ref under `thread`'s prefix that
+    /// `select` picks by name, at the value the remote advertised (names that are not valid
+    /// ref names are left alone), so a ref someone moved
+    /// since is refused by the remote and reported. Returns what happened to each, in name
+    /// order: [`Pushed::Updated`] for a deleted ref.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PushFailed`] if the remote does not speak the protocol mahi needs
+    /// or does not offer `delete-refs`, [`StoreError::Interrupted`] if `interrupt` is set, or
+    /// [`StoreError::Git`] if the transport fails.
+    pub fn delete_remote_refs<T: Transport>(
+        &self,
+        mut transport: T,
+        thread: ThreadId,
+        select: &dyn Fn(&str) -> bool,
+        interrupt: &AtomicBool,
+    ) -> Result<Vec<(String, Pushed)>, StoreError> {
+        let prefix = format!("{THREADS_PREFIX}{thread}/");
+        let advertised = advertisement(
+            &mut transport,
+            &|name| {
+                name.starts_with(prefix.as_str())
+                    && gix_validate::reference::name(name.into()).is_ok()
+                    && select(name)
+            },
+            &|_| false,
+        )?;
+        let mut doomed: Vec<(String, ObjectId)> = advertised.wanted.into_iter().collect();
+        if doomed.is_empty() {
+            finish_without_commands(&mut transport)?;
+            return Ok(Vec::new());
+        }
+        if !advertised.delete_refs {
+            finish_without_commands(&mut transport)?;
+            return Err(StoreError::PushFailed(
+                "the remote does not offer delete-refs".to_owned(),
+            ));
+        }
+        check(interrupt)?;
+        doomed.sort();
+        let null = ObjectId::null(gix::hash::Kind::Sha1);
+        let commands: Vec<Command> = doomed
+            .into_iter()
+            .map(|(name, id)| (name, Some(id), null))
+            .collect();
+        let report = self.send(
+            &mut transport,
+            &commands,
+            (advertised.atomic, &[]),
+            interrupt,
+        )?;
+        Ok(commands
+            .into_iter()
+            .map(|(name, _, _)| {
+                let mut outcome = Pushed::Updated;
+                settle(&mut outcome, &report, &name);
+                (name, outcome)
+            })
+            .collect())
     }
 
     fn decide(
@@ -550,7 +615,7 @@ fn settle(outcome: &mut Pushed, report: &Report, name: &str) {
 
 fn advertisement<T: Transport>(
     transport: &mut T,
-    names: &HashSet<String>,
+    wanted: &dyn Fn(&str) -> bool,
     is_tip: &dyn Fn(&str) -> bool,
 ) -> Result<Advertisement, StoreError> {
     let response = transport
@@ -564,24 +629,27 @@ fn advertisement<T: Transport>(
         }
     }
     let atomic = response.capabilities.contains("atomic");
+    let delete_refs = response.capabilities.contains("delete-refs");
     let Some(mut lines) = response.refs else {
         return Ok(Advertisement {
             wanted: HashMap::new(),
             tips: HashSet::new(),
             atomic,
+            delete_refs,
         });
     };
-    let (wanted, tips) = parse_advertisement(&mut |line| lines.readline_str(line), names, is_tip)?;
+    let (wanted, tips) = parse_advertisement(&mut |line| lines.readline_str(line), wanted, is_tip)?;
     Ok(Advertisement {
         wanted,
         tips,
         atomic,
+        delete_refs,
     })
 }
 
 pub(crate) fn parse_advertisement(
     next_line: &mut dyn FnMut(&mut String) -> io::Result<usize>,
-    names: &HashSet<String>,
+    names: &dyn Fn(&str) -> bool,
     is_tip: &dyn Fn(&str) -> bool,
 ) -> Result<(HashMap<String, ObjectId>, HashSet<ObjectId>), StoreError> {
     let mut wanted = HashMap::new();
@@ -600,7 +668,7 @@ pub(crate) fn parse_advertisement(
             continue;
         }
         let id = ObjectId::from_hex(id.as_bytes()).map_err(|_| unexpected())?;
-        if names.contains(name) {
+        if names(name) {
             wanted.insert(name.to_owned(), id);
             tips.insert(id);
         } else if name == "HEAD" || is_tip(name) {
@@ -705,7 +773,7 @@ mod tests {
                 &format!("{ONE} HEAD"),
                 &format!("{TWO} refs/threads/{}/meta", ThreadId::random().unwrap()),
             ]),
-            &names,
+            &|name| names.contains(name),
             &is_tip,
         )
         .unwrap();
@@ -718,7 +786,11 @@ mod tests {
         );
         assert_eq!(tips.len(), 2);
         assert!(matches!(
-            parse_advertisement(&mut lines(&["not a ref line"]), &names, &is_tip),
+            parse_advertisement(
+                &mut lines(&["not a ref line"]),
+                &|name| names.contains(name),
+                &is_tip
+            ),
             Err(StoreError::PushFailed(_))
         ));
         let many: Vec<String> = (0..=MAX_ADVERTISED_REFS)
@@ -726,7 +798,7 @@ mod tests {
             .collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
         assert!(matches!(
-            parse_advertisement(&mut lines(&many), &names, &is_tip),
+            parse_advertisement(&mut lines(&many), &|name| names.contains(name), &is_tip),
             Err(StoreError::PushFailed(reason)) if reason.contains("too many")
         ));
     }

@@ -35,9 +35,10 @@ pub fn send_pack(data: &[u8]) {
     let meta = ThreadRef::new(ThreadId::from_bytes([1; 16]), RefKind::Meta);
     let names: HashSet<String> = HashSet::from([meta.to_string()]);
     if selector.is_multiple_of(2) {
-        let _ = push::parse_advertisement(&mut lines(rest), &names, &|name| {
-            name.starts_with("refs/threads/")
-        });
+        let _ =
+            push::parse_advertisement(&mut lines(rest), &|name| names.contains(name), &|name| {
+                name.starts_with("refs/threads/")
+            });
     } else {
         let _ = push::read_report(&mut lines(rest), &names);
     }

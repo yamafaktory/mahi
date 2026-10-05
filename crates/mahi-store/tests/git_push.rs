@@ -507,4 +507,85 @@ mod tests {
         );
         git(&setup.remote, &["fsck", "--strict", "--no-dangling"]);
     }
+
+    #[test]
+    fn selected_thread_refs_are_deleted_on_the_remote_at_their_advertised_values() {
+        let setup = setup();
+        let thread = setup.meta.thread();
+        let carol = snapshots_of(thread, "carol");
+        commit(&setup.store, &setup.meta, None, "meta");
+        commit(&setup.store, &setup.snapshots, None, "bob");
+        commit(&setup.store, &carol, None, "carol");
+        let refs = [setup.meta.clone(), setup.snapshots.clone(), carol.clone()];
+        push(&setup.store, &setup.remote, &refs);
+        let meta = setup.meta.to_string();
+        let delete = |select: &dyn Fn(&str) -> bool| {
+            setup
+                .store
+                .delete_remote_refs(
+                    file::connect(
+                        setup.remote.as_os_str().as_encoded_bytes(),
+                        Protocol::V1,
+                        false,
+                    )
+                    .unwrap(),
+                    thread,
+                    select,
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+        };
+        let deleted = delete(&|name| name != meta);
+        let mut expected = vec![
+            (setup.snapshots.to_string(), Pushed::Updated),
+            (carol.to_string(), Pushed::Updated),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(deleted, expected);
+        assert_eq!(
+            git(&setup.remote, &["for-each-ref", "--format=%(refname)"]),
+            meta
+        );
+        assert!(delete(&|name| name != meta).is_empty());
+        push(&setup.store, &setup.remote, std::slice::from_ref(&carol));
+        let hook = setup.remote.join("hooks/pre-receive");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ngit update-ref {carol} $(git rev-parse {meta})\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let moved = delete(&|name| name == carol.to_string());
+        assert!(
+            matches!(moved.as_slice(), [(name, Pushed::Refused(_))] if *name == carol.to_string()),
+            "{moved:?}"
+        );
+        assert_eq!(
+            git(&setup.remote, &["rev-parse", &carol.to_string()]),
+            git(&setup.remote, &["rev-parse", &meta])
+        );
+        std::fs::remove_file(&hook).unwrap();
+        assert!(matches!(
+            setup.store.delete_remote_refs(
+                file::connect(
+                    setup.remote.as_os_str().as_encoded_bytes(),
+                    Protocol::V1,
+                    false
+                )
+                .unwrap(),
+                thread,
+                &|_| true,
+                &AtomicBool::new(true),
+            ),
+            Err(mahi_store::StoreError::Interrupted)
+        ));
+        git(&setup.remote, &["rev-parse", &carol.to_string()]);
+        assert_eq!(
+            delete(&|name| name == carol.to_string()),
+            [(carol.to_string(), Pushed::Updated)]
+        );
+        assert_eq!(delete(&|_| true), [(meta.clone(), Pushed::Updated)]);
+        assert!(git(&setup.remote, &["for-each-ref"]).is_empty());
+        assert!(setup.store.head(&setup.snapshots).unwrap().is_some());
+    }
 }
