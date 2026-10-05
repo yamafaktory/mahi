@@ -45,10 +45,12 @@ pub use meta::{
     InvalidMeta,
     MAX_META_BYTES,
     MAX_PARTICIPANTS,
+    MetaDocument,
     MetaDraft,
     MetaError,
     Participant,
     PrivateMeta,
+    Tombstone,
     VerifiedMeta,
 };
 pub use node::{

@@ -47,6 +47,7 @@ pub const MAX_META_BYTES: usize = 256 * 1024;
 pub const MAX_PARTICIPANTS: usize = 256;
 
 const VERSION: u16 = 2;
+const TOMBSTONE_VERSION: u16 = 3;
 const NAMESPACE: &str = "mahi-meta";
 const HASH: HashAlg = HashAlg::Sha512;
 const MAX_TITLE_BYTES: usize = 256;
@@ -96,6 +97,25 @@ pub struct VerifiedMeta {
     recipient: x25519::Recipient,
     participants: Vec<(Participant, Vec<u8>)>,
     private: Vec<u8>,
+}
+
+/// The last meta document of a purged thread, whose signature was checked against a trusted
+/// owner key: it names no participant, wraps no key and seals nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tombstone {
+    thread: ThreadId,
+    generation: u64,
+    body_hash: [u8; 32],
+    owner: ParticipantName,
+}
+
+/// A verified meta document: a live thread's, or the tombstone of a purged one.
+#[derive(Debug, Clone)]
+pub enum MetaDocument {
+    /// A thread still in use.
+    Live(VerifiedMeta),
+    /// A thread its owner purged.
+    Purged(Tombstone),
 }
 
 /// A rule of the meta document format that was broken.
@@ -157,6 +177,9 @@ pub enum InvalidMeta {
     /// The landing branch is not a valid git branch name.
     #[error("landing branch is not a valid branch name")]
     Branch,
+    /// The document's generation is the highest there is, so none can follow it.
+    #[error("no generation can follow this document")]
+    LastGeneration,
 }
 
 /// Building, signing or reading a meta document failed.
@@ -213,6 +236,10 @@ pub enum MetaError {
     /// A wrapped key does not match the thread's recipient.
     #[error("wrapped thread key does not match the thread")]
     KeyMismatch,
+    /// The document is the tombstone its owner signed when they purged the thread, at the
+    /// generation given.
+    #[error("the thread was purged by its owner")]
+    Purged(u64),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -241,6 +268,13 @@ struct WireParticipant<'a> {
     recipient: &'a str,
     node: [u8; 32],
     wrapped: &'a [u8],
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireTombstone<'a> {
+    thread: [u8; 16],
+    generation: u64,
+    owner: &'a str,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -475,6 +509,155 @@ impl MetaDraft {
     }
 }
 
+impl MetaDocument {
+    /// Decodes the meta document read for `thread`, live or a tombstone, and checks that
+    /// `trusted_owner` signed it, as [`VerifiedMeta::decode`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`VerifiedMeta::decode`], except [`MetaError::Purged`].
+    pub fn decode(
+        encoded: &[u8],
+        thread: ThreadId,
+        trusted_owner: &ParticipantKey,
+    ) -> Result<Self, MetaError> {
+        if encoded.len() > MAX_META_BYTES {
+            return Err(MetaError::TooLarge);
+        }
+        let envelope: WireEnvelope<'_> = decode_exact(encoded)?;
+        if envelope.version != VERSION && envelope.version != TOMBSTONE_VERSION {
+            return Err(MetaError::UnsupportedVersion(envelope.version));
+        }
+        if envelope.signature.len() > MAX_SIGNATURE_BYTES {
+            return Err(MetaError::BadSignature);
+        }
+        let signature =
+            SshSig::from_pem(envelope.signature).map_err(|_| MetaError::BadSignature)?;
+        if signature.hash_alg() != HASH
+            || !trusted_owner.verifies(NAMESPACE, envelope.body, &signature)
+        {
+            return Err(MetaError::BadSignature);
+        }
+        if envelope.version == TOMBSTONE_VERSION {
+            return Tombstone::decode_body(envelope.body, thread).map(Self::Purged);
+        }
+        VerifiedMeta::decode_body(envelope.body, thread, trusted_owner).map(Self::Live)
+    }
+
+    /// Returns the thread the document describes.
+    #[must_use]
+    pub fn thread(&self) -> ThreadId {
+        match self {
+            Self::Live(meta) => meta.thread,
+            Self::Purged(tombstone) => tombstone.thread,
+        }
+    }
+
+    /// Returns the document's generation.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Live(meta) => meta.generation,
+            Self::Purged(tombstone) => tombstone.generation,
+        }
+    }
+
+    /// Returns the SHA-256 hash of the signed body, which identifies the document.
+    #[must_use]
+    pub fn body_hash(&self) -> [u8; 32] {
+        match self {
+            Self::Live(meta) => meta.body_hash,
+            Self::Purged(tombstone) => tombstone.body_hash,
+        }
+    }
+}
+
+impl Tombstone {
+    /// Signs, with `owner_key`, the tombstone that follows `current`: the next generation of
+    /// its thread, naming its owner and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetaError::Invalid`] if `owner_key` is not the owner's key or `current` is at
+    /// the last generation, or another [`MetaError`] if encoding or signing fails.
+    pub fn sign(current: &VerifiedMeta, owner_key: &dyn SshSigner) -> Result<Vec<u8>, MetaError> {
+        let owner = current
+            .participants()
+            .find(|participant| participant.name == current.owner)
+            .ok_or(InvalidMeta::OwnerNotListed)?;
+        if owner.key.public_key().key_data() != owner_key.public_key().key_data() {
+            return Err(InvalidMeta::SigningKeyNotOwner.into());
+        }
+        let generation = current
+            .generation
+            .checked_add(1)
+            .ok_or(InvalidMeta::LastGeneration)?;
+        let body = postcard::to_allocvec(&WireTombstone {
+            thread: *current.thread.as_bytes(),
+            generation,
+            owner: current.owner.as_str(),
+        })
+        .map_err(MetaError::Encode)?;
+        let signature = owner_key
+            .sign_sshsig(NAMESPACE, HASH, &body)
+            .map_err(MetaError::Sign)?;
+        if owner
+            .key
+            .public_key()
+            .verify(NAMESPACE, &body, &signature)
+            .is_err()
+        {
+            return Err(MetaError::InvalidSignature);
+        }
+        let signature = signature
+            .to_pem(LineEnding::LF)
+            .map_err(|error| MetaError::Sign(error.into()))?;
+        postcard::to_allocvec(&WireEnvelope {
+            version: TOMBSTONE_VERSION,
+            body: &body,
+            signature: &signature,
+        })
+        .map_err(MetaError::Encode)
+    }
+
+    pub(crate) fn decode_body(encoded: &[u8], thread: ThreadId) -> Result<Self, MetaError> {
+        let body: WireTombstone<'_> = decode_exact(encoded)?;
+        if ThreadId::from_bytes(body.thread) != thread {
+            return Err(MetaError::ThreadMismatch);
+        }
+        Ok(Self {
+            thread,
+            generation: body.generation,
+            body_hash: Sha256::digest(encoded).into(),
+            owner: ParticipantName::new(body.owner)?,
+        })
+    }
+
+    /// Returns the purged thread.
+    #[must_use]
+    pub fn thread(&self) -> ThreadId {
+        self.thread
+    }
+
+    /// Returns the tombstone's generation, one past the thread's last live document.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the SHA-256 hash of the signed body, which identifies the document.
+    #[must_use]
+    pub fn body_hash(&self) -> [u8; 32] {
+        self.body_hash
+    }
+
+    /// Returns the name of the owner who purged the thread.
+    #[must_use]
+    pub fn owner(&self) -> &ParticipantName {
+        &self.owner
+    }
+}
+
 impl fmt::Debug for MetaDraft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MetaDraft")
@@ -500,30 +683,17 @@ impl VerifiedMeta {
     /// Returns [`MetaError::BadSignature`] if `trusted_owner` did not sign it with SHA-512,
     /// [`MetaError::ThreadMismatch`] if it describes another thread, or another [`MetaError`]
     /// if it is too large, malformed, or breaks a rule of the format.
+    ///
+    /// A tombstone is refused with [`MetaError::Purged`]; [`MetaDocument::decode`] reads both.
     pub fn decode(
         encoded: &[u8],
         thread: ThreadId,
         trusted_owner: &ParticipantKey,
     ) -> Result<Self, MetaError> {
-        if encoded.len() > MAX_META_BYTES {
-            return Err(MetaError::TooLarge);
+        match MetaDocument::decode(encoded, thread, trusted_owner)? {
+            MetaDocument::Live(meta) => Ok(meta),
+            MetaDocument::Purged(tombstone) => Err(MetaError::Purged(tombstone.generation)),
         }
-        let envelope: WireEnvelope<'_> = decode_exact(encoded)?;
-        if envelope.version != VERSION {
-            return Err(MetaError::UnsupportedVersion(envelope.version));
-        }
-        if envelope.signature.len() > MAX_SIGNATURE_BYTES {
-            return Err(MetaError::BadSignature);
-        }
-        let signature =
-            SshSig::from_pem(envelope.signature).map_err(|_| MetaError::BadSignature)?;
-        if signature.hash_alg() != HASH
-            || !trusted_owner.verifies(NAMESPACE, envelope.body, &signature)
-        {
-            return Err(MetaError::BadSignature);
-        }
-
-        Self::decode_body(envelope.body, thread, trusted_owner)
     }
 
     /// Decodes and checks a signed document's body, whose signature was already checked.
@@ -844,6 +1014,71 @@ mod tests {
     }
 
     #[test]
+    fn a_tombstone_follows_the_last_document_and_only_its_owner_signs_it() {
+        let (alice, bob) = (Person::new("alice"), Person::new("bob"));
+        let draft = draft(&alice, &[&bob]);
+        let encoded = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
+        let live = VerifiedMeta::decode(&encoded, draft.thread, &alice.key()).unwrap();
+        let tombstone = Tombstone::sign(&live, &alice.private).unwrap();
+        let MetaDocument::Purged(read) =
+            MetaDocument::decode(&tombstone, draft.thread, &alice.key()).unwrap()
+        else {
+            panic!("a tombstone reads back as one");
+        };
+        assert_eq!(
+            (read.thread(), read.generation(), read.owner()),
+            (draft.thread, 1, &alice.name)
+        );
+        assert_ne!(read.body_hash(), live.body_hash());
+        assert!(matches!(
+            VerifiedMeta::decode(&tombstone, draft.thread, &alice.key()),
+            Err(MetaError::Purged(1))
+        ));
+        assert!(matches!(
+            MetaDocument::decode(&tombstone, draft.thread, &bob.key()),
+            Err(MetaError::BadSignature)
+        ));
+        assert!(matches!(
+            MetaDocument::decode(&tombstone, ThreadId::random().unwrap(), &alice.key()),
+            Err(MetaError::ThreadMismatch)
+        ));
+        assert!(matches!(
+            Tombstone::sign(&live, &bob.private),
+            Err(MetaError::Invalid(InvalidMeta::SigningKeyNotOwner))
+        ));
+        let MetaDocument::Live(again) =
+            MetaDocument::decode(&encoded, draft.thread, &alice.key()).unwrap()
+        else {
+            panic!("a live document reads back as one");
+        };
+        assert_eq!(again.body_hash(), live.body_hash());
+        let live_body_as_tombstone = signed_envelope(
+            &alice.private,
+            &body_of(&encoded),
+            HASH,
+            NAMESPACE,
+            TOMBSTONE_VERSION,
+        );
+        assert!(matches!(
+            MetaDocument::decode(&live_body_as_tombstone, draft.thread, &alice.key()),
+            Err(MetaError::Malformed)
+        ));
+        let last = MetaDraft {
+            generation: u64::MAX,
+            ..draft.clone()
+        }
+        .sign(&ThreadKey::generate(), &alice.private)
+        .unwrap();
+        let last = VerifiedMeta::decode(&last, draft.thread, &alice.key()).unwrap();
+        assert!(matches!(
+            Tombstone::sign(&last, &alice.private),
+            Err(MetaError::Invalid(InvalidMeta::LastGeneration))
+        ));
+        let tombstone_body_as_live = resign(&alice.private, &body_of(&tombstone));
+        assert!(MetaDocument::decode(&tombstone_body_as_live, draft.thread, &alice.key()).is_err());
+    }
+
+    #[test]
     fn a_participant_reads_back_everything() {
         let (alice, bob) = (Person::new("alice"), Person::new("bob"));
         let draft = draft(&alice, &[&bob]);
@@ -1027,7 +1262,7 @@ mod tests {
         let alice = Person::new("alice");
         let draft = draft(&alice, &[]);
         let encoded = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
-        for version in [VERSION - 1, VERSION + 1] {
+        for version in [VERSION - 1, TOMBSTONE_VERSION + 1] {
             let other =
                 signed_envelope(&alice.private, &body_of(&encoded), HASH, NAMESPACE, version);
             assert!(matches!(

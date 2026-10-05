@@ -47,6 +47,7 @@ pub fn meta_body(data: &[u8]) {
     if let Some(owner) = owner() {
         let _ = VerifiedMeta::decode_body(data, ThreadId::from_bytes([1; 16]), &owner);
     }
+    let _ = crate::Tombstone::decode_body(data, ThreadId::from_bytes([1; 16]));
 }
 
 /// Parses `data` as a participant card.
