@@ -43,7 +43,7 @@ use crate::profile::Profile;
 
 const MAX_TURNS: usize = 10_000;
 const MAX_LOG_LINE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_CHANGED_FILES: usize = 1000;
+pub(crate) const MAX_CHANGED_FILES: usize = 1000;
 const RECENT_TOOLS: usize = 20;
 
 /// The prompt a new agent is started with to read its briefing at `path`.
@@ -90,6 +90,11 @@ impl Gathered {
         }
     }
 
+    fn cut(&self, walked: bool) -> bool {
+        let reached_start = walked && self.turns < MAX_TURNS;
+        !reached_start && self.prompts > 0
+    }
+
     fn into_prompts(self) -> (Vec<String>, usize) {
         let omitted = self
             .prompts
@@ -115,20 +120,8 @@ pub(crate) fn briefing(
     (base, snapshot): (ObjectId, ObjectId),
 ) -> Result<Briefing, HandoffError> {
     let private = meta.private(key).map_err(HandoffError::Meta)?;
-    let mut gathered = Gathered::default();
-    let walked = walk_turns(store, key, meta.thread(), from, MAX_TURNS, |turn| {
-        gathered.turns += 1;
-        for event in turn.events().iter().rev() {
-            let Some((name, payload)) = split_event(event.payload()) else {
-                continue;
-            };
-            if let Some(kind) = HookKind::parse(name) {
-                gathered.visit(kind, payload);
-            }
-        }
-    });
-    let reached_start = walked.is_ok() && gathered.turns < MAX_TURNS;
-    let transcript_cut = !reached_start && gathered.prompts > 0;
+    let (gathered, walked) = gather(store, key, meta.thread(), from);
+    let transcript_cut = gathered.cut(walked.is_ok());
     if walked.is_err() && gathered.turns == 0 {
         walked.map_err(HandoffError::Transcript)?;
     }
@@ -151,6 +144,42 @@ pub(crate) fn briefing(
         tools,
         replies,
     })
+}
+
+/// Returns the first prompt of `from`'s agent in `thread`, walking its transcript newest first
+/// through at most 10,000 turns, and whether the walk stopped before the transcript's start, so
+/// the prompt is only the earliest one read.
+pub(crate) fn goal(
+    store: &Store,
+    key: &ThreadKey,
+    thread: ThreadId,
+    from: &AgentSlot,
+) -> (Option<String>, bool) {
+    let (gathered, walked) = gather(store, key, thread, from);
+    let cut = gathered.cut(walked.is_ok());
+    let (prompts, _) = gathered.into_prompts();
+    (prompts.into_iter().next(), cut)
+}
+
+fn gather(
+    store: &Store,
+    key: &ThreadKey,
+    thread: ThreadId,
+    from: &AgentSlot,
+) -> (Gathered, Result<(), TranscriptError>) {
+    let mut gathered = Gathered::default();
+    let walked = walk_turns(store, key, thread, from, MAX_TURNS, |turn| {
+        gathered.turns += 1;
+        for event in turn.events().iter().rev() {
+            let Some((name, payload)) = split_event(event.payload()) else {
+                continue;
+            };
+            if let Some(kind) = HookKind::parse(name) {
+                gathered.visit(kind, payload);
+            }
+        }
+    });
+    (gathered, walked)
 }
 
 /// Returns the latest replies of `from`'s agent, oldest first, from the newest session log its
@@ -292,9 +321,12 @@ mod tests {
         ParticipantName,
     };
     use mahi_thread::{
+        Event,
         GitSigner,
         SessionPath,
         SessionWriter,
+        TurnRecord,
+        append_turn,
     };
     use ssh_key::{
         Algorithm,
@@ -447,5 +479,44 @@ mod tests {
             AgentName::new("codex").unwrap(),
         );
         assert!(replies(&store, &key, thread, &codex, &alice_key).is_empty());
+    }
+
+    #[test]
+    fn the_goal_is_the_first_prompt_of_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let key = ThreadKey::generate();
+        let thread = mahi_core::ThreadId::random().unwrap();
+        let from = AgentSlot::new(
+            ParticipantName::new("alice").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+        assert_eq!(goal(&store, &key, thread, &from), (None, false));
+        let signer = GitSigner(PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap());
+        let mut tip = None;
+        for (turn, prompt) in ["add a login page", "now the tests"]
+            .into_iter()
+            .enumerate()
+        {
+            let events = vec![
+                Event::new(
+                    2 * turn as u64,
+                    format!("prompt\n{{\"prompt\":\"{prompt}\"}}").into_bytes(),
+                )
+                .unwrap(),
+                Event::new(2 * turn as u64 + 1, b"turn-end\n{}".to_vec()).unwrap(),
+            ];
+            let record = TurnRecord::new(turn as u64, events).unwrap();
+            tip = Some(
+                append_turn(&store, &key, thread, &from, tip.as_ref(), &record, &signer).unwrap(),
+            );
+        }
+        assert_eq!(
+            goal(&store, &key, thread, &from),
+            (Some("add a login page".to_owned()), false)
+        );
+        let other = ThreadKey::generate();
+        assert_eq!(goal(&store, &other, thread, &from), (None, false));
     }
 }

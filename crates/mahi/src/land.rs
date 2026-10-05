@@ -19,6 +19,7 @@ use mahi_core::{
     ThreadId,
     ThreadRef,
 };
+use mahi_crypto::ThreadKey;
 use mahi_identity::{
     ConfigDir,
     ConfigError,
@@ -40,9 +41,11 @@ use mahi_store::{
 };
 use mahi_thread::{
     KeyError,
+    LandedAgent,
     MetaError,
     OwnerError,
     ParticipantKey,
+    PullRequestDraft,
     ThreadError,
     VerifiedMeta,
     load_meta,
@@ -53,6 +56,7 @@ use thiserror::Error;
 use crate::{
     cli::LandCommand,
     environment::Environment,
+    handoff,
     merge::{
         self,
         MergeRequest,
@@ -78,6 +82,7 @@ use crate::{
 
 const LAND: &str = "land";
 const LANDED_FILE: &str = "mahi-landed";
+const DRAFT_FILE: &str = "PR.md";
 const MAX_STATE_BYTES: u64 = 64 * 1024;
 const LANDING: &str = "the landing worktree";
 
@@ -147,6 +152,8 @@ pub(crate) enum LandError {
     Trailers(#[source] StoreError),
     #[error("cannot push the landing branch")]
     Push(#[source] PushError),
+    #[error("cannot read what the landing branch changed")]
+    Draft(#[source] StoreError),
 }
 
 /// What `mahi land` did.
@@ -272,11 +279,9 @@ fn push(
         .branch_tip(&landing)
         .map_err(LandError::Worktree)?
         .ok_or(LandError::NoLandingBranch(landing))?;
-    let state = store
-        .worktree_admin(&name)
-        .map_err(LandError::Worktree)?
-        .join(LANDED_FILE);
-    let trailers = trailers(thread, &read_landed(&state)?);
+    let admin = store.worktree_admin(&name).map_err(LandError::Worktree)?;
+    let landed = read_landed(&admin.join(LANDED_FILE))?;
+    let trailers = trailers(thread, &landed);
     let termination = TerminationSignals::listen().map_err(LandError::Signals)?;
     let mut report = String::new();
     let (done, caught) = until_stopped(&termination, |interrupt| {
@@ -293,10 +298,89 @@ fn push(
         return Ok(Outcome::Stopped(signal, report));
     }
     Ok(match done {
-        Ok(true) => Outcome::Done(report),
+        Ok(true) => {
+            drop(termination);
+            let path = admin.join(DRAFT_FILE);
+            match draft(store, (&meta, &key), &landed, (base, &branch)) {
+                Ok(text) => {
+                    match write_state(&path, text.as_bytes()) {
+                        Ok(()) => {
+                            let _ = writeln!(
+                                report,
+                                "\npull request draft, kept in {}:",
+                                path.display()
+                            );
+                        }
+                        Err(error) => {
+                            let _ = writeln!(
+                                report,
+                                "\ncannot keep the pull request draft in {}: {error}\npull request draft:",
+                                path.display()
+                            );
+                        }
+                    }
+                    let _ = write!(report, "\n{text}");
+                }
+                Err(error) => {
+                    let _ = writeln!(report, "cannot draft the pull request: {error}");
+                }
+            }
+            Outcome::Done(report)
+        }
         Ok(false) => Outcome::NotPushed(report),
         Err(error) => Outcome::Failed(report, error),
     })
+}
+
+/// Drafts the pull request of the landing branch `branch` from the records of the agents
+/// `landed` names, with the files it changed from `base`.
+fn draft(
+    store: &Store,
+    (meta, key): (&VerifiedMeta, &ThreadKey),
+    landed: &MergedFrom,
+    (base, branch): (ObjectId, &str),
+) -> Result<String, LandError> {
+    let thread = meta.thread();
+    let title = meta
+        .private(key)
+        .map_err(LandError::Private)?
+        .title()
+        .to_owned();
+    let mut people = BTreeSet::new();
+    let mut agents = Vec::new();
+    for slot in landed.sources() {
+        people.insert(slot.participant().to_string());
+        let (goal, goal_cut) = handoff::goal(store, key, thread, slot);
+        let last_reply = meta
+            .participants()
+            .find(|listed| listed.name() == slot.participant())
+            .and_then(|listed| handoff::replies(store, key, thread, slot, listed.key()).pop());
+        agents.push(LandedAgent {
+            slot: slot.to_string(),
+            goal,
+            goal_cut,
+            last_reply,
+        });
+    }
+    let tip = store
+        .branch_tip(branch)
+        .map_err(LandError::Draft)?
+        .ok_or_else(|| LandError::Draft(StoreError::NoBranch(branch.to_owned())))?;
+    let changes = store
+        .changed_paths(
+            store.commit_tree(base).map_err(LandError::Draft)?,
+            store.commit_tree(tip).map_err(LandError::Draft)?,
+            handoff::MAX_CHANGED_FILES,
+        )
+        .map_err(LandError::Draft)?;
+    Ok(PullRequestDraft {
+        title,
+        thread: thread.to_string(),
+        agents,
+        people: people.into_iter().collect(),
+        changes,
+    }
+    .render())
 }
 
 fn trailers(thread: ThreadId, landed: &MergedFrom) -> String {
@@ -602,14 +686,18 @@ fn read_landed(state: &Path) -> Result<MergedFrom, LandError> {
 }
 
 fn write_landed(state: &Path, landed: &MergedFrom) -> Result<(), LandError> {
-    let directory = state.parent().ok_or_else(|| {
-        LandError::State(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no state directory",
-        ))
-    })?;
-    let staged = directory.join(format!(".{LANDED_FILE}.mahi"));
-    fs::write(&staged, landed.message()).map_err(LandError::State)?;
+    write_state(state, landed.message().as_bytes())
+}
+
+fn write_state(state: &Path, contents: &[u8]) -> Result<(), LandError> {
+    let missing = || LandError::State(io::Error::new(io::ErrorKind::NotFound, "no state file"));
+    let directory = state.parent().ok_or_else(missing)?;
+    let file = state.file_name().ok_or_else(missing)?;
+    let mut staged_name = std::ffi::OsString::from(".");
+    staged_name.push(file);
+    staged_name.push(".mahi");
+    let staged = directory.join(staged_name);
+    fs::write(&staged, contents).map_err(LandError::State)?;
     fs::rename(&staged, state).map_err(LandError::State)
 }
 

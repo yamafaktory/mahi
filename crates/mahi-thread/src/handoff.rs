@@ -238,14 +238,14 @@ fn push_newest_that_fit(
     text.push('\n');
 }
 
-fn push_count(out: &mut String, number: usize, noun: &str) {
+pub(crate) fn push_count(out: &mut String, number: usize, noun: &str) {
     let _ = write!(out, "{number} {noun}");
     if number != 1 {
         out.push('s');
     }
 }
 
-fn shown_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+pub(crate) fn shown_chars(text: &str) -> impl Iterator<Item = char> + '_ {
     text.chars().filter(|character| {
         (!character.is_control() || matches!(character, '\n' | '\t')) && !is_invisible(*character)
     })
@@ -284,7 +284,7 @@ fn push_quote(out: &mut String, text: &str, max_chars: usize, max_lines: usize) 
 
 /// Writes `text` on one line, at most `max_chars` characters, as a code span fenced longer than
 /// any run of backquotes in it.
-fn push_code(out: &mut String, text: &str, max_chars: usize) {
+pub(crate) fn push_code(out: &mut String, text: &str, max_chars: usize) {
     let mut longest = 0;
     let mut run = 0;
     for character in shown_chars(text).take(max_chars) {
@@ -309,7 +309,7 @@ fn push_code(out: &mut String, text: &str, max_chars: usize) {
     fence(out);
 }
 
-fn cut(mut text: String, max_bytes: usize) -> String {
+pub(crate) fn cut(mut text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text;
     }

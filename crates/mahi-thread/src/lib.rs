@@ -11,6 +11,7 @@ mod meta;
 mod node;
 mod owners;
 mod pins;
+mod pull_request;
 mod session_files;
 mod signer;
 mod thread;
@@ -60,6 +61,11 @@ pub use owners::{
     remembered_owner,
 };
 pub use pins::PinError;
+pub use pull_request::{
+    LandedAgent,
+    MAX_DRAFT_BYTES,
+    PullRequestDraft,
+};
 pub use session_files::{
     MAX_SESSION_BYTES,
     MAX_SESSION_CHUNKS,
