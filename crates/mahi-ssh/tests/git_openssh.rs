@@ -92,7 +92,8 @@ mod tests {
                         ],
                     );
                     let session = connect(&runtime, &server);
-                    let said = output_of(&runtime, &session, "echo hello").unwrap();
+                    let said = output_of(&runtime, &session, "echo hello")
+                        .unwrap_or_else(|error| panic!("{error}: {}", server.log()));
                     assert_eq!(said, b"hello\n", "{kex} {cipher} {host_key}");
                     runtime.block_on(session.close()).unwrap();
                 }
@@ -139,13 +140,17 @@ mod tests {
         );
     }
 
-    fn failure(runtime: &Runtime, session: &SshSession, command: &str) -> RemoteFailure {
+    fn failure(
+        runtime: &Runtime,
+        (session, server): (&SshSession, &OpenSsh),
+        command: &str,
+    ) -> RemoteFailure {
         let error = output_of(runtime, session, command).unwrap_err();
+        let shown = format!("{error:?}");
         *error
             .into_inner()
-            .unwrap()
-            .downcast::<RemoteFailure>()
-            .unwrap()
+            .and_then(|inner| inner.downcast::<RemoteFailure>().ok())
+            .unwrap_or_else(|| panic!("{shown}: {}", server.log()))
     }
 
     #[test]
@@ -154,11 +159,15 @@ mod tests {
         let server = openssh::start("ssh-ed25519", &[]);
         let session = connect(&runtime, &server);
         assert_eq!(
-            failure(&runtime, &session, "exit 7"),
+            failure(&runtime, (&session, &server), "exit 7"),
             RemoteFailure::Status(7)
         );
         assert_eq!(
-            failure(&runtime, &session, "echo 'no such repository' >&2; exit 1"),
+            failure(
+                &runtime,
+                (&session, &server),
+                "echo 'no such repository' >&2; exit 1"
+            ),
             RemoteFailure::Said("no such repository".to_owned())
         );
         assert_eq!(output_of(&runtime, &session, "true").unwrap(), b"");
