@@ -25,6 +25,7 @@ mod palette;
 mod profile;
 mod prompt;
 mod prompts;
+mod purge;
 mod recorder;
 mod remote;
 mod run;
@@ -95,6 +96,30 @@ fn main() {
                 0
             }
             Ok(end::Ended::Stopped(signal)) => {
+                signal.reraise();
+                128 + signal.number()
+            }
+            Err(error) => {
+                report(&error);
+                1
+            }
+        },
+        Command::Purge(command) => match purge::purge(&command, &environment) {
+            Ok(purge::Purged::Done(done)) => {
+                eprint!("{done}");
+                0
+            }
+            Ok(purge::Purged::Kept) => {
+                eprintln!("mahi: nothing was purged");
+                1
+            }
+            Ok(purge::Purged::Failed(done, error)) => {
+                eprint!("{done}");
+                report(&error);
+                1
+            }
+            Ok(purge::Purged::Stopped(signal, done)) => {
+                eprint!("{done}");
                 signal.reraise();
                 128 + signal.number()
             }

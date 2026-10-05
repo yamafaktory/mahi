@@ -69,6 +69,9 @@ pub(crate) enum Command {
     /// Ends a thread you started that is not running: records its worktree in a last
     /// snapshot, then removes the worktree and the agent's state. Its history stays.
     End(EndCommand),
+    /// Purges a thread: ends it on the chosen remote and deletes its refs there, then deletes
+    /// its refs, worktrees and agents' state here. Asks first, unless --yes is given.
+    Purge(PurgeCommand),
     /// Lists the threads of this repository, with their agents and whether their worktree is
     /// still there.
     Threads,
@@ -373,6 +376,15 @@ pub(crate) struct EndCommand {
     /// such as files too large or unreadable, which are then lost.
     #[arg(long)]
     pub(crate) force: bool,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct PurgeCommand {
+    /// The thread to purge, as `mahi threads` lists it.
+    pub(crate) thread: ThreadId,
+    /// Purges without asking.
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 fn hook_kind() -> impl clap::builder::TypedValueParser<Value = HookKind> {

@@ -745,6 +745,13 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
     }
 
     fn in_terminal_with(command: PtyCommand, passphrase: Option<&str>) -> (i32, String) {
+        in_terminal_answering(
+            command,
+            passphrase.map(|passphrase| ("Passphrase", passphrase)),
+        )
+    }
+
+    fn in_terminal_answering(command: PtyCommand, answer: Option<(&str, &str)>) -> (i32, String) {
         let mut mahi = command.spawn().unwrap();
         let mut terminal = mahi.writer().unwrap();
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -761,12 +768,12 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
             }
             let _ = ended.send(());
         });
-        if let Some(passphrase) = passphrase {
-            wait_until("the passphrase question", || {
-                String::from_utf8_lossy(&output.lock().unwrap()).contains("Passphrase")
+        if let Some((question, answer)) = answer {
+            wait_until(question, || {
+                String::from_utf8_lossy(&output.lock().unwrap()).contains(question)
             });
             terminal
-                .write_all(format!("{passphrase}\n").as_bytes())
+                .write_all(format!("{answer}\n").as_bytes())
                 .unwrap();
         }
         let mut status = None;
@@ -1804,6 +1811,63 @@ cat parser.rs
         let refused = fixture.mahi(&["land", &thread, "--push", "--from", "tester.claude"]);
         assert_eq!(refused.status.code(), Some(2));
         assert!(fixture.mahi(&["end", &thread]).status.success());
+    }
+
+    fn terminal_command(fixture: &Fixture, arguments: &[&str]) -> PtyCommand {
+        let mut command = PtyCommand::new(
+            Path::new(env!("CARGO_BIN_EXE_mahi")),
+            &fixture.repo,
+            WindowSize {
+                rows: 24,
+                cols: 200,
+            },
+        );
+        for argument in arguments {
+            command = command.arg(argument);
+        }
+        command
+            .env("PATH", "/usr/bin:/bin:/usr")
+            .env("HOME", &fixture.home)
+            .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+            .env("SSH_AUTH_SOCK", &fixture.socket)
+            .env("USER", "tester")
+            .env("MAHI_LIVE", "off")
+    }
+
+    #[test]
+    fn purging_asks_first_then_ends_the_thread_and_removes_its_copy_here() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let worktree = fixture.thread_worktrees().pop().unwrap();
+        let (code, output) = in_terminal_answering(
+            terminal_command(&fixture, &["purge", &thread]),
+            Some(("[y/N]", "n")),
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("nothing was purged"), "{output}");
+        assert!(worktree.is_dir());
+        assert!(fixture.threads().len() > 1);
+        let purged = fixture.mahi(&["purge", &thread, "--yes"]);
+        let stderr = String::from_utf8_lossy(&purged.stderr);
+        assert!(purged.status.success(), "{stderr}");
+        for said in [
+            "ended thread",
+            "no remote is chosen; only the local copy is purged",
+            "removed the worktree",
+            "purged thread",
+        ] {
+            assert!(stderr.contains(said), "{said}: {stderr}");
+        }
+        assert!(!worktree.exists());
+        assert_eq!(fixture.threads(), [format!("refs/threads/{thread}/meta")]);
+        let (code, output) = in_terminal(&fixture, &["resume", &thread], None);
+        assert_eq!(code, 1, "{output}");
+        let again = fixture.mahi(&["purge", &thread, "--yes"]);
+        assert!(
+            again.status.success(),
+            "{}",
+            String::from_utf8_lossy(&again.stderr)
+        );
     }
 
     #[test]
@@ -3939,11 +4003,51 @@ exit 3
             (server, remote)
         }
 
+        fn push_thread_refs(fixture: &Fixture, thread: &str, agent: &Path, remote: &Path) {
+            let (code, output) = in_terminal(
+                fixture,
+                &["resume", thread, "--", agent.to_str().unwrap()],
+                Some(PASSPHRASE),
+            );
+            assert_eq!(code, 0, "{output}");
+            assert!(
+                git(remote, &["for-each-ref", "refs/threads/"])
+                    .lines()
+                    .count()
+                    > 1,
+                "{output}"
+            );
+        }
+
+        fn purge_on_remote(fixture: &Fixture, thread: &str, remote: &Path) {
+            let purged = fixture.mahi(&["purge", thread, "--yes"]);
+            let stderr = String::from_utf8_lossy(&purged.stderr);
+            assert!(purged.status.success(), "{stderr}");
+            assert!(
+                stderr.contains(&format!("ended thread {thread} on up")),
+                "{stderr}"
+            );
+            let meta = format!("refs/threads/{thread}/meta");
+            assert_eq!(
+                git(
+                    remote,
+                    &["for-each-ref", "--format=%(refname)", "refs/threads/"]
+                ),
+                meta
+            );
+            assert_eq!(
+                git(remote, &["rev-parse", &meta]),
+                git(&fixture.repo, &["rev-parse", &meta])
+            );
+            assert_eq!(fixture.threads(), [meta]);
+        }
+
         #[test]
         fn a_landed_branch_is_pushed_with_its_trailers_and_its_draft_rewritten_read_only() {
             let fixture = fixture();
-            let (thread, _claude) = worked_thread(&fixture);
+            let (thread, claude) = worked_thread(&fixture);
             let (server, remote) = serve_remote(&fixture);
+            push_thread_refs(&fixture, &thread, &claude, &remote);
             let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
             assert_eq!(code, 0, "{output}");
             let landing = worktree_named(&fixture, &format!("{thread}@land"));
@@ -4032,6 +4136,8 @@ exit 3
                 output.contains("it sent more than 100 bytes; raise fetch-limit in config.toml"),
                 "{output}"
             );
+            fs::remove_file(config_dir(&fixture.home).settings_file()).unwrap();
+            purge_on_remote(&fixture, &thread, &remote);
         }
     }
 }

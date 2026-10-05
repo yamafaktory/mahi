@@ -359,6 +359,8 @@ pub(crate) enum ConnectError {
 pub(crate) enum FetchError {
     #[error(transparent)]
     Connect(#[from] ConnectError),
+    #[error("the remote sent more than {0} bytes; raise fetch-limit in config.toml")]
+    OverLimit(u64),
     #[error("the fetch failed")]
     Fetch(#[from] StoreError),
     #[error("the fetched thread was not accepted")]
@@ -464,6 +466,32 @@ pub(crate) fn fetch_until_stopped(
     caught
 }
 
+/// Fetches `thread` from `setup`'s remote within `fetch_limit` and accepts what checks out
+/// for `local` trusting `owner`, as [`fetch_thread`] does, returning what was accepted, or
+/// `None` when the remote does not have the thread.
+///
+/// # Errors
+///
+/// Returns [`FetchError`] if the remote cannot be reached, the fetch fails or passes
+/// `fetch_limit`, or the fetched thread is refused.
+pub(crate) fn fetch_from(
+    (store, setup): (&Store, &SyncSetup),
+    (thread, owner, local): (ThreadId, &ParticipantKey, Option<&ParticipantName>),
+    fetch_limit: u64,
+    interrupt: &Arc<AtomicBool>,
+) -> Result<Option<Accepted>, FetchError> {
+    let budget = ReadBudget::new(fetch_limit);
+    let fetched = setup
+        .access
+        .connect(&setup.remote, interrupt, budget.clone())
+        .map_err(FetchError::from)
+        .and_then(|transport| fetch_and_accept(store, transport, thread, owner, local, interrupt));
+    if budget.exceeded() {
+        return Err(FetchError::OverLimit(fetch_limit));
+    }
+    fetched
+}
+
 fn fetch_and_accept<T: Transport>(
     store: &Store,
     transport: T,
@@ -521,6 +549,13 @@ fn fetch_report(
                 count => {
                     let _ = writeln!(text, "mahi: fetched {count} refs of the thread from {name}");
                 }
+            }
+            if accepted.purged {
+                let _ = writeln!(
+                    text,
+                    "mahi: the thread was purged by its owner on {name}; mahi purge removes the \
+                     local copy"
+                );
             }
             for thread_ref in &accepted.diverged {
                 let _ = writeln!(
@@ -783,6 +818,15 @@ mod tests {
         let meta = ThreadRef::new(thread, RefKind::Meta);
         assert_eq!(fetch_report(&Ok(None), &name), None);
         assert_eq!(fetch_report(&Ok(Some(Accepted::default())), &name), None);
+        let purged = Accepted {
+            purged: true,
+            ..Accepted::default()
+        };
+        assert!(
+            fetch_report(&Ok(Some(purged)), &name)
+                .unwrap()
+                .contains("purged by its owner on origin; mahi purge removes the local copy")
+        );
         let accepted = Accepted {
             updated: vec![meta.clone()],
             diverged: vec![meta.clone()],
