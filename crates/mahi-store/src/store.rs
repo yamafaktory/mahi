@@ -76,6 +76,7 @@ const SIGNATURE_HEADER: &str = "gpgsig";
 pub(crate) const MAX_TREE_BYTES: u64 = 1024 * 1024;
 const DISABLE_REFLOG: &str = "core.logAllRefUpdates=false";
 const REF_LOCK_TIMEOUT: &str = "core.filesRefLockTimeout=5000";
+const ALLOC_LIMIT: &str = "gitoxide.objects.allocLimit=536870912";
 
 /// The project's git repository, seen through the objects and refs mahi writes.
 #[derive(Debug)]
@@ -815,7 +816,7 @@ impl Store {
 }
 
 pub(crate) fn open_options() -> gix::open::Options {
-    gix::open::Options::default().config_overrides([DISABLE_REFLOG, REF_LOCK_TIMEOUT])
+    gix::open::Options::default().config_overrides([DISABLE_REFLOG, REF_LOCK_TIMEOUT, ALLOC_LIMIT])
 }
 
 fn generic_signature() -> Signature {
@@ -924,6 +925,26 @@ mod tests {
             Store::discover(outside.path()),
             Err(StoreError::Git(_))
         ));
+    }
+
+    #[test]
+    fn every_store_limits_what_one_object_may_allocate() {
+        let (_dir, store) = store();
+        assert_eq!(
+            store
+                .repo
+                .config_snapshot()
+                .integer("gitoxide.objects.allocLimit"),
+            Some(512 * 1024 * 1024)
+        );
+        let discovered = Store::discover(store.common_dir()).unwrap();
+        assert_eq!(
+            discovered
+                .repo
+                .config_snapshot()
+                .integer("gitoxide.objects.allocLimit"),
+            Some(512 * 1024 * 1024)
+        );
     }
 
     #[test]
