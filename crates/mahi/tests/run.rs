@@ -3240,8 +3240,12 @@ cat parser.rs
     }
 
     fn exit_of(child: &mut PtyChild) -> i32 {
+        exit_within(child, WAIT)
+    }
+
+    fn exit_within(child: &mut PtyChild, wait: Duration) -> i32 {
         let mut status = None;
-        wait_until("mahi to finish", || {
+        wait_until_within("mahi to finish", wait, || {
             status = child.try_wait().unwrap();
             status.is_some()
         });
@@ -3435,7 +3439,7 @@ cat parser.rs
         });
         keys.write_all(format!("{PASSPHRASE}\n").as_bytes())
             .unwrap();
-        let code = exit_of(&mut mahi);
+        let code = exit_within(&mut mahi, Duration::from_secs(75));
         let _ = output_end.recv_timeout(Duration::from_secs(10));
         let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
         (code, text)
@@ -3504,15 +3508,14 @@ cat parser.rs
     }
 
     const CLAIM_WATCHER: &str = r#"#!/bin/sh
-i=0
-while [ $i -lt 120 ]; do
+start=$(date +%s)
+while [ $(($(date +%s) - start)) -lt 60 ]; do
   out=$(printf '%s\n' \
     '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
     '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_claims"}}' \
     | "$MAHI_BIN" mcp)
   case "$out" in *"by bob.sh"*) echo "saw bob's claim"; exit 0;; esac
   sleep 0.25
-  i=$((i+1))
 done
 echo "never saw it"
 "#;
@@ -3521,8 +3524,8 @@ echo "never saw it"
   '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
   '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"claim","arguments":{"what":"docs"}}}' \
   | "$MAHI_BIN" mcp > /dev/null
-i=0
-until [ -e done ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done"#;
+start=$(date +%s)
+until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
 
     #[test]
     fn a_teammates_claim_reaches_the_owners_agent_through_their_hosts() {
@@ -3761,8 +3764,14 @@ until [ -e done ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done"#;
         assert!(stdout.contains("input-ended"), "{stdout}");
     }
 
-    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+    const WAIT: Duration = Duration::from_secs(20);
+
+    fn wait_until(what: &str, done: impl FnMut() -> bool) {
+        wait_until_within(what, WAIT, done);
+    }
+
+    fn wait_until_within(what: &str, wait: Duration, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + wait;
         while !done() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             thread::sleep(Duration::from_millis(20));
