@@ -2611,15 +2611,22 @@ cat parser.rs
             .find_entry("work.txt")
             .is_some();
         assert!(recorded, "{}", String::from_utf8_lossy(&first.stderr));
-        fs::remove_dir_all(&worktree).unwrap();
-        let (code, output) = in_terminal(
-            &fixture,
-            &["resume", &thread, "--", "cat", "work.txt"],
-            Some(PASSPHRASE),
-        );
-        assert_eq!(code, 0, "{output}");
-        assert!(output.contains("recorded work"), "{output}");
-        assert!(worktree.join("README").is_file());
+        let mut failures = Vec::new();
+        for round in 0..25 {
+            let _ = fs::remove_dir_all(&worktree);
+            let (code, output) = in_terminal(
+                &fixture,
+                &["resume", &thread, "--", "cat", "work.txt"],
+                Some(PASSPHRASE),
+            );
+            let content = fs::read(worktree.join("work.txt")).ok();
+            if code != 0 || !output.contains("recorded work") {
+                failures.push(format!(
+                    "round {round}: code={code} file={content:?} output={output:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
     }
 
     #[test]

@@ -2429,8 +2429,12 @@ fn await_outcome(
     let mut output_done = false;
     loop {
         match received.recv() {
-            Ok(Event::Exited(code)) if output_done => return Ok(Outcome::Exited(code?)),
+            Ok(Event::Exited(code)) if output_done => {
+                eprintln!("PROBE outcome=exited-after-output-end");
+                return Ok(Outcome::Exited(code?));
+            }
             Ok(Event::Exited(code)) => {
+                eprintln!("PROBE outcome=exited-first");
                 return finish_output(received, (progress, stop), code?);
             }
             Ok(Event::OutputEnded(Ok(()))) => output_done = true,
@@ -2487,6 +2491,7 @@ fn finish_output(
 ) -> Result<Outcome, RunError> {
     let exited = Ok(Outcome::Exited(code));
     let give_up = |stop: UnixStream| {
+        eprintln!("PROBE finish=give-up");
         drop(stop);
         await_output_end(received);
         Ok(Outcome::Exited(code))
@@ -2502,6 +2507,7 @@ fn finish_output(
                 return output_failure(error).map(|_| Outcome::Exited(code));
             }
             Ok(Event::OutputEnded(Ok(()))) | Err(RecvTimeoutError::Disconnected) => {
+                eprintln!("PROBE finish=output-ended");
                 return exited;
             }
             Ok(Event::Stopped(signal)) => return Ok(Outcome::Stopped(signal)),
@@ -2536,6 +2542,7 @@ fn copy_output(
         match wait_for_output(reader, stop)? {
             Ready::Output => {
                 if !copy_chunk(reader, &mut buffer, (progress, tap, screen))? {
+                    eprintln!("PROBE copy=eof chunks={}", progress.load(Ordering::Relaxed));
                     return screen.0.close();
                 }
             }
@@ -2547,6 +2554,7 @@ fn copy_output(
                         break;
                     }
                 }
+                eprintln!("PROBE copy=stop chunks={}", progress.load(Ordering::Relaxed));
                 return screen.0.close();
             }
         }
