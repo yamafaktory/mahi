@@ -34,6 +34,7 @@ use crate::{
 };
 
 mod scratch;
+mod temp;
 mod trees;
 
 fn lines(data: &[u8]) -> impl FnMut(&mut String) -> io::Result<usize> + '_ {

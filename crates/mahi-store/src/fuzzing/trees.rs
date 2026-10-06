@@ -57,8 +57,7 @@ struct Place {
 }
 
 static PLACE: LazyLock<Place> = LazyLock::new(|| {
-    let root = std::env::temp_dir().join(format!("mahi-fuzz-trees-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = super::temp::fresh_dir("mahi-fuzz-trees");
     let nested: PathBuf = std::iter::repeat_n("n", NESTING).collect();
     fs::create_dir_all(root.join(&nested).join("sandbox")).expect("the sandbox is created");
     fs::create_dir_all(root.join("outside")).expect("the outside directory is created");

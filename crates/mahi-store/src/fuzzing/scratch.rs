@@ -21,8 +21,7 @@ struct Scratch {
 }
 
 static SCRATCH: LazyLock<Scratch> = LazyLock::new(|| {
-    let root = std::env::temp_dir().join(format!("mahi-fuzz-scratch-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = super::temp::fresh_dir("mahi-fuzz-scratch");
     gix::init(&root).expect("a repository is created");
     let repo = gix::open_opts(&root, store::open_options())
         .expect("the repository opens")
