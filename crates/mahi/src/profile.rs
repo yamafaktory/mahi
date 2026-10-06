@@ -34,6 +34,7 @@ use mahi_agent::{
         UserProfile,
         When,
         Write as Writing,
+        template,
     },
 };
 use mahi_identity::{
@@ -80,6 +81,7 @@ pub(crate) enum Tools {
 #[derive(Debug)]
 enum Install {
     ClaudeCode,
+    Codex,
     Files(Vec<StateFile>),
 }
 
@@ -96,6 +98,7 @@ pub(crate) struct Profile {
     pub(crate) env: Vec<(String, String)>,
     pub(crate) state_env: Option<String>,
     pub(crate) resume_args: Vec<String>,
+    pub(crate) args: Vec<String>,
     pub(crate) credential: Option<(CredentialName, String)>,
     reader: Option<Reader>,
     pub(crate) takes_prompt: bool,
@@ -149,6 +152,7 @@ fn claude_code_profile() -> Profile {
         .collect(),
         state_env: Some("CLAUDE_CONFIG_DIR".to_owned()),
         resume_args: vec!["--continue".to_owned()],
+        args: Vec::new(),
         credential: "claude"
             .parse()
             .ok()
@@ -160,10 +164,68 @@ fn claude_code_profile() -> Profile {
     }
 }
 
+const CODEX_ARGS: [&str; 8] = [
+    "-c",
+    "sandbox_mode=\"danger-full-access\"",
+    "-c",
+    "cli_auth_credentials_store=\"file\"",
+    "-c",
+    "check_for_update_on_startup=false",
+    "-c",
+    "analytics.enabled=false",
+];
+
+const CODEX_TOOL_ARGS: [&str; 8] = [
+    "-c",
+    "mcp_servers.mahi.command=\"{mahi_bin}\"",
+    "-c",
+    "mcp_servers.mahi.args=[\"mcp\"]",
+    "-c",
+    "mcp_servers.mahi.env.MAHI_MCP_SOCKET=\"{mcp_socket}\"",
+    "-c",
+    "mcp_servers.mahi.default_tools_approval_mode=\"approve\"",
+];
+
+fn codex_profile() -> Profile {
+    Profile {
+        name: "codex".to_owned(),
+        program: "codex".to_owned(),
+        source: None,
+        hosts: ["api.openai.com", "chatgpt.com", "auth.openai.com"]
+            .iter()
+            .filter_map(|host| host.parse().ok())
+            .collect(),
+        optional_env: Vec::new(),
+        env: Vec::new(),
+        state_env: Some("CODEX_HOME".to_owned()),
+        resume_args: ["resume", "--last", "--all"]
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect(),
+        args: CODEX_ARGS.iter().map(|arg| (*arg).to_owned()).collect(),
+        credential: None,
+        reader: None,
+        takes_prompt: true,
+        tools: Tools::Args(
+            CODEX_TOOL_ARGS
+                .iter()
+                .map(|arg| {
+                    template("codex", arg).expect("built-in templates hold only known placeholders")
+                })
+                .collect(),
+        ),
+        install: Install::Codex,
+    }
+}
+
+fn builtin_profiles() -> [Profile; 2] {
+    [claude_code_profile(), codex_profile()]
+}
+
 static PROFILES: OnceLock<Vec<Profile>> = OnceLock::new();
 
 fn profiles() -> &'static [Profile] {
-    PROFILES.get_or_init(|| vec![claude_code_profile()])
+    PROFILES.get_or_init(|| builtin_profiles().into())
 }
 
 /// Reads the user's profiles from `profiles/*.toml` in `config`, before any profile is
@@ -183,21 +245,22 @@ pub(crate) fn load(config: &ConfigDir) -> Result<(), LoadError> {
 }
 
 fn with_builtin(mut loaded: Vec<Profile>) -> Result<Vec<Profile>, LoadError> {
-    let builtin = claude_code_profile();
-    if let Some(clash) = loaded
-        .iter()
-        .find(|profile| profile.name == builtin.name && profile.program != builtin.program)
-    {
-        return Err(LoadError::BuiltInName(
-            clash.source.clone().unwrap_or_default(),
-            clash.name.clone(),
-        ));
-    }
-    if !loaded
-        .iter()
-        .any(|profile| profile.program == builtin.program)
-    {
-        loaded.push(builtin);
+    for builtin in builtin_profiles() {
+        if let Some(clash) = loaded
+            .iter()
+            .find(|profile| profile.name == builtin.name && profile.program != builtin.program)
+        {
+            return Err(LoadError::BuiltInName(
+                clash.source.clone().unwrap_or_default(),
+                clash.name.clone(),
+            ));
+        }
+        if !loaded
+            .iter()
+            .any(|profile| profile.program == builtin.program)
+        {
+            loaded.push(builtin);
+        }
     }
     Ok(loaded)
 }
@@ -286,6 +349,7 @@ fn read_profile(path: &Path) -> Result<Profile, LoadError> {
         env: user.env,
         state_env: user.state_env,
         resume_args: user.resume_args,
+        args: user.args,
         credential: user
             .credential
             .map(|credential| (credential.name, credential.variable)),
@@ -355,12 +419,13 @@ impl Profile {
     ) -> io::Result<()> {
         match &self.install {
             Install::ClaudeCode => install_claude_code(state, tools),
+            Install::Codex => replace(state, "hooks.json", CODEX_HOOKS.as_bytes()),
             Install::Files(files) => install_files(files, state, state_path, tools),
         }
     }
 
-    /// Returns the arguments a user profile adds when mahi serves the agent its tools, filled
-    /// in with the state directory and `tools`; `None` when a value is not safe to put there.
+    /// Returns the arguments the profile adds when mahi serves the agent its tools, filled in
+    /// with the state directory and `tools`; `None` when a value is not safe to put there.
     pub(crate) fn tool_args(&self, state_path: &Path, tools: (&str, &str)) -> Option<Vec<String>> {
         let Tools::Args(templates) = &self.tools else {
             return Some(Vec::new());
@@ -448,6 +513,21 @@ const CLAUDE_CODE_SETTINGS: &str = r#"{
     ],
     "PostToolUse": [
       { "matcher": "*", "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook tool" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook turn-end" }] }
+    ]
+  }
+}
+"#;
+
+const CODEX_HOOKS: &str = r#"{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook prompt" }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook tool" }] }
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook turn-end" }] }
@@ -740,10 +820,17 @@ content = "first\n"
         assert!(matches!(clash, LoadError::BuiltInName(..)), "{clash}");
         let replacing = profiles_dir(&[("c.toml", "name = \"mine\"\nprogram = \"claude\"\n")]);
         let profiles = with_builtin(read_profiles(replacing.path()).unwrap()).unwrap();
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "mine");
+        let names: Vec<&str> = profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
+        assert_eq!(names, ["mine", "codex"]);
         let none = with_builtin(Vec::new()).unwrap();
-        assert_eq!(none[0].name, "claude-code");
+        let names: Vec<&str> = none.iter().map(|profile| profile.name.as_str()).collect();
+        assert_eq!(names, ["claude-code", "codex"]);
+        let codex_name = profiles_dir(&[("c.toml", "name = \"codex\"\nprogram = \"cx\"\n")]);
+        let clash = with_builtin(read_profiles(codex_name.path()).unwrap()).unwrap_err();
+        assert!(matches!(clash, LoadError::BuiltInName(..)), "{clash}");
     }
 
     #[test]
@@ -795,7 +882,7 @@ content = "first\n"
     }
 
     #[test]
-    fn the_claude_program_gets_the_claude_code_profile() {
+    fn the_claude_and_codex_programs_get_their_built_in_profiles() {
         assert_eq!(
             Profile::for_agent(OsStr::new("claude")).unwrap().name,
             "claude-code"
@@ -806,7 +893,13 @@ content = "first\n"
                 .name,
             "claude-code"
         );
-        for other in ["claude-code", "sh", "codex", "/", ""] {
+        assert_eq!(
+            Profile::for_agent(OsStr::new("/usr/local/bin/codex"))
+                .unwrap()
+                .name,
+            "codex"
+        );
+        for other in ["claude-code", "sh", "codex-cli", "/", ""] {
             assert!(Profile::for_agent(OsStr::new(other)).is_none(), "{other}");
         }
     }
@@ -957,5 +1050,65 @@ content = "first\n"
             claude_code_profile().tools,
             Tools::McpFlag("--mcp-config")
         ));
+    }
+
+    #[test]
+    fn codex_hooks_report_prompts_tools_and_turn_ends_to_mahi() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, "untouched").unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("hooks.json")).unwrap();
+        codex_profile()
+            .install(&open_dir(&state), Path::new(""), None)
+            .unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
+        let hooks: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.join("hooks.json")).unwrap()).unwrap();
+        for (event, kind) in [
+            ("UserPromptSubmit", "prompt"),
+            ("PostToolUse", "tool"),
+            ("Stop", "turn-end"),
+        ] {
+            let hook = &hooks["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["type"], "command");
+            assert_eq!(hook["command"], format!("\"$MAHI_BIN\" hook {kind}"));
+        }
+        let mode = fs::metadata(state.join("hooks.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn codex_runs_in_mahis_sandbox_and_is_told_where_mahi_mcp_is() {
+        let codex = codex_profile();
+        assert_eq!(codex.state_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(codex.resume_args, ["resume", "--last", "--all"]);
+        assert!(codex.takes_prompt && codex.credential.is_none() && codex.optional_env.is_empty());
+        let hosts: Vec<String> = codex.hosts.iter().map(ToString::to_string).collect();
+        assert_eq!(hosts, ["api.openai.com", "chatgpt.com", "auth.openai.com"]);
+        assert_eq!(codex.args, CODEX_ARGS);
+        let tools = ("/usr/bin/mahi", "/tmp/m/mcp.sock");
+        assert_eq!(
+            codex.tool_args(Path::new("/state"), tools).unwrap(),
+            [
+                "-c",
+                "mcp_servers.mahi.command=\"/usr/bin/mahi\"",
+                "-c",
+                "mcp_servers.mahi.args=[\"mcp\"]",
+                "-c",
+                "mcp_servers.mahi.env.MAHI_MCP_SOCKET=\"/tmp/m/mcp.sock\"",
+                "-c",
+                "mcp_servers.mahi.default_tools_approval_mode=\"approve\"",
+            ]
+        );
+        assert!(
+            codex
+                .tool_args(Path::new("/state"), ("/opt/\"x\"/mahi", "/tmp/s"))
+                .is_none()
+        );
     }
 }

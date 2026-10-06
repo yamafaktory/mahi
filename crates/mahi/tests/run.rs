@@ -1258,7 +1258,7 @@ cat parser.rs
     fn another_agent_takes_over_with_the_work_and_a_briefing_of_it() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);
-        let taker = script(&fixture, "taking", "codex", TAKER);
+        let taker = script(&fixture, "taking", "helper", TAKER);
         let taker = taker.to_str().unwrap();
 
         let (code, output) = in_terminal(
@@ -1268,7 +1268,7 @@ cat parser.rs
         );
         assert_eq!(code, 0, "{output}");
         assert!(
-            output.contains("handing tester.claude's work over to codex"),
+            output.contains("handing tester.claude's work over to helper"),
             "{output}"
         );
         assert!(
@@ -1292,7 +1292,7 @@ cat parser.rs
             thread.parse().unwrap(),
             RefKind::Snapshots(AgentSlot::new(
                 ParticipantName::new("tester").unwrap(),
-                AgentName::new("codex").unwrap(),
+                AgentName::new("helper").unwrap(),
             )),
         );
         all_signed_by(&store, &handed, &fixture.owner);

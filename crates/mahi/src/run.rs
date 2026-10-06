@@ -2066,13 +2066,17 @@ struct Launch<'a> {
 }
 
 impl Launch<'_> {
-    /// Adds the agent's arguments: the user's, then, when mahi serves the agent its tools,
-    /// what its profile adds for them (the built-in flag and the file in its state directory
-    /// `state` that tells it where `mahi mcp` is, or a user profile's arguments), then the
-    /// first prompt of a handoff, after those so it is not taken as one of their values.
+    /// Adds the agent's arguments: the user's, then those its profile always adds, then, when
+    /// mahi serves the agent its tools, what its profile adds for them (a flag and the file in
+    /// its state directory `state` that tells it where `mahi mcp` is, or the profile's tool
+    /// arguments), then the user's after `--` and the first prompt of a handoff, after those
+    /// so it is not taken as one of their values.
     fn agent_arguments(&self, mut pty: PtyCommand, state: Option<&Path>) -> PtyCommand {
         let (before, after) = split_at_separator(self.arguments);
         for argument in before {
+            pty = pty.arg(argument);
+        }
+        for argument in self.profile.iter().flat_map(|profile| &profile.args) {
             pty = pty.arg(argument);
         }
         if let (Some(profile), Some(tools)) = (self.profile, self.tools_config()) {

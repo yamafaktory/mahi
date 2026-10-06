@@ -168,6 +168,8 @@ pub struct UserProfile {
     pub state_env: Option<String>,
     /// The arguments `mahi resume` runs the program with.
     pub resume_args: Vec<String>,
+    /// The arguments added after the user's own, before any `--`, every time the agent runs.
+    pub args: Vec<String>,
     /// The stored credential the agent gets.
     pub credential: Option<ProfileCredential>,
     /// Whether a handoff's first prompt is given as the agent's last argument, after `--`.
@@ -234,6 +236,8 @@ struct RawProfile {
     state_env: Option<String>,
     #[serde(default)]
     resume_args: Vec<String>,
+    #[serde(default)]
+    args: Vec<String>,
     credential: Option<RawCredential>,
     #[serde(default)]
     first_prompt_arg: bool,
@@ -534,6 +538,10 @@ impl UserProfile {
             .iter()
             .map(|argument| value("resume-args", argument))
             .collect::<Result<_, _>>()?;
+        let args = at_most(raw.args, MAX_LIST, "args")?
+            .iter()
+            .map(|argument| value("args", argument))
+            .collect::<Result<_, _>>()?;
         let reader = match raw.reader.as_deref() {
             None => None,
             Some("claude-code") => Some(Reader::ClaudeCode),
@@ -566,6 +574,7 @@ impl UserProfile {
             env,
             state_env,
             resume_args,
+            args,
             credential,
             first_prompt_arg: raw.first_prompt_arg,
             reader,
@@ -587,6 +596,7 @@ pass-env = ["OPENAI_API_KEY"]
 env = { CODEX_QUIET = "1" }
 state-env = "CODEX_HOME"
 resume-args = ["resume", "--last"]
+args = ["-c", "sandbox_mode=\"danger-full-access\""]
 credential = { name = "openai", variable = "OPENAI_TOKEN" }
 first-prompt-arg = true
 reader = "claude-code"
@@ -615,6 +625,7 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
         assert_eq!(profile.env, [("CODEX_QUIET".to_owned(), "1".to_owned())]);
         assert_eq!(profile.state_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(profile.resume_args, ["resume", "--last"]);
+        assert_eq!(profile.args, ["-c", "sandbox_mode=\"danger-full-access\""]);
         assert_eq!(profile.credential.unwrap().variable, "OPENAI_TOKEN");
         assert!(profile.first_prompt_arg);
         assert_eq!(profile.reader, Some(Reader::ClaudeCode));
@@ -680,6 +691,7 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
                 "twice",
             ),
             (&format!("{base}reader = \"codex\"\n"), "reader"),
+            (&format!("{base}args = [\"a\\u0000b\"]\n"), "args"),
             (
                 &format!("{base}[[file]]\npath = \"f\"\ncontent = \"x\"\n"),
                 "state-env",
