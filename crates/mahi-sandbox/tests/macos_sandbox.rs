@@ -69,6 +69,57 @@ mod tests {
     }
 
     #[test]
+    fn probe_output_written_before_a_late_reader() {
+        let (_dir, work) = canonical_tempdir();
+        fs::write(work.join("work.txt"), "recorded work\n").unwrap();
+        let mut table = Vec::new();
+        for sandboxed in [false, true] {
+            for program in ["cat", "sh"] {
+                for delay in [0_u64, 150] {
+                    let mut lost = 0;
+                    let mut empty_eof = 0;
+                    for _ in 0..40 {
+                        let command = if program == "cat" {
+                            PtyCommand::new(Path::new("/bin/cat"), &work, SIZE).arg("work.txt")
+                        } else {
+                            PtyCommand::new(Path::new("/bin/sh"), &work, SIZE)
+                                .arg("-c")
+                                .arg("cat work.txt")
+                        };
+                        let command = command.env("PATH", "/usr/bin:/bin");
+                        let command = if sandboxed {
+                            command.sandbox(system_with(&[(&work, Access::ReadWrite)]))
+                        } else {
+                            command
+                        };
+                        let mut child = command.spawn().unwrap();
+                        let mut reader = child.reader().unwrap();
+                        thread::sleep(Duration::from_millis(delay));
+                        let (sender, receiver) = mpsc::channel();
+                        thread::spawn(move || {
+                            let mut output = Vec::new();
+                            let _ = reader.read_to_end(&mut output);
+                            let _ = sender.send(output);
+                        });
+                        let output = receiver.recv_timeout(Duration::from_secs(20)).unwrap();
+                        let _ = child.wait();
+                        if !String::from_utf8_lossy(&output).contains("recorded work") {
+                            lost += 1;
+                            if output.is_empty() {
+                                empty_eof += 1;
+                            }
+                        }
+                    }
+                    table.push(format!(
+                        "sandboxed={sandboxed} program={program} delay={delay}ms lost={lost}/40 empty={empty_eof}"
+                    ));
+                }
+            }
+        }
+        panic!("PROBE\n{}", table.join("\n"));
+    }
+
+    #[test]
     fn homebrew_programs_are_readable_but_its_service_data_is_not() {
         let homebrew = Path::new("/opt/homebrew");
         assert!(
