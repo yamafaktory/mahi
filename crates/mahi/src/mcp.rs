@@ -99,6 +99,7 @@ use crate::{
     thread_lock::RunningLock,
 };
 
+const RELAY_CHUNK: usize = 8192;
 const MOST_CONNECTIONS: usize = 4;
 const META_REREAD: Duration = Duration::from_secs(5);
 const MAX_SLOT_CHARS: usize = 65;
@@ -158,13 +159,30 @@ fn relay_with(
     let stream = UnixStream::connect(socket)?;
     let requests = stream.try_clone()?;
     thread::spawn(move || {
-        let mut writer = &requests;
-        let _ = io::copy(&mut input, &mut writer);
+        let _ = pass_on(&mut input, &mut &requests);
         let _ = requests.shutdown(Shutdown::Write);
     });
-    let mut replies = &stream;
-    io::copy(&mut replies, output)?;
-    output.flush()
+    pass_on(&mut &stream, output)
+}
+
+/// Writes what `from` gives to `to` as soon as it is read, until `from` ends or either side
+/// fails; unlike [`io::copy`], it never lets the kernel splice between a pipe and a socket,
+/// which can hold a request back until the agent closes its input.
+fn pass_on(from: &mut impl Read, to: &mut impl Write) -> io::Result<()> {
+    let mut buffer = [0; RELAY_CHUNK];
+    loop {
+        let read = match from.read(&mut buffer) {
+            Ok(0) => return to.flush(),
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(chunk) = buffer.get(..read) else {
+            return Err(io::Error::other("a reader gave more than its buffer holds"));
+        };
+        to.write_all(chunk)?;
+        to.flush()?;
+    }
 }
 
 /// Answers the MCP connections of `mahi mcp` at `listener` with `toolbox`, at most four at a
@@ -1049,6 +1067,47 @@ mod tests {
         push_clean(&mut long, &"é".repeat(MAX_TOOL_TEXT));
         assert!(long.len() <= MAX_TOOL_TEXT);
         assert!(long.ends_with(CUT_SHORT));
+    }
+
+    #[test]
+    fn the_relay_passes_each_request_on_while_the_agent_keeps_its_input_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let echo = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut lines = BufReader::new(&stream).lines();
+            let mut writer = &stream;
+            for _ in 0..3 {
+                let line = lines.next().unwrap().unwrap();
+                writer
+                    .write_all(format!("got {line}\n").as_bytes())
+                    .unwrap();
+            }
+        });
+        let (input, mut agent) = io::pipe().unwrap();
+        let (mut replies, output) = io::pipe().unwrap();
+        let relay = thread::spawn(move || {
+            let mut output = output;
+            relay_with(&path, input, &mut output)
+        });
+        let mut replies_read = BufReader::new(&mut replies);
+        let mut reply = String::new();
+        agent.write_all(b"first\n").unwrap();
+        replies_read.read_line(&mut reply).unwrap();
+        assert_eq!(reply, "got first\n");
+        agent.write_all(b"second\nthird\n").unwrap();
+        for wanted in ["got second\n", "got third\n"] {
+            reply.clear();
+            replies_read.read_line(&mut reply).unwrap();
+            assert_eq!(reply, wanted);
+        }
+        drop(agent);
+        echo.join().unwrap();
+        relay.join().unwrap().unwrap();
     }
 
     #[test]
