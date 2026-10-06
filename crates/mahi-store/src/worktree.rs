@@ -24,6 +24,10 @@ use gix::{
 use crate::{
     Store,
     StoreError,
+    changes::{
+        MAX_CHECKED_OUT_BYTES,
+        MAX_CHECKED_OUT_FILES,
+    },
 };
 
 const WORKTREES: &str = "worktrees";
@@ -66,8 +70,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns the errors of [`Store::add_worktree`], and [`StoreError::WrongObject`] if
-    /// `contents` is not a tree.
+    /// Returns the errors of [`Store::add_worktree`], [`StoreError::WrongObject`] if
+    /// `contents` is not a tree or an entry's object is not of its mode's kind,
+    /// [`StoreError::CheckoutTooLarge`] if `contents` or `commit`'s tree would write more than
+    /// 2,000,000 files or 64 GiB, counting a subtree each time it is named, holds a file over
+    /// 256 MiB, or holds more trees or levels than mahi checks out, [`StoreError::TooLarge`]
+    /// if one of their trees is larger than 1 MiB, or [`StoreError::DuplicateEntryName`] if
+    /// one names an entry twice.
     pub fn restore_worktree(
         &self,
         name: &str,
@@ -76,7 +85,34 @@ impl Store {
         contents: ObjectId,
         interrupt: &AtomicBool,
     ) -> Result<PathBuf, StoreError> {
+        self.restore_worktree_within(
+            (name, path),
+            (commit, contents),
+            (MAX_CHECKED_OUT_FILES, MAX_CHECKED_OUT_BYTES),
+            interrupt,
+        )
+    }
+
+    pub(crate) fn restore_worktree_within(
+        &self,
+        (name, path): (&str, &Path),
+        (commit, contents): (ObjectId, ObjectId),
+        budget: (usize, u64),
+        interrupt: &AtomicBool,
+    ) -> Result<PathBuf, StoreError> {
         self.require_kind(contents, Kind::Tree)?;
+        self.require_kind(commit, Kind::Commit)?;
+        let base = self
+            .repo
+            .find_commit(commit)?
+            .tree_id()
+            .map_err(gix::Error::from)?
+            .detach();
+        for tree in [contents, base] {
+            if !self.fits_checkout(tree, budget, interrupt)? {
+                return Err(StoreError::CheckoutTooLarge(tree));
+            }
+        }
         self.make_worktree(name, path, (commit, None), Some(contents), interrupt)
     }
 
@@ -524,6 +560,109 @@ mod tests {
                 &AtomicBool::new(false)
             ),
             Err(StoreError::WrongObject { .. })
+        ));
+    }
+
+    #[test]
+    fn a_tree_naming_its_subtrees_over_and_over_is_refused_before_anything_is_written() {
+        let (dir, store) = store();
+        let base = sample_commit(&store);
+        let blob = store.write_blob(b"x").unwrap();
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let mut level = store
+            .write_tree(&names.map(|name| (name, EntryKind::Blob, blob)))
+            .unwrap();
+        let mut two = None;
+        for depth in 0..7 {
+            level = store
+                .write_tree(&names.map(|name| (name, EntryKind::Tree, level)))
+                .unwrap();
+            if depth == 0 {
+                two = Some(level);
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let path = dir.path().join("bomb");
+        assert!(matches!(
+            store.restore_worktree("bomb", &path, base, level, &stop),
+            Err(StoreError::CheckoutTooLarge(tree)) if tree == level
+        ));
+        assert!(fs::symlink_metadata(&path).is_err());
+        assert!(fs::symlink_metadata(store.common_dir().join("worktrees/bomb")).is_err());
+
+        let two = two.unwrap();
+        assert!(matches!(
+            store.restore_worktree_within(("small", &path), (base, two), (63, u64::MAX), &stop),
+            Err(StoreError::CheckoutTooLarge(_))
+        ));
+        let restored = store
+            .restore_worktree_within(("small", &path), (base, two), (64, u64::MAX), &stop)
+            .unwrap();
+        assert!(restored.join("h/h").is_file());
+
+        let mut deep = store.write_tree(&[("f", EntryKind::Blob, blob)]).unwrap();
+        for _ in 0..crate::MAX_SNAPSHOT_DEPTH {
+            deep = store.write_tree(&[("d", EntryKind::Tree, deep)]).unwrap();
+        }
+        let deepest = store
+            .restore_worktree("deepest", &dir.path().join("deepest"), base, deep, &stop)
+            .unwrap();
+        let mut file = deepest;
+        file.extend(std::iter::repeat_n("d", crate::MAX_SNAPSHOT_DEPTH));
+        assert!(file.join("f").is_file());
+        let deeper = store.write_tree(&[("d", EntryKind::Tree, deep)]).unwrap();
+        assert!(matches!(
+            store.restore_worktree("deeper", &dir.path().join("deeper"), base, deeper, &stop),
+            Err(StoreError::CheckoutTooLarge(_))
+        ));
+
+        let large = store.write_blob(&[0; 1024]).unwrap();
+        let heavy = store
+            .write_tree(&names.map(|name| (name, EntryKind::Blob, large)))
+            .unwrap();
+        let refused = dir.path().join("refused");
+        assert!(matches!(
+            store.restore_worktree_within(
+                ("heavy", &refused),
+                (base, heavy),
+                (64, 8 * 1024 - 1),
+                &stop
+            ),
+            Err(StoreError::CheckoutTooLarge(_))
+        ));
+        assert!(fs::symlink_metadata(&refused).is_err());
+        store
+            .restore_worktree_within(
+                ("heavy", &dir.path().join("heavy")),
+                (base, heavy),
+                (64, 8 * 1024),
+                &stop,
+            )
+            .unwrap();
+
+        let mut chain = store.write_tree(&[("f", EntryKind::Blob, blob)]).unwrap();
+        for _ in 0..100 {
+            chain = store.write_tree(&[("c", EntryKind::Tree, chain)]).unwrap();
+        }
+        let wrapped = |levels: usize| {
+            let mut tree = chain;
+            for _ in 0..levels {
+                tree = store.write_tree(&[("w", EntryKind::Tree, tree)]).unwrap();
+            }
+            store
+                .write_tree(&[("a", EntryKind::Tree, chain), ("b", EntryKind::Tree, tree)])
+                .unwrap()
+        };
+        let fits = store
+            .fits_checkout(wrapped(155), (64, u64::MAX), &stop)
+            .unwrap();
+        let too_deep = store
+            .fits_checkout(wrapped(156), (64, u64::MAX), &stop)
+            .unwrap();
+        assert!(fits && !too_deep);
+        assert!(matches!(
+            store.fits_checkout(wrapped(1), (64, u64::MAX), &AtomicBool::new(true)),
+            Err(StoreError::Interrupted)
         ));
     }
 

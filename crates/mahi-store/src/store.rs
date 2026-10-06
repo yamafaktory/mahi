@@ -203,6 +203,9 @@ pub enum StoreError {
     /// A side of a merge changes more paths than mahi merges.
     #[error("tree {0} changes more paths than mahi merges")]
     MergeTooLarge(ObjectId),
+    /// A tree would write more files, trees or levels into a worktree than mahi checks out.
+    #[error("tree {0} holds more than mahi checks out into a worktree")]
+    CheckoutTooLarge(ObjectId),
 }
 
 impl Store {

@@ -1,4 +1,13 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    sync::atomic::{
+        AtomicBool,
+        Ordering,
+    },
+};
 
 use gix::{
     ObjectId,
@@ -6,15 +15,27 @@ use gix::{
     objs::tree::EntryMode,
 };
 
-use crate::store::{
-    MAX_TREE_BYTES,
-    Store,
-    StoreError,
+use crate::{
+    snapshot::{
+        MAX_SNAPSHOT_DEPTH,
+        MAX_SNAPSHOT_FILE_BYTES,
+    },
+    store::{
+        MAX_TREE_BYTES,
+        Store,
+        StoreError,
+    },
 };
 
 const MAX_DEPTH: usize = 64;
 const MAX_TREES: usize = 65_536;
 const MAX_TREE_BYTES_READ: u64 = 32 * 1024 * 1024;
+/// The most files a tree that mahi checks out into a worktree may hold.
+pub(crate) const MAX_CHECKED_OUT_FILES: usize = 2_000_000;
+/// The most bytes of files a tree that mahi checks out into a worktree may hold.
+pub(crate) const MAX_CHECKED_OUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_CHECKED_OUT_TREES: usize = 262_144;
+const MAX_CHECKED_OUT_TREE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How a path differs from one tree to another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,10 +63,26 @@ struct Walk<'a> {
     limit: usize,
     trees: usize,
     bytes: u64,
+    most_trees: usize,
+    most_bytes: u64,
     changes: Changes,
 }
 
 type Entries = BTreeMap<Vec<u8>, (EntryMode, ObjectId)>;
+
+#[derive(Debug, Clone, Copy)]
+struct Counted {
+    files: usize,
+    bytes: u64,
+    height: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Budget<'a> {
+    files: usize,
+    bytes: u64,
+    interrupt: &'a AtomicBool,
+}
 
 impl Store {
     /// Returns the files that differ between the trees `old` and `new`, at most `limit` of
@@ -69,10 +106,50 @@ impl Store {
             limit,
             trees: 0,
             bytes: 0,
+            most_trees: MAX_TREES,
+            most_bytes: MAX_TREE_BYTES_READ,
             changes: Changes::default(),
         };
         walk.compare(Some(old), Some(new), "", 0)?;
         Ok(walk.changes)
+    }
+
+    /// Returns whether checking `tree` out would write at most `most_files` files and
+    /// `most_bytes` bytes, counting a subtree's files each time it is named, with no file over
+    /// [`MAX_SNAPSHOT_FILE_BYTES`] and no directory deeper than [`MAX_SNAPSHOT_DEPTH`], within
+    /// 262,144 distinct trees and 256 MiB of them read, so a small tree that names the same
+    /// subtrees or blobs over and over cannot stand for millions of files or a full disk. Each
+    /// distinct tree is read once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::TooLarge`] if a tree is larger than 1 MiB,
+    /// [`StoreError::DuplicateEntryName`] if a tree names an entry twice,
+    /// [`StoreError::WrongObject`] if an entry's object is not of its mode's kind,
+    /// [`StoreError::Interrupted`] if `interrupt` is set, or [`StoreError::Git`] if reading
+    /// fails.
+    pub(crate) fn fits_checkout(
+        &self,
+        tree: ObjectId,
+        (most_files, most_bytes): (usize, u64),
+        interrupt: &AtomicBool,
+    ) -> Result<bool, StoreError> {
+        let mut walk = Walk {
+            store: self,
+            limit: 0,
+            trees: 0,
+            bytes: 0,
+            most_trees: MAX_CHECKED_OUT_TREES,
+            most_bytes: MAX_CHECKED_OUT_TREE_BYTES,
+            changes: Changes::default(),
+        };
+        let mut counted = HashMap::new();
+        let budget = Budget {
+            files: most_files,
+            bytes: most_bytes,
+            interrupt,
+        };
+        Ok(walk.count(tree, 0, &mut counted, budget)?.is_some())
     }
 }
 
@@ -82,7 +159,7 @@ impl Walk<'_> {
             return Ok(Some(Entries::new()));
         };
         let size = self.store.bounded_size(tree, Kind::Tree, MAX_TREE_BYTES)?;
-        if self.trees >= MAX_TREES || self.bytes.saturating_add(size) > MAX_TREE_BYTES_READ {
+        if self.trees >= self.most_trees || self.bytes.saturating_add(size) > self.most_bytes {
             return Ok(None);
         }
         self.trees += 1;
@@ -99,6 +176,58 @@ impl Walk<'_> {
             entries.insert(name, (entry.mode(), entry.object_id()));
         }
         Ok(Some(entries))
+    }
+
+    fn count(
+        &mut self,
+        tree: ObjectId,
+        depth: usize,
+        counted: &mut HashMap<ObjectId, Counted>,
+        budget: Budget<'_>,
+    ) -> Result<Option<Counted>, StoreError> {
+        if budget.interrupt.load(Ordering::Relaxed) {
+            return Err(StoreError::Interrupted);
+        }
+        if let Some(&seen) = counted.get(&tree) {
+            return Ok((depth + seen.height <= MAX_SNAPSHOT_DEPTH + 1).then_some(seen));
+        }
+        if depth > MAX_SNAPSHOT_DEPTH {
+            return Ok(None);
+        }
+        let Some(entries) = self.entries(Some(tree))? else {
+            return Ok(None);
+        };
+        let mut sum = Counted {
+            files: 0,
+            bytes: 0,
+            height: 1,
+        };
+        for (mode, id) in entries.values() {
+            if mode.is_tree() {
+                let Some(below) = self.count(*id, depth + 1, counted, budget)? else {
+                    return Ok(None);
+                };
+                sum.files = sum.files.saturating_add(below.files);
+                sum.bytes = sum.bytes.saturating_add(below.bytes);
+                sum.height = sum.height.max(below.height + 1);
+            } else if !mode.is_commit() {
+                let size = match self
+                    .store
+                    .bounded_size(*id, Kind::Blob, MAX_SNAPSHOT_FILE_BYTES)
+                {
+                    Ok(size) => size,
+                    Err(StoreError::TooLarge { .. }) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                sum.files += 1;
+                sum.bytes = sum.bytes.saturating_add(size);
+            }
+            if sum.files > budget.files || sum.bytes > budget.bytes {
+                return Ok(None);
+            }
+        }
+        counted.insert(tree, sum);
+        Ok(Some(sum))
     }
 
     fn full(&self) -> bool {
