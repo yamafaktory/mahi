@@ -397,7 +397,7 @@ fn local_branch(head: Option<gix::refs::FullName>) -> Option<String> {
     std::str::from_utf8(short).ok().map(str::to_owned)
 }
 
-fn validate_name(name: &str) -> Result<(), StoreError> {
+pub(crate) fn validate_name(name: &str) -> Result<(), StoreError> {
     let valid = name.len() <= MAX_NAME_BYTES
         && !name.starts_with('.')
         && gix_validate::path::component(

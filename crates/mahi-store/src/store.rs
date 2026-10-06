@@ -830,7 +830,7 @@ fn generic_signature() -> Signature {
     }
 }
 
-fn validate_entry_name(name: &str, kind: EntryKind) -> Result<(), StoreError> {
+pub(crate) fn validate_entry_name(name: &str, kind: EntryKind) -> Result<(), StoreError> {
     let mode = (kind == EntryKind::Link).then_some(Mode::Symlink);
     let valid = name.len() <= MAX_ENTRY_NAME_BYTES
         && gix_validate::path::component(name.into(), mode, component::Options::default()).is_ok();

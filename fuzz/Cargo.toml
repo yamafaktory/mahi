@@ -242,3 +242,10 @@ path = "fuzz_targets/identity_file.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "store-names"
+path = "fuzz_targets/store_names.rs"
+test = false
+doc = false
+bench = false

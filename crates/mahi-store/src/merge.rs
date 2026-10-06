@@ -634,7 +634,7 @@ impl Writer<'_> {
     }
 }
 
-fn safe_name(name: &BStr, entry: Option<(EntryMode, ObjectId)>) -> bool {
+pub(crate) fn safe_name(name: &BStr, entry: Option<(EntryMode, ObjectId)>) -> bool {
     let mode = entry.and_then(|(mode, _)| {
         if mode.is_link() {
             Some(gix_validate::path::component::Mode::Symlink)
@@ -652,6 +652,7 @@ fn safe_name(name: &BStr, entry: Option<(EntryMode, ObjectId)>) -> bool {
     )
     .is_ok()
         && !name.starts_with(TEMPORARY_PREFIX.as_bytes())
+        && !name.contains(&0)
 }
 
 fn open_directory(dir: &OwnedFd, name: &BStr, create: bool) -> Opened {
@@ -711,6 +712,17 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn a_name_with_a_nul_byte_is_never_safe_to_write() {
+        let blob = Some((
+            EntryKind::Blob.into(),
+            ObjectId::null(gix::hash::Kind::Sha1),
+        ));
+        assert!(safe_name(b"notes".as_bstr(), blob));
+        assert!(!safe_name(b";\\$\0\0".as_bstr(), blob));
+        assert!(!safe_name(b"$\0".as_bstr(), None));
+    }
 
     struct Repo {
         dir: TempDir,

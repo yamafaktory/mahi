@@ -907,16 +907,17 @@ fn join(dir: &BString, name: &[u8]) -> BString {
     path
 }
 
-fn safe_name(name: &[u8]) -> bool {
-    gix_validate::path::component(
-        name.as_bstr(),
-        None,
-        gix_validate::path::component::Options {
-            protect_windows: false,
-            ..gix_validate::path::component::Options::default()
-        },
-    )
-    .is_ok()
+pub(crate) fn safe_name(name: &[u8]) -> bool {
+    !name.contains(&0)
+        && gix_validate::path::component(
+            name.as_bstr(),
+            None,
+            gix_validate::path::component::Options {
+                protect_windows: false,
+                ..gix_validate::path::component::Options::default()
+            },
+        )
+        .is_ok()
 }
 
 fn open_entry(dir: &OwnedFd, name: &[u8]) -> Result<Leaf, Errno> {
@@ -1682,6 +1683,13 @@ mod tests {
         let path = checkout(&setup, commit);
         fs::write(path.join("vendor/.git"), b"").unwrap();
         assert_eq!(snapshot(&setup).tree, tree_of(&setup.store, commit));
+    }
+
+    #[test]
+    fn a_name_with_a_nul_byte_is_never_safe() {
+        assert!(safe_name(b"notes"));
+        assert!(!safe_name(b"\0{{{"));
+        assert!(!safe_name(b"notes\0"));
     }
 
     #[test]
