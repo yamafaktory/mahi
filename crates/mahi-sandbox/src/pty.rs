@@ -12,6 +12,7 @@ use std::{
     net::TcpListener,
     os::{
         fd::{
+            AsFd,
             BorrowedFd,
             OwnedFd,
         },
@@ -473,6 +474,12 @@ impl Read for PtyReader {
     }
 }
 
+impl AsFd for PtyReader {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
 /// Returns the exit code, or 128 plus the signal number if the program was killed.
 #[must_use]
 pub fn exit_code(status: ExitStatus) -> i32 {
@@ -519,6 +526,49 @@ mod tests {
     fn output_arrives_through_the_terminal() {
         let mut child = sh("echo hello").spawn().unwrap();
         assert!(output_of(&child).contains("hello"));
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn the_reader_polls_ready_for_output_and_for_the_end() {
+        use rustix::event::{
+            PollFd,
+            PollFlags,
+            Timespec,
+        };
+        let mut child = sh("echo ready; read line; echo got $line").spawn().unwrap();
+        let mut reader = child.reader().unwrap();
+        let ready = |reader: &PtyReader| {
+            let mut fds = [PollFd::new(reader, PollFlags::IN)];
+            let wait = Timespec {
+                tv_sec: 10,
+                tv_nsec: 0,
+            };
+            assert_eq!(rustix::event::poll(&mut fds, Some(&wait)).unwrap(), 1);
+            let events = fds[0].revents();
+            assert!(
+                !events.intersects(PollFlags::NVAL | PollFlags::ERR),
+                "{events:?}"
+            );
+            events.intersects(PollFlags::IN | PollFlags::HUP)
+        };
+        let mut seen = Vec::new();
+        let mut buffer = [0_u8; 256];
+        while !String::from_utf8_lossy(&seen).contains("ready\r\n") {
+            assert!(ready(&reader));
+            let read = reader.read(&mut buffer).unwrap();
+            seen.extend_from_slice(&buffer[..read]);
+        }
+        child.writer().unwrap().write_all(b"more\n").unwrap();
+        loop {
+            assert!(ready(&reader));
+            let read = reader.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buffer[..read]);
+        }
+        assert!(String::from_utf8_lossy(&seen).contains("got more"));
         assert!(child.wait().unwrap().success());
     }
 
