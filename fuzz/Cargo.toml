@@ -256,3 +256,10 @@ path = "fuzz_targets/ssh_exec_output.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "store-trees"
+path = "fuzz_targets/store_trees.rs"
+test = false
+doc = false
+bench = false

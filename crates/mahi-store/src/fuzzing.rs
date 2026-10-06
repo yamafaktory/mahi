@@ -18,6 +18,7 @@ use mahi_core::{
     ThreadRef,
 };
 
+pub use self::trees::trees;
 use crate::{
     merge,
     push,
@@ -25,6 +26,8 @@ use crate::{
     store,
     worktree,
 };
+
+mod trees;
 
 fn lines(data: &[u8]) -> impl FnMut(&mut String) -> io::Result<usize> + '_ {
     let mut rest = data.split(|byte| *byte == b'\n');
@@ -79,6 +82,11 @@ fn harmless(name: &[u8]) -> bool {
 /// writes, a tree entry is given and a worktree is called, none of which, once accepted, can
 /// leave its directory or reach `.git`, and the branch names, which must stay the branch they
 /// name under `refs/heads/`.
+///
+/// # Panics
+///
+/// Panics if a check accepts a name that could leave its directory, reach `.git` or name
+/// another branch.
 pub fn names(data: &[u8]) {
     if snapshot::safe_name(data) {
         assert!(harmless(data), "{:?}", data.as_bstr());
