@@ -193,7 +193,7 @@ pub(crate) fn replies(
     writer: &ParticipantKey,
 ) -> Vec<String> {
     let Some(read_line) =
-        Profile::for_agent(from.agent().as_str().as_ref()).and_then(|profile| profile.log_line)
+        Profile::for_agent(from.agent().as_str().as_ref()).and_then(Profile::log_line)
     else {
         return Vec::new();
     };

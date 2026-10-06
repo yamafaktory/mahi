@@ -57,6 +57,13 @@ pub enum IdentityError {
         .0.display()
     )]
     NotPrivate(PathBuf),
+    /// A file whose contents decide what mahi does, or its directory, is not the user's own or
+    /// can be written by someone else.
+    #[error(
+        "{} must be owned by you and writable by no one else (chmod go-w)",
+        .0.display()
+    )]
+    WritableByOthers(PathBuf),
     /// The identity path is not a regular file.
     #[error("{} is not a regular file", .0.display())]
     NotAFile(PathBuf),

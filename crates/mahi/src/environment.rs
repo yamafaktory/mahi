@@ -39,8 +39,9 @@ pub(crate) const MAHI_BIN: &str = "MAHI_BIN";
 pub(crate) const PROXY_VARIABLES: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 
 const LONGEST_ENV_NAME: usize = 128;
-const RESERVED: [&str; 13] = [
+const RESERVED: [&str; 14] = [
     "HOME",
+    "MAHI_HANDOFF",
     "TMPDIR",
     HOOK_SOCKET,
     MCP_SOCKET,
@@ -225,6 +226,21 @@ impl Environment {
                     required,
                 })
                 .collect(),
+        }
+    }
+
+    /// Reads the variables named in `optional` too, which profiles pass on when they are set,
+    /// leaving those already read alone.
+    pub(crate) fn read_optional(&mut self, optional: &[EnvName]) {
+        for name in optional {
+            if self.pass_env.iter().any(|passed| passed.name == *name) {
+                continue;
+            }
+            self.pass_env.push(Passed {
+                name: name.clone(),
+                value: env::var_os(name.as_str()).map(|value| Zeroizing::new(value.into_vec())),
+                required: false,
+            });
         }
     }
 

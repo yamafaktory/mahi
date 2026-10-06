@@ -216,6 +216,7 @@ use crate::{
     profile::{
         self,
         Profile,
+        Tools,
     },
     prompt::{
         Prompt,
@@ -1050,7 +1051,7 @@ fn resumed_command(
     let program = OsString::from(slot.agent().as_str());
     let profile = command.options.profile_for(&program);
     let arguments = profile
-        .map(|profile| profile.resume_args)
+        .map(|profile| profile.resume_args.as_slice())
         .unwrap_or_default()
         .iter()
         .map(OsString::from)
@@ -1090,13 +1091,12 @@ fn gather_credentials(
             .ok_or_else(|| RunError::NoCredential(binding.name.clone()))?;
         hand(binding.variable.as_str(), credential)?;
     }
-    if let Some((name, variable)) = profile.and_then(|profile| profile.credential)
+    if let Some((name, variable)) = profile.and_then(|profile| profile.credential.as_ref())
         && !options
             .credentials()
             .iter()
             .any(|binding| binding.variable.as_str() == variable)
-        && let Ok(name) = name.parse::<CredentialName>()
-        && let Some(credential) = Credential::load(config, &name)
+        && let Some(credential) = Credential::load(config, name)
             .map_err(|error| RunError::Credential(name.clone(), error))?
     {
         hand(variable, credential)?;
@@ -1253,9 +1253,16 @@ impl Prepared {
         })
     }
 
+    /// Returns the agent's state directory, when its profile points the agent at one.
+    fn state_dir(&self, started: &Started) -> Option<PathBuf> {
+        self.profile
+            .filter(|profile| profile.state_env.is_some())
+            .map(|_| started.state_dir(&self.store))
+    }
+
     /// Returns where the agent keeps its session, when its profile names a directory for it.
     fn session_source(&self, started: &Started) -> Option<SessionSource> {
-        self.profile.and_then(|profile| profile.session_dir).and_then(|dir| {
+        self.profile.and_then(Profile::session_dir).and_then(|dir| {
             let named = fs::canonicalize(&started.worktree).ok().and_then(|worktree| dir(&worktree));
             if named.is_none() {
                 eprintln!(
@@ -1276,10 +1283,17 @@ impl Prepared {
             started.worktree.display()
         );
         if let Some(profile) = self.profile {
-            eprintln!(
-                "mahi: {} profile (--no-profile runs the agent without it)",
-                profile.name
-            );
+            match &profile.source {
+                Some(source) => eprintln!(
+                    "mahi: {} profile from {} (--no-profile runs the agent without it)",
+                    profile.name,
+                    source.display()
+                ),
+                None => eprintln!(
+                    "mahi: {} profile (--no-profile runs the agent without it)",
+                    profile.name
+                ),
+            }
         }
         if terminal::is_interactive() {
             eprintln!(
@@ -1326,7 +1340,7 @@ impl Prepared {
             mcp_socket: &self.mcp_socket,
             host: &self.host,
             profile: self.profile,
-            state: self.profile.map(|_| started.state_dir(&self.store)),
+            state: self.state_dir(&started),
             credentials: &self.credentials,
         };
         let (sandbox, network) = (self.sandbox, self.network);
@@ -1889,7 +1903,7 @@ fn check_profile(
         return Ok(());
     };
     if environment.mahi_exe.is_none() {
-        return Err(RunError::NoMahiBinary(profile.name));
+        return Err(RunError::NoMahiBinary(profile.name.as_str()));
     }
     let set = profile.set_names();
     match environment
@@ -1899,7 +1913,7 @@ fn check_profile(
     {
         Some(passed) => Err(RunError::SetByProfile {
             name: passed.name.clone(),
-            profile: profile.name,
+            profile: profile.name.as_str(),
         }),
         None => Ok(()),
     }
@@ -1981,10 +1995,10 @@ fn require_passed(environment: &Environment) -> Result<(), RunError> {
 
 fn allowed_hosts(allowed: &[HostName], profile: Option<&Profile>) -> Vec<HostName> {
     let from_profile = profile
-        .map(|profile| profile.hosts)
+        .map(|profile| profile.hosts.as_slice())
         .unwrap_or_default()
         .iter()
-        .filter_map(|host| host.parse().ok());
+        .cloned();
     allowed.iter().cloned().chain(from_profile).collect()
 }
 
@@ -2052,20 +2066,39 @@ struct Launch<'a> {
 }
 
 impl Launch<'_> {
-    /// Adds the agent's arguments: the user's, then, when its profile names a flag for it, the
-    /// file in its state directory `state` that tells it where `mahi mcp` is, then the first
-    /// prompt of a handoff, after the variadic flag so it is not taken as one of its values.
+    /// Adds the agent's arguments: the user's, then, when mahi serves the agent its tools,
+    /// what its profile adds for them (the built-in flag and the file in its state directory
+    /// `state` that tells it where `mahi mcp` is, or a user profile's arguments), then the
+    /// first prompt of a handoff, after those so it is not taken as one of their values.
     fn agent_arguments(&self, mut pty: PtyCommand, state: Option<&Path>) -> PtyCommand {
-        let flag = self
-            .profile
-            .and_then(|profile| profile.mcp_flag)
-            .zip(state.filter(|_| self.tools_config().is_some()));
         let (before, after) = split_at_separator(self.arguments);
         for argument in before {
             pty = pty.arg(argument);
         }
-        if let Some((flag, state)) = flag {
-            pty = pty.arg(flag).arg(state.join(profile::MCP_CONFIG));
+        if let (Some(profile), Some(tools)) = (self.profile, self.tools_config()) {
+            match &profile.tools {
+                Tools::None => {}
+                Tools::McpFlag(flag) => {
+                    if let Some(state) = state {
+                        pty = pty.arg(flag).arg(state.join(profile::MCP_CONFIG));
+                    }
+                }
+                Tools::Args(_) => {
+                    match profile.tool_args(state.unwrap_or_else(|| Path::new("")), tools) {
+                        Some(arguments) => {
+                            for argument in arguments {
+                                pty = pty.arg(argument);
+                            }
+                        }
+                        None => eprintln!(
+                            "mahi: the agent's tools are off, since a value the {} profile \
+                             puts in its arguments holds a quote, a backslash or a control \
+                             character",
+                            profile.name
+                        ),
+                    }
+                }
+            }
         }
         for argument in after {
             pty = pty.arg(argument);
@@ -2135,7 +2168,7 @@ impl Launch<'_> {
             .map_err(RunError::State)?
             .ok_or_else(not_private)?;
         profile
-            .install(&directory, self.tools_config())
+            .install(&directory, &parent.join(name), self.tools_config())
             .map_err(RunError::State)?;
         Ok(Some(parent.join(name)))
     }
@@ -2201,10 +2234,12 @@ impl Launch<'_> {
         };
         let offered = |passed: &&Passed| {
             passed.required
-                || (self
-                    .profile
-                    .is_some_and(|profile| profile.optional_env.contains(&passed.name.as_str()))
-                    && !handed(passed.name.as_str()))
+                || (self.profile.is_some_and(|profile| {
+                    profile
+                        .optional_env
+                        .iter()
+                        .any(|name| name == passed.name.as_str())
+                }) && !handed(passed.name.as_str()))
         };
         for passed in self.environment.pass_env.iter().filter(offered) {
             if let Some(value) = &passed.value {
@@ -2217,9 +2252,11 @@ impl Launch<'_> {
                 OsStr::from_bytes(handed.credential.expose()),
             );
         }
-        if let (Some(profile), Some(state)) = (self.profile, &state) {
-            pty = pty.env(profile.state_env, state);
-            for (name, value) in profile.env {
+        if let Some(profile) = self.profile {
+            if let (Some(variable), Some(state)) = (&profile.state_env, &state) {
+                pty = pty.env(variable, state);
+            }
+            for (name, value) in &profile.env {
                 pty = pty.env(name, value);
             }
         }

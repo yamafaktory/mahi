@@ -91,6 +91,64 @@ pub(crate) fn read(path: &Path, max_bytes: u64) -> Result<Vec<u8>, IdentityError
     Ok(mem::take(&mut *bytes))
 }
 
+/// Reads the regular file at `path`, at most `max_bytes` long, without following a symbolic
+/// link, when it and its directory are the user's own and writable by no one else.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::NotFound`] if there is no file, [`IdentityError::NotAFile`] if it
+/// is not a regular file, [`IdentityError::WritableByOthers`] if it or its directory is
+/// another user's or writable by someone else, [`IdentityError::Malformed`] if it is longer
+/// than `max_bytes`, or [`IdentityError::Io`] if it cannot be read.
+pub fn read_owned_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, IdentityError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(IdentityError::NotFound(path.to_path_buf()));
+        }
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(IdentityError::NotAFile(path.to_path_buf()));
+        }
+        Ok(_) => {}
+    }
+    check_owned_dir(parent_of(path))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(no_follow())
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(IdentityError::NotAFile(path.to_path_buf()));
+    }
+    if !is_owned_unshared(&metadata) {
+        return Err(IdentityError::WritableByOthers(path.to_path_buf()));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(IdentityError::Malformed);
+    }
+    Ok(bytes)
+}
+
+/// Checks that `dir` is a directory of the user's own that no one else can write to.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::WritableByOthers`] if it is not, or [`IdentityError::Io`] if it
+/// cannot be looked at.
+pub fn check_owned_dir(dir: &Path) -> Result<(), IdentityError> {
+    let metadata = fs::metadata(dir)?;
+    if !metadata.is_dir() || !is_owned_unshared(&metadata) {
+        return Err(IdentityError::WritableByOthers(dir.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn is_owned_unshared(metadata: &Metadata) -> bool {
+    metadata.uid() == rustix::process::geteuid().as_raw() && metadata.mode() & 0o022 == 0
+}
+
 fn no_follow() -> i32 {
     rustix::fs::OFlags::NOFOLLOW.bits().cast_signed()
 }
@@ -130,4 +188,55 @@ pub(crate) fn check_private_dir(dir: &Path) -> Result<(), IdentityError> {
         return Err(IdentityError::NotPrivate(dir.to_path_buf()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{
+        PermissionsExt,
+        symlink,
+    };
+
+    use super::*;
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn an_owned_file_no_one_else_can_write_is_read_whatever_others_may_read() {
+        let dir = tempfile::tempdir().unwrap();
+        set_mode(dir.path(), 0o755);
+        let path = dir.path().join("codex.toml");
+        fs::write(&path, b"name = \"codex\"\n").unwrap();
+        set_mode(&path, 0o644);
+        assert_eq!(read_owned_file(&path, 64).unwrap(), b"name = \"codex\"\n");
+
+        assert!(matches!(
+            read_owned_file(&path, 4),
+            Err(IdentityError::Malformed)
+        ));
+        set_mode(&path, 0o664);
+        assert!(matches!(
+            read_owned_file(&path, 64),
+            Err(IdentityError::WritableByOthers(refused)) if refused == path
+        ));
+        set_mode(&path, 0o600);
+        set_mode(dir.path(), 0o775);
+        assert!(matches!(
+            read_owned_file(&path, 64),
+            Err(IdentityError::WritableByOthers(refused)) if refused == dir.path()
+        ));
+        set_mode(dir.path(), 0o700);
+        let link = dir.path().join("link.toml");
+        symlink(&path, &link).unwrap();
+        assert!(matches!(
+            read_owned_file(&link, 64),
+            Err(IdentityError::NotAFile(_))
+        ));
+        assert!(matches!(
+            read_owned_file(&dir.path().join("missing.toml"), 64),
+            Err(IdentityError::NotFound(_))
+        ));
+    }
 }

@@ -112,7 +112,7 @@ impl Template {
     }
 
     /// Writes the template into `out`, filling each value in with `value`.
-    pub fn render(&self, value: impl Fn(Placeholder) -> String, out: &mut String) {
+    pub fn render(&self, mut value: impl FnMut(Placeholder) -> String, out: &mut String) {
         for piece in &self.0 {
             match piece {
                 Piece::Text(text) => out.push_str(text),
@@ -211,8 +211,8 @@ pub enum ProfileError {
     /// other.
     #[error("the file {0:?} is listed twice or is also a directory of another")]
     DuplicateFile(String),
-    /// Files are listed, or `{state_dir}` used, without a `state-env`.
-    #[error("files and {{state_dir}} need a state-env")]
+    /// Files are listed, `{state_dir}` used or a session log named without a `state-env`.
+    #[error("files, {{state_dir}} and session-log need a state-env")]
     NoStateDir,
     /// A file written on every start uses a value only known when tools are served.
     #[error("the file {0:?} uses {{mahi_bin}} or {{mcp_socket}}, so it needs when = \"tools\"")]
@@ -554,7 +554,7 @@ impl UserProfile {
             .iter()
             .chain(files.iter().map(|file| &file.content))
             .any(|template| template.uses(|placeholder| placeholder == Placeholder::StateDir));
-        if state_env.is_none() && (!files.is_empty() || uses_state_dir) {
+        if state_env.is_none() && (!files.is_empty() || uses_state_dir || session_log.is_some()) {
             return Err(ProfileError::NoStateDir);
         }
         Ok(Self {
@@ -741,6 +741,10 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
                 "file.path",
             ),
             (&format!("{base}\nhosts = 3\n"), "line 4"),
+            (
+                &format!("{base}session-log = \"claude-code\"\n"),
+                "state-env",
+            ),
         ];
         for (text, expected) in cases {
             let error = UserProfile::parse(text).unwrap_err().to_string();

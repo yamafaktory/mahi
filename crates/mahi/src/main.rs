@@ -50,6 +50,7 @@ use std::{
 };
 
 use clap::Parser;
+use mahi_identity::ConfigDir;
 
 use crate::{
     cli::{
@@ -68,18 +69,35 @@ use crate::{
 fn main() {
     let cli = Cli::parse();
     let required = match &cli.command {
-        Command::Run(command) => command.options.pass_env().to_vec(),
-        Command::Resume(command) => command.options.pass_env().to_vec(),
-        Command::Handoff(command) => command.options.pass_env().to_vec(),
-        Command::Agent(AgentCommand::Add(command)) => command.options.pass_env().to_vec(),
-        Command::Land(command) => command.options.pass_env().to_vec(),
-        Command::Join(command) if command.agent().is_some() => command.options.pass_env().to_vec(),
-        _ => Vec::new(),
+        Command::Run(command) => Some(command.options.pass_env().to_vec()),
+        Command::Resume(command) => Some(command.options.pass_env().to_vec()),
+        Command::Handoff(command) => Some(command.options.pass_env().to_vec()),
+        Command::Agent(AgentCommand::Add(command)) => Some(command.options.pass_env().to_vec()),
+        Command::Land(command) => Some(command.options.pass_env().to_vec()),
+        Command::Join(command) if command.agent().is_some() => {
+            Some(command.options.pass_env().to_vec())
+        }
+        _ => None,
     };
+    let mut environment = Environment::read(required.as_deref().unwrap_or_default(), &[]);
+    if required.is_some() {
+        let loaded = ConfigDir::resolve(
+            environment.home.as_deref(),
+            environment.xdg_config_home.as_deref(),
+        )
+        .map_err(|error| Box::new(error) as Box<dyn Error>)
+        .and_then(|config| {
+            profile::load(&config).map_err(|error| Box::new(error) as Box<dyn Error>)
+        });
+        if let Err(error) = loaded {
+            report(error.as_ref());
+            process::exit(1);
+        }
+    }
     let optional: Vec<_> = Profile::optional_env_of_all()
         .filter_map(|name| name.parse().ok())
         .collect();
-    let environment = Environment::read(&required, &optional);
+    environment.read_optional(&optional);
     let code = match cli.command {
         Command::Init => match TerminalPrompt::open()
             .map_err(InitError::Prompt)

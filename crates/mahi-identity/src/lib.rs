@@ -30,6 +30,10 @@ pub use identity::{
     LocalIdentity,
 };
 pub use node::NodeKey;
+pub use private_file::{
+    check_owned_dir,
+    read_owned_file,
+};
 pub use public::{
     PublicIdentity,
     SigningKey,

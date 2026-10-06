@@ -12,13 +12,38 @@ use std::{
         fd::OwnedFd,
         unix::fs::DirBuilderExt,
     },
-    path::Path,
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::OnceLock,
 };
 
-use mahi_agent::claude_code::{
-    self,
-    LogLine,
+use mahi_agent::{
+    claude_code::{
+        self,
+        LogLine,
+    },
+    profile::{
+        MAX_PROFILE_BYTES,
+        Placeholder,
+        ProfileError,
+        SessionLog,
+        StateFile,
+        Template,
+        UserProfile,
+        When,
+        Write as Writing,
+    },
 };
+use mahi_identity::{
+    ConfigDir,
+    CredentialName,
+    IdentityError,
+    check_owned_dir,
+    read_owned_file,
+};
+use mahi_proxy::HostName;
 use rustix::{
     fs::{
         AtFlags,
@@ -27,57 +52,393 @@ use rustix::{
     },
     io::Errno,
 };
+use thiserror::Error;
 
-/// Writes a profile's files into the agent's state directory, given the mahi binary and the
-/// socket its tools are served at, when the agent should start `mahi mcp`.
-type Install = fn(&OwnedFd, Option<(&str, &str)>) -> io::Result<()>;
+use crate::environment::{
+    EnvName,
+    EnvNameError,
+    PASSED_ON,
+};
 
 /// Reads one line of an agent's own session log.
 pub(crate) type ReadLogLine = fn(&[u8]) -> Option<LogLine>;
 
+/// Finds where an agent keeps its sessions for a worktree.
+pub(crate) type SessionDir = fn(&Path) -> Option<String>;
+
+/// How mahi tells the agent where its tools are.
+#[derive(Debug)]
+pub(crate) enum Tools {
+    /// It does not.
+    None,
+    /// With this flag before the file in the state directory that names `mahi mcp`.
+    McpFlag(&'static str),
+    /// With these arguments, filled in.
+    Args(Vec<Template>),
+}
+
+#[derive(Debug)]
+enum Install {
+    ClaudeCode,
+    Files(Vec<StateFile>),
+}
+
 /// What mahi knows about one agent: the hosts it needs, the variables it may be given, the
-/// settings that keep it quiet, and how its hooks report to mahi.
+/// settings that keep it quiet, and how its hooks and tools reach mahi; built in, or read
+/// from a user's profile file.
 #[derive(Debug)]
 pub(crate) struct Profile {
-    pub(crate) name: &'static str,
-    program: &'static str,
-    pub(crate) hosts: &'static [&'static str],
-    pub(crate) optional_env: &'static [&'static str],
-    pub(crate) env: &'static [(&'static str, &'static str)],
-    pub(crate) state_env: &'static str,
-    pub(crate) resume_args: &'static [&'static str],
-    pub(crate) credential: Option<(&'static str, &'static str)>,
-    pub(crate) session_dir: Option<fn(&Path) -> Option<String>>,
+    pub(crate) name: String,
+    program: String,
+    pub(crate) source: Option<PathBuf>,
+    pub(crate) hosts: Vec<HostName>,
+    pub(crate) optional_env: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) state_env: Option<String>,
+    pub(crate) resume_args: Vec<String>,
+    pub(crate) credential: Option<(CredentialName, String)>,
+    session_log: Option<SessionLog>,
     pub(crate) takes_prompt: bool,
-    pub(crate) log_line: Option<ReadLogLine>,
-    pub(crate) mcp_flag: Option<&'static str>,
+    pub(crate) tools: Tools,
     install: Install,
 }
 
 /// The file in the agent's state directory that tells it where `mahi mcp` is.
 pub(crate) const MCP_CONFIG: &str = "mcp.json";
 
-const CLAUDE_CODE: Profile = Profile {
-    name: "claude-code",
-    program: "claude",
-    hosts: &["api.anthropic.com"],
-    optional_env: &["CLAUDE_CODE_OAUTH_TOKEN"],
-    env: &[
-        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
-        ("DISABLE_AUTOUPDATER", "1"),
-        ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
-    ],
-    state_env: "CLAUDE_CONFIG_DIR",
-    resume_args: &["--continue"],
-    credential: Some(("claude", "CLAUDE_CODE_OAUTH_TOKEN")),
-    session_dir: Some(claude_code::session_dir),
-    takes_prompt: true,
-    log_line: Some(claude_code::log_line),
-    mcp_flag: Some("--mcp-config"),
-    install: install_claude_code,
-};
+/// A user's profile file that mahi cannot use.
+#[derive(Debug, Error)]
+pub(crate) enum LoadError {
+    #[error("cannot read the profile {}", .0.display())]
+    Read(PathBuf, #[source] IdentityError),
+    #[error("the profile {} is not UTF-8", .0.display())]
+    NotUtf8(PathBuf),
+    #[error("the profile {}", .0.display())]
+    Invalid(PathBuf, #[source] ProfileError),
+    #[error("the profile {}", .0.display())]
+    Variable(PathBuf, #[source] EnvNameError),
+    #[error("the profile {} sets {}, which mahi already passes on", .0.display(), .1)]
+    PassedOn(PathBuf, String),
+    #[error("the profiles {} and {} are both for {}", .0.display(), .1.display(), .2)]
+    Twice(PathBuf, PathBuf, String),
+    #[error("the profiles {} and {} are both named {}", .0.display(), .1.display(), .2)]
+    SameName(PathBuf, PathBuf, String),
+    #[error("the profile {} is named {}, as mahi's built-in profile for another program", .0.display(), .1)]
+    BuiltInName(PathBuf, String),
+    #[error("cannot list the profiles in {}", .0.display())]
+    List(PathBuf, #[source] io::Error),
+}
 
-const PROFILES: [&Profile; 1] = [&CLAUDE_CODE];
+fn claude_code_profile() -> Profile {
+    Profile {
+        name: "claude-code".to_owned(),
+        program: "claude".to_owned(),
+        source: None,
+        hosts: ["api.anthropic.com"]
+            .iter()
+            .filter_map(|host| host.parse().ok())
+            .collect(),
+        optional_env: vec!["CLAUDE_CODE_OAUTH_TOKEN".to_owned()],
+        env: [
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+            ("DISABLE_AUTOUPDATER", "1"),
+            ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
+        ]
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect(),
+        state_env: Some("CLAUDE_CONFIG_DIR".to_owned()),
+        resume_args: vec!["--continue".to_owned()],
+        credential: "claude"
+            .parse()
+            .ok()
+            .map(|name| (name, "CLAUDE_CODE_OAUTH_TOKEN".to_owned())),
+        session_log: Some(SessionLog::ClaudeCode),
+        takes_prompt: true,
+        tools: Tools::McpFlag("--mcp-config"),
+        install: Install::ClaudeCode,
+    }
+}
+
+static PROFILES: OnceLock<Vec<Profile>> = OnceLock::new();
+
+fn profiles() -> &'static [Profile] {
+    PROFILES.get_or_init(|| vec![claude_code_profile()])
+}
+
+/// Reads the user's profiles from `profiles/*.toml` in `config`, before any profile is
+/// looked up; each replaces the built-in profile for the same program. A missing directory
+/// means none.
+///
+/// # Errors
+///
+/// Returns a [`LoadError`] naming the file when one cannot be read, is invalid, sets or
+/// passes a variable mahi reserves or passes on itself, or is for the same program or has
+/// the same name as another.
+pub(crate) fn load(config: &ConfigDir) -> Result<(), LoadError> {
+    let loaded = with_builtin(read_profiles(&config.profiles_dir())?)?;
+    let fresh = PROFILES.set(loaded).is_ok();
+    debug_assert!(fresh, "profiles are loaded before any is looked up");
+    Ok(())
+}
+
+fn with_builtin(mut loaded: Vec<Profile>) -> Result<Vec<Profile>, LoadError> {
+    let builtin = claude_code_profile();
+    if let Some(clash) = loaded
+        .iter()
+        .find(|profile| profile.name == builtin.name && profile.program != builtin.program)
+    {
+        return Err(LoadError::BuiltInName(
+            clash.source.clone().unwrap_or_default(),
+            clash.name.clone(),
+        ));
+    }
+    if !loaded
+        .iter()
+        .any(|profile| profile.program == builtin.program)
+    {
+        loaded.push(builtin);
+    }
+    Ok(loaded)
+}
+
+fn read_profiles(dir: &Path) -> Result<Vec<Profile>, LoadError> {
+    match fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(LoadError::List(dir.to_path_buf(), error)),
+        Ok(metadata) if metadata.is_symlink() => {
+            return Err(LoadError::Read(
+                dir.to_path_buf(),
+                IdentityError::WritableByOthers(dir.to_path_buf()),
+            ));
+        }
+        Ok(_) => {}
+    }
+    check_owned_dir(dir).map_err(|error| LoadError::Read(dir.to_path_buf(), error))?;
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|error| LoadError::List(dir.to_path_buf(), error))? {
+        let path = entry
+            .map_err(|error| LoadError::List(dir.to_path_buf(), error))?
+            .path();
+        let shown = path
+            .file_name()
+            .is_some_and(|name| !name.as_encoded_bytes().starts_with(b"."));
+        if shown
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    let mut loaded: Vec<Profile> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let profile = read_profile(&path)?;
+        if let Some(other) = loaded.iter().find(|other| other.program == profile.program) {
+            return Err(LoadError::Twice(
+                other.source.clone().unwrap_or_default(),
+                path,
+                profile.program,
+            ));
+        }
+        if let Some(other) = loaded.iter().find(|other| other.name == profile.name) {
+            return Err(LoadError::SameName(
+                other.source.clone().unwrap_or_default(),
+                path,
+                profile.name,
+            ));
+        }
+        loaded.push(profile);
+    }
+    Ok(loaded)
+}
+
+fn read_profile(path: &Path) -> Result<Profile, LoadError> {
+    let bytes = read_owned_file(path, MAX_PROFILE_BYTES as u64)
+        .map_err(|error| LoadError::Read(path.to_path_buf(), error))?;
+    let text = String::from_utf8(bytes).map_err(|_| LoadError::NotUtf8(path.to_path_buf()))?;
+    let user =
+        UserProfile::parse(&text).map_err(|error| LoadError::Invalid(path.to_path_buf(), error))?;
+    let names = user
+        .pass_env
+        .iter()
+        .chain(user.env.iter().map(|(name, _)| name))
+        .chain(user.state_env.iter())
+        .chain(
+            user.credential
+                .iter()
+                .map(|credential| &credential.variable),
+        );
+    for name in names {
+        name.parse::<EnvName>()
+            .map_err(|error| LoadError::Variable(path.to_path_buf(), error))?;
+        if PASSED_ON.contains(&name.as_str()) {
+            return Err(LoadError::PassedOn(path.to_path_buf(), name.clone()));
+        }
+    }
+    Ok(Profile {
+        name: user.name.as_str().to_owned(),
+        program: user.program,
+        source: Some(path.to_path_buf()),
+        hosts: user.hosts,
+        optional_env: user.pass_env,
+        env: user.env,
+        state_env: user.state_env,
+        resume_args: user.resume_args,
+        credential: user
+            .credential
+            .map(|credential| (credential.name, credential.variable)),
+        session_log: user.session_log,
+        takes_prompt: user.first_prompt_arg,
+        tools: if user.tool_args.is_empty() {
+            Tools::None
+        } else {
+            Tools::Args(user.tool_args)
+        },
+        install: Install::Files(user.files),
+    })
+}
+
+impl Profile {
+    /// Returns the optional variables of every profile, which mahi reads at startup, before it
+    /// knows which profile applies.
+    pub(crate) fn optional_env_of_all() -> impl Iterator<Item = &'static str> {
+        profiles()
+            .iter()
+            .flat_map(|profile| profile.optional_env.iter().map(String::as_str))
+    }
+
+    /// Returns the profile for the agent program `program`, found by its file name.
+    pub(crate) fn for_agent(program: &OsStr) -> Option<&'static Self> {
+        let name = Path::new(program).file_name()?;
+        profiles()
+            .iter()
+            .find(|profile| OsStr::new(&profile.program) == name)
+    }
+
+    /// Returns the variables the profile sets itself.
+    pub(crate) fn set_names(&self) -> Vec<&str> {
+        self.env
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain(self.state_env.as_deref())
+            .collect()
+    }
+
+    /// Returns where the agent keeps its sessions, when mahi has a reader for them.
+    pub(crate) fn session_dir(&self) -> Option<SessionDir> {
+        self.session_log
+            .map(|SessionLog::ClaudeCode| claude_code::session_dir as SessionDir)
+    }
+
+    /// Returns how one line of the agent's session log reads, when mahi has a reader for it.
+    pub(crate) fn log_line(&self) -> Option<ReadLogLine> {
+        self.session_log
+            .map(|SessionLog::ClaudeCode| claude_code::log_line as ReadLogLine)
+    }
+
+    /// Writes the profile's files into the agent's state directory, open as `state` and found
+    /// at `state_path`, replacing what the agent may have left there without following any
+    /// symbolic link it planted; with `tools`, the mahi binary and the socket its tools are
+    /// served at, they also tell the agent to start `mahi mcp`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file cannot be written, or a value a file needs holds a quote, a
+    /// backslash or a control character.
+    pub(crate) fn install(
+        &self,
+        state: &OwnedFd,
+        state_path: &Path,
+        tools: Option<(&str, &str)>,
+    ) -> io::Result<()> {
+        match &self.install {
+            Install::ClaudeCode => install_claude_code(state, tools),
+            Install::Files(files) => install_files(files, state, state_path, tools),
+        }
+    }
+
+    /// Returns the arguments a user profile adds when mahi serves the agent its tools, filled
+    /// in with the state directory and `tools`; `None` when a value is not safe to put there.
+    pub(crate) fn tool_args(&self, state_path: &Path, tools: (&str, &str)) -> Option<Vec<String>> {
+        let Tools::Args(templates) = &self.tools else {
+            return Some(Vec::new());
+        };
+        templates
+            .iter()
+            .map(|template| render(template, state_path, Some(tools)))
+            .collect()
+    }
+}
+
+fn safe(value: &str) -> bool {
+    !value.contains(['"', '\\']) && !value.chars().any(char::is_control)
+}
+
+fn render(template: &Template, state_path: &Path, tools: Option<(&str, &str)>) -> Option<String> {
+    let state = state_path.to_str().filter(|state| safe(state));
+    let (mahi, socket) = tools
+        .filter(|(mahi, socket)| safe(mahi) && safe(socket))
+        .unzip();
+    let mut missing = false;
+    let mut out = String::new();
+    template.render(
+        |placeholder| {
+            let value = match placeholder {
+                Placeholder::StateDir => state,
+                Placeholder::MahiBin => mahi,
+                Placeholder::McpSocket => socket,
+            };
+            value.map_or_else(
+                || {
+                    missing = true;
+                    String::new()
+                },
+                str::to_owned,
+            )
+        },
+        &mut out,
+    );
+    (!missing).then_some(out)
+}
+
+fn install_files(
+    files: &[StateFile],
+    state: &OwnedFd,
+    state_path: &Path,
+    tools: Option<(&str, &str)>,
+) -> io::Result<()> {
+    for file in files {
+        if file.when == When::Tools && tools.is_none() {
+            continue;
+        }
+        let contents = render(&file.content, state_path, tools).ok_or_else(|| {
+            io::Error::other(
+                "a value the profile's file needs holds a quote, a backslash or a control \
+                 character, or is not UTF-8",
+            )
+        })?;
+        let Some((name, parents)) = file.path.split_last() else {
+            continue;
+        };
+        let mut directory = None;
+        for component in parents {
+            let parent = directory.as_ref().unwrap_or(state);
+            directory = Some(open_private_dir(parent, component)?.ok_or_else(|| {
+                io::Error::other(format!(
+                    "{component:?} in the state directory is not a directory"
+                ))
+            })?);
+        }
+        let directory = directory.as_ref().unwrap_or(state);
+        match file.write {
+            Writing::Replace => replace(directory, name, contents.as_bytes())?,
+            Writing::Create => create_if_missing(directory, name, contents.as_bytes())?,
+        }
+    }
+    Ok(())
+}
 
 const CLAUDE_CODE_SETTINGS: &str = r#"{
   "permissions": { "allow": ["mcp__mahi"] },
@@ -96,41 +457,6 @@ const CLAUDE_CODE_SETTINGS: &str = r#"{
 "#;
 
 const CLAUDE_CODE_STATE: &str = "{\"hasCompletedOnboarding\": true}\n";
-
-impl Profile {
-    /// Returns the optional variables of every profile, which mahi reads at startup, before it
-    /// knows which profile applies.
-    pub(crate) fn optional_env_of_all() -> impl Iterator<Item = &'static str> {
-        PROFILES
-            .into_iter()
-            .flat_map(|profile| profile.optional_env.iter().copied())
-    }
-
-    /// Returns the profile for the agent program `program`, found by its file name.
-    pub(crate) fn for_agent(program: &OsStr) -> Option<&'static Self> {
-        let name = Path::new(program).file_name()?;
-        PROFILES
-            .into_iter()
-            .find(|profile| OsStr::new(profile.program) == name)
-    }
-
-    /// Returns the variables the profile sets itself.
-    pub(crate) fn set_names(&self) -> Vec<&'static str> {
-        self.env
-            .iter()
-            .map(|(name, _)| *name)
-            .chain([self.state_env])
-            .collect()
-    }
-
-    /// Writes the profile's files into the agent's state directory, open as `state`, replacing
-    /// what the agent may have left there without following any symbolic link it planted; with
-    /// `tools`, the mahi binary and the socket its tools are served at, they also tell the agent
-    /// to start `mahi mcp`.
-    pub(crate) fn install(&self, state: &OwnedFd, tools: Option<(&str, &str)>) -> io::Result<()> {
-        (self.install)(state, tools)
-    }
-}
 
 fn install_claude_code(state: &OwnedFd, tools: Option<(&str, &str)>) -> io::Result<()> {
     replace(state, "settings.json", CLAUDE_CODE_SETTINGS.as_bytes())?;
@@ -282,6 +608,192 @@ mod tests {
         assert!(open_private_dir(&parent, "file").unwrap().is_none());
     }
 
+    fn profiles_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, text) in files {
+            fs::write(dir.path().join(name), text).unwrap();
+            fs::set_permissions(dir.path().join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        dir
+    }
+
+    const CODEX: &str = r#"
+name = "codex"
+program = "codex"
+hosts = ["api.openai.com"]
+pass-env = ["OPENAI_API_KEY"]
+env = { CODEX_QUIET = "1" }
+state-env = "CODEX_HOME"
+resume-args = ["resume", "--last"]
+first-prompt-arg = true
+
+[tools]
+args = ["--mcp", "{state_dir}/mcp.json"]
+
+[[file]]
+path = "hooks/notify.toml"
+content = "command = [\"$MAHI_BIN\", \"hook\", \"turn-end\"]\n"
+
+[[file]]
+path = "mcp.json"
+when = "tools"
+content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
+
+[[file]]
+path = "seen.txt"
+write = "create"
+content = "first\n"
+"#;
+
+    #[test]
+    fn user_profiles_are_read_from_their_directory_and_checked() {
+        let dir = profiles_dir(&[("codex.toml", CODEX), ("notes.md", "not a profile")]);
+        let loaded = read_profiles(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let codex = &loaded[0];
+        assert_eq!(
+            (codex.name.as_str(), codex.program.as_str()),
+            ("codex", "codex")
+        );
+        assert_eq!(
+            codex.source.as_deref(),
+            Some(dir.path().join("codex.toml").as_path())
+        );
+        assert_eq!(codex.state_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(codex.set_names(), ["CODEX_QUIET", "CODEX_HOME"]);
+        assert!(codex.takes_prompt && codex.session_dir().is_none());
+        assert!(
+            read_profiles(&dir.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
+
+        let twice = profiles_dir(&[
+            ("a.toml", "name = \"a\"\nprogram = \"codex\"\n"),
+            ("b.toml", "name = \"b\"\nprogram = \"codex\"\n"),
+        ]);
+        assert!(matches!(
+            read_profiles(twice.path()),
+            Err(LoadError::Twice(..))
+        ));
+        for (text, wanted) in [
+            ("env = { HTTPS_PROXY = \"x\" }", "Variable"),
+            ("pass-env = [\"MAHI_BIN\"]", "Variable"),
+            ("env = { PATH = \"/x\" }", "PassedOn"),
+            ("hosts = [\"-bad\"]", "Invalid"),
+        ] {
+            let bad = profiles_dir(&[(
+                "bad.toml",
+                &format!("name = \"bad\"\nprogram = \"bad\"\n{text}\n"),
+            )]);
+            let error = read_profiles(bad.path()).unwrap_err();
+            assert!(
+                format!("{error:?}").starts_with(wanted),
+                "{text}: {error:?}"
+            );
+        }
+        let shared = profiles_dir(&[("codex.toml", CODEX)]);
+        fs::set_permissions(
+            shared.path().join("codex.toml"),
+            fs::Permissions::from_mode(0o664),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_profiles(shared.path()),
+            Err(LoadError::Read(..))
+        ));
+    }
+
+    #[test]
+    fn hidden_files_are_skipped_and_clashes_and_linked_directories_refused() {
+        let dir = profiles_dir(&[("codex.toml", CODEX)]);
+        std::os::unix::fs::symlink("gone", dir.path().join(".#codex.toml")).unwrap();
+        assert_eq!(read_profiles(dir.path()).unwrap().len(), 1);
+
+        let same_name = profiles_dir(&[
+            ("a.toml", "name = \"same\"\nprogram = \"a\"\n"),
+            ("b.toml", "name = \"same\"\nprogram = \"b\"\n"),
+        ]);
+        let error = read_profiles(same_name.path()).unwrap_err();
+        assert!(error.to_string().contains("both named same"), "{error}");
+
+        let linked = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path(), linked.path().join("profiles")).unwrap();
+        assert!(matches!(
+            read_profiles(&linked.path().join("profiles")),
+            Err(LoadError::Read(..))
+        ));
+
+        let handoff = profiles_dir(&[(
+            "h.toml",
+            "name = \"h\"\nprogram = \"h\"\nenv = { MAHI_HANDOFF = \"/x\" }\n",
+        )]);
+        assert!(matches!(
+            read_profiles(handoff.path()),
+            Err(LoadError::Variable(..))
+        ));
+
+        let builtin_name =
+            profiles_dir(&[("c.toml", "name = \"claude-code\"\nprogram = \"cc\"\n")]);
+        let clash = with_builtin(read_profiles(builtin_name.path()).unwrap()).unwrap_err();
+        assert!(matches!(clash, LoadError::BuiltInName(..)), "{clash}");
+        let replacing = profiles_dir(&[("c.toml", "name = \"mine\"\nprogram = \"claude\"\n")]);
+        let profiles = with_builtin(read_profiles(replacing.path()).unwrap()).unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "mine");
+        let none = with_builtin(Vec::new()).unwrap();
+        assert_eq!(none[0].name, "claude-code");
+    }
+
+    #[test]
+    fn a_user_profiles_files_and_tool_arguments_are_filled_in_and_written() {
+        let dir = profiles_dir(&[("codex.toml", CODEX)]);
+        let codex = read_profiles(dir.path()).unwrap().remove(0);
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = state_dir.path();
+        codex.install(&open_dir(state), state, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(state.join("hooks/notify.toml")).unwrap(),
+            "command = [\"$MAHI_BIN\", \"hook\", \"turn-end\"]\n"
+        );
+        assert!(!state.join("mcp.json").exists());
+        fs::write(state.join("seen.txt"), "kept\n").unwrap();
+        let tools = ("/usr/bin/mahi", "/tmp/m/mcp.sock");
+        codex.install(&open_dir(state), state, Some(tools)).unwrap();
+        assert_eq!(
+            fs::read_to_string(state.join("seen.txt")).unwrap(),
+            "kept\n"
+        );
+        assert_eq!(
+            fs::read_to_string(state.join("mcp.json")).unwrap(),
+            r#"{"command": "/usr/bin/mahi", "socket": "/tmp/m/mcp.sock"}"#
+        );
+        assert_eq!(
+            codex.tool_args(state, tools).unwrap(),
+            ["--mcp".to_owned(), format!("{}/mcp.json", state.display())]
+        );
+        let quoted = state.join("a\"b");
+        fs::create_dir(&quoted).unwrap();
+        assert!(codex.tool_args(&quoted, tools).is_none());
+        let unsafe_mahi = ("/opt/\"x\"/mahi", "/tmp/s");
+        assert!(
+            codex
+                .install(&open_dir(state), state, Some(unsafe_mahi))
+                .is_err()
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        let planted = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), planted.path().join("hooks")).unwrap();
+        assert!(
+            codex
+                .install(&open_dir(planted.path()), planted.path(), None)
+                .is_err()
+        );
+        assert!(!outside.path().join("notify.toml").exists());
+    }
+
     #[test]
     fn the_claude_program_gets_the_claude_code_profile() {
         assert_eq!(
@@ -302,7 +814,9 @@ mod tests {
     #[test]
     fn claude_code_hooks_report_prompts_tools_and_turn_ends_to_mahi() {
         let dir = tempfile::tempdir().unwrap();
-        CLAUDE_CODE.install(&open_dir(dir.path()), None).unwrap();
+        claude_code_profile()
+            .install(&open_dir(dir.path()), Path::new(""), None)
+            .unwrap();
         let settings = fs::read_to_string(dir.path().join("settings.json")).unwrap();
         for (event, kind) in [
             ("UserPromptSubmit", "prompt"),
@@ -327,7 +841,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         fs::create_dir(&state).unwrap();
-        CLAUDE_CODE.install(&open_dir(&state), None).unwrap();
+        claude_code_profile()
+            .install(&open_dir(&state), Path::new(""), None)
+            .unwrap();
         assert_eq!(
             fs::read_to_string(state.join(".claude.json")).unwrap(),
             CLAUDE_CODE_STATE
@@ -339,7 +855,9 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         assert!(!state.join(".claude.json.mahi").exists());
         fs::write(state.join(".claude.json"), "{\"kept\": true}").unwrap();
-        CLAUDE_CODE.install(&open_dir(&state), None).unwrap();
+        claude_code_profile()
+            .install(&open_dir(&state), Path::new(""), None)
+            .unwrap();
         assert_eq!(
             fs::read_to_string(state.join(".claude.json")).unwrap(),
             "{\"kept\": true}"
@@ -348,7 +866,9 @@ mod tests {
         let linked = dir.path().join("linked");
         fs::create_dir(&linked).unwrap();
         std::os::unix::fs::symlink(&outside, linked.join(".claude.json")).unwrap();
-        CLAUDE_CODE.install(&open_dir(&linked), None).unwrap();
+        claude_code_profile()
+            .install(&open_dir(&linked), Path::new(""), None)
+            .unwrap();
         assert!(!outside.exists());
         assert!(
             fs::symlink_metadata(linked.join(".claude.json"))
@@ -366,8 +886,12 @@ mod tests {
         fs::create_dir(&state).unwrap();
         std::os::unix::fs::symlink(&outside, state.join("settings.json")).unwrap();
         std::os::unix::fs::symlink(&outside, state.join(".settings.json.mahi")).unwrap();
-        CLAUDE_CODE.install(&open_dir(&state), None).unwrap();
-        CLAUDE_CODE.install(&open_dir(&state), None).unwrap();
+        claude_code_profile()
+            .install(&open_dir(&state), Path::new(""), None)
+            .unwrap();
+        claude_code_profile()
+            .install(&open_dir(&state), Path::new(""), None)
+            .unwrap();
         assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
         let settings = state.join("settings.json");
         assert!(!fs::symlink_metadata(&settings).unwrap().is_symlink());
@@ -377,11 +901,11 @@ mod tests {
 
     #[test]
     fn no_profile_sets_or_passes_a_variable_mahi_reserves() {
-        for profile in PROFILES {
+        for profile in profiles() {
             for name in profile
                 .set_names()
                 .into_iter()
-                .chain(profile.optional_env.iter().copied())
+                .chain(profile.optional_env.iter().map(String::as_str))
             {
                 assert!(
                     name.parse::<crate::environment::EnvName>().is_ok(),
@@ -394,9 +918,13 @@ mod tests {
 
     #[test]
     fn claude_code_needs_only_the_api_host_and_passes_only_the_subscription_token() {
-        assert_eq!(CLAUDE_CODE.hosts, ["api.anthropic.com"]);
-        assert_eq!(CLAUDE_CODE.optional_env, ["CLAUDE_CODE_OAUTH_TOKEN"]);
-        for (name, _) in CLAUDE_CODE.env {
+        let claude = claude_code_profile();
+        assert_eq!(
+            claude.hosts,
+            ["api.anthropic.com".parse::<HostName>().unwrap()]
+        );
+        assert_eq!(claude.optional_env, ["CLAUDE_CODE_OAUTH_TOKEN"]);
+        for (name, _) in &claude.env {
             assert!(!name.contains("API_KEY") && !name.contains("AUTH_TOKEN"));
         }
     }
@@ -404,9 +932,10 @@ mod tests {
     #[test]
     fn claude_code_is_told_where_mahi_mcp_is_and_may_use_its_tools() {
         let dir = tempfile::tempdir().unwrap();
-        CLAUDE_CODE
+        claude_code_profile()
             .install(
                 &open_dir(dir.path()),
+                Path::new(""),
                 Some(("/opt/mahi \"x\"/mahi", "/tmp/s/mcp.sock")),
             )
             .unwrap();
@@ -424,6 +953,9 @@ mod tests {
         let settings: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.path().join("settings.json")).unwrap()).unwrap();
         assert_eq!(settings["permissions"]["allow"][0], "mcp__mahi");
-        assert_eq!(CLAUDE_CODE.mcp_flag, Some("--mcp-config"));
+        assert!(matches!(
+            claude_code_profile().tools,
+            Tools::McpFlag("--mcp-config")
+        ));
     }
 }

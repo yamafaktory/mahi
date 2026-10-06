@@ -11,6 +11,7 @@ const RECIPIENT_FILE: &str = "identity.pub";
 const SIGNING_KEY_FILE: &str = "signing-key.pub";
 const NODE_KEY_FILE: &str = "node.key";
 const SETTINGS_FILE: &str = "config.toml";
+const PROFILES_DIR: &str = "profiles";
 
 /// mahi's per-user configuration directory.
 ///
@@ -79,6 +80,12 @@ impl ConfigDir {
     #[must_use]
     pub fn settings_file(&self) -> PathBuf {
         self.0.join(SETTINGS_FILE)
+    }
+
+    /// Returns the directory of the user's agent profiles, `profiles`.
+    #[must_use]
+    pub fn profiles_dir(&self) -> PathBuf {
+        self.0.join(PROFILES_DIR)
     }
 }
 

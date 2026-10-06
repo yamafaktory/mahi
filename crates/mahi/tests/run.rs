@@ -591,6 +591,132 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
         claude
     }
 
+    const FAKER: &str = r#"#!/bin/sh
+echo "set=$FAKE_SET"
+echo "file=$(cat "$FAKE_HOME/hello.txt")"
+echo "args=$*"
+cat "$FAKE_HOME/tools/mcp.json"
+"#;
+
+    const FAKER_PROFILE: &str = r#"
+name = "faker"
+program = "faker"
+env = { FAKE_SET = "yes" }
+state-env = "FAKE_HOME"
+
+[tools]
+args = ["--tools", "{state_dir}/tools/mcp.json"]
+
+[[file]]
+path = "hello.txt"
+content = "hello from {state_dir}"
+
+[[file]]
+path = "tools/mcp.json"
+when = "tools"
+content = '{{"bin": "{mahi_bin}"}}'
+"#;
+
+    fn write_profile(fixture: &Fixture, name: &str, text: &str) {
+        let profiles = config_dir(&fixture.home).profiles_dir();
+        fs::create_dir_all(&profiles).unwrap();
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = profiles.join(name);
+        fs::write(&path, text).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn a_user_profile_sets_up_its_agent_with_its_files_variables_and_tool_arguments() {
+        let fixture = fixture();
+        write_profile(&fixture, "faker.toml", FAKER_PROFILE);
+        let faker = script(&fixture, "faking", "faker", FAKER);
+        let output = fixture
+            .command(&["run", faker.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+        assert!(stderr.contains("faker profile from"), "{stderr}");
+        let worktree = worktree_of(&stderr);
+        let state = fs::canonicalize(
+            fixture
+                .repo
+                .join(".git/mahi/state")
+                .join(thread_of(&worktree))
+                .join("tester.faker"),
+        )
+        .unwrap();
+        assert!(stdout.contains("set=yes"), "{stdout}");
+        assert!(
+            stdout.contains(&format!("file=hello from {}", state.display())),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "args=--tools {}",
+                state.join("tools/mcp.json").display()
+            )),
+            "{stdout}"
+        );
+        assert!(stdout.contains("{\"bin\": \"/"), "{stdout}");
+        let bare = fixture
+            .command(&["run", "--no-profile", faker.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&bare.stdout);
+        assert!(
+            stdout.contains("set=") && !stdout.contains("set=yes"),
+            "{stdout}"
+        );
+    }
+
+    #[test]
+    fn a_profile_with_no_state_directory_still_sets_its_variables() {
+        let fixture = fixture();
+        write_profile(
+            &fixture,
+            "plain.toml",
+            "name = \"plain\"\nprogram = \"plain\"\nenv = { PLAIN_SET = \"yes\" }\n",
+        );
+        let plain = script(
+            &fixture,
+            "plain",
+            "plain",
+            "#!/bin/sh\necho \"plain=$PLAIN_SET\"\n",
+        );
+        let output = fixture
+            .command(&["run", plain.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("plain=yes"), "{stdout}");
+    }
+
+    #[test]
+    fn a_broken_profile_stops_agents_from_starting_and_says_where() {
+        let fixture = fixture();
+        write_profile(
+            &fixture,
+            "broken.toml",
+            "name = \"broken\"\nprogram = \"sh\"\nsurprise = 1\n",
+        );
+        let output = fixture.mahi(&["run", "true"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("broken.toml"), "{stderr}");
+        assert!(stderr.contains("surprise"), "{stderr}");
+        let threads = fixture.mahi(&["threads"]);
+        assert_eq!(threads.status.code(), Some(0));
+    }
+
     #[test]
     fn claude_gets_its_profile_hooks_state_and_subscription_token_only() {
         let fixture = fixture();
