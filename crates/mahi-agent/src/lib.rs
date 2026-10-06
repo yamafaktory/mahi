@@ -2,6 +2,7 @@
 //! each agent's own files and payloads, and the profiles users write for their agents.
 
 pub mod claude_code;
+pub mod codex;
 pub mod hook;
 pub mod mcp;
 pub mod payload;

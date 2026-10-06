@@ -284,3 +284,10 @@ path = "fuzz_targets/agent_profile.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "codex-hook-trust"
+path = "fuzz_targets/codex_hook_trust.rs"
+test = false
+doc = false
+bench = false

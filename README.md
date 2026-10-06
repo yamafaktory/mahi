@@ -75,13 +75,13 @@ The profile reaches only `api.anthropic.com` and hands Claude Code the `claude` 
 mahi run codex
 ```
 
-Codex keeps its sign-in in the thread's own state directory, so it asks to sign in once in
-each thread. The browser sign-in cannot reach back into the sandbox: choose **Sign in with
-Device Code** (turn on device code sign-in for Codex in ChatGPT's security settings first), or
-an API key. Codex also asks you to approve mahi's three hooks, which report each prompt, tool
-call and turn end to mahi; without them no turns are recorded. Codex's own sandbox is turned
-off, since mahi's replaces it, so do not pass it `--sandbox`, `--full-auto` or a `--profile`
-that sets one.
+Codex keeps its sign-in in the thread's own state directory, so it asks to sign in once in each
+thread. The browser sign-in cannot reach back into the sandbox: choose **Sign in with Device
+Code** (turn on device code sign-in for Codex in ChatGPT's security settings first), or an API
+key. The first time, Codex also asks you to approve mahi's three hooks, which report each
+prompt, tool call and turn end to mahi; mahi remembers the approval for later threads. Codex's
+own sandbox is turned off, since mahi's replaces it, so do not pass it `--sandbox`,
+`--full-auto` or a `--profile` that sets one.
 
 ### Any other agent
 

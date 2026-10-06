@@ -1324,6 +1324,7 @@ impl Prepared {
                 },
                 dir: &source.dir,
             });
+        let state = self.state_dir(&started);
         let launch = Launch {
             restore,
             handoff: self.handoff.as_deref(),
@@ -1340,7 +1341,7 @@ impl Prepared {
             mcp_socket: &self.mcp_socket,
             host: &self.host,
             profile: self.profile,
-            state: self.state_dir(&started),
+            state: state.clone(),
             credentials: &self.credentials,
         };
         let (sandbox, network) = (self.sandbox, self.network);
@@ -1382,7 +1383,7 @@ impl Prepared {
         let (tools, prompts) = serve_tools(
             self.mcp,
             (self.owner, key, live.as_ref(), can_merge),
-            (&self.git_dir, config),
+            (&self.git_dir, config.clone()),
             &started,
         );
         let merging = Merging::open(door, recorder.as_ref(), &started);
@@ -1406,7 +1407,25 @@ impl Prepared {
             live,
         );
         tools.store(false, Ordering::SeqCst);
+        keep_hook_trust(self.profile, state, config.path());
         outcome
+    }
+}
+
+/// Keeps in the user's configuration directory, for their later threads, the approvals of
+/// mahi's hooks the agent recorded in its state directory, when it has a profile and one.
+fn keep_hook_trust(profile: Option<&Profile>, state: Option<PathBuf>, config: &Path) {
+    let (Some(profile), Some(state)) = (profile, state) else {
+        return;
+    };
+    let (Some(parent), Some(name)) = (state.parent(), state.file_name()) else {
+        return;
+    };
+    let Ok(parent) = fs::canonicalize(parent) else {
+        return;
+    };
+    if let Err(error) = profile.keep_hook_trust(&parent.join(name), config) {
+        crate::report_with("the approval of mahi's hooks was not kept", &error);
     }
 }
 
@@ -2171,10 +2190,18 @@ impl Launch<'_> {
         let directory = profile::open_private_dir(&parent_dir, name)
             .map_err(RunError::State)?
             .ok_or_else(not_private)?;
+        let state_path = parent.join(name);
         profile
-            .install(&directory, &parent.join(name), self.tools_config())
+            .install(&directory, &state_path, self.tools_config())
             .map_err(RunError::State)?;
-        Ok(Some(parent.join(name)))
+        if let Ok(config) = ConfigDir::resolve(
+            self.environment.home.as_deref(),
+            self.environment.xdg_config_home.as_deref(),
+        ) && let Err(error) = profile.seed_hook_trust(&directory, &state_path, config.path())
+        {
+            crate::report_with("the approval of mahi's hooks was not carried over", &error);
+        }
+        Ok(Some(state_path))
     }
 
     fn spawn(

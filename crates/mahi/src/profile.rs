@@ -6,10 +6,14 @@ use std::{
     },
     io::{
         self,
+        Read,
         Write,
     },
     os::{
-        fd::OwnedFd,
+        fd::{
+            AsFd,
+            OwnedFd,
+        },
         unix::fs::DirBuilderExt,
     },
     path::{
@@ -23,6 +27,11 @@ use mahi_agent::{
     claude_code::{
         self,
         LogLine,
+    },
+    codex::{
+        HookTrust,
+        MAX_CONFIG_BYTES,
+        MAX_SAVED_BYTES,
     },
     profile::{
         MAX_PROFILE_BYTES,
@@ -48,6 +57,7 @@ use mahi_proxy::HostName;
 use rustix::{
     fs::{
         AtFlags,
+        FileType,
         Mode,
         OFlags,
     },
@@ -419,9 +429,86 @@ impl Profile {
     ) -> io::Result<()> {
         match &self.install {
             Install::ClaudeCode => install_claude_code(state, tools),
-            Install::Codex => replace(state, "hooks.json", CODEX_HOOKS.as_bytes()),
+            Install::Codex => replace(state, CODEX_HOOKS_FILE, CODEX_HOOKS.as_bytes()),
             Install::Files(files) => install_files(files, state, state_path, tools),
         }
+    }
+
+    /// When the agent is Codex, adds to its `config.toml` in the state directory `state`, found
+    /// at `state_path`, the approvals of mahi's hooks the user gave in an earlier thread and
+    /// mahi kept in `config`, so Codex does not ask for them again; a hook already recorded
+    /// there is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file cannot be read or written.
+    pub(crate) fn seed_hook_trust(
+        &self,
+        state: &OwnedFd,
+        state_path: &Path,
+        config: &Path,
+    ) -> io::Result<()> {
+        let (Install::Codex, Some(hooks)) = (&self.install, codex_hooks_path(state_path)) else {
+            return Ok(());
+        };
+        let Some(config_dir) = open_owned_dir(config)? else {
+            return Ok(());
+        };
+        let Small::Read(saved) = read_small(&config_dir, CODEX_TRUST, MAX_SAVED_BYTES)? else {
+            return Ok(());
+        };
+        let trust = HookTrust::from_saved(&String::from_utf8_lossy(&saved));
+        let current = match read_small(state, CODEX_CONFIG, MAX_CONFIG_BYTES)? {
+            Small::Missing => Vec::new(),
+            Small::Read(current) => current,
+            Small::Unusable => return Ok(()),
+        };
+        let Ok(current) = String::from_utf8(current) else {
+            return Ok(());
+        };
+        match trust.added_to(&current, &hooks) {
+            Some(seeded) => replace(state, CODEX_CONFIG, seeded.as_bytes()),
+            None => Ok(()),
+        }
+    }
+
+    /// When the agent is Codex, keeps in `config` the approvals of all of mahi's hooks that
+    /// Codex recorded in its state directory at `state_path`, for the user's later threads;
+    /// the directory itself is opened without following a link the agent may have put there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file cannot be read or written.
+    pub(crate) fn keep_hook_trust(&self, state_path: &Path, config: &Path) -> io::Result<()> {
+        let (Install::Codex, Some(hooks)) = (&self.install, codex_hooks_path(state_path)) else {
+            return Ok(());
+        };
+        let (Some(parent), Some(name)) = (state_path.parent(), state_path.file_name()) else {
+            return Ok(());
+        };
+        let Some(parent) = open_owned_dir(parent)? else {
+            return Ok(());
+        };
+        let (Some(state), Some(config_dir)) = (
+            open_owned_dir_at(&parent, Path::new(name))?,
+            open_owned_dir(config)?,
+        ) else {
+            return Ok(());
+        };
+        let Small::Read(current) = read_small(&state, CODEX_CONFIG, MAX_CONFIG_BYTES)? else {
+            return Ok(());
+        };
+        let trust = HookTrust::recorded(&String::from_utf8_lossy(&current), &hooks);
+        if !trust.is_complete() {
+            return Ok(());
+        }
+        let saved = trust.to_saved();
+        if let Small::Read(kept) = read_small(&config_dir, CODEX_TRUST, MAX_SAVED_BYTES)?
+            && kept == saved.as_bytes()
+        {
+            return Ok(());
+        }
+        replace(&config_dir, CODEX_TRUST, saved.as_bytes())
     }
 
     /// Returns the arguments the profile adds when mahi serves the agent its tools, filled in
@@ -435,6 +522,71 @@ impl Profile {
             .map(|template| render(template, state_path, Some(tools)))
             .collect()
     }
+}
+
+const CODEX_CONFIG: &str = "config.toml";
+const CODEX_HOOKS_FILE: &str = "hooks.json";
+const CODEX_TRUST: &str = "codex-hooks.toml";
+
+fn codex_hooks_path(state_path: &Path) -> Option<String> {
+    state_path
+        .join(CODEX_HOOKS_FILE)
+        .to_str()
+        .map(str::to_owned)
+}
+
+fn open_owned_dir(path: &Path) -> io::Result<Option<OwnedFd>> {
+    open_owned_dir_at(rustix::fs::CWD, path)
+}
+
+fn open_owned_dir_at(parent: impl AsFd, path: &Path) -> io::Result<Option<OwnedFd>> {
+    let directory = match rustix::fs::openat(
+        parent,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(directory) => directory,
+        Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let stat = rustix::fs::fstat(&directory)?;
+    let private = stat.st_uid == rustix::process::geteuid().as_raw() && stat.st_mode & 0o022 == 0;
+    Ok(private.then_some(directory))
+}
+
+/// What [`read_small`] found.
+enum Small {
+    Missing,
+    Read(Vec<u8>),
+    Unusable,
+}
+
+fn read_small(directory: &OwnedFd, name: &str, most: usize) -> io::Result<Small> {
+    let file = match rustix::fs::openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(file) => file,
+        Err(Errno::NOENT) => return Ok(Small::Missing),
+        Err(Errno::LOOP | Errno::ISDIR | Errno::NXIO) => return Ok(Small::Unusable),
+        Err(error) => return Err(error.into()),
+    };
+    let stat = rustix::fs::fstat(&file)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Ok(Small::Unusable);
+    }
+    let mut bytes = Vec::new();
+    File::from(file)
+        .take(u64::try_from(most).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(if bytes.len() <= most {
+        Small::Read(bytes)
+    } else {
+        Small::Unusable
+    })
 }
 
 fn safe(value: &str) -> bool {
@@ -650,7 +802,13 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        fmt::Write as _,
+        os::unix::fs::{
+            FileTypeExt,
+            PermissionsExt,
+        },
+    };
 
     use super::*;
 
@@ -1110,5 +1268,172 @@ content = "first\n"
                 .tool_args(Path::new("/state"), ("/opt/\"x\"/mahi", "/tmp/s"))
                 .is_none()
         );
+    }
+
+    fn approvals_in(state: &Path) -> String {
+        let hooks = state.join(CODEX_HOOKS_FILE);
+        let mut text = String::new();
+        for (event, digit) in ["user_prompt_submit", "post_tool_use", "stop"]
+            .iter()
+            .zip(['1', '2', '3'])
+        {
+            writeln!(
+                text,
+                "[hooks.state.\"{}:{event}:0:0\"]\ntrusted_hash = \"sha256:{}\"",
+                hooks.display(),
+                digit.to_string().repeat(64)
+            )
+            .unwrap();
+        }
+        text
+    }
+
+    fn private_dir(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn codex_hook_approvals_given_in_one_thread_are_carried_into_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second, config) = (
+            dir.path().join("first"),
+            dir.path().join("second"),
+            dir.path().join("config"),
+        );
+        for path in [&first, &second, &config] {
+            private_dir(path);
+        }
+        let codex = codex_profile();
+        codex.keep_hook_trust(&first, &config).unwrap();
+        assert!(!config.join(CODEX_TRUST).exists());
+        fs::write(first.join(CODEX_CONFIG), approvals_in(&first)).unwrap();
+        codex.keep_hook_trust(&first, &config).unwrap();
+        let mode = fs::metadata(config.join(CODEX_TRUST))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        fs::write(second.join(CODEX_CONFIG), "[tui]\nx = 1\n").unwrap();
+        codex.install(&open_dir(&second), &second, None).unwrap();
+        codex
+            .seed_hook_trust(&open_dir(&second), &second, &config)
+            .unwrap();
+        let seeded = fs::read_to_string(second.join(CODEX_CONFIG)).unwrap();
+        assert!(seeded.starts_with("[tui]\nx = 1\n"));
+        let recorded = HookTrust::recorded(&seeded, codex_hooks_path(&second).as_deref().unwrap());
+        assert!(recorded.is_complete());
+        assert_eq!(
+            HookTrust::recorded(
+                &approvals_in(&second),
+                codex_hooks_path(&second).as_deref().unwrap()
+            ),
+            recorded
+        );
+        codex
+            .seed_hook_trust(&open_dir(&second), &second, &config)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(second.join(CODEX_CONFIG)).unwrap(),
+            seeded
+        );
+    }
+
+    #[test]
+    fn only_codex_carries_approvals_and_planted_links_or_shared_dirs_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second, config) = (
+            dir.path().join("first"),
+            dir.path().join("second"),
+            dir.path().join("config"),
+        );
+        for path in [&first, &second, &config] {
+            private_dir(path);
+        }
+        fs::write(first.join(CODEX_CONFIG), approvals_in(&first)).unwrap();
+        claude_code_profile()
+            .keep_hook_trust(&first, &config)
+            .unwrap();
+        assert!(!config.join(CODEX_TRUST).exists());
+
+        let outside = dir.path().join("outside.toml");
+        fs::write(&outside, approvals_in(&first)).unwrap();
+        fs::remove_file(first.join(CODEX_CONFIG)).unwrap();
+        std::os::unix::fs::symlink(&outside, first.join(CODEX_CONFIG)).unwrap();
+        codex_profile().keep_hook_trust(&first, &config).unwrap();
+        assert!(!config.join(CODEX_TRUST).exists());
+
+        fs::remove_file(first.join(CODEX_CONFIG)).unwrap();
+        fs::write(first.join(CODEX_CONFIG), approvals_in(&first)).unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o777)).unwrap();
+        codex_profile().keep_hook_trust(&first, &config).unwrap();
+        assert!(!config.join(CODEX_TRUST).exists());
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
+        codex_profile().keep_hook_trust(&first, &config).unwrap();
+        assert!(config.join(CODEX_TRUST).exists());
+
+        let before = "[tui]\n";
+        fs::write(second.join(CODEX_CONFIG), before).unwrap();
+        claude_code_profile()
+            .seed_hook_trust(&open_dir(&second), &second, &config)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(second.join(CODEX_CONFIG)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_fifo_an_oversized_config_or_a_linked_state_dir_never_hangs_or_loses_codexs_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, config, real) = (
+            dir.path().join("state"),
+            dir.path().join("config"),
+            dir.path().join("real"),
+        );
+        for path in [&state, &config, &real] {
+            private_dir(path);
+        }
+        fs::write(real.join(CODEX_CONFIG), approvals_in(&real)).unwrap();
+        codex_profile().keep_hook_trust(&real, &config).unwrap();
+        assert!(config.join(CODEX_TRUST).exists());
+
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            state.join(CODEX_CONFIG),
+            FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let codex = codex_profile();
+        codex.keep_hook_trust(&state, &config).unwrap();
+        codex
+            .seed_hook_trust(&open_dir(&state), &state, &config)
+            .unwrap();
+        assert!(
+            fs::symlink_metadata(state.join(CODEX_CONFIG))
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+
+        fs::remove_file(state.join(CODEX_CONFIG)).unwrap();
+        let oversized = format!("# {}\n", "x".repeat(MAX_CONFIG_BYTES));
+        fs::write(state.join(CODEX_CONFIG), &oversized).unwrap();
+        codex
+            .seed_hook_trust(&open_dir(&state), &state, &config)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(state.join(CODEX_CONFIG)).unwrap(),
+            oversized
+        );
+
+        fs::remove_file(config.join(CODEX_TRUST)).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        codex.keep_hook_trust(&linked, &config).unwrap();
+        assert!(!config.join(CODEX_TRUST).exists());
     }
 }
