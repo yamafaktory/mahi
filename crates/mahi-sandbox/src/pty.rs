@@ -79,6 +79,7 @@ pub struct PtyCommand {
     cwd: PathBuf,
     size: WindowSize,
     sandbox: Option<Sandbox>,
+    hold_terminal: bool,
 }
 
 /// A program running in a pseudo-terminal, and the terminal's controlling side.
@@ -91,6 +92,7 @@ pub struct PtyChild {
     master: File,
     child: Child,
     loopback: Option<TcpListener>,
+    terminal: Option<OwnedFd>,
 }
 
 /// Starting or driving a program in a pseudo-terminal failed.
@@ -118,6 +120,7 @@ impl PtyCommand {
             cwd: cwd.to_path_buf(),
             size,
             sandbox: None,
+            hold_terminal: false,
         }
     }
 
@@ -141,6 +144,16 @@ impl PtyCommand {
     #[must_use]
     pub fn sandbox(mut self, sandbox: Sandbox) -> Self {
         self.sandbox = Some(sandbox);
+        self
+    }
+
+    /// Keeps the caller's own copy of the terminal open until [`PtyChild::take_terminal`], so
+    /// the program's exit never closes the last copy. macOS drops what the program wrote and
+    /// no one read yet when its last copy closes; a copy closed by a live process instead waits
+    /// until it has been read. A reader sees the end only once the copy is taken and dropped.
+    #[must_use]
+    pub fn hold_terminal(mut self) -> Self {
+        self.hold_terminal = true;
         self
     }
 
@@ -176,11 +189,11 @@ impl PtyCommand {
             .spawn()
             .map_err(|error| PtyError::Spawn(self.program.clone(), error))?;
         drop(command);
-        drop(slave);
         PtyChild {
             master: File::from(master),
             child,
             loopback: None,
+            terminal: self.hold_terminal.then_some(slave),
         }
         .with_loopback(receiver)
         .map_err(|error| PtyError::Spawn(self.program.clone(), error))
@@ -199,6 +212,7 @@ impl fmt::Debug for PtyCommand {
             .field("cwd", &self.cwd)
             .field("size", &self.size)
             .field("sandbox", &self.sandbox)
+            .field("hold_terminal", &self.hold_terminal)
             .finish()
     }
 }
@@ -338,6 +352,13 @@ impl PtyChild {
     #[must_use]
     pub fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Takes the caller's copy of the terminal that [`PtyCommand::hold_terminal`] kept, to be
+    /// dropped once the program has exited; dropping it on macOS waits until what the program
+    /// wrote has been read, so it belongs on a thread of its own.
+    pub fn take_terminal(&mut self) -> Option<OwnedFd> {
+        self.terminal.take()
     }
 
     /// Returns a handle to read what the program writes to its terminal.
@@ -495,7 +516,10 @@ mod tests {
         io::Write,
         sync::mpsc,
         thread,
-        time::Duration,
+        time::{
+            Duration,
+            Instant,
+        },
     };
 
     use super::*;
@@ -570,6 +594,38 @@ mod tests {
         }
         assert!(String::from_utf8_lossy(&seen).contains("got more"));
         assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_held_terminal_keeps_what_the_program_wrote_until_it_is_read_and_ends_once_released() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("work.txt"), "recorded work\n").unwrap();
+        for _ in 0..30 {
+            let mut child = PtyCommand::new(Path::new("/bin/cat"), dir.path(), SIZE)
+                .arg("work.txt")
+                .hold_terminal()
+                .spawn()
+                .unwrap();
+            let mut reader = child.reader().unwrap();
+            thread::sleep(Duration::from_millis(150));
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let mut output = Vec::new();
+                let _ = reader.read_to_end(&mut output);
+                let _ = sender.send(output);
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "the program exits");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+            drop(child.take_terminal());
+            let output = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the terminal ends once released");
+            assert_eq!(String::from_utf8_lossy(&output), "recorded work\r\n");
+        }
     }
 
     #[test]

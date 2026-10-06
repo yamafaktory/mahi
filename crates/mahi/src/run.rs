@@ -2211,7 +2211,8 @@ impl Launch<'_> {
         if let Some(network) = &network {
             sandbox.open_loopback_port(network.port())?;
         }
-        let pty = PtyCommand::new(&self.agent.program, self.worktree, terminal::size());
+        let pty =
+            PtyCommand::new(&self.agent.program, self.worktree, terminal::size()).hold_terminal();
         let mut pty = self.agent_arguments(pty, state.as_deref());
         for (name, value) in &self.environment.passed_on {
             pty = pty.env(name, value);
@@ -2469,11 +2470,18 @@ fn await_output_end(received: &Receiver<Event>) {
 
 fn wait_for(child: &Mutex<PtyChild>) -> Result<i32, PtyError> {
     loop {
-        let status = match child.lock() {
-            Ok(mut child) => child.try_wait()?,
+        let (status, terminal) = match child.lock() {
+            Ok(mut child) => {
+                let status = child.try_wait()?;
+                let terminal = status.and_then(|_| child.take_terminal());
+                (status, terminal)
+            }
             Err(_) => return Ok(1),
         };
         if let Some(status) = status {
+            if let Some(terminal) = terminal {
+                thread::spawn(move || drop(terminal));
+            }
             return Ok(exit_code(status));
         }
         thread::sleep(EXIT_POLL);
