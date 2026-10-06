@@ -376,28 +376,11 @@ impl ThreadTools {
             }
         }
         let mut text = format!(
-            "Thread {}. You are {}. Participants and their agents:\n",
+            "Thread {}. You are {}. Participants and their agents with snapshots here:\n",
             self.thread, self.me
         );
-        for (name, _, owner) in &view.listed {
-            let _ = write!(text, "- {name}");
-            if *owner {
-                text.push_str(" (owner)");
-            }
-            text.push(':');
-            match agents.get(name) {
-                None => text.push_str(" no agent yet"),
-                Some(names) => {
-                    for agent in names {
-                        let _ = write!(text, " {name}.{agent}");
-                        if name == self.me.participant() && agent == self.me.agent() {
-                            text.push_str(" (you)");
-                        }
-                    }
-                }
-            }
-            text.push('\n');
-        }
+        let listed = view.listed.iter().map(|(name, _, owner)| (name, *owner));
+        push_agents(&mut text, listed, &agents, &self.me);
         push_claims(&mut text, &self.claims.all(&self.me));
         Ok(cleaned(&text))
     }
@@ -699,8 +682,9 @@ impl Toolbox for ThreadTools {
         vec![
             Tool {
                 name: "list_agents",
-                description: "Lists the thread's participants and their agents, as \
-                              <participant>.<agent>, marking which one you are.",
+                description: "Lists the thread's participants and their agents that have \
+                              snapshots here, as <participant>.<agent>, marking which one you \
+                              are, and the claims.",
                 input_schema: json!({ "type": "object", "properties": {} }),
             },
             Tool {
@@ -797,9 +781,74 @@ impl Toolbox for ThreadTools {
     }
 }
 
+fn push_agents<'a>(
+    text: &mut String,
+    listed: impl Iterator<Item = (&'a ParticipantName, bool)>,
+    agents: &BTreeMap<ParticipantName, Vec<AgentName>>,
+    me: &AgentSlot,
+) {
+    let mut any_missing = false;
+    for (name, owner) in listed {
+        let _ = write!(text, "- {name}");
+        if owner {
+            text.push_str(" (owner)");
+        }
+        text.push(':');
+        match agents.get(name) {
+            None => {
+                any_missing = true;
+                text.push_str(" no snapshots here yet");
+            }
+            Some(names) => {
+                for agent in names {
+                    let _ = write!(text, " {name}.{agent}");
+                    if name == me.participant() && agent == me.agent() {
+                        text.push_str(" (you)");
+                    }
+                }
+            }
+        }
+        text.push('\n');
+    }
+    if any_missing {
+        text.push_str(
+            "A participant with no snapshots here may still have agents running; their claims \
+             show them while their host is connected live, and their work arrives here when the \
+             thread is fetched from its remote.\n",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_participant_without_snapshots_here_is_not_said_to_have_no_agent() {
+        let alice = ParticipantName::new("alice").unwrap();
+        let bob = ParticipantName::new("bob").unwrap();
+        let claude = AgentName::new("claude").unwrap();
+        let me = AgentSlot::new(alice.clone(), claude.clone());
+        let agents = BTreeMap::from([(alice.clone(), vec![claude])]);
+        let mut text = String::new();
+        push_agents(
+            &mut text,
+            [(&alice, true), (&bob, false)].into_iter(),
+            &agents,
+            &me,
+        );
+        assert_eq!(
+            text,
+            "- alice (owner): alice.claude (you)\n\
+             - bob: no snapshots here yet\n\
+             A participant with no snapshots here may still have agents running; their claims \
+             show them while their host is connected live, and their work arrives here when the \
+             thread is fetched from its remote.\n"
+        );
+        text.clear();
+        push_agents(&mut text, [(&alice, true)].into_iter(), &agents, &me);
+        assert_eq!(text, "- alice (owner): alice.claude (you)\n");
+    }
 
     struct Echo;
 
