@@ -22,6 +22,9 @@ mahi-ssh = { path = "../crates/mahi-ssh" }
 mahi-store = { path = "../crates/mahi-store" }
 mahi-term = { path = "../crates/mahi-term" }
 mahi-thread = { path = "../crates/mahi-thread" }
+mahi-tls = { path = "../crates/mahi-tls" }
+rustls = { version = "0.23.45", default-features = false, features = ["std"] }
+webpki-roots = "1.0.9"
 
 [workspace]
 members = ["."]
@@ -208,6 +211,20 @@ bench = false
 [[bin]]
 name = "live-local"
 path = "fuzz_targets/live_local.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls-open"
+path = "fuzz_targets/tls_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls-verify"
+path = "fuzz_targets/tls_verify.rs"
 test = false
 doc = false
 bench = false

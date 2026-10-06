@@ -3212,6 +3212,9 @@ dependencies = [
  "mahi-store",
  "mahi-term",
  "mahi-thread",
+ "mahi-tls",
+ "rustls",
+ "webpki-roots",
 ]
 
 [[package]]
