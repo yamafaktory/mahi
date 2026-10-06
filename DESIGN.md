@@ -290,6 +290,5 @@ Fuzzing (see Testing) comes as its own step after milestone 3, covering every pa
 
 ## Open questions
 
-- Automerge vs Loro for shared state.
 - Windows support (WSL2 only?).
 - Name: mahi, at mahi.social, a domain the project owns, used wherever mahi needs a domain or a URL of its own. The `mahi` crate looked unclaimed on crates.io (Sept 2026); confirm GitHub and other registries. Be thoughtful about using a te reo Māori word if this becomes commercial.
