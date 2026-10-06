@@ -57,6 +57,7 @@ use gix::{
         Find as _,
         Tree,
         Write as _,
+        WriteTo as _,
         tree::{
             Entry,
             EntryKind,
@@ -87,7 +88,10 @@ use crate::{
     Store,
     StoreError,
     merge::TEMPORARY_PREFIX,
-    store::open_options,
+    store::{
+        MAX_TREE_BYTES,
+        open_options,
+    },
 };
 
 /// Files larger than this are left out of snapshots and reported instead.
@@ -133,6 +137,9 @@ pub enum Skipped {
     NotAFile,
     /// The directory is nested deeper than [`MAX_SNAPSHOT_DEPTH`].
     TooDeep,
+    /// The directory holds so many entries that its tree would be larger than 1 MiB, more
+    /// than mahi reads back when it restores a worktree.
+    TooManyEntries,
     /// The file's content is not in the repository yet, and the snapshot already added as much
     /// new content as it may.
     NewContentLimit,
@@ -230,6 +237,12 @@ struct Frame {
     name: Vec<u8>,
     names: std::vec::IntoIter<Vec<u8>>,
     entries: Vec<Entry>,
+}
+
+enum Written {
+    Tree(ObjectId),
+    Empty,
+    TooLarge,
 }
 
 enum Step {
@@ -491,7 +504,21 @@ impl<'a> Walk<'a> {
             };
             self.ignore.patterns.pop();
             self.attributes.pop_pattern_list();
-            let tree = self.write_tree(frame.entries)?;
+            let tree = match self.write_tree(frame.entries)? {
+                Written::Tree(tree) => Some(tree),
+                Written::Empty => None,
+                Written::TooLarge if stack.is_empty() => {
+                    return Err(StoreError::SnapshotRootTooLarge);
+                }
+                Written::TooLarge => {
+                    let mut rela = frame.rela;
+                    if rela.last() == Some(&b'/') {
+                        rela.pop();
+                    }
+                    self.skipped.push((rela, Skipped::TooManyEntries));
+                    None
+                }
+            };
             match (stack.last_mut(), tree) {
                 (None, tree) => return Ok(tree),
                 (Some(parent), Some(tree)) => parent.entries.push(Entry {
@@ -504,12 +531,16 @@ impl<'a> Walk<'a> {
         }
     }
 
-    fn write_tree(&self, mut entries: Vec<Entry>) -> Result<Option<ObjectId>, StoreError> {
+    fn write_tree(&self, mut entries: Vec<Entry>) -> Result<Written, StoreError> {
         if entries.is_empty() {
-            return Ok(None);
+            return Ok(Written::Empty);
         }
         entries.sort();
-        Ok(Some(self.repo.write_object(&Tree { entries })?.detach()))
+        let tree = Tree { entries };
+        if tree.size() > MAX_TREE_BYTES {
+            return Ok(Written::TooLarge);
+        }
+        Ok(Written::Tree(self.repo.write_object(&tree)?.detach()))
     }
 
     fn enter(
@@ -1703,6 +1734,58 @@ mod tests {
         assert!(safe_name(b"notes"));
         assert!(!safe_name(b"\0{{{"));
         assert!(!safe_name(b"notes\0"));
+    }
+
+    #[test]
+    fn a_directory_whose_tree_would_pass_one_mib_is_left_out_and_reported() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        let big = path.join("big");
+        fs::create_dir(&big).unwrap();
+        let long = "n".repeat(200);
+        for index in 0..4700 {
+            fs::write(big.join(format!("{long}{index}")), b"").unwrap();
+        }
+        let kept = path.join("kept");
+        fs::create_dir(&kept).unwrap();
+        for index in 0..4400 {
+            fs::write(kept.join(format!("{long}{index}")), b"").unwrap();
+        }
+        let snapshot = snapshot(&setup);
+        let recorded = only_names(&setup.store, snapshot.tree);
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|name| name.starts_with("kept/"))
+                .count(),
+            4400
+        );
+        assert_eq!(
+            snapshot.skipped,
+            [(BString::from("big"), Skipped::TooManyEntries)]
+        );
+        let names = only_names(&setup.store, snapshot.tree);
+        assert!(
+            !names.iter().any(|name| name.starts_with("big/")),
+            "{}",
+            names.len()
+        );
+        assert!(names.contains(&"README.md".to_owned()), "{names:?}");
+
+        fs::remove_dir_all(&kept).unwrap();
+        for entry in fs::read_dir(&big).unwrap() {
+            let entry = entry.unwrap();
+            fs::rename(entry.path(), path.join(entry.file_name())).unwrap();
+        }
+        assert!(matches!(
+            setup.store.snapshot(
+                "agent",
+                &crate::GlobalPatterns::default(),
+                &mut crate::SnapshotCache::default(),
+                &AtomicBool::new(false),
+            ),
+            Err(StoreError::SnapshotRootTooLarge)
+        ));
     }
 
     #[test]

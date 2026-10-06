@@ -206,6 +206,10 @@ pub enum StoreError {
     /// A tree would write more files, trees or levels into a worktree than mahi checks out.
     #[error("tree {0} holds more than mahi checks out into a worktree")]
     CheckoutTooLarge(ObjectId),
+    /// The worktree's root directory holds so many entries that its tree would be larger than
+    /// 1 MiB, more than mahi reads back.
+    #[error("the worktree's root directory has more entries than a snapshot records")]
+    SnapshotRootTooLarge,
 }
 
 impl Store {
