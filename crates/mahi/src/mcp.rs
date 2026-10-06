@@ -34,10 +34,6 @@ use std::{
 };
 
 use mahi_agent::{
-    claude_code::{
-        prompt_text,
-        tool_text,
-    },
     hook::HookKind,
     mcp::{
         self,
@@ -46,6 +42,10 @@ use mahi_agent::{
         MAX_MESSAGE_BYTES,
         RpcError,
         Tool,
+    },
+    payload::{
+        prompt_text,
+        tool_text,
     },
 };
 use mahi_core::{

@@ -8,11 +8,11 @@ use std::{
 };
 
 use mahi_agent::{
-    claude_code::{
+    hook::HookKind,
+    payload::{
         prompt_text,
         tool_text,
     },
-    hook::HookKind,
 };
 use mahi_core::{
     AgentSlot,

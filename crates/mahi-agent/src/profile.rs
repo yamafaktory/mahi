@@ -48,9 +48,10 @@ impl fmt::Display for ProfileName {
     }
 }
 
-/// A reader mahi has built in for an agent's own session log and directory.
+/// A reader mahi has built in for one agent: where it keeps its sessions and how its session
+/// log reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionLog {
+pub enum Reader {
     /// Claude Code's session directories and log lines.
     ClaudeCode,
 }
@@ -171,8 +172,8 @@ pub struct UserProfile {
     pub credential: Option<ProfileCredential>,
     /// Whether a handoff's first prompt is given as the agent's last argument, after `--`.
     pub first_prompt_arg: bool,
-    /// The built-in reader of the agent's session log.
-    pub session_log: Option<SessionLog>,
+    /// The reader mahi has built in for the agent's sessions.
+    pub reader: Option<Reader>,
     /// The arguments added before the user's when mahi serves the agent its tools.
     pub tool_args: Vec<Template>,
     /// The files written into the state directory.
@@ -211,8 +212,8 @@ pub enum ProfileError {
     /// other.
     #[error("the file {0:?} is listed twice or is also a directory of another")]
     DuplicateFile(String),
-    /// Files are listed, `{state_dir}` used or a session log named without a `state-env`.
-    #[error("files, {{state_dir}} and session-log need a state-env")]
+    /// Files are listed, `{state_dir}` used or a reader named without a `state-env`.
+    #[error("files, {{state_dir}} and a reader need a state-env")]
     NoStateDir,
     /// A file written on every start uses a value only known when tools are served.
     #[error("the file {0:?} uses {{mahi_bin}} or {{mcp_socket}}, so it needs when = \"tools\"")]
@@ -236,7 +237,7 @@ struct RawProfile {
     credential: Option<RawCredential>,
     #[serde(default)]
     first_prompt_arg: bool,
-    session_log: Option<String>,
+    reader: Option<String>,
     tools: Option<RawTools>,
     #[serde(default)]
     file: Vec<RawFile>,
@@ -533,10 +534,10 @@ impl UserProfile {
             .iter()
             .map(|argument| value("resume-args", argument))
             .collect::<Result<_, _>>()?;
-        let session_log = match raw.session_log.as_deref() {
+        let reader = match raw.reader.as_deref() {
             None => None,
-            Some("claude-code") => Some(SessionLog::ClaudeCode),
-            Some(other) => return Err(invalid("session-log", other)),
+            Some("claude-code") => Some(Reader::ClaudeCode),
+            Some(other) => return Err(invalid("reader", other)),
         };
         let tool_args: Vec<Template> = at_most(
             raw.tools.map_or_else(Vec::new, |tools| tools.args),
@@ -554,7 +555,7 @@ impl UserProfile {
             .iter()
             .chain(files.iter().map(|file| &file.content))
             .any(|template| template.uses(|placeholder| placeholder == Placeholder::StateDir));
-        if state_env.is_none() && (!files.is_empty() || uses_state_dir || session_log.is_some()) {
+        if state_env.is_none() && (!files.is_empty() || uses_state_dir || reader.is_some()) {
             return Err(ProfileError::NoStateDir);
         }
         Ok(Self {
@@ -567,7 +568,7 @@ impl UserProfile {
             resume_args,
             credential,
             first_prompt_arg: raw.first_prompt_arg,
-            session_log,
+            reader,
             tool_args,
             files,
         })
@@ -588,7 +589,7 @@ state-env = "CODEX_HOME"
 resume-args = ["resume", "--last"]
 credential = { name = "openai", variable = "OPENAI_TOKEN" }
 first-prompt-arg = true
-session-log = "claude-code"
+reader = "claude-code"
 
 [tools]
 args = ["--config", "{state_dir}/mcp.json"]
@@ -616,7 +617,7 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
         assert_eq!(profile.resume_args, ["resume", "--last"]);
         assert_eq!(profile.credential.unwrap().variable, "OPENAI_TOKEN");
         assert!(profile.first_prompt_arg);
-        assert_eq!(profile.session_log, Some(SessionLog::ClaudeCode));
+        assert_eq!(profile.reader, Some(Reader::ClaudeCode));
         assert_eq!(profile.files.len(), 2);
         assert_eq!(profile.files[0].path, ["hooks", "config.toml"]);
         assert_eq!(profile.files[1].when, When::Tools);
@@ -678,7 +679,7 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
                 &format!("{base}pass-env = [\"A\"]\nenv = {{ A = \"1\" }}\n"),
                 "twice",
             ),
-            (&format!("{base}session-log = \"codex\"\n"), "session-log"),
+            (&format!("{base}reader = \"codex\"\n"), "reader"),
             (
                 &format!("{base}[[file]]\npath = \"f\"\ncontent = \"x\"\n"),
                 "state-env",
@@ -741,10 +742,7 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
                 "file.path",
             ),
             (&format!("{base}\nhosts = 3\n"), "line 4"),
-            (
-                &format!("{base}session-log = \"claude-code\"\n"),
-                "state-env",
-            ),
+            (&format!("{base}reader = \"claude-code\"\n"), "state-env"),
         ];
         for (text, expected) in cases {
             let error = UserProfile::parse(text).unwrap_err().to_string();

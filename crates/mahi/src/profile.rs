@@ -28,7 +28,7 @@ use mahi_agent::{
         MAX_PROFILE_BYTES,
         Placeholder,
         ProfileError,
-        SessionLog,
+        Reader,
         StateFile,
         Template,
         UserProfile,
@@ -97,7 +97,7 @@ pub(crate) struct Profile {
     pub(crate) state_env: Option<String>,
     pub(crate) resume_args: Vec<String>,
     pub(crate) credential: Option<(CredentialName, String)>,
-    session_log: Option<SessionLog>,
+    reader: Option<Reader>,
     pub(crate) takes_prompt: bool,
     pub(crate) tools: Tools,
     install: Install,
@@ -153,7 +153,7 @@ fn claude_code_profile() -> Profile {
             .parse()
             .ok()
             .map(|name| (name, "CLAUDE_CODE_OAUTH_TOKEN".to_owned())),
-        session_log: Some(SessionLog::ClaudeCode),
+        reader: Some(Reader::ClaudeCode),
         takes_prompt: true,
         tools: Tools::McpFlag("--mcp-config"),
         install: Install::ClaudeCode,
@@ -289,7 +289,7 @@ fn read_profile(path: &Path) -> Result<Profile, LoadError> {
         credential: user
             .credential
             .map(|credential| (credential.name, credential.variable)),
-        session_log: user.session_log,
+        reader: user.reader,
         takes_prompt: user.first_prompt_arg,
         tools: if user.tool_args.is_empty() {
             Tools::None
@@ -328,14 +328,14 @@ impl Profile {
 
     /// Returns where the agent keeps its sessions, when mahi has a reader for them.
     pub(crate) fn session_dir(&self) -> Option<SessionDir> {
-        self.session_log
-            .map(|SessionLog::ClaudeCode| claude_code::session_dir as SessionDir)
+        self.reader
+            .map(|Reader::ClaudeCode| claude_code::session_dir as SessionDir)
     }
 
     /// Returns how one line of the agent's session log reads, when mahi has a reader for it.
     pub(crate) fn log_line(&self) -> Option<ReadLogLine> {
-        self.session_log
-            .map(|SessionLog::ClaudeCode| claude_code::log_line as ReadLogLine)
+        self.reader
+            .map(|Reader::ClaudeCode| claude_code::log_line as ReadLogLine)
     }
 
     /// Writes the profile's files into the agent's state directory, open as `state` and found
