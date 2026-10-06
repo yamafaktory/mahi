@@ -523,6 +523,19 @@ mod tests {
     }
 
     #[test]
+    fn output_written_just_before_exit_is_read_after_the_program_is_reaped() {
+        for _ in 0..20 {
+            let mut child = sh("echo last words").spawn().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                assert!(std::time::Instant::now() < deadline, "the program exits");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(output_of(&child).contains("last words"));
+        }
+    }
+
+    #[test]
     fn the_program_has_a_controlling_terminal() {
         let mut child = sh("test -t 0 && test -t 1 && echo ok > /dev/tty")
             .spawn()
