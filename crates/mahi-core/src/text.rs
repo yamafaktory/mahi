@@ -1,5 +1,8 @@
 /// Returns whether `c` is invisible when shown: a zero-width or filler character, a
-/// text-direction mark or a tag, which could hide or reorder what a reader sees.
+/// text-direction mark, a tag or another format control that draws nothing (shorthand,
+/// musical and hieroglyph format controls), which could hide or reorder what a reader sees.
+/// Variation selectors are not counted, since emoji use them, nor the number signs and marks
+/// that span the digits after them, which show.
 #[must_use]
 pub fn is_invisible(c: char) -> bool {
     matches!(
@@ -20,6 +23,11 @@ pub fn is_invisible(c: char) -> bool {
             | '\u{2066}'..='\u{206F}'
             | '\u{FEFF}'
             | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
             | '\u{E0000}'..='\u{E007F}'
     )
 }
@@ -37,10 +45,23 @@ mod tests {
             '\u{FEFF}',
             '\u{E0041}',
             '\u{00AD}',
+            '\u{17B4}',
+            '\u{1343F}',
+            '\u{1BCA3}',
+            '\u{1D17A}',
         ] {
             assert!(is_invisible(c), "{c:?}");
         }
-        for c in ['a', ' ', 'é', '\u{4E2D}', '\u{1F600}'] {
+        for c in [
+            'a',
+            ' ',
+            'é',
+            '\u{4E2D}',
+            '\u{1F600}',
+            '\u{FE0F}',
+            '\u{0600}',
+            '\u{06DD}',
+        ] {
             assert!(!is_invisible(c), "{c:?}");
         }
     }

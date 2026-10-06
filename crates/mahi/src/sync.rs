@@ -447,7 +447,7 @@ fn check_branch(
         eprintln!(
             "mahi: the branch {} is gone from {name}, merged or closed; mahi purge {thread} \
              removes the thread",
-            record.branch
+            BranchRecord::shown(&record.branch)
         );
     }
 }

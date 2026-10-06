@@ -70,7 +70,7 @@ pub(crate) fn threads() -> Result<String, ThreadsError> {
                 listing,
                 "  branch {} gone from the remote, merged or closed; mahi purge {thread} removes \
                  the thread",
-                record.branch
+                BranchRecord::shown(&record.branch)
             );
         }
         listing.push('\n');

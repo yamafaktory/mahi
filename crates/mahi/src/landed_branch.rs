@@ -7,7 +7,10 @@ use std::{
     path::PathBuf,
 };
 
-use mahi_core::ThreadId;
+use mahi_core::{
+    ThreadId,
+    is_invisible,
+};
 use mahi_store::{
     ObjectId,
     Store,
@@ -70,6 +73,14 @@ impl BranchRecord {
         fs::rename(&staged, target)
     }
 
+    /// Returns `name`, a branch or remote name from a record, as it may be shown: without
+    /// control or invisible characters, which git allows in branch names.
+    pub(crate) fn shown(name: &str) -> String {
+        name.chars()
+            .filter(|character| !character.is_control() && !is_invisible(*character))
+            .collect()
+    }
+
     /// Removes `thread`'s record, if any.
     pub(crate) fn remove(store: &Store, thread: ThreadId) -> io::Result<()> {
         match fs::remove_file(path(store, thread)) {
@@ -118,5 +129,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(BranchRecord::read(&store, thread), None);
+        fs::write(
+            &path,
+            "remote up\nbranch mahi/a\u{202e}b\ntip 0123456789abcdef0123456789abcdef01234567\nlanding main\n",
+        )
+        .unwrap();
+        let record = BranchRecord::read(&store, thread).unwrap();
+        assert_eq!(record.branch, "mahi/a\u{202e}b");
+        assert_eq!(BranchRecord::shown(&record.branch), "mahi/ab");
     }
 }

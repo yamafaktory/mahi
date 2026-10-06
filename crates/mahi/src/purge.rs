@@ -358,7 +358,8 @@ fn unmerged_work(store: &Store, thread: ThreadId) -> Option<String> {
         format!(
             "warning: the work last pushed on {} is not in {} here (a squash merge looks like \
              this too), so this thread may hold the only copy of it",
-            record.branch, record.landing
+            BranchRecord::shown(&record.branch),
+            BranchRecord::shown(&record.landing)
         )
     })
 }
