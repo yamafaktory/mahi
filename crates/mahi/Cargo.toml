@@ -17,6 +17,7 @@ assets = [
 conf-files = ["/etc/apparmor.d/usr.bin.mahi"]
 breaks = "apparmor (<< 4.0~)"
 depends = "$auto"
+license-file = ["../../LICENSE", "0"]
 extended-description = "mahi runs a terminal coding agent in a sandbox and shares its thread with teammates in real time. The package installs an AppArmor profile that lets /usr/bin/mahi create the user namespaces its sandbox needs and confines it in no other way."
 maintainer-scripts = "../../packaging/deb/"
 priority = "optional"
