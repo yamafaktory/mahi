@@ -58,6 +58,7 @@ use mahi_core::{
     is_invisible,
 };
 use mahi_crypto::ThreadKey;
+use mahi_identity::ConfigDir;
 use mahi_live::{
     PromptOutcome,
     PromptText,
@@ -95,6 +96,7 @@ use crate::{
     },
     merged::MergedFrom,
     prompts::Prompts,
+    thread_lock::RunningLock,
 };
 
 const MOST_CONNECTIONS: usize = 4;
@@ -284,6 +286,7 @@ pub(crate) fn push_clean(out: &mut String, text: &str) {
 #[derive(Debug)]
 pub(crate) struct ThreadTools {
     git_dir: PathBuf,
+    config: ConfigDir,
     thread: ThreadId,
     owner: ParticipantKey,
     key: Option<Arc<ThreadKey>>,
@@ -307,16 +310,18 @@ fn failed(error: &dyn std::error::Error) -> ToolError {
 
 impl ThreadTools {
     /// Returns the tools of the agent `me` in `thread`, whose `meta` is `owner`'s and whose
-    /// records `key` opens, in the repository at `git_dir`; the merges it asks for wait in
+    /// records `key` opens, in the repository at `git_dir`, for the user whose mahi
+    /// configuration is `config`; the merges it asks for wait in
     /// `prompts`, the palette's, when the user can accept them, and its claims are kept in
     /// `claims`.
     pub(crate) fn new(
-        git_dir: PathBuf,
+        (git_dir, config): (PathBuf, ConfigDir),
         (thread, owner, key): (ThreadId, ParticipantKey, Option<Arc<ThreadKey>>),
         (me, prompts, claims): (AgentSlot, Option<Arc<Prompts>>, Arc<Claims>),
     ) -> Self {
         Self {
             git_dir,
+            config,
             thread,
             owner,
             key,
@@ -380,7 +385,9 @@ impl ThreadTools {
             self.thread, self.me
         );
         let listed = view.listed.iter().map(|(name, _, owner)| (name, *owner));
-        push_agents(&mut text, listed, &agents, &self.me);
+        let mut looker = RunningLock::looker(&self.config);
+        let running = |agent: &AgentName| looker.runs(self.thread, agent).unwrap_or(false);
+        push_agents(&mut text, listed, &agents, (&self.me, running));
         push_claims(&mut text, &self.claims.all(&self.me));
         Ok(cleaned(&text))
     }
@@ -684,7 +691,8 @@ impl Toolbox for ThreadTools {
                 name: "list_agents",
                 description: "Lists the thread's participants and their agents that have \
                               snapshots here, as <participant>.<agent>, marking which one you \
-                              are, and the claims.",
+                              are and which of your user's other agents run on this machine, \
+                              and the claims.",
                 input_schema: json!({ "type": "object", "properties": {} }),
             },
             Tool {
@@ -785,7 +793,7 @@ fn push_agents<'a>(
     text: &mut String,
     listed: impl Iterator<Item = (&'a ParticipantName, bool)>,
     agents: &BTreeMap<ParticipantName, Vec<AgentName>>,
-    me: &AgentSlot,
+    (me, mut running_here): (&AgentSlot, impl FnMut(&AgentName) -> bool),
 ) {
     let mut any_missing = false;
     for (name, owner) in listed {
@@ -802,8 +810,12 @@ fn push_agents<'a>(
             Some(names) => {
                 for agent in names {
                     let _ = write!(text, " {name}.{agent}");
-                    if name == me.participant() && agent == me.agent() {
-                        text.push_str(" (you)");
+                    if name == me.participant() {
+                        if agent == me.agent() {
+                            text.push_str(" (you)");
+                        } else if running_here(agent) {
+                            text.push_str(" (running here)");
+                        }
                     }
                 }
             }
@@ -831,11 +843,12 @@ mod tests {
         let me = AgentSlot::new(alice.clone(), claude.clone());
         let agents = BTreeMap::from([(alice.clone(), vec![claude])]);
         let mut text = String::new();
+        let nowhere = |_: &AgentName| false;
         push_agents(
             &mut text,
             [(&alice, true), (&bob, false)].into_iter(),
             &agents,
-            &me,
+            (&me, nowhere),
         );
         assert_eq!(
             text,
@@ -846,8 +859,43 @@ mod tests {
              thread is fetched from its remote.\n"
         );
         text.clear();
-        push_agents(&mut text, [(&alice, true)].into_iter(), &agents, &me);
+        push_agents(
+            &mut text,
+            [(&alice, true)].into_iter(),
+            &agents,
+            (&me, nowhere),
+        );
         assert_eq!(text, "- alice (owner): alice.claude (you)\n");
+    }
+
+    #[test]
+    fn the_users_other_agents_are_marked_when_they_run_here() {
+        let alice = ParticipantName::new("alice").unwrap();
+        let bob = ParticipantName::new("bob").unwrap();
+        let claude = AgentName::new("claude").unwrap();
+        let codex = AgentName::new("codex").unwrap();
+        let aider = AgentName::new("aider").unwrap();
+        let me = AgentSlot::new(alice.clone(), claude.clone());
+        let agents = BTreeMap::from([
+            (
+                alice.clone(),
+                vec![aider.clone(), claude.clone(), codex.clone()],
+            ),
+            (bob.clone(), vec![codex.clone()]),
+        ]);
+        let running = |agent: &AgentName| *agent == codex || *agent == claude;
+        let mut text = String::new();
+        push_agents(
+            &mut text,
+            [(&alice, true), (&bob, false)].into_iter(),
+            &agents,
+            (&me, running),
+        );
+        assert_eq!(
+            text,
+            "- alice (owner): alice.aider alice.claude (you) alice.codex (running here)\n\
+             - bob: bob.codex\n"
+        );
     }
 
     struct Echo;

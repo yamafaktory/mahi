@@ -261,6 +261,7 @@ use crate::{
     thread_lock::{
         AgentLock,
         LockError,
+        RunningLock,
         ThreadLock,
     },
     turns::{
@@ -1329,6 +1330,8 @@ impl Prepared {
             credentials: &self.credentials,
         };
         let (sandbox, network) = (self.sandbox, self.network);
+        let (config, _running) = mark_running(environment, &started)
+            .inspect_err(|_| started.discard_or_report(&self.store))?;
         let door = open_door(environment, &started);
         let live = start_live(self.live.take(), &self.git_dir, &started);
         let launched = started.launch(&self.store, || launch.spawn(sandbox, network));
@@ -1365,7 +1368,7 @@ impl Prepared {
         let (tools, prompts) = serve_tools(
             self.mcp,
             (self.owner, key, live.as_ref(), can_merge),
-            &self.git_dir,
+            (&self.git_dir, config),
             &started,
         );
         let merging = Merging::open(door, recorder.as_ref(), &started);
@@ -1393,6 +1396,20 @@ impl Prepared {
     }
 }
 
+/// Takes the lock that tells the user's other mahis that `started`'s agent runs here, with the
+/// user's configuration directory it is in.
+fn mark_running(
+    environment: &Environment,
+    started: &Started,
+) -> Result<(ConfigDir, RunningLock), RunError> {
+    let config = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )?;
+    let running = RunningLock::acquire(&config, started.thread, started.slot.agent())?;
+    Ok((config, running))
+}
+
 /// Splits the agent's `arguments` before the first `--`, after which the agent takes no
 /// options.
 fn split_at_separator(arguments: &[OsString]) -> (&[OsString], &[OsString]) {
@@ -1415,7 +1432,7 @@ fn serve_tools(
         Option<&Link>,
         bool,
     ),
-    git_dir: &Path,
+    (git_dir, config): (&Path, ConfigDir),
     started: &Started,
 ) -> (Arc<AtomicBool>, Arc<Prompts>) {
     let serving = Arc::new(AtomicBool::new(true));
@@ -1426,7 +1443,7 @@ fn serve_tools(
         return (serving, prompts);
     };
     let tools = ThreadTools::new(
-        git_dir.to_path_buf(),
+        (git_dir.to_path_buf(), config),
         (started.thread, owner, key),
         (
             started.slot.clone(),

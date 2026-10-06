@@ -1654,6 +1654,59 @@ call() {
         assert_eq!(replies[&5]["error"]["code"], -32602);
     }
 
+    const LISTER: &str = r#"#!/bin/sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_agents"}}' \
+  | "$MAHI_BIN" mcp
+"#;
+
+    #[test]
+    fn list_agents_marks_the_users_other_agents_that_run_on_this_machine() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let waiter = script(
+            &fixture,
+            "waiting",
+            "aider",
+            "#!/bin/sh\necho aider started\nwhile [ ! -e stop ]; do sleep 0.1; done\n",
+        );
+        let mut aider = Session::start(
+            &fixture,
+            &["agent", "add", &thread, "--", waiter.to_str().unwrap()],
+        );
+        aider.wait_for("Passphrase");
+        aider.type_keys(format!("{PASSPHRASE}\n").as_bytes());
+        aider.wait_for("aider started");
+        let lister = script(&fixture, "listing", "codex", LISTER);
+        let (code, output) = in_terminal(
+            &fixture,
+            &["agent", "add", &thread, "--", lister.to_str().unwrap()],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        let reply: serde_json::Value = output
+            .lines()
+            .filter_map(|line| line.find("{\"jsonrpc\"").and_then(|at| line.get(at..)))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+            .find(|reply| reply["id"] == 1)
+            .unwrap();
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(
+                "- tester (owner): tester.aider (running here) tester.claude tester.codex (you)"
+            ),
+            "{text}"
+        );
+        fs::write(
+            worktree_named(&fixture, &format!("{thread}.aider")).join("stop"),
+            "",
+        )
+        .unwrap();
+        let (code, text) = aider.finish();
+        assert_eq!(code, 0, "{text}");
+    }
+
     const ASKER: &str = r#"#!/bin/sh
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \

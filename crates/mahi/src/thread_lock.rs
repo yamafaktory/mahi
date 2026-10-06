@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     io,
     os::fd::OwnedFd,
     path::{
@@ -54,6 +55,13 @@ pub(crate) struct AgentLock {
 pub(crate) struct LandLock {
     _thread: Held,
     _land: Held,
+}
+
+/// The lock a mahi holds alone while its agent runs, so the user's other mahis can tell the
+/// agent runs on this machine by looking at it shared, without taking a lock the agent needs.
+#[derive(Debug)]
+pub(crate) struct RunningLock {
+    _held: Held,
 }
 
 /// The lock the mahi hosting a thread's live layer holds, alone, while it hosts: the user's
@@ -132,6 +140,68 @@ impl LiveLock {
     }
 }
 
+impl RunningLock {
+    /// Takes `agent`'s running lock in `thread` alone, waiting while another mahi looks at it.
+    pub(crate) fn acquire(
+        config: &ConfigDir,
+        thread: ThreadId,
+        agent: &AgentName,
+    ) -> Result<Self, LockError> {
+        let directory = locks_dir(config)?;
+        Held::take_with(
+            &directory.join(running_name(thread, agent)),
+            FlockOperation::LockExclusive,
+        )?
+        .map(|held| Self { _held: held })
+        .ok_or_else(|| LockError::AgentBusy(thread, agent.clone()))
+    }
+
+    /// Returns a way to look at the running locks of the user whose configuration is `config`.
+    pub(crate) fn looker(config: &ConfigDir) -> RunningLooker {
+        RunningLooker {
+            path: config.path().join(LOCKS),
+            name: String::new(),
+        }
+    }
+}
+
+/// Looks at the running locks of the user's agents, reusing its buffers from one look to the
+/// next.
+#[derive(Debug)]
+pub(crate) struct RunningLooker {
+    path: PathBuf,
+    name: String,
+}
+
+impl RunningLooker {
+    /// Returns whether a mahi of the user runs `agent` in `thread` on this machine now.
+    pub(crate) fn runs(&mut self, thread: ThreadId, agent: &AgentName) -> io::Result<bool> {
+        self.name.clear();
+        let _ = write!(self.name, "{thread}.{agent}@running");
+        self.path.push(&self.name);
+        let opened = rustix::fs::open(
+            &self.path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        );
+        self.path.pop();
+        let file = match opened {
+            Ok(file) => file,
+            Err(Errno::NOENT) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        match rustix::fs::flock(&file, FlockOperation::NonBlockingLockShared) {
+            Ok(()) => Ok(false),
+            Err(Errno::WOULDBLOCK) => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+fn running_name(thread: ThreadId, agent: &AgentName) -> String {
+    format!("{thread}.{agent}@running")
+}
+
 fn live_name(thread: ThreadId) -> String {
     format!("{thread}@live")
 }
@@ -183,6 +253,10 @@ impl Held {
         } else {
             FlockOperation::NonBlockingLockShared
         };
+        Self::take_with(path, operation)
+    }
+
+    fn take_with(path: &Path, operation: FlockOperation) -> Result<Option<Self>, LockError> {
         for _ in 0..ATTEMPTS {
             let file = rustix::fs::open(
                 path,
@@ -190,10 +264,13 @@ impl Held {
                 Mode::from_raw_mode(0o600),
             )
             .map_err(io::Error::from)?;
-            match rustix::fs::flock(&file, operation) {
-                Ok(()) => {}
-                Err(Errno::WOULDBLOCK) => return Ok(None),
-                Err(error) => return Err(io::Error::from(error).into()),
+            loop {
+                match rustix::fs::flock(&file, operation) {
+                    Ok(()) => break,
+                    Err(Errno::INTR) => {}
+                    Err(Errno::WOULDBLOCK) => return Ok(None),
+                    Err(error) => return Err(io::Error::from(error).into()),
+                }
             }
             let held = Self {
                 file,
@@ -265,6 +342,47 @@ mod tests {
         stale.remove().unwrap();
         assert!(path.exists());
         drop(fresh);
+    }
+
+    #[test]
+    fn a_running_agent_is_seen_by_others_until_it_stops_and_a_look_never_turns_it_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ConfigDir::resolve(Some(dir.path()), Some(dir.path())).unwrap();
+        let thread = ThreadId::random().unwrap();
+        let claude = AgentName::new("claude").unwrap();
+        let codex = AgentName::new("codex").unwrap();
+        let mut looker = RunningLock::looker(&config);
+        assert!(!looker.runs(thread, &claude).unwrap());
+
+        let running = RunningLock::acquire(&config, thread, &claude).unwrap();
+        assert!(looker.runs(thread, &claude).unwrap());
+        assert!(looker.runs(thread, &claude).unwrap());
+        assert!(!looker.runs(thread, &codex).unwrap());
+        drop(running);
+        assert!(!looker.runs(thread, &claude).unwrap());
+
+        let path = config
+            .path()
+            .join(LOCKS)
+            .join(running_name(thread, &claude));
+        let looking = rustix::fs::open(&path, OFlags::RDONLY, Mode::empty()).unwrap();
+        rustix::fs::flock(&looking, FlockOperation::LockShared).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let starting = config.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(RunningLock::acquire(&starting, thread, &claude).is_ok());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(looking);
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+        );
+
+        let ending = ThreadLock::acquire(&config, thread).unwrap();
+        ending.remove().unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
