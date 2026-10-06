@@ -523,16 +523,55 @@ mod tests {
     }
 
     #[test]
-    fn output_written_just_before_exit_is_read_after_the_program_is_reaped() {
-        for _ in 0..20 {
-            let mut child = sh("echo last words").spawn().unwrap();
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while child.try_wait().unwrap().is_none() {
-                assert!(std::time::Instant::now() < deadline, "the program exits");
-                thread::sleep(Duration::from_millis(5));
+    fn probe_concurrent_reader_timing() {
+        use std::time::Instant;
+        let mut lost = 0;
+        let mut eof_after_exit = Vec::new();
+        let mut never = 0;
+        for round in 0..200 {
+            let script = if round % 2 == 0 { "echo last words" } else { "exec cat /etc/hosts; " };
+            let mut child = sh(script).spawn().unwrap();
+            let mut reader = child.reader().unwrap();
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let mut output = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => output.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let _ = sender.send((Instant::now(), output));
+            });
+            let mut exited = None;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while exited.is_none() && Instant::now() < deadline {
+                if child.try_wait().unwrap().is_some() {
+                    exited = Some(Instant::now());
+                }
+                thread::sleep(Duration::from_millis(1));
             }
-            assert!(output_of(&child).contains("last words"));
+            let exited = exited.expect("exit");
+            match receiver.recv_timeout(Duration::from_secs(5)) {
+                Ok((at, output)) => {
+                    eof_after_exit.push(at.saturating_duration_since(exited).as_millis());
+                    let want: &[u8] = if round % 2 == 0 { b"last words" } else { b"localhost" };
+                    if !output.windows(want.len()).any(|w| w == want) {
+                        lost += 1;
+                    }
+                }
+                Err(_) => never += 1,
+            }
         }
+        eof_after_exit.sort_unstable();
+        panic!(
+            "lost={lost} never_eof={never} eof_after_exit_ms min={:?} p50={:?} p99={:?} max={:?}",
+            eof_after_exit.first(),
+            eof_after_exit.get(eof_after_exit.len() / 2),
+            eof_after_exit.get(eof_after_exit.len() * 99 / 100),
+            eof_after_exit.last()
+        );
     }
 
     #[test]
