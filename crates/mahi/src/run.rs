@@ -24,8 +24,14 @@ use std::{
             OpenOptionsExt,
             PermissionsExt,
         },
-        io::OwnedFd,
-        net::UnixListener,
+        io::{
+            AsFd,
+            OwnedFd,
+        },
+        net::{
+            UnixListener,
+            UnixStream,
+        },
     },
     path::{
         Path,
@@ -123,6 +129,11 @@ use mahi_thread::{
     load_meta,
 };
 use rustix::{
+    event::{
+        PollFd,
+        PollFlags,
+        Timespec,
+    },
     fs::{
         FileType,
         Mode,
@@ -198,6 +209,7 @@ use crate::{
         Running,
     },
     palette::{
+        AgentTerminal,
         Repainter,
         Screen,
     },
@@ -292,6 +304,7 @@ const PRIVATE_ON_SYSTEM: [&str; 3] = ["/run", "/private/var/run", "/private/tmp"
 const OUTPUT_GRACE: Duration = Duration::from_millis(500);
 const OUTPUT_LIMIT: Duration = Duration::from_secs(5);
 const EXIT_POLL: Duration = Duration::from_millis(50);
+const DRAIN_CHUNKS: usize = 16;
 const STOP_POLL: Duration = Duration::from_millis(50);
 const KILL_GRACE: Duration = Duration::from_secs(2);
 const PALETTE_WAIT: Duration = Duration::from_millis(200);
@@ -2245,6 +2258,7 @@ fn relay(
     tap: Option<OutputTap>,
     (prompts, merging, merger): (Option<Arc<Prompts>>, Option<Merging>, Option<Merger>),
 ) -> Result<Outcome, RunError> {
+    let (stop, stopped) = UnixStream::pair().map_err(RunError::Output)?;
     let writer = Arc::new(Mutex::new(child.writer()?));
     let repainter = Repainter::new(child.resizer()?);
     let screen = Arc::new(Screen::new(
@@ -2318,7 +2332,7 @@ fn relay(
     let (output_screen, output_activity) = (Arc::clone(&screen), Arc::clone(activity));
     thread::spawn(move || {
         let ended = copy_output(
-            &mut reader,
+            (&mut reader, &stopped),
             &output_progress,
             tap.as_ref(),
             (&output_screen, &output_activity),
@@ -2330,7 +2344,7 @@ fn relay(
     thread::spawn(move || {
         let _ = events.send(Event::Exited(wait_for(&waited)));
     });
-    let outcome = await_outcome(&child, received, &progress);
+    let outcome = await_outcome(&child, received, (&progress, stop));
     running.store(false, Ordering::SeqCst);
     merge_server.stop();
     let _ = screen.close();
@@ -2356,14 +2370,14 @@ fn arrival_text(arrival: &Arrival, key: PaletteKey, out: &mut String) {
 fn await_outcome(
     child: &Mutex<PtyChild>,
     received: &Receiver<Event>,
-    progress: &AtomicU64,
+    (progress, stop): (&AtomicU64, UnixStream),
 ) -> Result<Outcome, RunError> {
     let mut output_done = false;
     loop {
         match received.recv() {
             Ok(Event::Exited(code)) if output_done => return Ok(Outcome::Exited(code?)),
             Ok(Event::Exited(code)) => {
-                return finish_output(received, progress, code?);
+                return finish_output(received, (progress, stop), code?);
             }
             Ok(Event::OutputEnded(Ok(()))) => output_done = true,
             Ok(Event::OutputEnded(Err(error))) => {
@@ -2372,6 +2386,7 @@ fn await_outcome(
             }
             Ok(Event::Stopped(signal)) => {
                 kill(child);
+                drop(stop);
                 if !output_done {
                     await_output_end(received);
                 }
@@ -2413,15 +2428,20 @@ fn wait_for(child: &Mutex<PtyChild>) -> Result<i32, PtyError> {
 
 fn finish_output(
     received: &Receiver<Event>,
-    progress: &AtomicU64,
+    (progress, stop): (&AtomicU64, UnixStream),
     code: i32,
 ) -> Result<Outcome, RunError> {
     let exited = Ok(Outcome::Exited(code));
+    let give_up = |stop: UnixStream| {
+        drop(stop);
+        await_output_end(received);
+        Ok(Outcome::Exited(code))
+    };
     let mut seen = progress.load(Ordering::Relaxed);
     let deadline = Instant::now() + OUTPUT_LIMIT;
     loop {
         if Instant::now() > deadline {
-            return exited;
+            return give_up(stop);
         }
         match received.recv_timeout(OUTPUT_GRACE) {
             Ok(Event::OutputEnded(Err(error))) => {
@@ -2435,7 +2455,7 @@ fn finish_output(
             Err(RecvTimeoutError::Timeout) => {
                 let now = progress.load(Ordering::Relaxed);
                 if now == seen {
-                    return exited;
+                    return give_up(stop);
                 }
                 seen = now;
             }
@@ -2452,23 +2472,94 @@ fn output_failure(error: io::Error) -> Result<i32, RunError> {
 }
 
 fn copy_output(
-    reader: &mut impl Read,
+    (reader, stop): (&mut (impl Read + AsFd), &UnixStream),
     progress: &AtomicU64,
     tap: Option<&OutputTap>,
-    (screen, activity): (&UserScreen, &Activity),
+    screen: (&Screen<impl Write, impl AgentTerminal>, &Activity),
 ) -> io::Result<()> {
     let mut buffer = [0_u8; 8192];
     loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return screen.close();
+        match wait_for_output(reader, stop)? {
+            Ready::Output => {
+                if !copy_chunk(reader, &mut buffer, (progress, tap, screen))? {
+                    return screen.0.close();
+                }
+            }
+            Ready::Stop => {
+                for _ in 0..DRAIN_CHUNKS {
+                    if !(output_waiting(reader)?
+                        && copy_chunk(reader, &mut buffer, (progress, tap, screen))?)
+                    {
+                        break;
+                    }
+                }
+                return screen.0.close();
+            }
         }
-        activity.touched();
-        screen.output(&buffer[..read])?;
-        if let Some(tap) = tap {
-            tap.output(&buffer[..read]);
+    }
+}
+
+fn copy_chunk(
+    reader: &mut impl Read,
+    buffer: &mut [u8],
+    (progress, tap, (screen, activity)): (
+        &AtomicU64,
+        Option<&OutputTap>,
+        (&Screen<impl Write, impl AgentTerminal>, &Activity),
+    ),
+) -> io::Result<bool> {
+    let read = reader.read(buffer)?;
+    let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
+        return Ok(false);
+    };
+    activity.touched();
+    screen.output(chunk)?;
+    if let Some(tap) = tap {
+        tap.output(chunk);
+    }
+    progress.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
+}
+
+enum Ready {
+    Output,
+    Stop,
+}
+
+fn wait_for_output(reader: &impl AsFd, stop: &UnixStream) -> io::Result<Ready> {
+    loop {
+        let mut fds = [
+            PollFd::new(reader, PollFlags::IN),
+            PollFd::new(stop, PollFlags::IN),
+        ];
+        match rustix::event::poll(&mut fds, None) {
+            Ok(_) => {
+                let [output, stop] = &fds;
+                if !stop.revents().is_empty() {
+                    return Ok(Ready::Stop);
+                }
+                if !output.revents().is_empty() {
+                    return Ok(Ready::Output);
+                }
+            }
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
         }
-        progress.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn output_waiting(reader: &impl AsFd) -> io::Result<bool> {
+    let now = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    loop {
+        let mut fds = [PollFd::new(reader, PollFlags::IN)];
+        match rustix::event::poll(&mut fds, Some(&now)) {
+            Ok(ready) => return Ok(ready > 0),
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 
@@ -2860,6 +2951,71 @@ fn read_draft(directory: &OwnedFd) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StillTerminal;
+
+    impl AgentTerminal for StillTerminal {
+        fn size(&self) -> mahi_sandbox::WindowSize {
+            mahi_sandbox::WindowSize { rows: 24, cols: 80 }
+        }
+
+        fn repaint(&self) {}
+    }
+
+    struct StallingOnce {
+        written: Arc<Mutex<Vec<u8>>>,
+        stall: Option<Duration>,
+    }
+
+    impl Write for StallingOnce {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(stall) = self.stall.take() {
+                thread::sleep(stall);
+            }
+            self.written.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn output_already_read_when_waiting_for_the_terminal_ends_is_still_shown() {
+        let (mut agent, mut terminal) = UnixStream::pair().unwrap();
+        let (stop, stopped) = UnixStream::pair().unwrap();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let screen = Screen::new(
+            StallingOnce {
+                written: Arc::clone(&written),
+                stall: Some(OUTPUT_GRACE * 3),
+            },
+            StillTerminal,
+            PaletteKey::default(),
+            None,
+        );
+        let progress = Arc::new(AtomicU64::new(0));
+        let (events, received) = mpsc::channel();
+        let copied = Arc::clone(&progress);
+        agent.write_all(b"first ").unwrap();
+        thread::spawn(move || {
+            let ended = copy_output(
+                (&mut terminal, &stopped),
+                &copied,
+                None,
+                (&screen, &Activity::default()),
+            );
+            let _ = events.send(Event::OutputEnded(ended));
+        });
+        thread::sleep(Duration::from_millis(100));
+        agent.write_all(b"last words").unwrap();
+
+        let outcome = finish_output(&received, (&progress, stop), 0).unwrap();
+
+        assert_eq!(outcome, Outcome::Exited(0));
+        assert_eq!(*written.lock().unwrap(), b"first last words");
+    }
 
     fn executable(path: &Path) {
         fs::write(path, "#!/bin/sh\n").unwrap();
