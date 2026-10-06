@@ -83,6 +83,13 @@ pub fn names(data: &[u8]) {
     if snapshot::safe_name(data) {
         assert!(harmless(data), "{:?}", data.as_bstr());
     }
+    if snapshot::safe_link_name(data) {
+        assert!(
+            harmless(data) && !data.eq_ignore_ascii_case(b".gitmodules"),
+            "{:?}",
+            data.as_bstr()
+        );
+    }
     let blob = (
         EntryKind::Blob.into(),
         ObjectId::null(gix::hash::Kind::Sha1),

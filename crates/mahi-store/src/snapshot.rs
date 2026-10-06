@@ -126,7 +126,8 @@ pub enum Skipped {
     /// The file cannot be converted as its `.gitattributes` ask, such as an invalid
     /// `working-tree-encoding`.
     Unconvertible,
-    /// The name is one git refuses to check out, such as `.GIT` or `git~1`.
+    /// The name is one git refuses to check out, such as `.GIT` or `git~1`, or a symbolic link
+    /// named `.gitmodules`, which git refuses to accept.
     UnsafeName,
     /// A `.gitignore` or `.gitattributes` that is not a regular file, such as a symbolic link.
     NotAFile,
@@ -660,6 +661,10 @@ impl<'a> Walk<'a> {
                 if tracked.is_none() && (dir_ignored || self.is_ignored(rela.as_bstr(), false)) {
                     return Ok(Step::Nothing);
                 }
+                if !safe_link_name(&filename) {
+                    self.skipped.push((rela, Skipped::UnsafeName));
+                    return Ok(Step::Nothing);
+                }
                 let id = self.repo.write_blob(&target)?.detach();
                 Ok(entry(EntryKind::Link, id))
             }
@@ -908,10 +913,18 @@ fn join(dir: &BString, name: &[u8]) -> BString {
 }
 
 pub(crate) fn safe_name(name: &[u8]) -> bool {
+    safe_as(name, None)
+}
+
+pub(crate) fn safe_link_name(name: &[u8]) -> bool {
+    safe_as(name, Some(gix_validate::path::component::Mode::Symlink))
+}
+
+fn safe_as(name: &[u8], mode: Option<gix_validate::path::component::Mode>) -> bool {
     !name.contains(&0)
         && gix_validate::path::component(
             name.as_bstr(),
-            None,
+            mode,
             gix_validate::path::component::Options {
                 protect_windows: false,
                 ..gix_validate::path::component::Options::default()
@@ -1690,6 +1703,30 @@ mod tests {
         assert!(safe_name(b"notes"));
         assert!(!safe_name(b"\0{{{"));
         assert!(!safe_name(b"notes\0"));
+    }
+
+    #[test]
+    fn a_symbolic_link_named_gitmodules_is_left_out_but_a_file_so_named_is_kept() {
+        let setup = setup();
+        let path = checkout(&setup, default_base(&setup.store));
+        std::os::unix::fs::symlink("elsewhere", path.join(".GitModules")).unwrap();
+        fs::create_dir(path.join("nested")).unwrap();
+        fs::write(path.join("nested/.gitmodules"), b"[submodule]").unwrap();
+        std::os::unix::fs::symlink("target", path.join("nested/link")).unwrap();
+        let snapshot = snapshot(&setup);
+        assert_eq!(
+            snapshot.skipped,
+            [(BString::from(".GitModules"), Skipped::UnsafeName)]
+        );
+        let names = only_names(&setup.store, snapshot.tree);
+        assert!(!names.iter().any(|name| name == ".GitModules"), "{names:?}");
+        assert!(
+            names.contains(&"nested/.gitmodules".to_owned())
+                && names.contains(&"nested/link".to_owned()),
+            "{names:?}"
+        );
+        assert!(safe_name(b".gitmodules") && !safe_link_name(b".gitmodules"));
+        assert!(!safe_link_name(b"GITMOD~1") && safe_link_name(b"link"));
     }
 
     #[test]
