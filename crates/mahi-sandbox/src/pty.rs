@@ -91,6 +91,7 @@ pub struct PtyChild {
     master: File,
     child: Child,
     loopback: Option<TcpListener>,
+    terminal: Option<OwnedFd>,
 }
 
 /// Starting or driving a program in a pseudo-terminal failed.
@@ -176,11 +177,11 @@ impl PtyCommand {
             .spawn()
             .map_err(|error| PtyError::Spawn(self.program.clone(), error))?;
         drop(command);
-        drop(slave);
         PtyChild {
             master: File::from(master),
             child,
             loopback: None,
+            terminal: Some(slave),
         }
         .with_loopback(receiver)
         .map_err(|error| PtyError::Spawn(self.program.clone(), error))
@@ -338,6 +339,11 @@ impl PtyChild {
     #[must_use]
     pub fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Closes mahi's own copy of the terminal.
+    pub fn release_terminal(&mut self) {
+        self.terminal = None;
     }
 
     /// Returns a handle to read what the program writes to its terminal.
