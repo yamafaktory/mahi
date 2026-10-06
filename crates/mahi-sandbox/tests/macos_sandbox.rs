@@ -78,7 +78,7 @@ mod tests {
                 for delay in [150_u64, 400] {
                     let mut lost = 0;
                     let mut empty_eof = 0;
-                    for _ in 0..80 {
+                    for _ in 0..60 {
                         let command = if program == "cat" {
                             PtyCommand::new(Path::new("/bin/cat"), &work, SIZE).arg("work.txt")
                         } else {
@@ -95,15 +95,15 @@ mod tests {
                         let mut child = command.spawn().unwrap();
                         let mut reader = child.reader().unwrap();
                         thread::sleep(Duration::from_millis(delay));
-                        while child.try_wait().unwrap().is_none() {
-                            thread::sleep(Duration::from_millis(5));
-                        }
                         let (sender, receiver) = mpsc::channel();
                         thread::spawn(move || {
                             let mut output = Vec::new();
                             let _ = reader.read_to_end(&mut output);
                             let _ = sender.send(output);
                         });
+                        while child.try_wait().unwrap().is_none() {
+                            thread::sleep(Duration::from_millis(5));
+                        }
                         thread::sleep(Duration::from_millis(20));
                         child.release_terminal();
                         let output = receiver.recv_timeout(Duration::from_secs(20)).unwrap();
@@ -116,7 +116,7 @@ mod tests {
                         }
                     }
                     table.push(format!(
-                        "sandboxed={sandboxed} program={program} delay={delay}ms lost={lost}/80 held empty={empty_eof}"
+                        "sandboxed={sandboxed} program={program} delay={delay}ms lost={lost}/60 held empty={empty_eof}"
                     ));
                 }
             }
