@@ -62,7 +62,11 @@ impl PublicIdentity {
     /// does not hold exactly one age X25519 recipient, or another [`IdentityError`] if it
     /// cannot be read.
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
-        single_line(&private_file::read(path, MAX_PUBLIC_BYTES)?)?
+        Self::parse(&private_file::read(path, MAX_PUBLIC_BYTES)?)
+    }
+
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, IdentityError> {
+        single_line(bytes)?
             .parse()
             .map(Self)
             .map_err(|_| IdentityError::Malformed)
@@ -103,8 +107,11 @@ impl SigningKey {
     /// the key is not ed25519, [`IdentityError::Malformed`] if it is not a single OpenSSH public
     /// key line, or another [`IdentityError`] if it cannot be read.
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
-        let bytes = private_file::read(path, MAX_PUBLIC_BYTES)?;
-        let line = single_line(&bytes)?;
+        Self::parse(&private_file::read(path, MAX_PUBLIC_BYTES)?)
+    }
+
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, IdentityError> {
+        let line = single_line(bytes)?;
         let key = PublicKey::from_openssh(line).map_err(|_| IdentityError::Malformed)?;
         let key = Self::try_from(key)?;
         let written = key.0.to_openssh().map_err(|_| IdentityError::Malformed)?;

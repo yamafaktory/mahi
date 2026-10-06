@@ -228,3 +228,17 @@ path = "fuzz_targets/tls_verify.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "key-files"
+path = "fuzz_targets/key_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "identity-file"
+path = "fuzz_targets/identity_file.rs"
+test = false
+doc = false
+bench = false

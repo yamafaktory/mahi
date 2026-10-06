@@ -68,12 +68,18 @@ impl NodeKey {
     /// [`IdentityError::NotAFile`] if it or its directory is not private to the user, or
     /// [`IdentityError::Malformed`] if it does not hold exactly 32 bytes.
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
-        let bytes = Zeroizing::new(private_file::read(path, SECRET_BYTES as u64)?);
+        Self::parse(&Zeroizing::new(private_file::read(
+            path,
+            SECRET_BYTES as u64,
+        )?))
+    }
+
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, IdentityError> {
         let mut secret = Zeroizing::new([0_u8; SECRET_BYTES]);
         if bytes.len() != SECRET_BYTES {
             return Err(IdentityError::Malformed);
         }
-        secret.copy_from_slice(&bytes);
+        secret.copy_from_slice(bytes);
         Ok(Self(secret))
     }
 }

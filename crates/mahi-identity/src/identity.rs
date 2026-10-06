@@ -121,14 +121,22 @@ impl LocalIdentity {
         passphrase: &SecretString,
         work_factor: u8,
     ) -> Result<(), IdentityError> {
+        let encrypted = self.encrypt(passphrase, work_factor)?;
+        private_file::write_new(path, &encrypted)
+    }
+
+    pub(crate) fn encrypt(
+        &self,
+        passphrase: &SecretString,
+        work_factor: u8,
+    ) -> Result<Vec<u8>, IdentityError> {
         let mut recipient = scrypt::Recipient::new(passphrase.clone());
         recipient.set_work_factor(work_factor);
         let encryptor = Encryptor::with_recipients(iter::once(&recipient as &dyn age::Recipient))
             .map_err(|error| io::Error::other(error.to_string()))?;
         let mut writer = encryptor.wrap_output(Vec::new())?;
         writer.write_all(self.0.to_string().expose_secret().as_bytes())?;
-        let encrypted = writer.finish()?;
-        private_file::write_new(path, &encrypted)
+        Ok(writer.finish()?)
     }
 
     /// Reads the identity at `path` and decrypts it with `passphrase`.
@@ -140,10 +148,14 @@ impl LocalIdentity {
     /// private to the current user, [`IdentityError::WrongPassphrase`] if the passphrase is
     /// wrong, or another [`IdentityError`] if the file is malformed or unreadable.
     pub fn load(path: &Path, passphrase: &SecretString) -> Result<Self, IdentityError> {
-        let encrypted = private_file::read(path, MAX_FILE_BYTES)?;
+        Self::decrypt(&private_file::read(path, MAX_FILE_BYTES)?, passphrase)
+    }
 
-        let decryptor =
-            Decryptor::new(encrypted.as_slice()).map_err(|_| IdentityError::Malformed)?;
+    pub(crate) fn decrypt(
+        encrypted: &[u8],
+        passphrase: &SecretString,
+    ) -> Result<Self, IdentityError> {
+        let decryptor = Decryptor::new(encrypted).map_err(|_| IdentityError::Malformed)?;
         if !decryptor.is_scrypt() {
             return Err(IdentityError::Malformed);
         }
