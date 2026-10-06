@@ -5,7 +5,8 @@ Instructions for coding agents that work in this repository.
 ## Project
 
 mahi is a single Rust binary. It lets several engineers work together in real time with any
-terminal coding agent. Read [DESIGN.md](DESIGN.md) before you make a change. The design is the
+terminal coding agent. Its home is mahi.social, a domain the project owns: use it wherever mahi
+needs a domain or a URL of its own (website, documentation links, contact addresses). Read [DESIGN.md](DESIGN.md) before you make a change. The design is the
 specification. If a change goes against it, update the design in the same commit, or ask first.
 
 ## Toolchain
