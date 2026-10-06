@@ -133,6 +133,8 @@ impl Exec {
 impl ExecInput {
     /// Tells the command that its input has ended.
     ///
+    /// Succeeds when the command has already exited, because its input has ended then too.
+    ///
     /// # Errors
     ///
     /// Returns an error if the connection is gone or the host takes more than 5 minutes.

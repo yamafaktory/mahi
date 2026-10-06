@@ -679,7 +679,7 @@ impl Driver {
             Command::Eof { id, ack } => match self.slots.get_mut(&id) {
                 Some(slot) => slot.eof = Some(ack),
                 None => {
-                    let _ = ack.send(Err(io::ErrorKind::BrokenPipe.into()));
+                    let _ = ack.send(Ok(()));
                 }
             },
             Command::Consumed { id, count } => {
@@ -728,7 +728,7 @@ impl Driver {
                         let _ = ack.send(Err(io::ErrorKind::BrokenPipe.into()));
                     }
                     if let Some(ack) = slot.eof.take() {
-                        let _ = ack.send(Err(io::ErrorKind::BrokenPipe.into()));
+                        let _ = ack.send(Ok(()));
                     }
                     return Ok(());
                 }
@@ -742,11 +742,8 @@ impl Driver {
         }
         if let Some(ack) = slot.eof.take() {
             match self.connection.send_eof(&mut self.wire.transport, id) {
-                Ok(()) => {
+                Ok(()) | Err(ChannelError::Closed | ChannelError::UnknownChannel) => {
                     let _ = ack.send(Ok(()));
-                }
-                Err(ChannelError::Closed | ChannelError::UnknownChannel) => {
-                    let _ = ack.send(Err(io::ErrorKind::BrokenPipe.into()));
                 }
                 Err(error) => return Err(reason(error)),
             }
@@ -810,6 +807,9 @@ impl Driver {
                     }
                     for (_, ack) in slot.input.drain(..) {
                         let _ = ack.send(Err(io::ErrorKind::BrokenPipe.into()));
+                    }
+                    if let Some(ack) = slot.eof.take() {
+                        let _ = ack.send(Ok(()));
                     }
                 }
             }
@@ -1491,6 +1491,29 @@ mod tests {
         let mut said = String::new();
         output.read_to_string(&mut said).unwrap();
         assert_eq!(said, "still here");
+    }
+
+    #[test]
+    fn ending_the_input_of_a_command_that_already_exited_succeeds_and_its_status_comes_back() {
+        let (key, public) = user();
+        let fixture = fixture(&public, key);
+        let session = fixture.session();
+        let (mut output, mut input) = fixture.exec(&session, "exit 3").unwrap().split();
+        let error = output.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(
+            *error
+                .into_inner()
+                .unwrap()
+                .downcast::<RemoteFailure>()
+                .unwrap(),
+            RemoteFailure::Status(3)
+        );
+        input.finish().unwrap();
+        input.finish().unwrap();
+        assert_eq!(
+            input.write_all(b"late").unwrap_err().kind(),
+            ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
