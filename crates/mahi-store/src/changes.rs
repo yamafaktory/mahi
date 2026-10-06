@@ -74,6 +74,7 @@ type Entries = BTreeMap<Vec<u8>, (EntryMode, ObjectId)>;
 struct Counted {
     files: usize,
     bytes: u64,
+    dirs: usize,
     height: usize,
 }
 
@@ -114,12 +115,13 @@ impl Store {
         Ok(walk.changes)
     }
 
-    /// Returns whether checking `tree` out would write at most `most_files` files and
-    /// `most_bytes` bytes, counting a subtree's files each time it is named, with no file over
-    /// [`MAX_SNAPSHOT_FILE_BYTES`] and no directory deeper than [`MAX_SNAPSHOT_DEPTH`], within
-    /// 262,144 distinct trees and 256 MiB of them read, so a small tree that names the same
-    /// subtrees or blobs over and over cannot stand for millions of files or a full disk. Each
-    /// distinct tree is read once.
+    /// Returns whether checking `tree` out would write at most `most_files` files (gitlinks
+    /// included) and `most_bytes` bytes and 262,144 directories, counting a subtree's files and
+    /// directories each time it is named, with no file over [`MAX_SNAPSHOT_FILE_BYTES`] and no
+    /// directory deeper than [`MAX_SNAPSHOT_DEPTH`], within 262,144 distinct trees and 256 MiB
+    /// of them read, so a small tree that names the same subtrees or blobs over and over, even
+    /// empty ones or ones holding only gitlinks, cannot stand for millions of entries or a full
+    /// disk. Each distinct tree is read once.
     ///
     /// # Errors
     ///
@@ -200,6 +202,7 @@ impl Walk<'_> {
         let mut sum = Counted {
             files: 0,
             bytes: 0,
+            dirs: 1,
             height: 1,
         };
         for (mode, id) in entries.values() {
@@ -209,8 +212,11 @@ impl Walk<'_> {
                 };
                 sum.files = sum.files.saturating_add(below.files);
                 sum.bytes = sum.bytes.saturating_add(below.bytes);
+                sum.dirs = sum.dirs.saturating_add(below.dirs);
                 sum.height = sum.height.max(below.height + 1);
-            } else if !mode.is_commit() {
+            } else if mode.is_commit() {
+                sum.files += 1;
+            } else {
                 let size = match self
                     .store
                     .bounded_size(*id, Kind::Blob, MAX_SNAPSHOT_FILE_BYTES)
@@ -222,7 +228,10 @@ impl Walk<'_> {
                 sum.files += 1;
                 sum.bytes = sum.bytes.saturating_add(size);
             }
-            if sum.files > budget.files || sum.bytes > budget.bytes {
+            if sum.files > budget.files
+                || sum.bytes > budget.bytes
+                || sum.dirs > MAX_CHECKED_OUT_TREES
+            {
                 return Ok(None);
             }
         }

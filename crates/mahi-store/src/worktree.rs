@@ -564,6 +564,31 @@ mod tests {
     }
 
     #[test]
+    fn subtrees_holding_nothing_or_only_gitlinks_still_count_against_a_checkout() {
+        let (_dir, store) = store();
+        let base = sample_commit(&store);
+        let stop = AtomicBool::new(false);
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let empty = store.write_tree(&[]).unwrap();
+        let gitlink = store
+            .write_tree(&[("module", EntryKind::Commit, base)])
+            .unwrap();
+        for leaf in [empty, gitlink] {
+            let mut level = leaf;
+            for _ in 0..8 {
+                level = store
+                    .write_tree(&names.map(|name| (name, EntryKind::Tree, level)))
+                    .unwrap();
+            }
+            assert!(
+                !store
+                    .fits_checkout(level, (usize::MAX, u64::MAX), &stop)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn a_tree_naming_its_subtrees_over_and_over_is_refused_before_anything_is_written() {
         let (dir, store) = store();
         let base = sample_commit(&store);
