@@ -277,3 +277,10 @@ path = "fuzz_targets/thread_fetched.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "agent-profile"
+path = "fuzz_targets/agent_profile.rs"
+test = false
+doc = false
+bench = false
