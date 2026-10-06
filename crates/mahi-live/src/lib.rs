@@ -3,7 +3,7 @@
 
 mod endpoint;
 mod frame;
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, feature = "fuzzing"))]
 pub mod fuzzing;
 mod gossip;
 mod local;

@@ -1002,7 +1002,7 @@ fn drawn_slot(body: &Body) -> Option<&AgentSlot> {
 }
 
 /// Decodes `data` as a frame's plaintext and parses its body, for the fuzz targets.
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, feature = "fuzzing"))]
 pub(crate) fn fuzz_plaintext(data: &[u8]) {
     if let Ok(plain) = decode_exact::<WirePlain<'_>>(data) {
         let _ = parse_body(&plain.body);

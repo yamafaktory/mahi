@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+fuzzing = ["mahi-store/fuzzing"]
+
 [dependencies]
 age = { workspace = true }
 bech32 = { workspace = true }

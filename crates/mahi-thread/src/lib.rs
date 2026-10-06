@@ -3,7 +3,7 @@
 mod card;
 mod commits;
 mod fetched;
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, feature = "fuzzing"))]
 pub mod fuzzing;
 mod handoff;
 mod key;

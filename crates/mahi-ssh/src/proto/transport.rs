@@ -182,7 +182,7 @@ impl Transport {
         Ok(transport)
     }
 
-    #[cfg(fuzzing)]
+    #[cfg(any(fuzzing, feature = "fuzzing"))]
     pub(crate) fn established() -> Result<Self, TransportError> {
         let mut transport = Self::new(&[HostKeyAlgorithm::Ed25519])?;
         transport.identification = None;

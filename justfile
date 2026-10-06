@@ -11,6 +11,7 @@ fmt-check:
 
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo clippy --workspace --all-targets --locked --features mahi-identity/fuzzing,mahi-live/fuzzing,mahi-proxy/fuzzing,mahi-ssh/fuzzing,mahi-store/fuzzing,mahi-thread/fuzzing -- -D warnings
 
 test *args:
     cargo nextest run --workspace --locked --no-tests=pass {{args}}

@@ -1,6 +1,6 @@
-//! Entry points for the fuzz targets in `fuzz/`, built only with `--cfg fuzzing`: each takes
-//! untrusted bytes as a peer, a remote or an agent could send them, and must neither panic nor
-//! use more than its bounds allow.
+//! Entry points for the fuzz targets in `fuzz/`, built only with `--cfg fuzzing` or, to lint them,
+//! the `fuzzing` feature: each takes untrusted bytes as a peer, a remote or an agent could send
+//! them, and must neither panic nor use more than its bounds allow.
 
 use std::{
     collections::HashSet,

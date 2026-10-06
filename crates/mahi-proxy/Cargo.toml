@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 base64 = { workspace = true }
 rustix = { workspace = true }

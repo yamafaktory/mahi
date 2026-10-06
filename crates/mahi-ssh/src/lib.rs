@@ -2,7 +2,7 @@
 //! logins through ssh-agent.
 
 mod exec;
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, feature = "fuzzing"))]
 pub mod fuzzing;
 mod git;
 mod known_hosts;

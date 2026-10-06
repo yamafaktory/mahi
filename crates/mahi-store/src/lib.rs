@@ -6,7 +6,7 @@ compile_error!("mahi supports Linux and macOS only");
 mod changes;
 mod diff;
 mod fetch;
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, feature = "fuzzing"))]
 pub mod fuzzing;
 mod history;
 mod merge;

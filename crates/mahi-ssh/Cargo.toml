@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 aes = { workspace = true }
 aes-gcm = { workspace = true }

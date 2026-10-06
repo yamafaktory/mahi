@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 gix = { workspace = true }
 gix-imara-diff = { workspace = true }

@@ -49,7 +49,7 @@ impl Inbound {
         self.start = self.start.saturating_add(count).min(self.buffer.len());
     }
 
-    #[cfg(any(test, fuzzing))]
+    #[cfg(any(test, fuzzing, feature = "fuzzing"))]
     pub(crate) fn next(
         &mut self,
         opener: &mut Opener,

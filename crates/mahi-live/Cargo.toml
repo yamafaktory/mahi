@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 bech32 = { workspace = true }
 blake3 = { workspace = true }

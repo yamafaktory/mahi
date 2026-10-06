@@ -5,7 +5,7 @@ compile_error!("mahi supports Linux and macOS only");
 
 mod config;
 mod credential;
-#[cfg(fuzzing)]
+#[cfg(any(fuzzing, feature = "fuzzing"))]
 pub mod fuzzing;
 mod identity;
 mod node;
