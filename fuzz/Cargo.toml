@@ -263,3 +263,17 @@ path = "fuzz_targets/store_trees.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "session-files"
+path = "fuzz_targets/session_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thread-fetched"
+path = "fuzz_targets/thread_fetched.rs"
+test = false
+doc = false
+bench = false

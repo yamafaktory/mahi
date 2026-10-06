@@ -496,6 +496,64 @@ pub(crate) fn decode_manifest(encoded: &[u8], commit: ObjectId) -> Result<Manife
     Ok(manifest)
 }
 
+/// Checks a decoded manifest's files against what a reader may write: valid paths in strictly
+/// increasing order, no two the same once ASCII case is folded and none also a directory of
+/// another, as many pieces as each length needs, each one present (`has_piece`), and at most
+/// [`MAX_SESSION_FILES`] files and [`MAX_SESSION_BYTES`] in all.
+pub(crate) fn accepted_files(
+    manifest: &Manifest,
+    has_piece: impl Fn(&str) -> bool,
+    commit: ObjectId,
+) -> Result<Vec<SessionFile>, SessionError> {
+    let malformed = || SessionError::Malformed(commit);
+    if manifest.files.len() > MAX_SESSION_FILES {
+        return Err(SessionError::TooManyFiles);
+    }
+    let mut total: u64 = 0;
+    let mut folded = HashSet::new();
+    let mut directories = HashSet::new();
+    let mut files = Vec::with_capacity(manifest.files.len());
+    let mut last: Option<&str> = None;
+    for file in &manifest.files {
+        let path = SessionPath::new(&file.path).map_err(|_| malformed())?;
+        if last.is_some_and(|last| last >= file.path.as_str()) {
+            return Err(malformed());
+        }
+        last = Some(&file.path);
+        if !folded.insert(file.path.to_ascii_lowercase()) {
+            return Err(malformed());
+        }
+        let mut prefix = String::new();
+        let components: Vec<&str> = path.components().collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(&component.to_ascii_lowercase());
+            directories.insert(prefix.clone());
+        }
+        files.push(SessionFile {
+            path,
+            len: file.len,
+        });
+        let pieces = file.len.div_ceil(SESSION_CHUNK_BYTES as u64);
+        if pieces != file.chunks.len() as u64 {
+            return Err(malformed());
+        }
+        if file.chunks.iter().any(|tag| !has_piece(&entry_name(tag))) {
+            return Err(malformed());
+        }
+        total = total
+            .checked_add(file.len)
+            .filter(|total| *total <= MAX_SESSION_BYTES)
+            .ok_or(SessionError::TooLarge)?;
+    }
+    if folded.iter().any(|path| directories.contains(path)) {
+        return Err(malformed());
+    }
+    Ok(files)
+}
+
 /// A file of a recorded session: its path and size.
 ///
 /// Neither appears in `Debug` output.
@@ -554,55 +612,7 @@ impl<'a> SessionReader<'a> {
             store.commit_blobs(commit)?.into_iter().collect();
         let manifest_blob = blobs.remove(MANIFEST_ENTRY).ok_or_else(malformed)?;
         let manifest = read_manifest(store, key, commit, manifest_blob)?;
-        if manifest.files.len() > MAX_SESSION_FILES {
-            return Err(SessionError::TooManyFiles);
-        }
-        let mut total: u64 = 0;
-        let mut folded = HashSet::new();
-        let mut directories = HashSet::new();
-        let mut files = Vec::with_capacity(manifest.files.len());
-        let mut last: Option<&str> = None;
-        for file in &manifest.files {
-            let path = SessionPath::new(&file.path).map_err(|_| malformed())?;
-            if last.is_some_and(|last| last >= file.path.as_str()) {
-                return Err(malformed());
-            }
-            last = Some(&file.path);
-            if !folded.insert(file.path.to_ascii_lowercase()) {
-                return Err(malformed());
-            }
-            let mut prefix = String::new();
-            let components: Vec<&str> = path.components().collect();
-            for component in components.iter().take(components.len().saturating_sub(1)) {
-                if !prefix.is_empty() {
-                    prefix.push('/');
-                }
-                prefix.push_str(&component.to_ascii_lowercase());
-                directories.insert(prefix.clone());
-            }
-            files.push(SessionFile {
-                path,
-                len: file.len,
-            });
-            let pieces = file.len.div_ceil(SESSION_CHUNK_BYTES as u64);
-            if pieces != file.chunks.len() as u64 {
-                return Err(malformed());
-            }
-            if file
-                .chunks
-                .iter()
-                .any(|tag| !blobs.contains_key(&entry_name(tag)))
-            {
-                return Err(malformed());
-            }
-            total = total
-                .checked_add(file.len)
-                .filter(|total| *total <= MAX_SESSION_BYTES)
-                .ok_or(SessionError::TooLarge)?;
-        }
-        if folded.iter().any(|path| directories.contains(path)) {
-            return Err(malformed());
-        }
+        let files = accepted_files(&manifest, |name| blobs.contains_key(name), commit)?;
         Ok(Self {
             store,
             key,

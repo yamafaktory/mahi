@@ -2,7 +2,10 @@
 //! untrusted bytes as a peer, a remote or an agent could send them, and must neither panic nor
 //! use more than its bounds allow.
 
-use std::str::FromStr;
+use std::{
+    collections::HashSet,
+    str::FromStr,
+};
 
 use ed25519_dalek::SigningKey;
 use mahi_core::ThreadId;
@@ -16,6 +19,7 @@ use ssh_key::{
     public::Ed25519PublicKey,
 };
 
+pub use self::fetched::fetched;
 use crate::{
     Briefing,
     MAX_BRIEFING_BYTES,
@@ -25,6 +29,8 @@ use crate::{
     session_files,
     transcript,
 };
+
+mod fetched;
 
 fn owner() -> Option<ParticipantKey> {
     let point = SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes();
@@ -126,4 +132,48 @@ pub fn briefing(data: &[u8]) {
         replies: rest.iter().rev().take(4).cloned().collect(),
     };
     assert!(briefing.render().len() <= MAX_BRIEFING_BYTES);
+}
+
+/// Decodes `data` as a session manifest and, when it decodes, checks the files a reader would
+/// accept from it with every piece present: each a relative path with no empty, `.` or `..`
+/// component, in strictly increasing order, none the same as another once ASCII case is
+/// folded nor a directory of another, within the file and byte limits.
+///
+/// # Panics
+///
+/// Panics if the reader accepts a file list that breaks one of these, the bug looked for.
+pub fn session_files(data: &[u8]) {
+    let Ok(manifest) = session_files::decode_manifest(data, null()) else {
+        return;
+    };
+    let Ok(files) = session_files::accepted_files(&manifest, |_| true, null()) else {
+        return;
+    };
+    assert!(files.len() <= session_files::MAX_SESSION_FILES);
+    let mut folded = HashSet::new();
+    let mut directories = HashSet::new();
+    let mut total: u64 = 0;
+    let mut previous: Option<&str> = None;
+    for file in &files {
+        let path = file.path.as_str();
+        assert!(
+            path.split('/').all(|part| !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.contains('\0')),
+            "{path:?}"
+        );
+        assert!(previous.is_none_or(|previous| previous < path), "{path:?}");
+        previous = Some(path);
+        let lower = path.to_ascii_lowercase();
+        let mut at = 0;
+        while let Some(slash) = lower[at..].find('/') {
+            directories.insert(lower[..at + slash].to_owned());
+            at += slash + 1;
+        }
+        assert!(folded.insert(lower), "{path:?}");
+        total += file.len;
+    }
+    assert!(total <= session_files::MAX_SESSION_BYTES);
+    assert!(folded.iter().all(|path| !directories.contains(path)));
 }

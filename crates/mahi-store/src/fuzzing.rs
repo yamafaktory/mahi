@@ -18,7 +18,13 @@ use mahi_core::{
     ThreadRef,
 };
 
-pub use self::trees::trees;
+pub use self::{
+    scratch::{
+        scratch_store,
+        set_ref,
+    },
+    trees::trees,
+};
 use crate::{
     merge,
     push,
@@ -27,6 +33,7 @@ use crate::{
     worktree,
 };
 
+mod scratch;
 mod trees;
 
 fn lines(data: &[u8]) -> impl FnMut(&mut String) -> io::Result<usize> + '_ {
