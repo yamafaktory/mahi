@@ -130,7 +130,8 @@ refs/threads/<id>/agents/<participant>.<agent>/session     # native agent sessio
 - SSH keys other than ed25519 are refused, `ssh-rsa` included. Since thread keys are wrapped to mahi keys, not SSH keys, mahi does not build `age`'s SSH support at all, and with it the `rsa` crate and its unfixed timing advisory (RUSTSEC-2023-0071) are gone.
 - `age` (Rust `age` crate): each thread has its own age X25519 identity, the thread key. Content is encrypted to the thread key's recipient. The thread key's secret is itself encrypted to each participant's mahi key and stored in `meta`. Adding a participant wraps the existing thread key once more; nothing else is re-encrypted.
 - Always encrypted: transcripts, native session files, CRDT state, screen captures.
-- Code snapshots: plaintext for private remotes (keeps dedup and diffs), encrypted bundles per checkpoint for public remotes. Ask when unsure.
+- Code snapshots: plaintext, which keeps dedup and diffs, so they are pushed only to a remote the user declared private (`mahi remote <name> --private`); on a remote declared public they stay in the local repository, and only the encrypted records are pushed. Visibility is never guessed: nothing is pushed until the user chooses a remote and says which it is.
+- Authorship comes from signatures, not encryption: anyone who has a thread's public recipient can seal content to it, but every agent commit (snapshots, transcript turns, sessions) is signed with its participant's SSH key, and a fetch accepts only commits signed by the key `meta` lists for that participant, so no one can write in another's name.
 - Removing a participant rotates the thread key for future content: a new thread identity, wrapped for the remaining participants. Content written before the removal stays readable to the removed participant.
 - Optional team recovery recipient (an offline key).
 
@@ -289,8 +290,6 @@ Fuzzing (see Testing) comes as its own step after milestone 3, covering every pa
 
 ## Open questions
 
-- Authorship: anyone who has a thread's public recipient can seal content to it, so encryption alone does not say who wrote a blob. Turn commits (or their content) should be signed with the author's key if mahi needs to know who wrote what.
 - Automerge vs Loro for shared state.
 - Windows support (WSL2 only?).
-- Default snapshot encryption policy when the remote's visibility is unknown.
 - Name: mahi, at mahi.social, a domain the project owns, used wherever mahi needs a domain or a URL of its own. The `mahi` crate looked unclaimed on crates.io (Sept 2026); confirm GitHub and other registries. Be thoughtful about using a te reo Māori word if this becomes commercial.
