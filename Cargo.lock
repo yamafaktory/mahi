@@ -3305,6 +3305,7 @@ dependencies = [
  "age",
  "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",
+ "mahi-core",
  "rustix",
  "signature 2.2.0",
  "ssh-key",

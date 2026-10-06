@@ -249,3 +249,10 @@ path = "fuzz_targets/store_names.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ssh-exec-output"
+path = "fuzz_targets/ssh_exec_output.rs"
+test = false
+doc = false
+bench = false

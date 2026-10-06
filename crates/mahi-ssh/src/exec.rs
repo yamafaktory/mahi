@@ -282,19 +282,7 @@ pub(crate) fn printable(bytes: &[u8]) -> String {
 }
 
 fn hidden(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00ad}'
-                | '\u{061c}'
-                | '\u{180e}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{feff}'
-                | '\u{fff9}'..='\u{fffb}'
-        )
+    c.is_control() || mahi_core::is_invisible(c)
 }
 
 impl Drop for ExecOutput {
@@ -335,6 +323,10 @@ mod tests {
         assert_eq!(
             printable("a\u{9b}31m b\u{202e}c\u{2066}d\u{200b}e".as_bytes()),
             "a?31m b?c?d?e"
+        );
+        assert_eq!(
+            printable("a\u{2028}b\u{e0041}c\u{3164}d\u{115f}e".as_bytes()),
+            "a?b?c?d?e"
         );
     }
 }

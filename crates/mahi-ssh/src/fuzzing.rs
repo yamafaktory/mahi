@@ -2,25 +2,28 @@
 //! untrusted bytes as an SSH server could send them, and must neither panic nor use more than
 //! its bounds allow.
 
-use crate::proto::{
-    auth::{
-        Auth,
-        Progress,
-    },
-    channel::{
-        Connection,
-        Event,
-    },
-    cipher::{
-        CipherName,
-        Opener,
-    },
-    kex::HostKeyAlgorithm,
-    message::Message,
-    packet::Inbound,
-    transport::{
-        Poll,
-        Transport,
+use crate::{
+    exec,
+    proto::{
+        auth::{
+            Auth,
+            Progress,
+        },
+        channel::{
+            Connection,
+            Event,
+        },
+        cipher::{
+            CipherName,
+            Opener,
+        },
+        kex::HostKeyAlgorithm,
+        message::Message,
+        packet::Inbound,
+        transport::{
+            Poll,
+            Transport,
+        },
     },
 };
 
@@ -191,4 +194,21 @@ pub fn connection(data: &[u8]) {
         },
     );
     let _ = connection.send_eof(&mut transport, id);
+}
+
+/// Shows `data` as mahi shows what a remote command wrote to its error stream: nothing that
+/// could drive or disguise the terminal is left, and every line after the first is marked as
+/// the remote's.
+pub fn exec_output(data: &[u8]) {
+    let shown = exec::printable(data);
+    assert!(
+        shown
+            .chars()
+            .all(|c| c == '\n' || c == '\t' || !(c.is_control() || mahi_core::is_invisible(c))),
+        "{shown:?}"
+    );
+    for line in shown.split('\n').skip(1) {
+        assert!(line.starts_with("remote: "), "{shown:?}");
+    }
+    assert!(shown.len() <= data.len() * 3 + data.iter().filter(|b| **b == b'\n').count() * 8);
 }

@@ -669,28 +669,13 @@ pub(crate) fn printable(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes.get(..MAX_DESCRIPTION).unwrap_or(bytes))
         .chars()
         .map(|c| {
-            if c.is_control() || is_format(c) {
+            if c.is_control() || mahi_core::is_invisible(c) {
                 '?'
             } else {
                 c
             }
         })
         .collect()
-}
-
-fn is_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00ad}'
-            | '\u{061c}'
-            | '\u{180e}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
-    )
 }
 
 #[cfg(test)]
@@ -759,6 +744,14 @@ mod tests {
             Ok(Message::ServiceAccept(b"ssh-userauth"))
         );
         assert_eq!(server.received.pop(), Some(request));
+    }
+
+    #[test]
+    fn a_disconnect_description_is_shown_without_control_or_invisible_characters() {
+        assert_eq!(
+            printable("bye\x1b[2J now\u{2028}x\u{e0041}y\u{202e}z".as_bytes()),
+            "bye?[2J now?x?y?z"
+        );
     }
 
     #[test]

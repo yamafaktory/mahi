@@ -316,11 +316,7 @@ fn sanitised(comment: &[u8]) -> String {
         .chars()
         .take(MAX_COMMENT_CHARS)
         .map(|character| {
-            let hidden = matches!(
-                character,
-                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-            );
-            if character.is_control() || hidden {
+            if character.is_control() || mahi_core::is_invisible(character) {
                 char::REPLACEMENT_CHARACTER
             } else {
                 character
@@ -574,13 +570,17 @@ mod tests {
         let key = ed25519().public_key().to_bytes().unwrap();
         let mut comment = b"a\x1b[2Jb\xe2\x80\xaec\xc2\x9bd\xff".to_vec();
         comment.extend(std::iter::repeat_n(b'x', 1000));
-        let keys = list(identities(&[(key, &comment)], 1, &[])).unwrap();
+        let keys = list(identities(&[(key.clone(), &comment)], 1, &[])).unwrap();
         let shown = keys[0].comment();
         assert!(
             shown.starts_with("a\u{FFFD}[2Jb\u{FFFD}c\u{FFFD}d\u{FFFD}"),
             "{shown:?}"
         );
         assert_eq!(shown.chars().count(), MAX_COMMENT_CHARS);
+
+        let hidden = "w\u{2028}x\u{E0041}y\u{3164}z";
+        let keys = list(identities(&[(key, hidden.as_bytes())], 1, &[])).unwrap();
+        assert_eq!(keys[0].comment(), "w\u{FFFD}x\u{FFFD}y\u{FFFD}z");
     }
 
     #[test]
