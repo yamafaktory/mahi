@@ -26,6 +26,10 @@ pub fn agent_answer(data: &[u8]) {
 /// Reads `data` as each of the key files mahi keeps in plaintext: the public identity, the
 /// signing key, the node key and a stored credential. What one of them accepts reads back the
 /// same once written again.
+///
+/// # Panics
+///
+/// Panics if an accepted file does not read back the same, the bug looked for.
 pub fn key_files(data: &[u8]) {
     if let Ok(public) = PublicIdentity::parse(data) {
         let written = format!("{}\n", public.recipient());
@@ -61,6 +65,10 @@ static ENCRYPTED: LazyLock<Vec<u8>> = LazyLock::new(|| {
 /// Reads `data` as the encrypted identity file, opened with a fixed passphrase, or, when its
 /// first byte is odd, flips the bits it names in a real identity file encrypted with that
 /// passphrase at a low work factor, which opens when no bit is flipped.
+///
+/// # Panics
+///
+/// Panics if the untouched file does not open, the bug looked for.
 pub fn identity_file(data: &[u8]) {
     let passphrase = SecretString::from(PASSPHRASE.to_owned());
     let Some((&choice, rest)) = data.split_first() else {

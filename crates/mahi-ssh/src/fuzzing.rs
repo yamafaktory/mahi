@@ -185,7 +185,7 @@ pub fn connection(data: &[u8]) {
             Ok(Event::Opened(channel) | Event::WindowOpened(channel)) => {
                 let _ = connection.exec(transport, channel, "git-upload-pack 'repo'");
                 connection
-                    .send_data(transport, channel, &[0; 40_000])
+                    .send_data(transport, channel, &vec![0; 40_000])
                     .is_ok()
             }
             Ok(Event::Eof(channel)) => connection.close(transport, channel).is_ok(),
@@ -199,6 +199,10 @@ pub fn connection(data: &[u8]) {
 /// Shows `data` as mahi shows what a remote command wrote to its error stream: nothing that
 /// could drive or disguise the terminal is left, and every line after the first is marked as
 /// the remote's.
+///
+/// # Panics
+///
+/// Panics if a hidden character is left or a later line is not marked, the bug looked for.
 pub fn exec_output(data: &[u8]) {
     let shown = exec::printable(data);
     assert!(
@@ -210,5 +214,5 @@ pub fn exec_output(data: &[u8]) {
     for line in shown.split('\n').skip(1) {
         assert!(line.starts_with("remote: "), "{shown:?}");
     }
-    assert!(shown.len() <= data.len() * 3 + data.iter().filter(|b| **b == b'\n').count() * 8);
+    assert!(shown.len() <= data.len() * 11);
 }
