@@ -150,7 +150,9 @@ impl PtyCommand {
     /// Keeps the caller's own copy of the terminal open until [`PtyChild::take_terminal`], so
     /// the program's exit never closes the last copy. macOS drops what the program wrote and
     /// no one read yet when its last copy closes; a copy closed by a live process instead waits
-    /// until it has been read. A reader sees the end only once the copy is taken and dropped.
+    /// until it has been read. On Linux a reader sees the end only once the copy is taken and
+    /// dropped; on macOS the end of the program's session may end the terminal sooner, after
+    /// what it wrote has been read.
     #[must_use]
     pub fn hold_terminal(mut self) -> Self {
         self.hold_terminal = true;
@@ -619,7 +621,9 @@ mod tests {
                 assert!(Instant::now() < deadline, "the program exits");
                 thread::sleep(Duration::from_millis(5));
             }
-            assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+            if cfg!(target_os = "linux") {
+                assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+            }
             drop(child.take_terminal());
             let output = receiver
                 .recv_timeout(Duration::from_secs(10))
