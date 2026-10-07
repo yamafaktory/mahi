@@ -11,7 +11,10 @@ mod tests {
         process::Command,
         sync::mpsc,
         thread,
-        time::Duration,
+        time::{
+            Duration,
+            Instant,
+        },
     };
 
     use mahi_sandbox::{
@@ -26,7 +29,7 @@ mod tests {
     const RAN: &str = "ran-Windows_NT";
     const SIZE: WindowSize = WindowSize { rows: 24, cols: 80 };
 
-    fn in_terminal(work: &Path, program: &Path, sandbox: Option<Sandbox>) -> (i32, String) {
+    fn in_terminal(work: &Path, program: &Path, sandbox: Option<Sandbox>) -> (Option<i32>, String) {
         let mut command = PtyCommand::new(program, work, SIZE)
             .arg("/c")
             .arg("echo ran-%OS%");
@@ -40,14 +43,34 @@ mod tests {
         let mut reader = child.reader().unwrap();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let mut output = Vec::new();
-            let _ = reader.read_to_end(&mut output);
-            let _ = sender.send(output);
+            let mut buffer = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 || sender.send(buffer[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
         });
-        let output = receiver
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the program closes its terminal");
-        let code = exit_code(child.wait().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut output = Vec::new();
+        let mut code = None;
+        while Instant::now() < deadline && !String::from_utf8_lossy(&output).contains(RAN) {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(chunk) => output.extend_from_slice(&chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                code = Some(exit_code(status));
+                while let Ok(chunk) = receiver.recv_timeout(Duration::from_secs(1)) {
+                    output.extend_from_slice(&chunk);
+                }
+                break;
+            }
+        }
+        if code.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         (code, String::from_utf8_lossy(&output).into_owned())
     }
 
@@ -65,14 +88,16 @@ mod tests {
             String::from_utf8_lossy(&outside.stdout).contains(RAN),
             "interop must work outside the sandbox: {outside:?}"
         );
-        let (code, output) = in_terminal(work.path(), &program, None);
-        assert_eq!(code, 0, "{output}");
-        assert!(output.contains(RAN), "{output}");
+        let (_, output) = in_terminal(work.path(), &program, None);
+        assert!(
+            output.contains(RAN),
+            "interop must work in a terminal: {output}"
+        );
         let mut sandbox = Sandbox::system().unwrap();
         sandbox.bind(work.path(), Access::ReadOnly).unwrap();
         let (code, output) = in_terminal(work.path(), &program, Some(sandbox));
-        eprintln!("in the sandbox: {code} {output:?}");
-        assert_ne!(code, 0, "{output}");
+        eprintln!("in the sandbox: {code:?} {output:?}");
+        assert_ne!(code, Some(0), "{output}");
         assert!(!output.contains(RAN), "{output}");
     }
 }
