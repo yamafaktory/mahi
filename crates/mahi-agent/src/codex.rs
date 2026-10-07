@@ -1,16 +1,32 @@
-//! Codex: the approvals it records for mahi's hooks, which mahi carries from one thread to the
-//! next so the user approves them once.
+//! Codex: where it keeps an agent's sessions, what its session log says, and the approvals it
+//! records for mahi's hooks, which mahi carries from one thread to the next so the user
+//! approves them once.
 
 use std::{
+    borrow::Cow,
     fmt::Write as _,
+    path::Path,
     str::FromStr,
 };
 
+use serde::Deserialize;
 use thiserror::Error;
 use toml::{
     Table,
     Value,
 };
+
+use crate::claude_code::{
+    ContentPart,
+    LogLine,
+    MAX_LOG_TIME_CHARS,
+    content_parts,
+    cut_chars,
+    joined,
+};
+
+/// The directory in Codex's home that holds its sessions, one log a session.
+pub const SESSION_DIR: &str = "sessions";
 
 /// The events of mahi's hooks, as Codex names them in its approval records, in the order a
 /// [`HookTrust`] keeps them.
@@ -24,6 +40,87 @@ pub const MAX_SAVED_BYTES: usize = 4096;
 
 const HASH_PREFIX: &str = "sha256:";
 const HASH_DIGITS: usize = 64;
+const LOG_PREFIX: &str = "rollout-";
+
+#[derive(Deserialize)]
+struct CodexEntry<'a> {
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    payload: Option<CodexPayload<'a>>,
+}
+
+#[derive(Deserialize)]
+struct CodexPayload<'a> {
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    role: Option<Cow<'a, str>>,
+    #[serde(borrow, default, deserialize_with = "content_parts")]
+    content: Vec<ContentPart<'a>>,
+}
+
+/// Returns where Codex keeps the sessions of an agent, inside its home: [`SESSION_DIR`],
+/// whatever the worktree, since each thread's agent has a home of its own.
+#[must_use]
+pub fn session_dir(_worktree: &Path) -> Option<String> {
+    Some(SESSION_DIR.to_owned())
+}
+
+/// Returns whether the file at `path`, relative to [`SESSION_DIR`], is a session log as Codex
+/// names it: `YYYY/MM/DD/rollout-….jsonl`. A log Codex has compressed is not.
+#[must_use]
+pub fn is_session_log(path: &str) -> bool {
+    let mut parts = path.split('/');
+    let digits = |part: Option<&str>, count: usize| {
+        part.is_some_and(|part| {
+            part.len() == count && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    };
+    digits(parts.next(), 4)
+        && digits(parts.next(), 2)
+        && digits(parts.next(), 2)
+        && parts.next().is_some_and(|name| {
+            name.starts_with(LOG_PREFIX)
+                && Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+        })
+        && parts.next().is_none()
+}
+
+/// Reads a line of a Codex session log: the `output_text` parts of an assistant `message`
+/// response item are its reply. Codex also writes each reply as an `item_completed` event,
+/// which is left out so a reply is read once; this form is the same in logs Codex wrote
+/// before and after it began writing those events.
+#[must_use]
+pub fn log_line(line: &[u8]) -> Option<LogLine> {
+    let entry: CodexEntry<'_> = serde_json::from_slice(line).ok()?;
+    let timestamp = entry
+        .timestamp
+        .as_deref()
+        .map(|time| cut_chars(time, MAX_LOG_TIME_CHARS));
+    let reply = entry
+        .payload
+        .filter(|payload| {
+            entry.kind.as_deref() == Some("response_item")
+                && payload.kind.as_deref() == Some("message")
+                && payload.role.as_deref() == Some("assistant")
+        })
+        .map(|payload| {
+            joined(
+                payload
+                    .content
+                    .iter()
+                    .filter(|part| part.kind.as_deref() == Some("output_text"))
+                    .filter_map(|part| part.text.as_deref()),
+            )
+        })
+        .filter(|text| !text.trim().is_empty());
+    Some(LogLine { timestamp, reply })
+}
 
 /// A hash Codex records for an approved hook: `sha256:` and 64 lowercase hexadecimal digits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +364,68 @@ mod tests {
         assert_eq!(trust().added_to("hooks = { state = {} }\n", HOOKS), None);
         for path in ["/a\"b/hooks.json", "/a\\b/hooks.json", "/a\nb/hooks.json"] {
             assert_eq!(trust().added_to("", path), None, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn codex_replies_are_read_once_from_response_items_in_old_and_new_logs() {
+        let reply = br#"{"timestamp":"2026-10-06T20:42:00.042Z","ordinal":23,"type":"response_item","payload":{"type":"message","id":"m","role":"assistant","content":[{"type":"output_text","text":"Created bye.txt."},{"type":"output_text","text":"Done."}],"phase":"final_answer"}}"#;
+        assert_eq!(
+            log_line(reply),
+            Some(LogLine {
+                timestamp: Some("2026-10-06T20:42:00.042Z".to_owned()),
+                reply: Some("Created bye.txt.\nDone.".to_owned()),
+            })
+        );
+        let older = br#"{"timestamp":"2025-06-01T10:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"old reply"}]}}"#;
+        assert_eq!(log_line(older).unwrap().reply.as_deref(), Some("old reply"));
+        let event = br#"{"timestamp":"2026-10-06T20:42:00.040Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"Created bye.txt."}]}}}"#;
+        let user = br#"{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"make it"}]}}"#;
+        let developer = br#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"rules"}]}}"#;
+        let call = br#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"ls"}}"#;
+        let blank = br#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"  "}]}}"#;
+        for line in [&event[..], user, developer, call, blank] {
+            assert_eq!(log_line(line).unwrap().reply, None);
+        }
+        assert_eq!(
+            log_line(event).unwrap().timestamp.as_deref(),
+            Some("2026-10-06T20:42:00.040Z")
+        );
+        assert_eq!(log_line(b"not json"), None);
+        let long = format!(
+            r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{}"}}]}}}}"#,
+            "x".repeat(10_000)
+        );
+        assert_eq!(
+            log_line(long.as_bytes())
+                .unwrap()
+                .reply
+                .unwrap()
+                .chars()
+                .count(),
+            4000
+        );
+    }
+
+    #[test]
+    fn only_codexs_dated_rollout_logs_are_session_logs() {
+        assert_eq!(
+            session_dir(Path::new("/any/worktree")).as_deref(),
+            Some("sessions")
+        );
+        assert!(is_session_log(
+            "2026/10/06/rollout-2026-10-06T22-41-35-01a1.jsonl"
+        ));
+        for other in [
+            "rollout-x.jsonl",
+            "2026/10/06/rollout-x.jsonl.zst",
+            "2026/10/06/history.jsonl",
+            "2026/10/6/rollout-x.jsonl",
+            "2026/1a/06/rollout-x.jsonl",
+            "2026/10/06/x/rollout-x.jsonl",
+            "",
+        ] {
+            assert!(!is_session_log(other), "{other}");
         }
     }
 }

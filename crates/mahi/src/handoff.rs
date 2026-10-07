@@ -4,7 +4,6 @@ use std::{
         self,
         Write,
     },
-    path::Path,
 };
 
 use mahi_agent::{
@@ -192,9 +191,11 @@ pub(crate) fn replies(
     from: &AgentSlot,
     writer: &ParticipantKey,
 ) -> Vec<String> {
-    let Some(read_line) =
-        Profile::for_agent(from.agent().as_str().as_ref()).and_then(Profile::log_line)
-    else {
+    let profile = Profile::for_agent(from.agent().as_str().as_ref());
+    let (Some(read_line), Some(is_log)) = (
+        profile.and_then(Profile::log_line),
+        profile.and_then(Profile::is_session_log),
+    ) else {
         return Vec::new();
     };
     let Ok(Some(head)) = store.head(&session_ref(thread, from)) else {
@@ -208,11 +209,7 @@ pub(crate) fn replies(
     };
     let mut newest: Option<(Option<String>, VecDeque<String>)> = None;
     for (index, file) in reader.files().iter().enumerate() {
-        let path = file.path.as_str();
-        let log = Path::new(path)
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"));
-        if path.contains('/') || !log {
+        if !is_log(file.path.as_str()) {
             continue;
         }
         let mut last = None;
@@ -479,6 +476,52 @@ mod tests {
             AgentName::new("codex").unwrap(),
         );
         assert!(replies(&store, &key, thread, &codex, &alice_key).is_empty());
+    }
+
+    fn codex_log(time: &str, text: &str) -> String {
+        format!(
+            "{{\"timestamp\":\"{time}\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{text}\"}}]}}}}\n"
+        )
+    }
+
+    #[test]
+    fn codex_replies_come_from_its_newest_dated_rollout_log() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let key = ThreadKey::generate();
+        let thread = mahi_core::ThreadId::random().unwrap();
+        let from = AgentSlot::new(
+            ParticipantName::new("alice").unwrap(),
+            AgentName::new("codex").unwrap(),
+        );
+        let alice = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let alice_key = ParticipantKey::from_public_key(alice.public_key()).unwrap();
+        let event = "{\"timestamp\":\"2026-10-06T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"item\":{\"type\":\"AgentMessage\",\"content\":[{\"type\":\"Text\",\"text\":\"done\"}]}}}\n";
+        let newer = [
+            codex_log("2026-10-06T10:00:00Z", "looking"),
+            event.to_owned(),
+            codex_log("2026-10-06T10:00:03Z", "done"),
+        ]
+        .concat();
+        let older = codex_log("2026-10-05T10:00:00Z", "yesterday");
+        let stray = codex_log("2027-01-01T00:00:00Z", "stray");
+        let mut writer = SessionWriter::new(&store, &key, &alice_key, None).unwrap();
+        for (name, text) in [
+            ("2026/10/06/rollout-2026-10-06T10-00-00-b.jsonl", &newer),
+            ("2026/10/05/rollout-2026-10-05T10-00-00-a.jsonl", &older),
+            ("history.jsonl", &stray),
+            ("2026/10/04/rollout-old.jsonl.zst", &stray),
+        ] {
+            writer
+                .add(SessionPath::new(name).unwrap(), &mut text.as_bytes())
+                .unwrap();
+        }
+        writer.commit(thread, &from, &GitSigner(alice)).unwrap();
+        assert_eq!(
+            replies(&store, &key, thread, &from, &alice_key),
+            ["looking", "done"]
+        );
     }
 
     #[test]

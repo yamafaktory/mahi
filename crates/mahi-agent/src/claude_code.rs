@@ -19,7 +19,7 @@ use serde::{
 
 const CLAUDE_CODE_LONGEST_PROJECT: usize = 200;
 const MAX_LOG_TEXT_CHARS: usize = 4000;
-const MAX_LOG_TIME_CHARS: usize = 64;
+pub(crate) const MAX_LOG_TIME_CHARS: usize = 64;
 const MAX_LOG_PARTS: usize = 1000;
 
 /// One line of an agent's own session log, as its profile reads it: when it was written, and
@@ -50,28 +50,31 @@ struct ClaudeEntry<'a> {
 struct ClaudeMessage<'a> {
     #[serde(borrow, default)]
     model: Option<Cow<'a, str>>,
-    #[serde(borrow, default, deserialize_with = "claude_parts")]
-    content: Vec<ClaudePart<'a>>,
+    #[serde(borrow, default, deserialize_with = "content_parts")]
+    content: Vec<ContentPart<'a>>,
 }
 
+/// One part of a message's content: its type and its text.
 #[derive(Deserialize)]
-struct ClaudePart<'a> {
+pub(crate) struct ContentPart<'a> {
     #[serde(rename = "type", borrow, default)]
-    kind: Option<Cow<'a, str>>,
+    pub(crate) kind: Option<Cow<'a, str>>,
     #[serde(borrow, default)]
-    text: Option<Cow<'a, str>>,
+    pub(crate) text: Option<Cow<'a, str>>,
 }
 
-fn claude_parts<'de, D: Deserializer<'de>>(
+/// Reads a message's content parts, at most [`MAX_LOG_PARTS`] of them, and none from content
+/// that is text rather than a list.
+pub(crate) fn content_parts<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<Vec<ClaudePart<'de>>, D::Error> {
-    deserializer.deserialize_any(ClaudeParts)
+) -> Result<Vec<ContentPart<'de>>, D::Error> {
+    deserializer.deserialize_any(ContentParts)
 }
 
-struct ClaudeParts;
+struct ContentParts;
 
-impl<'de> Visitor<'de> for ClaudeParts {
-    type Value = Vec<ClaudePart<'de>>;
+impl<'de> Visitor<'de> for ContentParts {
+    type Value = Vec<ContentPart<'de>>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a list of content parts, or text")
@@ -98,7 +101,7 @@ impl<'de> Visitor<'de> for ClaudeParts {
     }
 }
 
-fn cut_chars(text: &str, max: usize) -> String {
+pub(crate) fn cut_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
@@ -118,30 +121,47 @@ pub fn log_line(line: &[u8]) -> Option<LogLine> {
         .message
         .filter(|message| genuine && message.model.as_deref() != Some("<synthetic>"))
         .map(|message| {
-            let mut text = String::new();
-            let mut left = MAX_LOG_TEXT_CHARS;
-            let parts = message
-                .content
-                .iter()
-                .filter(|part| part.kind.as_deref() == Some("text"))
-                .filter_map(|part| part.text.as_deref());
-            for part in parts {
-                if left == 0 {
-                    break;
-                }
-                if !text.is_empty() {
-                    text.push('\n');
-                    left -= 1;
-                }
-                for character in part.chars().take(left) {
-                    text.push(character);
-                    left -= 1;
-                }
-            }
-            text
+            joined(
+                message
+                    .content
+                    .iter()
+                    .filter(|part| part.kind.as_deref() == Some("text"))
+                    .filter_map(|part| part.text.as_deref()),
+            )
         })
         .filter(|text| !text.trim().is_empty());
     Some(LogLine { timestamp, reply })
+}
+
+/// Joins the text `parts` of a reply with newlines, at most 4000 characters in all.
+pub(crate) fn joined<'a>(parts: impl Iterator<Item = &'a str>) -> String {
+    let mut text = String::new();
+    let mut left = MAX_LOG_TEXT_CHARS;
+    for part in parts {
+        if left == 0 {
+            break;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+            left -= 1;
+        }
+        for character in part.chars().take(left) {
+            text.push(character);
+            left -= 1;
+        }
+    }
+    text
+}
+
+/// Returns whether the file at `path`, relative to Claude Code's session directory, is the log
+/// of a session of the main conversation: a `.jsonl` file at its top, as a subagent's log is
+/// in a directory of its own.
+#[must_use]
+pub fn is_session_log(path: &str) -> bool {
+    !path.contains('/')
+        && Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
 }
 
 /// Returns where Claude Code keeps the sessions of an agent working in `worktree`, inside its

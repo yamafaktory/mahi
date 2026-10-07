@@ -54,6 +54,8 @@ impl fmt::Display for ProfileName {
 pub enum Reader {
     /// Claude Code's session directories and log lines.
     ClaudeCode,
+    /// Codex's session directory and log lines.
+    Codex,
 }
 
 /// When mahi writes a file into the agent's state directory.
@@ -545,6 +547,7 @@ impl UserProfile {
         let reader = match raw.reader.as_deref() {
             None => None,
             Some("claude-code") => Some(Reader::ClaudeCode),
+            Some("codex") => Some(Reader::Codex),
             Some(other) => return Err(invalid("reader", other)),
         };
         let tool_args: Vec<Template> = at_most(
@@ -629,6 +632,8 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
         assert_eq!(profile.credential.unwrap().variable, "OPENAI_TOKEN");
         assert!(profile.first_prompt_arg);
         assert_eq!(profile.reader, Some(Reader::ClaudeCode));
+        let codex = UserProfile::parse(&FULL.replace("\"claude-code\"", "\"codex\"")).unwrap();
+        assert_eq!(codex.reader, Some(Reader::Codex));
         assert_eq!(profile.files.len(), 2);
         assert_eq!(profile.files[0].path, ["hooks", "config.toml"]);
         assert_eq!(profile.files[1].when, When::Tools);
@@ -690,7 +695,7 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
                 &format!("{base}pass-env = [\"A\"]\nenv = {{ A = \"1\" }}\n"),
                 "twice",
             ),
-            (&format!("{base}reader = \"codex\"\n"), "reader"),
+            (&format!("{base}reader = \"aider\"\n"), "reader"),
             (&format!("{base}args = [\"a\\u0000b\"]\n"), "args"),
             (
                 &format!("{base}[[file]]\npath = \"f\"\ncontent = \"x\"\n"),

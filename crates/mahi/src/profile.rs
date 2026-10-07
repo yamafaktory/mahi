@@ -29,6 +29,7 @@ use mahi_agent::{
         LogLine,
     },
     codex::{
+        self,
         HookTrust,
         MAX_CONFIG_BYTES,
         MAX_SAVED_BYTES,
@@ -76,6 +77,10 @@ pub(crate) type ReadLogLine = fn(&[u8]) -> Option<LogLine>;
 
 /// Finds where an agent keeps its sessions for a worktree.
 pub(crate) type SessionDir = fn(&Path) -> Option<String>;
+
+/// Tells whether a file, by its path in the agent's session directory, is one of its session
+/// logs.
+pub(crate) type IsSessionLog = fn(&str) -> bool;
 
 /// How mahi tells the agent where its tools are.
 #[derive(Debug)]
@@ -214,7 +219,7 @@ fn codex_profile() -> Profile {
             .collect(),
         args: CODEX_ARGS.iter().map(|arg| (*arg).to_owned()).collect(),
         credential: None,
-        reader: None,
+        reader: Some(Reader::Codex),
         takes_prompt: true,
         tools: Tools::Args(
             CODEX_TOOL_ARGS
@@ -402,14 +407,27 @@ impl Profile {
 
     /// Returns where the agent keeps its sessions, when mahi has a reader for them.
     pub(crate) fn session_dir(&self) -> Option<SessionDir> {
-        self.reader
-            .map(|Reader::ClaudeCode| claude_code::session_dir as SessionDir)
+        self.reader.map(|reader| match reader {
+            Reader::ClaudeCode => claude_code::session_dir as SessionDir,
+            Reader::Codex => codex::session_dir,
+        })
+    }
+
+    /// Returns which files of the agent's session directory are its session logs, when mahi
+    /// has a reader for them.
+    pub(crate) fn is_session_log(&self) -> Option<IsSessionLog> {
+        self.reader.map(|reader| match reader {
+            Reader::ClaudeCode => claude_code::is_session_log as IsSessionLog,
+            Reader::Codex => codex::is_session_log,
+        })
     }
 
     /// Returns how one line of the agent's session log reads, when mahi has a reader for it.
     pub(crate) fn log_line(&self) -> Option<ReadLogLine> {
-        self.reader
-            .map(|Reader::ClaudeCode| claude_code::log_line as ReadLogLine)
+        self.reader.map(|reader| match reader {
+            Reader::ClaudeCode => claude_code::log_line as ReadLogLine,
+            Reader::Codex => codex::log_line,
+        })
     }
 
     /// Writes the profile's files into the agent's state directory, open as `state` and found

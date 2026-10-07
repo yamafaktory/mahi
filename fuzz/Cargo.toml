@@ -291,3 +291,10 @@ path = "fuzz_targets/codex_hook_trust.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "codex-session"
+path = "fuzz_targets/codex_session.rs"
+test = false
+doc = false
+bench = false

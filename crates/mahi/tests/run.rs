@@ -2201,6 +2201,53 @@ cat parser.rs
         );
     }
 
+    const FAKE_CODEX: &str = r#"#!/bin/sh
+log="$CODEX_HOME/sessions/2026/10/06/rollout-2026-10-06T10-00-00-a.jsonl"
+[ -f "$log" ] && echo "session=$(tr '\n' '|' < "$log")"
+{ mkdir -p "${log%/*}" && echo "turn in $(basename "$(pwd -P)")" >> "$log"; } 2>/dev/null
+echo stray > "$CODEX_HOME/history.jsonl"
+"#;
+
+    #[test]
+    fn codexs_dated_session_logs_are_recorded_and_restored_once_its_state_is_gone() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let codex = script(&fixture, "codex-tools", "codex", FAKE_CODEX);
+        let first = fixture
+            .command(&["run", codex.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert_eq!(first.status.code(), Some(0), "{stderr}");
+        assert!(!stderr.contains("session was not"), "{stderr}");
+        let thread = thread_of(&worktree_of(&stderr));
+        let session = ThreadRef::new(
+            thread.parse().unwrap(),
+            RefKind::Session(AgentSlot::new(
+                ParticipantName::new("tester").unwrap(),
+                AgentName::new("codex").unwrap(),
+            )),
+        );
+        let store = Store::open(&fixture.repo).unwrap();
+        all_signed_by(&store, &session, &fixture.owner);
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+
+        let (code, output) = in_terminal(
+            &fixture,
+            &["resume", &thread, "--", codex.to_str().unwrap()],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("restored the agent's session (1 file)"),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("session=turn in {thread}.codex|")),
+            "{output}"
+        );
+    }
+
     #[test]
     fn resuming_claude_continues_its_conversation_in_the_same_state() {
         let fixture = fixture();
