@@ -178,6 +178,62 @@ are recorded, and give it `mahi mcp`, so it gets the thread's tools. A profile f
 
 `mahi help <command>` shows every option.
 
+## Architecture
+
+mahi is one binary with no server. Everything a thread holds lives in the project's own git
+repository, encrypted, and travels through its existing remote; teammates who are online at
+the same time also connect to each other directly. [DESIGN.md](DESIGN.md) specifies every part.
+
+- **Threads in git.** A thread is a set of refs under `refs/threads/<id>/` in the project's
+  repository, read and written with [gitoxide](https://github.com/GitoxideLabs/gitoxide): each
+  agent's worktree snapshots, the transcript of its turns, its own session files, and a `meta`
+  document listing the participants. mahi pushes and fetches them with its own SSH and HTTPS
+  transports, so nothing else on the remote changes.
+- **Encryption.** Each thread has its own key, wrapped for every participant's
+  [age](https://age-encryption.org) key, and what the agents were asked and replied is
+  compressed ([LZ4](https://github.com/PSeitz/lz4_flex)) and sealed with it before it becomes a
+  git object. `meta` and every commit are signed with the participant's SSH key, through
+  ssh-agent.
+- **Sandbox.** The agent runs in a pseudo-terminal inside an OS sandbox mahi builds itself, with
+  no helper program: user, mount, PID and network namespaces,
+  [Landlock](https://landlock.io) and a [seccomp](https://www.kernel.org/doc/html/latest/userspace-api/seccomp_filter.html)
+  filter on Linux, Seatbelt on macOS. Its only way out is mahi's proxy, to the hosts its
+  profile allows.
+- **Live layer.** Peers connect directly over QUIC with [iroh](https://www.iroh.computer)
+  (hole punching, with relays as a fallback) and share the live terminal, prompts and claims
+  over [iroh-gossip](https://github.com/n0-computer/iroh-gossip), one topic per thread, sealed
+  with a key derived from the thread key so only its participants can read them. TLS is
+  [rustls](https://github.com/rustls/rustls) with mahi's own pure-Rust crypto provider, built
+  on [RustCrypto](https://github.com/RustCrypto). An invite ticket carries the host's address
+  and the key a joiner must trust.
+- **Agents.** A profile tells mahi how to launch an agent, which hosts it may reach and where
+  its state lives. Its hooks report each prompt, tool call and turn end to `mahi hook`, and
+  `mahi mcp` serves it the thread's tools over the
+  [Model Context Protocol](https://modelcontextprotocol.io). Built-in readers parse Claude
+  Code's and Codex's session logs for handoff briefings and pull request drafts.
+- **Terminal.** The live view and the in-session palette render the agent's screen with
+  [vt100](https://crates.io/crates/vt100), on [tokio](https://tokio.rs).
+
+The workspace is split where a part has a clear boundary:
+
+| Crate | What it holds |
+|---|---|
+| `mahi` | The binary: commands, the run loop, profiles, merge, handoff and landing |
+| `mahi-core` | Thread ids, names and the ref layout |
+| `mahi-crypto` | Thread keys and the sealed blob format |
+| `mahi-identity` | The passphrase-protected age key, ssh-agent signing and stored credentials |
+| `mahi-store` | Thread refs, snapshots, worktrees and merges in the project's git repository |
+| `mahi-thread` | The signed `meta` document, participants and transcripts |
+| `mahi-sandbox` | The pseudo-terminal and the sandbox, the only crate with `unsafe` code |
+| `mahi-proxy` | The allowlist proxy that is the sandbox's only network |
+| `mahi-schedule` | When to snapshot: on a hook's poke or an adaptive timer |
+| `mahi-agent` | Hook messages, profiles and the Claude Code and Codex session readers |
+| `mahi-live` | iroh endpoints, invite tickets and the live layer |
+| `mahi-tls` | The pure-Rust rustls crypto provider for QUIC and TLS 1.3 |
+| `mahi-ssh` | The SSH client for git remotes, with `known_hosts` checks |
+| `mahi-http` | The HTTPS transport for git remotes |
+| `mahi-term` | The terminal side of the in-session palette |
+
 ## Development
 
 The commands are in the `justfile`, and [AGENTS.md](AGENTS.md) describes how the project is
