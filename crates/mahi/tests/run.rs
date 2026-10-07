@@ -3641,7 +3641,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
             &["invite", &thread_text, card.trim()],
             &owner_env,
         );
-        let (invited, _) = collect(&invite);
+        let (invited, invite_end) = collect(&invite);
         let mut answer = invite.writer().unwrap();
         wait_until("the owner's passphrase question", || {
             String::from_utf8_lossy(&invited.lock().unwrap()).contains("Passphrase")
@@ -3650,6 +3650,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
             .write_all(format!("{PASSPHRASE}\n").as_bytes())
             .unwrap();
         assert_eq!(exit_of(&mut invite), 0);
+        let _ = invite_end.recv_timeout(Duration::from_secs(10));
         String::from_utf8_lossy(&invited.lock().unwrap())
             .split_whitespace()
             .find(|word| word.starts_with("mahi1"))
