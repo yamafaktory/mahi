@@ -637,6 +637,9 @@ mod tests {
         let high_tiocsti = tiocsti | (1 << 32);
         let byte = *b"x";
         let byte = byte.as_ptr() as usize;
+        let vsock = usize::try_from(libc::AF_VSOCK).unwrap();
+        let high_vsock = vsock | (1 << 32);
+        let stream = usize::try_from(libc::SOCK_STREAM).unwrap();
         let denied = [
             ("unshare", raw_syscall(libc::SYS_unshare, [flags, 0, 0])),
             ("keyctl", raw_syscall(libc::SYS_keyctl, [0, 0, 0])),
@@ -658,6 +661,14 @@ mod tests {
                 "TIOCSTI with high bits",
                 raw_syscall(libc::SYS_ioctl, [0, high_tiocsti, byte]),
             ),
+            (
+                "vsock socket",
+                raw_syscall(libc::SYS_socket, [vsock, stream, 0]),
+            ),
+            (
+                "vsock socket with high bits",
+                raw_syscall(libc::SYS_socket, [high_vsock, stream, 0]),
+            ),
         ];
         for (name, result) in denied {
             assert_eq!(result, Err(libc::EPERM), "{name}");
@@ -678,6 +689,8 @@ mod tests {
             fs::read_to_string("/proc/sys/user/max_user_namespaces").unwrap(),
             "0\n"
         );
+        let unix = usize::try_from(libc::AF_UNIX).unwrap();
+        assert!(raw_syscall(libc::SYS_socket, [unix, stream, 0]).is_ok());
         assert!(rustix::termios::tcgetwinsize(std::io::stdin()).is_ok());
         thread::spawn(|| 7).join().unwrap();
         assert!(Command::new("/bin/true").status().unwrap().success());

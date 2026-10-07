@@ -25,6 +25,7 @@ const NAMESPACE_FLAGS: libc::c_int = libc::CLONE_NEWCGROUP
     | libc::CLONE_NEWUTS;
 
 const DENIED_IOCTLS: [libc::Ioctl; 2] = [libc::TIOCSTI, libc::TIOCLINUX];
+const DENIED_SOCKET_FAMILIES: [libc::c_int; 1] = [libc::AF_VSOCK];
 const SYS_OPEN_TREE_ATTR: libc::c_long = 467;
 const MAXIMUM_LENGTH: usize = 4096;
 
@@ -121,6 +122,14 @@ impl Filter {
                 ARG1_LOW_OFFSET,
                 libc::BPF_JEQ,
                 u32::try_from(request).map_err(|_| Errno::INVAL)?,
+            ));
+        }
+        for family in DENIED_SOCKET_FAMILIES {
+            program.extend(deny_argument(
+                syscall_number(libc::SYS_socket)?,
+                ARG0_LOW_OFFSET,
+                libc::BPF_JEQ,
+                family.cast_unsigned(),
             ));
         }
         program.push(ret(libc::SECCOMP_RET_ALLOW));
