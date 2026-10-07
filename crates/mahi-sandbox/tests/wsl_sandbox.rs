@@ -27,11 +27,13 @@ mod tests {
 
     const WINDOWS_SHELL: &str = "/mnt/c/Windows/System32/cmd.exe";
     const RAN: &str = "ran-Windows_NT";
+    const PRESENT: &str = "program-present";
+    const REGISTRATION: &str = "/proc/sys/fs/binfmt_misc/WSLInterop";
     const SIZE: WindowSize = WindowSize { rows: 24, cols: 80 };
 
     fn in_terminal(work: &Path, program: &Path, sandbox: Option<Sandbox>) -> (Option<i32>, String) {
         let script = format!(
-            "'{}' /c 'echo ran-%OS%' < /dev/null 2>&1 | cat",
+            "[ -f '{0}' ] && echo {PRESENT}; '{0}' /c 'echo ran-%OS%' < /dev/null 2>&1 | cat",
             program.display()
         );
         let mut command = PtyCommand::new(Path::new("/bin/sh"), work, SIZE)
@@ -80,7 +82,11 @@ mod tests {
 
     #[test]
     fn a_windows_program_runs_outside_the_sandbox_and_not_inside_it() {
-        let work = tempfile::tempdir().unwrap();
+        eprintln!(
+            "registration: {:?}",
+            fs::read_to_string(REGISTRATION).unwrap_or_default()
+        );
+        let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let program = work.path().join("cmd.exe");
         fs::copy(WINDOWS_SHELL, &program).expect("WSL 2 with the C: drive mounted");
         let outside = Command::new(&program)
@@ -101,6 +107,7 @@ mod tests {
         sandbox.bind(work.path(), Access::ReadOnly).unwrap();
         let (code, output) = in_terminal(work.path(), &program, Some(sandbox));
         eprintln!("in the sandbox: {code:?} {output:?}");
+        assert!(output.contains(PRESENT), "{output}");
         assert!(!output.contains(RAN), "{output}");
     }
 }
