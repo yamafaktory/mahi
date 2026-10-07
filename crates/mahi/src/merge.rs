@@ -284,7 +284,9 @@ fn ask_running(
     request: &MergeRequest,
 ) -> Result<Outcome, MergeError> {
     let merged = MergedFrom::read(store, snapshots)?;
-    if merge_base(store, &merged, request)? == request.commit {
+    let own = store.head(snapshots)?.map(|head| (into, head));
+    let theirs = merged_by(store, request.commit);
+    if merge_base(store, (&merged, own), (request, &theirs))? == request.commit {
         return Ok(Outcome::Done(already(into, request).report().to_owned()));
     }
     let door = merge_door::door_path(&environment.runtime_dir(), snapshots.thread(), into.agent())
@@ -297,8 +299,8 @@ fn ask_running(
 }
 
 /// Merges `request` into `into`'s worktree, whose snapshots are at `head` and remembered in
-/// `cache`, from the snapshot of `request.from` it last merged, or else the thread's base; then
-/// records the result in a snapshot whose trailers name `request.commit`. Once the worktree is
+/// `cache`, from the base [`merge_base`] gives; then records the result in a snapshot whose
+/// trailers name `request.commit` and what that snapshot had itself merged. Once the worktree is
 /// written, the snapshot is taken even if `interrupt` is set, so a merge is never left
 /// unrecorded.
 pub(crate) fn merge_now(
@@ -309,13 +311,16 @@ pub(crate) fn merge_now(
     interrupt: &AtomicBool,
 ) -> Result<MergeDone, MergeError> {
     let mut merged_from = MergedFrom::read(store, into.snapshots)?;
-    let base = merge_base(store, &merged_from, request)?;
+    let theirs = merged_by(store, request.commit);
+    let own = head.map(|head| (into.slot, head));
+    let base = merge_base(store, (&merged_from, own), (request, &theirs))?;
     if base == request.commit {
         return Ok(already(into.slot, request));
     }
     if !merged_from.record(request.from.clone(), request.commit) {
         return Err(MergeError::TooManySources(into.slot.clone()));
     }
+    merged_from.absorb(store, (&theirs, into.snapshots.thread()), Some(into.slot));
     let (base, theirs) = (store.commit_tree(base)?, store.commit_tree(request.commit)?);
     let ours = snapshot(store, into.worktree, (into.globals, cache), interrupt)?;
     let labels = (into.slot.to_string(), request.from.to_string());
@@ -343,17 +348,29 @@ pub(crate) fn merge_now(
 }
 
 /// Returns the snapshot a merge of `request` starts from: the snapshot of `request.from` that
-/// `merged` says was merged last, when the requested one descends from it, or else the
-/// thread's base.
+/// `merged` says was merged last, when the requested one descends from it; else a snapshot of
+/// another agent that both the requested history, by its own trailers, and the target hold,
+/// through `merged` or through its own snapshots at `own` when the target is that agent, as
+/// after a handoff; or else the thread's base.
 pub(crate) fn merge_base(
     store: &Store,
-    merged: &MergedFrom,
-    request: &MergeRequest,
+    (merged, own): (&MergedFrom, Option<(&AgentSlot, ObjectId)>),
+    (request, theirs): (&MergeRequest, &MergedFrom),
 ) -> Result<ObjectId, StoreError> {
-    Ok(match merged.of(&request.from) {
-        Some(last) if store.descends_from(request.commit, last)? => last,
-        _ => request.thread_base,
-    })
+    if let Some(last) = merged.of(&request.from)
+        && store.descends_from(request.commit, last)?
+    {
+        return Ok(last);
+    }
+    Ok(merged
+        .shared_with(store, theirs, own)
+        .unwrap_or(request.thread_base))
+}
+
+/// Reads what the snapshot history ending at `commit` merged, or nothing when it cannot be
+/// read, since a merge only uses it to find a closer base.
+pub(crate) fn merged_by(store: &Store, commit: ObjectId) -> MergedFrom {
+    MergedFrom::read_from(store, Some(commit)).unwrap_or_default()
 }
 
 fn already(into: &AgentSlot, request: &MergeRequest) -> MergeDone {

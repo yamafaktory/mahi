@@ -834,6 +834,14 @@ fn starting_point(
         Start::Handoff(from) => {
             let (key, (commit, contents)) = brief(prepared, meta, from, participant, config)?;
             eprintln!("mahi: handing {from}'s work over to {agent_name}");
+            merged.absorb(
+                &prepared.store,
+                (
+                    &crate::merge::merged_by(&prepared.store, commit),
+                    meta.thread(),
+                ),
+                Some(&AgentSlot::new(participant.clone(), agent_name.clone())),
+            );
             merged.record(from.clone(), commit);
             Ok((key, contents, merged))
         }
@@ -841,6 +849,14 @@ fn starting_point(
             let (commit, contents) = source_snapshot(&prepared.store, meta, from)?;
             let key = unlock_thread_key(meta, participant, config)?;
             eprintln!("mahi: starting {agent_name} from {from}'s latest snapshot");
+            merged.absorb(
+                &prepared.store,
+                (
+                    &crate::merge::merged_by(&prepared.store, commit),
+                    meta.thread(),
+                ),
+                Some(&AgentSlot::new(participant.clone(), agent_name.clone())),
+            );
             merged.record(from.clone(), commit);
             Ok((key, contents, merged))
         }

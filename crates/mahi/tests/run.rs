@@ -1964,6 +1964,149 @@ cat parser.rs
     }
 
     #[test]
+    fn work_taken_over_by_a_handoff_lands_and_merges_back_without_conflicts() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let helper = script(
+            &fixture,
+            "extending",
+            "helper",
+            "#!/bin/sh\nprintf 'fn check() {}\\n' >> parser.rs\n",
+        );
+        let (code, output) = in_terminal(
+            &fixture,
+            &[
+                "handoff",
+                &thread,
+                "--from",
+                "tester.claude",
+                "--",
+                helper.to_str().unwrap(),
+            ],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+
+        let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("merged tester.helper into the landing worktree: 1 written"),
+            "{output}"
+        );
+        assert!(!output.contains("conflict"), "{output}");
+        let landing = worktree_named(&fixture, &format!("{thread}@land"));
+        assert_eq!(
+            fs::read_to_string(landing.join("parser.rs")).unwrap(),
+            "fn parse() {}\nfn check() {}\n"
+        );
+
+        let report = merge_report(&fixture, &thread, "tester.helper", "claude");
+        assert!(
+            report.contains("merged tester.helper into tester.claude: 1 written"),
+            "{report}"
+        );
+        assert!(!report.contains("conflict"), "{report}");
+        assert_eq!(
+            fs::read_to_string(
+                worktree_named(&fixture, &format!("{thread}.claude")).join("parser.rs")
+            )
+            .unwrap(),
+            "fn parse() {}\nfn check() {}\n"
+        );
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+    }
+
+    #[test]
+    fn work_taken_over_lands_cleanly_when_the_new_agent_lands_first() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let aider = script(
+            &fixture,
+            "extending",
+            "aider",
+            "#!/bin/sh\nprintf 'fn check() {}\\n' >> parser.rs\n",
+        );
+        let (code, output) = in_terminal(
+            &fixture,
+            &[
+                "handoff",
+                &thread,
+                "--from",
+                "tester.claude",
+                "--",
+                aider.to_str().unwrap(),
+            ],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+
+        let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("merged tester.aider into the landing worktree: 1 written"),
+            "{output}"
+        );
+        assert!(
+            output
+                .contains("the landing worktree already has the latest snapshot of tester.claude"),
+            "{output}"
+        );
+        assert!(!output.contains("conflict"), "{output}");
+        let landing = worktree_named(&fixture, &format!("{thread}@land"));
+        assert_eq!(
+            fs::read_to_string(landing.join("parser.rs")).unwrap(),
+            "fn parse() {}\nfn check() {}\n"
+        );
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+    }
+
+    #[test]
+    fn merging_taken_over_work_into_a_third_agent_records_the_work_it_started_from() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let helper = script(
+            &fixture,
+            "extending",
+            "helper",
+            "#!/bin/sh\nprintf 'fn check() {}\\n' >> parser.rs\n",
+        );
+        let third = script(&fixture, "idle", "third", "#!/bin/sh\n");
+        for arguments in [
+            vec![
+                "handoff",
+                &thread,
+                "--from",
+                "tester.claude",
+                "--",
+                helper.to_str().unwrap(),
+            ],
+            vec!["agent", "add", &thread, "--", third.to_str().unwrap()],
+        ] {
+            let (code, output) = in_terminal(&fixture, &arguments, Some(PASSPHRASE));
+            assert_eq!(code, 0, "{output}");
+        }
+
+        let report = merge_report(&fixture, &thread, "tester.helper", "third");
+        assert!(
+            report.contains("merged tester.helper into tester.third: 1 written"),
+            "{report}"
+        );
+        let report = merge_report(&fixture, &thread, "tester.claude", "third");
+        assert!(
+            report.contains("tester.third already has the latest snapshot of tester.claude"),
+            "{report}"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                worktree_named(&fixture, &format!("{thread}.third")).join("parser.rs")
+            )
+            .unwrap(),
+            "fn parse() {}\nfn check() {}\n"
+        );
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+    }
+
+    #[test]
     fn pushing_a_landing_branch_needs_a_chosen_remote_and_a_landing_worktree() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);

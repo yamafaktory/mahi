@@ -814,7 +814,9 @@ fn merge_sources(
             thread_base: meta.base(),
         };
         let failed = |error| LandError::Merge(Box::new(slot.clone()), error);
-        let base = merge::merge_base(store, &landed, &request).map_err(failed)?;
+        let recorded = merge::merged_by(store, commit);
+        let base =
+            merge::merge_base(store, (&landed, None), (&request, &recorded)).map_err(failed)?;
         if base == commit {
             let _ = writeln!(
                 report,
@@ -838,6 +840,7 @@ fn merge_sources(
         if !landed.record(slot.clone(), commit) {
             return Err(LandError::TooManySources(slot.clone()));
         }
+        landed.absorb(store, (&recorded, thread), None);
         let applied = store
             .apply_merge(name, ours, merged.tree, interrupt)
             .map_err(failed)?;

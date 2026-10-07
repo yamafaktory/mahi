@@ -534,7 +534,13 @@ impl ThreadTools {
         };
         let own = ThreadRef::new(self.thread, RefKind::Snapshots(self.me.clone()));
         let merged = MergedFrom::read(&store, &own).map_err(|error| failed(&error))?;
-        if merge::merge_base(&store, &merged, &request).map_err(|error| failed(&error))? == commit {
+        let head = store.head(&own).map_err(|error| failed(&error))?;
+        let mine = head.map(|head| (&self.me, head));
+        let theirs = merge::merged_by(&store, commit);
+        if merge::merge_base(&store, (&merged, mine), (&request, &theirs))
+            .map_err(|error| failed(&error))?
+            == commit
+        {
             return Ok(format!(
                 "You already have the latest work of {}.",
                 request.from
