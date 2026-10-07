@@ -33,8 +33,9 @@ release version *args: check
 apparmor-parse:
     cargo run --locked -q -p mahi -- apparmor | sudo apparmor_parser --skip-kernel-load
 
+# Build the .deb, with a pre-release such as 0.1.0-rc.1 versioned 0.1.0~rc.1 so Debian sorts it before 0.1.0
 deb:
-    cargo deb --locked -p mahi
+    cargo deb --locked -p mahi --deb-version "$(cargo pkgid -p mahi | sed 's/.*[#@]//; s/-/~/')"
 
 deb-check:
     test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
