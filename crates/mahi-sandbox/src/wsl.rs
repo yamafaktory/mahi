@@ -51,10 +51,7 @@ mod tests {
             Wsl::from_release("5.15.167.4-microsoft-standard-WSL2+\n"),
             Some(Wsl::Two)
         );
-        assert_eq!(
-            Wsl::from_release("6.6.0-Microsoft-custom\n"),
-            Some(Wsl::Two)
-        );
+        assert_eq!(Wsl::from_release("6.6.0-Microsoft-custom\n"), None);
         assert_eq!(Wsl::from_release("5.15.0-1057-azure\n"), None);
         assert_eq!(Wsl::from_release("7.2.9-1-cachyos\n"), None);
         assert_eq!(Wsl::from_release(""), None);
