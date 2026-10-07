@@ -33,6 +33,7 @@ just build
 just run -- …   # run the mahi binary
 just test-git   # the tests that run the git program (not part of just test)
 just test-wsl   # the tests that need WSL 2 (not part of just test; CI runs them on Windows)
+just dogfood    # the real Claude Code and Codex end to end, with your sign-ins (not in CI)
 just apparmor-parse # parse mahi apparmor's profile (needs apparmor_parser and sudo)
 just deb        # build the .deb (cargo-deb) into target/debian/
 just deb-check  # CI only: install the .deb on Ubuntu 24.04 and run mahi from /usr/bin

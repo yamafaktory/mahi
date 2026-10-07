@@ -22,6 +22,10 @@ test-git *args:
 test-wsl *args:
     cargo nextest run --workspace --locked --ignore-default-filter -E 'binary(/^wsl_/)' {{args}}
 
+# The real Claude Code and Codex through mahi; needs both signed in, see crates/mahi/tests/dogfood_agents.rs
+dogfood *args:
+    cargo nextest run -p mahi --locked --ignore-default-filter -E 'binary(/^dogfood_/)' --no-capture {{args}}
+
 apparmor-parse:
     cargo run --locked -q -p mahi -- apparmor | sudo apparmor_parser --skip-kernel-load
 

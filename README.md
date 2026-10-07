@@ -158,7 +158,13 @@ are recorded, and give it `mahi mcp`, so it gets the thread's tools. A profile f
 The commands are in the `justfile`, and [AGENTS.md](AGENTS.md) describes how the project is
 worked on. `just check` runs formatting, lints, tests and the dependency policy;
 `just test-git` runs the tests that need the `git` program, and `just test-wsl` the ones that
-need WSL 2.
+need WSL 2. `just dogfood` runs the real Claude Code and Codex through mahi end to end (a
+thread, a handoff, a resume and a landing) in a throwaway home, with your own sign-ins:
+
+```sh
+MAHI_DOGFOOD_CLAUDE_TOKEN=path/to/claude-setup-token \
+MAHI_DOGFOOD_CODEX_AUTH=~/.codex/auth.json just dogfood
+```
 
 ## License
 
