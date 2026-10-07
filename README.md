@@ -2,6 +2,12 @@
 
 > *mahi* (te reo Māori): work.
 
+> [!WARNING]
+> mahi is preview software. Commands, configuration and the formats it keeps in git may
+> change between releases without a migration, and its sandbox and encryption have not been
+> audited by a third party. Try it on repositories whose work you can redo, and keep your own
+> branches and backups.
+
 mahi lets several engineers work together in real time with any terminal coding agent, such as
 Claude Code or Codex. Each agent runs in a sandbox, in a git worktree of its own. Teammates
 watch it live and can hand it prompts, take over its work or merge it. Peers connect directly,
@@ -13,9 +19,11 @@ mahi is a single Rust binary for Linux and macOS, and for Windows through WSL 2.
 
 ## Status
 
-mahi is early and in active development: the first milestone is being built, and commands and
-formats may still change. [DESIGN.md](DESIGN.md) is the specification and says what is built
-and what is planned.
+mahi is a preview. Every part [DESIGN.md](DESIGN.md) specifies is built and tested, on Linux,
+macOS and WSL 2, and with the real Claude Code and Codex, but it has had few users so far:
+expect rough edges, and changes that need you to start threads again. DESIGN.md is the
+specification and lists what is still open. Please report what breaks in the
+[issues](https://github.com/yamafaktory/mahi/issues).
 
 ## Install
 
