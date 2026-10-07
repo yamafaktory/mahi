@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[package.metadata.dist]
+dist = true
+
 [package.metadata.deb]
 assets = [
   ["target/release/mahi", "usr/bin/", "755"],

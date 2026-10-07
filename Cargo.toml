@@ -105,9 +105,17 @@ todo = "deny"
 unimplemented = "deny"
 unwrap_used = "deny"
 
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
+
 [profile.dev]
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
 debug = false
+
+[profile.dist]
+inherits = "release"

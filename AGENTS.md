@@ -51,6 +51,14 @@ jobs. A `wsl` job runs `just test`, `just test-git` and `just test-wsl` inside a
 WSL 2 distribution on a Windows runner. Change a check in the `justfile`, not in the
 workflow, so that CI and local runs stay the same.
 
+Releases are made with [cargo-dist](https://github.com/axodotdev/cargo-dist), configured in
+`dist-workspace.toml`. Pushing a tag `v<version>` that matches `Cargo.toml` runs
+`.github/workflows/release.yml`: the checks, then the archives, the installer script and the
+`.deb` packages (`.github/workflows/build-deb.yml`), published as a GitHub release.
+`release.yml` is generated: change `dist-workspace.toml` and run `dist generate`, never edit it
+by hand. `dist plan` shows what a release would contain. A tag with a suffix, such as
+`v0.2.0-rc.1`, makes a pre-release, which the README's installer URL (`releases/latest`) skips.
+
 After every change, run `just fmt && just check`. A change is not done until `just check`
 passes. Do not silence a failure: fix the cause.
 

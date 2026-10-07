@@ -280,4 +280,4 @@ Fuzzing (see Testing) comes as its own step after milestone 3, covering every pa
 
 ## Open questions
 
-- Name: mahi, at mahi.social, a domain the project owns, used wherever mahi needs a domain or a URL of its own. The `mahi` crate looked unclaimed on crates.io (Sept 2026); confirm GitHub and other registries. Be thoughtful about using a te reo Māori word if this becomes commercial.
+- Name: mahi, at mahi.social, a domain the project owns, used wherever mahi needs a domain or a URL of its own. The `mahi` crate is reserved on crates.io with a 0.0.0 placeholder (Oct 2026), since mahi ships as a binary from GitHub releases; confirm other registries. Be thoughtful about using a te reo Māori word if this becomes commercial.

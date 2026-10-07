@@ -1,0 +1,22 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.33.0"
+ci = "github"
+installers = ["shell"]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+install-path = ["$MAHI_INSTALL_DIR/", "~/.local/bin/"]
+hosting = "github"
+install-updater = false
+github-attestations = true
+pr-run-mode = "skip"
+plan-jobs = ["./checks"]
+local-artifacts-jobs = ["./build-deb"]
+
+[dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"
+x86_64-unknown-linux-gnu = "ubuntu-22.04"
+
+[dist.min-glibc-version]
+"*" = "2.35"

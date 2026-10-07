@@ -1,0 +1,35 @@
+name: Debian packages
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deb:
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-deb
+      - run: just deb
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifacts-deb-${{ matrix.arch }}
+          path: target/debian/*.deb
+          if-no-files-found: error

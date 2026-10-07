@@ -27,16 +27,34 @@ specification and lists what is still open. Please report what breaks in the
 
 ## Install
 
-Build it from source with the Rust toolchain pinned in `rust-toolchain.toml`:
+On Linux (x86_64 and arm64, glibc 2.35 or later: Ubuntu 22.04, Debian 12 and newer), macOS
+(Apple silicon and Intel) and WSL 2, the installer script of the latest
+[release](https://github.com/yamafaktory/mahi/releases) puts `mahi` in `~/.local/bin`, or in
+`$MAHI_INSTALL_DIR` when it is set, and adds that directory to your shell's `PATH`
+(`MAHI_NO_MODIFY_PATH=1` leaves your shell files alone):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/yamafaktory/mahi/releases/latest/download/mahi-installer.sh | sh
+```
+
+Each release also has the archive for every platform, `mahi-<target>.tar.xz`, with the binary,
+its license and this README, and `.deb` packages for Ubuntu 24.04 and later. Each archive has
+a `.sha256` checksum, also listed in `sha256.sum`, and GitHub's build provenance attestation:
+`gh attestation verify mahi-<target>.tar.xz --repo yamafaktory/mahi`. The macOS binaries are not
+notarized yet: if a browser downloaded the archive, macOS refuses to run `mahi` until you remove
+its quarantine with `xattr -d com.apple.quarantine mahi` (the installer script is not affected).
+
+To build it from source instead, use the Rust toolchain pinned in `rust-toolchain.toml`:
 
 ```sh
 cargo install --locked --path crates/mahi
 ```
 
 On Ubuntu 23.10 and later, AppArmor denies unprivileged programs what the sandbox needs inside
-its user namespaces. Install the `.deb` (`just deb` builds it into `target/debian/`), which puts
-mahi in `/usr/bin` with an AppArmor profile that allows exactly that, or install the profile
-`mahi apparmor` prints, as mahi explains when it meets the restriction.
+its user namespaces, so a `mahi` installed by the script, from an archive or from source needs
+the profile `mahi apparmor` prints for it, as mahi explains when it meets the restriction.
+The release's `.deb` (or one built with `just deb`, into `target/debian/`) installs mahi in
+`/usr/bin` with that profile instead.
 
 ### Windows (WSL 2)
 
@@ -47,13 +65,12 @@ wsl --update                    # WSL's own kernel has what the sandbox needs (6
 wsl --install -d Ubuntu-24.04   # or wsl --set-version <distribution> 2 for an existing one
 ```
 
-Then, inside the distribution, install Rust with [rustup](https://rustup.rs) and build mahi as
-above. Keep your repositories in the distribution's Linux file system (`~/`) rather than under
+Then, inside the distribution, download a Linux release as above, or install Rust with
+[rustup](https://rustup.rs) and build mahi. Keep your repositories in the distribution's Linux file system (`~/`) rather than under
 `/mnt/c`, which is much slower and lets Windows programs run what an agent leaves there. WSL's
 kernel does not have Ubuntu's AppArmor restriction on user namespaces, so the `.deb` and
-`mahi apparmor` are not needed there. mahi refuses to run under
-WSL 1, and an agent in the sandbox cannot start Windows programs. CI runs mahi's tests inside
-WSL 2.
+`mahi apparmor` are not needed there. mahi refuses to run under WSL 1, and an agent in the
+sandbox cannot start Windows programs. CI runs mahi's tests inside WSL 2.
 
 ## Quick start
 
