@@ -70,7 +70,7 @@ jobs:
         with:
           distribution: Ubuntu-24.04
           wsl-version: 2
-          additional-packages: build-essential curl git just openssh-server
+          additional-packages: build-essential curl git openssh-server
       - shell: wsl-bash -u root {0}
         run: |
           uname -r
@@ -85,6 +85,7 @@ jobs:
           . ~/.cargo/env
           rustup toolchain install
           curl --proto '=https' --tlsv1.2 -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+          curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to ~/.cargo/bin
           just test --profile ci
           just test-git --profile ci
           just test-wsl --profile ci --success-output final
