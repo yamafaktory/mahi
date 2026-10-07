@@ -90,6 +90,16 @@ jobs:
           rustup toolchain install
           curl --proto '=https' --tlsv1.2 -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
           curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to ~/.cargo/bin
+          cargo nextest run --workspace --locked --no-run
+          (cargo nextest run --locked -p mahi -E 'test(taking_a_thread_from_the_remote)' --no-capture &
+            sleep 90
+            ps -eo pid,ppid,stat,wchan:32,etime,args --forest | grep -v ' \[' || true
+            for p in $(pgrep -f 'debug/mahi '); do
+              echo "== $p: $(tr '\0' ' ' < /proc/$p/cmdline)"
+              ls -l /proc/$p/fd || true
+              for t in /proc/$p/task/*; do echo "$(cat $t/comm) $(cat $t/wchan)"; done
+            done
+            wait) || true
           just test --profile ci
           just test-git --profile ci
           just test-wsl --profile ci --success-output final
