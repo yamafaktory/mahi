@@ -91,8 +91,9 @@ jobs:
           curl --proto '=https' --tlsv1.2 -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
           curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to ~/.cargo/bin
           cargo nextest run --workspace --locked --no-run
-          (cargo nextest run --locked -p mahi -E 'test(taking_a_thread_from_the_remote)' --no-capture &
-            sleep 90
+          (cargo nextest run --workspace --locked -E 'test(taking_a_thread_from_the_remote)' --no-capture &
+            for i in $(seq 600); do pgrep -f 'debug/mahi ' > /dev/null && break; sleep 1; done
+            sleep 30
             ps -eo pid,ppid,stat,wchan:32,etime,args --forest | grep -v ' \[' || true
             for p in $(pgrep -f 'debug/mahi '); do
               echo "== $p: $(tr '\0' ' ' < /proc/$p/cmdline)"
