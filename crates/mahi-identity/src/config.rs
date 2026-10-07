@@ -1,8 +1,18 @@
-use std::path::{
-    Path,
-    PathBuf,
+use std::{
+    io,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
+use rustix::{
+    fs::{
+        Mode,
+        OFlags,
+    },
+    io::Errno,
+};
 use thiserror::Error;
 
 const APP: &str = "mahi";
@@ -44,6 +54,31 @@ impl ConfigDir {
             .filter(|home| home.is_absolute())
             .ok_or(ConfigError::NoHome)?;
         Ok(Self(platform_dir(home, xdg_config_home)))
+    }
+
+    /// Makes the directory private when it is one the user owns that its group or others may
+    /// write to, as an installer that creates it with the user's umask can leave it, and returns
+    /// whether it did. A missing directory, a link or one owned by someone else is left as it
+    /// is, for the checks on reading and writing to refuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of opening, inspecting or changing the directory.
+    pub fn make_private(&self) -> io::Result<bool> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let dir = match rustix::fs::open(&self.0, flags, Mode::empty()) {
+            Ok(dir) => dir,
+            Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let stat = rustix::fs::fstat(&dir)?;
+        let owned = stat.st_uid == rustix::process::geteuid().as_raw();
+        let writable = Mode::from_raw_mode(stat.st_mode).intersects(Mode::WGRP | Mode::WOTH);
+        if !owned || !writable {
+            return Ok(false);
+        }
+        rustix::fs::fchmod(&dir, Mode::RWXU)?;
+        Ok(true)
     }
 
     /// Returns the directory.
@@ -104,6 +139,14 @@ fn platform_dir(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        os::unix::fs::{
+            PermissionsExt,
+            symlink,
+        },
+    };
+
     use super::*;
 
     #[test]
@@ -156,5 +199,31 @@ mod tests {
                 "{ignored:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_config_directory_others_may_write_to_is_made_private_once() {
+        let home = tempfile::tempdir().unwrap();
+        let config = ConfigDir::resolve(Some(home.path()), Some(&home.path().join("xdg"))).unwrap();
+        assert!(!config.make_private().unwrap());
+        fs::create_dir_all(config.path()).unwrap();
+        fs::set_permissions(config.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(config.make_private().unwrap());
+        let mode = fs::metadata(config.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(!config.make_private().unwrap());
+        fs::set_permissions(config.path(), fs::Permissions::from_mode(0o702)).unwrap();
+        assert!(config.make_private().unwrap());
+        let mode = fs::metadata(config.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        let elsewhere = home.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::remove_dir(config.path()).unwrap();
+        symlink(&elsewhere, config.path()).unwrap();
+        assert!(!config.make_private().unwrap());
+        let mode = fs::metadata(&elsewhere).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o777);
     }
 }

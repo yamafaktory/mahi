@@ -66,6 +66,28 @@ use crate::{
     run::Outcome,
 };
 
+/// Makes mahi's configuration directory private when its group or others may write to it, as
+/// an installer creating it with the user's umask can leave it, and says so.
+fn make_config_private(environment: &Environment) {
+    let Ok(config) = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    ) else {
+        return;
+    };
+    match config.make_private() {
+        Ok(true) => eprintln!(
+            "mahi: made {} private (mode 700), since its group or others could write to it",
+            config.path().display()
+        ),
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "mahi: could not make {} private: {error}",
+            config.path().display()
+        ),
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let required = match &cli.command {
@@ -80,6 +102,7 @@ fn main() {
         _ => None,
     };
     let mut environment = Environment::read(required.as_deref().unwrap_or_default(), &[]);
+    make_config_private(&environment);
     if required.is_some() {
         let loaded = ConfigDir::resolve(
             environment.home.as_deref(),
