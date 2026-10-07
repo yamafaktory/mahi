@@ -2547,10 +2547,20 @@ echo stray > "$CODEX_HOME/history.jsonl"
             PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
             None,
         );
+        let closing = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closing.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for connection in closing.incoming() {
+                drop(connection);
+            }
+        });
         let config = fixture.repo.join(".git/config");
-        let mut text = fs::read_to_string(&config).unwrap();
-        text.push_str("[remote \"origin\"]\n\turl = ssh://127.0.0.1:1/unreachable.git\n");
-        fs::write(&config, text).unwrap();
+        let text = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            format!("{text}[remote \"origin\"]\n\turl = ssh://127.0.0.1:{port}/unreachable.git\n"),
+        )
+        .unwrap();
         let refused = fixture
             .command(&["resume", "--take-remote", thread, "--", "true"])
             .env("SSH_AUTH_SOCK", &elsewhere)

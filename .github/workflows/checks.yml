@@ -74,6 +74,10 @@ jobs:
       - shell: wsl-bash -u root {0}
         run: |
           uname -r
+          wslinfo --networking-mode || true
+          start=$(date +%s%N)
+          timeout 60 bash -c 'exec 3<>/dev/tcp/127.0.0.1/1' || echo "closed loopback port: exit $?"
+          echo "closed loopback port answered in $(( ($(date +%s%N) - start) / 1000000 )) ms"
           useradd --create-home tester
           git -c safe.directory='*' clone --quiet . /home/tester/mahi
           chown -R tester: /home/tester/mahi
