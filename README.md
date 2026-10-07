@@ -8,7 +8,8 @@ watch it live and can hand it prompts, take over its work or merge it. Peers con
 with no mahi server, and a thread's history is kept in the project's own git remote, with what
 the agents were asked and replied encrypted.
 
-mahi is a single Rust binary for Linux and macOS. Its home is [mahi.social](https://mahi.social).
+mahi is a single Rust binary for Linux and macOS, and for Windows through WSL 2. Its home is
+[mahi.social](https://mahi.social).
 
 ## Status
 
@@ -28,6 +29,11 @@ On Ubuntu 23.10 and later, AppArmor denies unprivileged programs what the sandbo
 its user namespaces. Install the `.deb` (`just deb` builds it into `target/debian/`), which puts
 mahi in `/usr/bin` with an AppArmor profile that allows exactly that, or install the profile
 `mahi apparmor` prints, as mahi explains when it meets the restriction.
+
+On Windows, run mahi inside a WSL 2 distribution, such as Ubuntu, and keep your repositories in
+its Linux file system rather than under `/mnt/c`. The sandbox needs the kernel that WSL ships
+(6.1 or later; `wsl --update` updates it), and mahi refuses to run under WSL 1. An agent in the
+sandbox cannot start Windows programs. CI runs mahi's tests inside WSL 2.
 
 ## Quick start
 

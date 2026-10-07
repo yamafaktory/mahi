@@ -61,6 +61,34 @@ jobs:
       - if: runner.os == 'Linux'
         run: just apparmor-parse
 
+  wsl:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 2
+          additional-packages: build-essential curl git just openssh-server
+      - shell: wsl-bash -u root {0}
+        run: |
+          uname -r
+          useradd --create-home tester
+          git -c safe.directory='*' clone --quiet . /home/tester/mahi
+          chown -R tester: /home/tester/mahi
+      - shell: wsl-bash -u tester {0}
+        run: |
+          export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+          cd ~/mahi
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          . ~/.cargo/env
+          rustup toolchain install
+          curl --proto '=https' --tlsv1.2 -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+          just test --profile ci
+          just test-git --profile ci
+          just test-wsl --profile ci --success-output final
+
   deb:
     runs-on: ubuntu-24.04
     steps:

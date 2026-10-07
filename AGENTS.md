@@ -32,6 +32,7 @@ just test       # cargo nextest run; extra args pass through, e.g. just test -p 
 just build
 just run -- …   # run the mahi binary
 just test-git   # the tests that run the git program (not part of just test)
+just test-wsl   # the tests that need WSL 2 (not part of just test; CI runs them on Windows)
 just apparmor-parse # parse mahi apparmor's profile (needs apparmor_parser and sudo)
 just deb        # build the .deb (cargo-deb) into target/debian/
 just deb-check  # CI only: install the .deb on Ubuntu 24.04 and run mahi from /usr/bin
@@ -45,8 +46,9 @@ just mutants <crate> [args] # cargo-mutants on one crate, e.g. -f 'crates/mahi-s
 
 CI (`.github/workflows/checks.yml`) runs `just fmt-check`, `just clippy`,
 `just test --profile ci` with `just test-git --profile ci`, and `just deny` as separate
-jobs. Change a check in the `justfile`, not in the workflow, so that CI and local runs stay
-the same.
+jobs. A `wsl` job runs `just test`, `just test-git` and `just test-wsl` inside an Ubuntu
+WSL 2 distribution on a Windows runner. Change a check in the `justfile`, not in the
+workflow, so that CI and local runs stay the same.
 
 After every change, run `just fmt && just check`. A change is not done until `just check`
 passes. Do not silence a failure: fix the cause.
