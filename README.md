@@ -30,10 +30,22 @@ its user namespaces. Install the `.deb` (`just deb` builds it into `target/debia
 mahi in `/usr/bin` with an AppArmor profile that allows exactly that, or install the profile
 `mahi apparmor` prints, as mahi explains when it meets the restriction.
 
-On Windows, run mahi inside a WSL 2 distribution, such as Ubuntu, and keep your repositories in
-its Linux file system rather than under `/mnt/c`. The sandbox needs the kernel that WSL ships
-(6.1 or later; `wsl --update` updates it), and mahi refuses to run under WSL 1. An agent in the
-sandbox cannot start Windows programs. CI runs mahi's tests inside WSL 2.
+### Windows (WSL 2)
+
+mahi runs on Windows inside a WSL 2 distribution. In PowerShell:
+
+```powershell
+wsl --update                    # WSL's own kernel has what the sandbox needs (6.1 or later)
+wsl --install -d Ubuntu-24.04   # or wsl --set-version <distribution> 2 for an existing one
+```
+
+Then, inside the distribution, install Rust with [rustup](https://rustup.rs) and build mahi as
+above. Keep your repositories in the distribution's Linux file system (`~/`) rather than under
+`/mnt/c`, which is much slower and lets Windows programs run what an agent leaves there. WSL's
+kernel does not have Ubuntu's AppArmor restriction on user namespaces, so the `.deb` and
+`mahi apparmor` are not needed there. mahi refuses to run under
+WSL 1, and an agent in the sandbox cannot start Windows programs. CI runs mahi's tests inside
+WSL 2.
 
 ## Quick start
 
@@ -57,7 +69,8 @@ Any terminal agent runs in mahi. For an agent it has a profile for, mahi also kn
 the agent may reach, gives it a state directory of its own in each thread, records its turns
 through its hooks, and serves it the thread's tools (`mahi mcp`). mahi chooses the profile by
 the agent program's file name and says at start which one it uses. Profiles for Claude Code and
-Codex are built in.
+Codex are built in, and mahi also reads their session logs: a `mahi handoff` briefing quotes
+the agent's latest replies, and `mahi resume` on another machine restores its session.
 
 The sandbox reaches the network only through mahi's proxy, to the hosts the profile or
 `--allow-host` names. Options for `mahi run` go before the agent; everything after the agent is
@@ -99,8 +112,8 @@ mahi run --allow-host api.example.com --pass-env EXAMPLE_API_KEY my-agent --some
 ```
 
 To give it its hosts, variables and a state directory of its own in each thread, write a
-profile in `profiles/` in mahi's configuration directory (`~/.config/mahi`, or `~/Library/Application Support/mahi` on macOS),
-for example `profiles/my-agent.toml`:
+profile in `profiles/` in mahi's configuration directory (`~/.config/mahi`, or
+`~/Library/Application Support/mahi` on macOS), for example `profiles/my-agent.toml`:
 
 ```toml
 name = "my-agent"
@@ -113,7 +126,8 @@ resume-args = ["--continue"]
 
 A profile can also write the files that wire the agent's hooks to `mahi hook`, so its turns
 are recorded, and give it `mahi mcp`, so it gets the thread's tools. A profile for `claude` or
-`codex` replaces the built-in one. Every field is described in
+`codex` replaces the built-in one; `reader = "claude-code"` or `reader = "codex"`, with a
+`state-env`, keeps mahi reading its sessions. Every field is described in
 [DESIGN.md](DESIGN.md#adapters-agent-specific); `mahi run --no-profile` runs an agent bare.
 
 ## Commands
@@ -142,7 +156,9 @@ are recorded, and give it `mahi mcp`, so it gets the thread's tools. A profile f
 ## Development
 
 The commands are in the `justfile`, and [AGENTS.md](AGENTS.md) describes how the project is
-worked on. `just check` runs formatting, lints, tests and the dependency policy.
+worked on. `just check` runs formatting, lints, tests and the dependency policy;
+`just test-git` runs the tests that need the `git` program, and `just test-wsl` the ones that
+need WSL 2.
 
 ## License
 
