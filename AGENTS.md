@@ -33,6 +33,7 @@ just build
 just run -- …   # run the mahi binary
 just test-git   # the tests that run the git program (not part of just test)
 just test-wsl   # the tests that need WSL 2 (not part of just test; CI runs them on Windows)
+just release v  # check, bump every crate to version v, commit, tag v<v> and push (dry run without --execute)
 just dogfood    # the real Claude Code and Codex end to end, with your sign-ins (not in CI)
 just apparmor-parse # parse mahi apparmor's profile (needs apparmor_parser and sudo)
 just deb        # build the .deb (cargo-deb) into target/debian/
@@ -52,7 +53,11 @@ WSL 2 distribution on a Windows runner. Change a check in the `justfile`, not in
 workflow, so that CI and local runs stay the same.
 
 Releases are made with [cargo-dist](https://github.com/axodotdev/cargo-dist), configured in
-`dist-workspace.toml`. Pushing a tag `v<version>` that matches `Cargo.toml` runs
+`dist-workspace.toml`, and started with `just release <version> --execute`, which runs
+`just check`, then [cargo-release](https://github.com/crate-ci/cargo-release) (configured in the
+manifests' `[*.metadata.release]`): it bumps the shared version, commits and signs
+`Release mahi <version>`, tags `v<version>` and pushes, never publishing to crates.io. Without
+`--execute` it only shows what it would do. Pushing a tag `v<version>` that matches `Cargo.toml` runs
 `.github/workflows/release.yml`: the checks, then the archives, the installer script and the
 `.deb` packages (`.github/workflows/build-deb.yml`), published as a GitHub release.
 `release.yml` is generated: change `dist-workspace.toml` and run `dist generate`, never edit it

@@ -9,7 +9,17 @@ license = "MIT"
 publish = false
 repository = "https://github.com/yamafaktory/mahi"
 rust-version = "1.98"
-version = "0.1.0"
+version = "0.0.0"
+
+[workspace.metadata.release]
+allow-branch = ["main"]
+consolidate-commits = true
+pre-release-commit-message = "Release mahi {{version}}"
+publish = false
+shared-version = true
+sign-commit = true
+sign-tag = true
+tag = false
 
 [workspace.dependencies]
 aes = { version = "0.8.4", default-features = false, features = ["zeroize"] }

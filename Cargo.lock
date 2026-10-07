@@ -3211,7 +3211,7 @@ checksum = "d3d25b0e0b648a86960ac23b7ad4abb9717601dec6f66c165f5b037f3f03065f"
 
 [[package]]
 name = "mahi"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "age",
  "base64 0.22.1",
@@ -3248,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-agent"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "mahi-identity",
  "mahi-proxy",
@@ -3261,7 +3261,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-core"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "getrandom 0.4.3",
  "gix-validate",
@@ -3271,7 +3271,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-crypto"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "age",
  "bech32 0.11.1",
@@ -3285,7 +3285,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-http"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "gix",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-identity"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "age",
  "ed25519-dalek 2.2.0",
@@ -3320,7 +3320,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-live"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "bech32 0.11.1",
  "blake3",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-proxy"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "rustix",
@@ -3357,7 +3357,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-sandbox"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "libc",
  "rustix",
@@ -3367,14 +3367,14 @@ dependencies = [
 
 [[package]]
 name = "mahi-schedule"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "mahi-ssh"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3406,7 +3406,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-store"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "gix",
  "gix-imara-diff",
@@ -3422,7 +3422,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-term"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "mahi-core",
  "thiserror 2.0.21",
@@ -3432,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-thread"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "age",
  "bech32 0.11.1",
@@ -3460,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "mahi-tls"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "aes",
  "aes-gcm",

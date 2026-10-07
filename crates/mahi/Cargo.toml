@@ -12,6 +12,12 @@ version.workspace = true
 [package.metadata.dist]
 dist = true
 
+[package.metadata.release]
+pre-release-hook = ["cargo", "update", "--workspace", "--offline", "--manifest-path", "../../fuzz/Cargo.toml"]
+tag = true
+tag-message = "mahi {{version}}"
+tag-name = "v{{version}}"
+
 [package.metadata.deb]
 assets = [
   ["target/release/mahi", "usr/bin/", "755"],

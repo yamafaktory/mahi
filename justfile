@@ -26,6 +26,10 @@ test-wsl *args:
 dogfood *args:
     cargo nextest run -p mahi --locked --ignore-default-filter -E 'binary(/^dogfood_/)' --no-capture {{args}}
 
+# Bump every crate to the version, commit, tag v<version> and push, which starts the release (a dry run unless --execute)
+release version *args: check
+    cargo release {{version}} --no-publish {{args}}
+
 apparmor-parse:
     cargo run --locked -q -p mahi -- apparmor | sudo apparmor_parser --skip-kernel-load
 
