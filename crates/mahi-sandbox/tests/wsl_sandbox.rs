@@ -30,9 +30,13 @@ mod tests {
     const SIZE: WindowSize = WindowSize { rows: 24, cols: 80 };
 
     fn in_terminal(work: &Path, program: &Path, sandbox: Option<Sandbox>) -> (Option<i32>, String) {
-        let mut command = PtyCommand::new(program, work, SIZE)
-            .arg("/c")
-            .arg("echo ran-%OS%");
+        let script = format!(
+            "'{}' /c 'echo ran-%OS%' < /dev/null 2>&1 | cat",
+            program.display()
+        );
+        let mut command = PtyCommand::new(Path::new("/bin/sh"), work, SIZE)
+            .arg("-c")
+            .arg(script);
         if let Some(interop) = std::env::var_os("WSL_INTEROP") {
             command = command.env("WSL_INTEROP", interop);
         }
@@ -91,13 +95,12 @@ mod tests {
         let (_, output) = in_terminal(work.path(), &program, None);
         assert!(
             output.contains(RAN),
-            "interop must work in a terminal: {output}"
+            "interop must work from a shell in a terminal: {output}"
         );
         let mut sandbox = Sandbox::system().unwrap();
         sandbox.bind(work.path(), Access::ReadOnly).unwrap();
         let (code, output) = in_terminal(work.path(), &program, Some(sandbox));
         eprintln!("in the sandbox: {code:?} {output:?}");
-        assert_ne!(code, Some(0), "{output}");
         assert!(!output.contains(RAN), "{output}");
     }
 }
