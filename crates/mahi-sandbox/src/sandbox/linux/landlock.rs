@@ -25,6 +25,7 @@ use rustix::{
 };
 
 use super::process::standard_input;
+use crate::wsl::Wsl;
 
 const CREATE_RULESET_VERSION: libc::c_uint = 1;
 const RULE_PATH_BENEATH: libc::c_int = 1;
@@ -78,12 +79,16 @@ impl Landlock {
             Ok(abi) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
-                    "the kernel's Landlock ABI {abi} is too old; the sandbox needs ABI {MINIMUM_ABI} (Linux 5.19)"
+                    "the kernel's Landlock ABI {abi} is too old; the sandbox needs ABI {MINIMUM_ABI} (Linux 5.19){}",
+                    Wsl::current().map_or("", Wsl::kernel_hint)
                 ),
             )),
             Err(error) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("the kernel has no Landlock, which the sandbox needs: {error}"),
+                format!(
+                    "the kernel has no Landlock, which the sandbox needs: {error}{}",
+                    Wsl::current().map_or("", Wsl::kernel_hint)
+                ),
             )),
         }
     }

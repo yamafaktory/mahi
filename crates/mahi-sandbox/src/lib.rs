@@ -17,6 +17,8 @@ mod pty;
 mod sandbox;
 mod userns;
 mod window;
+#[cfg(any(target_os = "linux", test))]
+mod wsl;
 
 pub use pty::{
     PtyChild,

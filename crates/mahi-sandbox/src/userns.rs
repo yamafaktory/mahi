@@ -3,6 +3,9 @@ use std::{
     path::Path,
 };
 
+#[cfg(any(target_os = "linux", test))]
+use crate::wsl::Wsl;
+
 #[cfg(target_os = "linux")]
 const RESTRICT: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
 #[cfg(target_os = "linux")]
@@ -35,6 +38,8 @@ pub enum UsernsBlocked {
     AppArmor(Option<String>),
     /// Unprivileged user namespaces are turned off by the named setting.
     Disabled(&'static str),
+    /// The system is WSL 1, which has no user namespaces.
+    Wsl1,
 }
 
 /// An AppArmor profile for one mahi binary, and the file it goes in under `/etc/apparmor.d`.
@@ -73,6 +78,11 @@ impl fmt::Display for UsernsBlocked {
                     ),
                 }
             }
+            Self::Wsl1 => f.write_str(
+                "mahi's sandbox needs WSL 2, and this distribution runs under WSL 1, which has \
+                 no user namespaces; convert it in Windows with wsl --set-version \
+                 <distribution> 2",
+            ),
             Self::Disabled("user.max_user_namespaces") => f.write_str(
                 "user namespaces, which mahi's sandbox needs, are turned off \
                  (user.max_user_namespaces is 0); turn them on with sudo sysctl \
@@ -102,6 +112,7 @@ pub fn check_user_namespaces(binary: Option<&Path>) -> Result<(), UsernsBlocked>
         let label = LABELS.iter().find_map(|path| read(path));
         let privileged = read(STATUS).is_some_and(|status| may_administer(&status));
         if let Some(blocked) = blocked(
+            Wsl::current(),
             (
                 read(RESTRICT).as_deref(),
                 read(CLONE).as_deref(),
@@ -155,10 +166,14 @@ fn may_administer(status: &str) -> bool {
 
 #[cfg(any(target_os = "linux", test))]
 fn blocked(
+    wsl: Option<Wsl>,
     (restrict, clone, max): (Option<&str>, Option<&str>, Option<&str>),
     (label, privileged): (Option<&str>, bool),
     binary: Option<&Path>,
 ) -> Option<UsernsBlocked> {
+    if wsl == Some(Wsl::One) {
+        return Some(UsernsBlocked::Wsl1);
+    }
     let zero = |value: Option<&str>| value.is_some_and(|value| value.trim() == "0");
     if zero(max) {
         return Some(UsernsBlocked::Disabled("user.max_user_namespaces"));
@@ -194,44 +209,70 @@ mod tests {
         let user = |label| (Some(label), false);
         let mahi = Some(Path::new("/usr/bin/mahi"));
         assert_eq!(
-            blocked(ubuntu, user("unconfined\n"), mahi),
+            blocked(None, ubuntu, user("unconfined\n"), mahi),
             Some(UsernsBlocked::AppArmor(Some("/usr/bin/mahi".to_owned())))
         );
         assert_eq!(
-            blocked(ubuntu, user("unprivileged_userns (enforce)\n"), None),
+            blocked(None, ubuntu, user("unprivileged_userns (enforce)\n"), None),
             Some(UsernsBlocked::AppArmor(None))
         );
-        assert_eq!(blocked(ubuntu, (Some("unconfined\n"), true), mahi), None);
         assert_eq!(
-            blocked(ubuntu, user("usr.bin.mahi (unconfined)\n"), mahi),
+            blocked(None, ubuntu, (Some("unconfined\n"), true), mahi),
             None
         );
-        assert_eq!(blocked(ubuntu, (None, false), mahi), None);
+        assert_eq!(
+            blocked(None, ubuntu, user("usr.bin.mahi (unconfined)\n"), mahi),
+            None
+        );
+        assert_eq!(blocked(None, ubuntu, (None, false), mahi), None);
         assert_eq!(
             blocked(
+                None,
                 (Some("0\n"), Some("1\n"), Some("9\n")),
                 user("unconfined\n"),
                 mahi
             ),
             None
         );
-        assert_eq!(blocked((None, None, None), (None, false), mahi), None);
+        assert_eq!(blocked(None, (None, None, None), (None, false), mahi), None);
         assert_eq!(
-            blocked((None, Some("0\n"), Some("9\n")), (None, false), mahi),
+            blocked(Some(Wsl::One), ubuntu, (None, true), mahi),
+            Some(UsernsBlocked::Wsl1)
+        );
+        assert_eq!(
+            blocked(
+                Some(Wsl::One),
+                (None, None, Some("0\n")),
+                (None, false),
+                mahi
+            ),
+            Some(UsernsBlocked::Wsl1)
+        );
+        assert_eq!(
+            blocked(Some(Wsl::Two), ubuntu, user("unconfined\n"), mahi),
+            Some(UsernsBlocked::AppArmor(Some("/usr/bin/mahi".to_owned())))
+        );
+        assert_eq!(
+            blocked(None, (None, Some("0\n"), Some("9\n")), (None, false), mahi),
             Some(UsernsBlocked::Disabled("kernel.unprivileged_userns_clone"))
         );
         assert_eq!(
-            blocked((None, Some("0\n"), Some("9\n")), (None, true), mahi),
+            blocked(None, (None, Some("0\n"), Some("9\n")), (None, true), mahi),
             None
         );
         assert_eq!(
-            blocked((None, None, Some("0\n")), (None, true), mahi),
+            blocked(None, (None, None, Some("0\n")), (None, true), mahi),
             Some(UsernsBlocked::Disabled("user.max_user_namespaces"))
         );
     }
 
     #[test]
     fn the_messages_name_the_profile_file_or_the_setting_to_change() {
+        assert!(
+            UsernsBlocked::Wsl1
+                .to_string()
+                .contains("wsl --set-version <distribution> 2")
+        );
         let named = UsernsBlocked::AppArmor(Some("/opt/mahi/bin/mahi".to_owned())).to_string();
         assert!(
             named.contains(
