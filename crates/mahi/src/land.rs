@@ -779,7 +779,7 @@ fn new_landing_worktree(
 }
 
 /// Merges into the landing worktree `name` the latest snapshot of each of `sources`, from the
-/// one it landed last, recording each.
+/// base a merge would take, recording each that left no path as it was.
 fn merge_sources(
     store: &Store,
     (name, meta): (&str, &VerifiedMeta),
@@ -837,14 +837,18 @@ fn merge_sources(
                 (LANDING, &theirs),
             )
             .map_err(failed)?;
-        if !landed.record(slot.clone(), commit) {
+        let mut next = landed.clone();
+        if !next.record(slot.clone(), commit) {
             return Err(LandError::TooManySources(slot.clone()));
         }
-        landed.absorb(store, (&recorded, thread), None);
+        next.absorb(store, (&recorded, thread), None);
         let applied = store
             .apply_merge(name, ours, merged.tree, interrupt)
             .map_err(failed)?;
-        write_landed(&state, &landed)?;
+        if applied.left.is_empty() {
+            landed = next;
+            write_landed(&state, &landed)?;
+        }
         report.push_str(&merge::report(slot, &LANDING, &merged, &applied));
     }
     Ok(())

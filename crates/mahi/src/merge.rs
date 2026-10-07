@@ -299,10 +299,11 @@ fn ask_running(
 }
 
 /// Merges `request` into `into`'s worktree, whose snapshots are at `head` and remembered in
-/// `cache`, from the base [`merge_base`] gives; then records the result in a snapshot whose
-/// trailers name `request.commit` and what that snapshot had itself merged. Once the worktree is
-/// written, the snapshot is taken even if `interrupt` is set, so a merge is never left
-/// unrecorded.
+/// `cache`, from the base [`merge_base`] gives; then takes a snapshot whose trailers name
+/// `request.commit` and what that snapshot had itself merged, or, when the merge left a path as
+/// it was, the trailers it had before, so the next merge starts from the same base. Once the
+/// worktree is written, the snapshot is taken even if `interrupt` is set, so the written files
+/// are never left out of the agent's snapshots.
 pub(crate) fn merge_now(
     store: &Store,
     into: Recording<'_>,
@@ -310,7 +311,8 @@ pub(crate) fn merge_now(
     (cache, head): (&mut SnapshotCache, Option<ObjectId>),
     interrupt: &AtomicBool,
 ) -> Result<MergeDone, MergeError> {
-    let mut merged_from = MergedFrom::read(store, into.snapshots)?;
+    let previous = MergedFrom::read(store, into.snapshots)?;
+    let mut merged_from = previous.clone();
     let theirs = merged_by(store, request.commit);
     let own = head.map(|head| (into.slot, head));
     let base = merge_base(store, (&merged_from, own), (request, &theirs))?;
@@ -332,11 +334,16 @@ pub(crate) fn merge_now(
         (into.globals, cache),
         &AtomicBool::new(false),
     )?;
+    let recorded = if applied.left.is_empty() {
+        &merged_from
+    } else {
+        &previous
+    };
     let commit = store.append_signed(
         into.snapshots,
         head,
         tree,
-        &merged_from.message(),
+        &recorded.message(),
         into.commits.signer(),
     )?;
     Ok(MergeDone::Merged {
@@ -481,6 +488,13 @@ pub(crate) fn report(
             &mut report,
             (format_args!("left as they were ({label})"), LISTED),
             paths,
+        );
+    }
+    if !applied.left.is_empty() {
+        let _ = writeln!(
+            report,
+            "this merge is not recorded, since paths were left as they were: the next merge of \
+             {from} starts from the same base"
         );
     }
     report

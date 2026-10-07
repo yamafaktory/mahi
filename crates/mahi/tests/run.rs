@@ -2107,6 +2107,42 @@ cat parser.rs
     }
 
     #[test]
+    fn a_merge_that_leaves_a_path_unwritten_is_not_recorded_and_is_tried_again() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let ignoring = script(
+            &fixture,
+            "ignoring",
+            "ignoring",
+            "#!/bin/sh\nprintf 'parser.rs\\n' > .gitignore\nprintf 'local\\n' > parser.rs\n",
+        );
+        let (code, output) = in_terminal(
+            &fixture,
+            &["agent", "add", &thread, "--", ignoring.to_str().unwrap()],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+
+        for _ in 0..2 {
+            let report = merge_report(&fixture, &thread, "tester.claude", "ignoring");
+            assert!(
+                report.contains("left as they were (something else is in the way): \"parser.rs\""),
+                "{report}"
+            );
+            assert!(report.contains("this merge is not recorded"), "{report}");
+            assert!(!report.contains("already has"), "{report}");
+        }
+        assert_eq!(
+            fs::read_to_string(
+                worktree_named(&fixture, &format!("{thread}.ignoring")).join("parser.rs")
+            )
+            .unwrap(),
+            "local\n"
+        );
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+    }
+
+    #[test]
     fn pushing_a_landing_branch_needs_a_chosen_remote_and_a_landing_worktree() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);
