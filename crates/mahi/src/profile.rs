@@ -822,10 +822,7 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
 mod tests {
     use std::{
         fmt::Write as _,
-        os::unix::fs::{
-            FileTypeExt,
-            PermissionsExt,
-        },
+        os::unix::fs::PermissionsExt,
     };
 
     use super::*;
@@ -1417,27 +1414,27 @@ content = "first\n"
         codex_profile().keep_hook_trust(&real, &config).unwrap();
         assert!(config.join(CODEX_TRUST).exists());
 
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            state.join(CODEX_CONFIG),
-            FileType::Fifo,
-            Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
         let codex = codex_profile();
-        codex.keep_hook_trust(&state, &config).unwrap();
-        codex
-            .seed_hook_trust(&open_dir(&state), &state, &config)
+        #[cfg(target_os = "linux")]
+        {
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                state.join(CODEX_CONFIG),
+                Mode::from_raw_mode(0o600),
+            )
             .unwrap();
-        assert!(
-            fs::symlink_metadata(state.join(CODEX_CONFIG))
-                .unwrap()
-                .file_type()
-                .is_fifo()
-        );
+            codex.keep_hook_trust(&state, &config).unwrap();
+            codex
+                .seed_hook_trust(&open_dir(&state), &state, &config)
+                .unwrap();
+            assert!(std::os::unix::fs::FileTypeExt::is_fifo(
+                &fs::symlink_metadata(state.join(CODEX_CONFIG))
+                    .unwrap()
+                    .file_type()
+            ));
 
-        fs::remove_file(state.join(CODEX_CONFIG)).unwrap();
+            fs::remove_file(state.join(CODEX_CONFIG)).unwrap();
+        }
         let oversized = format!("# {}\n", "x".repeat(MAX_CONFIG_BYTES));
         fs::write(state.join(CODEX_CONFIG), &oversized).unwrap();
         codex
