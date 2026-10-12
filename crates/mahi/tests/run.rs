@@ -888,6 +888,18 @@ content = '{{"bin": "{mahi_bin}"}}'
     }
 
     fn in_terminal_answering(command: PtyCommand, answers: &[(&str, &str)]) -> (i32, String) {
+        let lines: Vec<(&str, String)> = answers
+            .iter()
+            .map(|(question, answer)| (*question, format!("{answer}\n")))
+            .collect();
+        let typed: Vec<(&str, &[u8])> = lines
+            .iter()
+            .map(|(question, line)| (*question, line.as_bytes()))
+            .collect();
+        in_terminal_typing(command, &typed)
+    }
+
+    fn in_terminal_typing(command: PtyCommand, answers: &[(&str, &[u8])]) -> (i32, String) {
         let mut mahi = command.spawn().unwrap();
         let mut terminal = mahi.writer().unwrap();
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -906,7 +918,13 @@ content = '{{"bin": "{mahi_bin}"}}'
         });
         let mut asked_from = 0;
         for (question, answer) in answers {
+            let waited = Instant::now();
             wait_until(question, || {
+                assert!(
+                    waited.elapsed() < WAIT.checked_sub(Duration::from_millis(100)).unwrap(),
+                    "{question:?} never came: {}",
+                    String::from_utf8_lossy(&output.lock().unwrap())
+                );
                 let seen = output.lock().unwrap();
                 let found = seen[asked_from..]
                     .windows(question.len())
@@ -914,9 +932,7 @@ content = '{{"bin": "{mahi_bin}"}}'
                     .map(|at| asked_from + at + question.len());
                 found.inspect(|&end| asked_from = end).is_some()
             });
-            terminal
-                .write_all(format!("{answer}\n").as_bytes())
-                .unwrap();
+            terminal.write_all(answer).unwrap();
         }
         let mut status = None;
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -1215,6 +1231,138 @@ cat parser.rs
         assert_eq!(first.status.code(), Some(0), "{stderr}");
         let thread = thread_of(&worktree_of(&stderr));
         (thread, claude)
+    }
+
+    #[test]
+    fn the_home_screen_lists_threads_and_quits_on_q() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let (code, output) = in_terminal_answering(
+            terminal_command(&fixture, &[]),
+            &[(&thread, ""), ("q quit", "q")],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("\x1b[?1049h") && output.contains("\x1b[?1049l"),
+            "{output}"
+        );
+        assert!(output.contains("here"), "{output}");
+        let outside = fixture.mahi(&[]);
+        assert_eq!(outside.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&outside.stderr).contains("Usage: mahi"));
+    }
+
+    #[test]
+    fn the_home_screen_ends_a_thread_after_its_confirmation_and_comes_back() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let worktree = fixture.thread_worktrees().pop().unwrap();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("q quit", b"e"),
+                (&format!("End thread {thread}? [y/N]"), b"y"),
+                ("Press Enter to go back", b"\n"),
+                (&format!("mahi end {thread} exited with 0"), b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(!worktree.exists(), "{output}");
+    }
+
+    #[test]
+    fn agents_started_twice_from_the_home_screen_each_get_the_keyboard() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho ready\nread line\necho \"got=$line\"\n";
+        let claude = script(&fixture, "home-agents", "claude", agent);
+        script(&fixture, "home-agents", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("q quit", b"n"),
+                ("Number: ", b"1\n"),
+                ("ready", b"first\r"),
+                ("Press Enter to go back", b"\n"),
+                ("q quit", b"n"),
+                ("Number: ", b"1\n"),
+                ("ready", b"second\r"),
+                ("Press Enter to go back", b"\n"),
+                ("q quit", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("got=first"), "{output}");
+        assert!(output.contains("got=second"), "{output}");
+    }
+
+    #[test]
+    fn a_terminate_signal_leaves_the_home_screen_and_restores_the_terminal() {
+        let fixture = fixture();
+        let mut mahi = terminal_command(&fixture, &[]).spawn().unwrap();
+        let mut reader = mahi.reader().unwrap();
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("q quit") {
+            let mut chunk = [0_u8; 4096];
+            let read = reader.read(&mut chunk).unwrap();
+            assert_ne!(read, 0);
+            seen.extend_from_slice(&chunk[..read]);
+        }
+        let pid = rustix::process::Pid::from_raw(i32::try_from(mahi.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest);
+            let _ = sender.send(rest);
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = mahi.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "mahi kept running");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        let rest = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_default();
+        let rest = String::from_utf8_lossy(&rest);
+        assert!(
+            rest.contains("\x1b[?25h") && rest.contains("\x1b[?1049l"),
+            "{rest:?}"
+        );
+    }
+
+    #[test]
+    fn a_paste_split_after_its_escape_quits_the_home_screen_and_does_nothing_else() {
+        let fixture = fixture();
+        let (_thread, _claude) = worked_thread(&fixture);
+        let worktree = fixture.thread_worktrees().pop().unwrap();
+        let mut mahi = terminal_command(&fixture, &[]).spawn().unwrap();
+        let mut terminal = mahi.writer().unwrap();
+        let mut reader = mahi.reader().unwrap();
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("q quit") {
+            let mut chunk = [0_u8; 4096];
+            let read = reader.read(&mut chunk).unwrap();
+            assert_ne!(read, 0);
+            seen.extend_from_slice(&chunk[..read]);
+        }
+        terminal.write_all(b"e\x1b").unwrap();
+        thread::sleep(Duration::from_millis(300));
+        terminal.write_all(b"[200~ey\r\x1b[201~").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = mahi.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "mahi kept running");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(exit_code(status), 0);
+        assert!(worktree.exists());
     }
 
     #[test]
@@ -4484,7 +4632,8 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         let help = fixture.mahi(&["--help"]);
         assert!(help.status.success());
         let help_text = String::from_utf8_lossy(&help.stdout);
-        assert!(help_text.contains("Usage: mahi <COMMAND>"), "{help_text}");
+        assert!(help_text.contains("Usage: mahi [COMMAND]"), "{help_text}");
+        assert!(help_text.contains("opens the home screen"), "{help_text}");
         assert!(help_text.contains("Exit codes"), "{help_text}");
         let run_help = fixture.mahi(&["run", "--help"]);
         assert!(run_help.status.success());

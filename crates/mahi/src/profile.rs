@@ -390,6 +390,11 @@ impl Profile {
             .flat_map(|profile| profile.optional_env.iter().map(String::as_str))
     }
 
+    /// Returns the program file names mahi has a profile for, built in or the user's.
+    pub(crate) fn programs() -> impl Iterator<Item = &'static str> {
+        profiles().iter().map(|profile| profile.program.as_str())
+    }
+
     /// Returns the profile for the agent program `program`, found by its file name.
     pub(crate) fn for_agent(program: &OsStr) -> Option<&'static Self> {
         let name = Path::new(program).file_name()?;

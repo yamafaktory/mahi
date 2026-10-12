@@ -3367,6 +3367,7 @@ dependencies = [
  "mahi-store",
  "mahi-term",
  "mahi-thread",
+ "ratatui-core",
  "rustix",
  "serde",
  "serde_json",

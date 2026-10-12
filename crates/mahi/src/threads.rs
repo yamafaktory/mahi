@@ -18,6 +18,8 @@ use mahi_store::{
     Store,
     StoreError,
 };
+use mahi_term::HomeRow;
+use mahi_thread::remembered_owner;
 use thiserror::Error;
 
 use crate::{
@@ -40,6 +42,34 @@ struct ThreadSummary {
     worktree: bool,
 }
 
+/// Returns the repository's threads as the home screen lists them; a thread whose remembered
+/// owner cannot be read counts as a teammate's.
+pub(crate) fn home_rows(store: &Store) -> Result<Vec<HomeRow>, StoreError> {
+    Ok(summarise(store)?
+        .into_iter()
+        .map(|(thread, summary)| HomeRow {
+            thread: thread.to_string(),
+            agents: agents_of(&summary),
+            worktree: summary.worktree,
+            owned: matches!(remembered_owner(store, thread), Ok(None)),
+        })
+        .collect())
+}
+
+fn agents_of(summary: &ThreadSummary) -> String {
+    if summary.agents.is_empty() {
+        return "no agent".to_owned();
+    }
+    let mut listed = String::new();
+    for (index, agent) in summary.agents.iter().enumerate() {
+        if index > 0 {
+            listed.push_str(", ");
+        }
+        let _ = write!(listed, "{agent}");
+    }
+    listed
+}
+
 /// Lists the threads of the repository around the current directory, with their agents and
 /// whether their worktree is still there. Reads no encrypted content.
 pub(crate) fn threads() -> Result<String, ThreadsError> {
@@ -53,12 +83,7 @@ pub(crate) fn threads() -> Result<String, ThreadsError> {
     }
     let mut listing = String::new();
     for (thread, summary) in summaries {
-        let agents: Vec<String> = summary.agents.iter().map(ToString::to_string).collect();
-        let agents = if agents.is_empty() {
-            "no agent".to_owned()
-        } else {
-            agents.join(", ")
-        };
+        let agents = agents_of(&summary);
         let worktree = if summary.worktree {
             "worktree"
         } else {

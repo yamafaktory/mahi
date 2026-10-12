@@ -48,6 +48,7 @@ mahi-schedule = { workspace = true }
 mahi-ssh = { workspace = true }
 mahi-store = { workspace = true }
 mahi-term = { workspace = true }
+ratatui-core = { workspace = true }
 mahi-thread = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }

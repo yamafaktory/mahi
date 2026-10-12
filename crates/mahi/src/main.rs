@@ -7,6 +7,7 @@ mod credentials;
 mod end;
 mod environment;
 mod handoff;
+mod home;
 mod hook;
 mod hub;
 mod id;
@@ -91,12 +92,15 @@ fn make_config_private(environment: &Environment) {
 fn main() {
     let cli = Cli::parse();
     let required = match &cli.command {
-        Command::Run(command) => Some(command.options.pass_env().to_vec()),
-        Command::Resume(command) => Some(command.options.pass_env().to_vec()),
-        Command::Handoff(command) => Some(command.options.pass_env().to_vec()),
-        Command::Agent(AgentCommand::Add(command)) => Some(command.options.pass_env().to_vec()),
-        Command::Land(command) => Some(command.options.pass_env().to_vec()),
-        Command::Join(command) if command.agent().is_some() => {
+        None => Some(Vec::new()),
+        Some(Command::Run(command)) => Some(command.options.pass_env().to_vec()),
+        Some(Command::Resume(command)) => Some(command.options.pass_env().to_vec()),
+        Some(Command::Handoff(command)) => Some(command.options.pass_env().to_vec()),
+        Some(Command::Agent(AgentCommand::Add(command))) => {
+            Some(command.options.pass_env().to_vec())
+        }
+        Some(Command::Land(command)) => Some(command.options.pass_env().to_vec()),
+        Some(Command::Join(command)) if command.agent().is_some() => {
             Some(command.options.pass_env().to_vec())
         }
         _ => None,
@@ -121,11 +125,26 @@ fn main() {
         .filter_map(|name| name.parse().ok())
         .collect();
     environment.read_optional(&optional);
-    set_up_first(&cli.command, &environment);
-    let code = match cli.command {
+    let Some(command) = cli.command else {
+        process::exit(home::home(&environment));
+    };
+    process::exit(run_command(command, &environment));
+}
+
+/// Sets mahi up when the command needs it, then runs the command, and returns its exit code.
+pub(crate) fn run_command(command: Command, environment: &Environment) -> i32 {
+    if !set_up_first(&command, environment) {
+        return 1;
+    }
+    dispatch(command, environment)
+}
+
+/// Runs one command and returns its exit code.
+fn dispatch(command: Command, environment: &Environment) -> i32 {
+    match command {
         Command::Init => match TerminalPrompt::open()
             .map_err(InitError::Prompt)
-            .and_then(|mut prompt| init::init(&environment, &mut prompt))
+            .and_then(|mut prompt| init::init(environment, &mut prompt))
         {
             Ok(()) => 0,
             Err(error) => {
@@ -133,7 +152,7 @@ fn main() {
                 1
             }
         },
-        Command::End(command) => match end::end(&command, &environment) {
+        Command::End(command) => match end::end(&command, environment) {
             Ok(end::Ended::Done(done)) => {
                 eprint!("{done}");
                 0
@@ -147,8 +166,8 @@ fn main() {
                 1
             }
         },
-        Command::Purge(command) => purged(&command, &environment),
-        Command::Credential(command) => match credentials::credential(&command, &environment) {
+        Command::Purge(command) => purged(&command, environment),
+        Command::Credential(command) => match credentials::credential(&command, environment) {
             Ok(done) if command == CredentialCommand::List => print_out(&done),
             Ok(done) => {
                 eprint!("{done}");
@@ -159,15 +178,15 @@ fn main() {
                 1
             }
         },
-        Command::Join(command) => outcome_code(join::join(&command, &environment)),
+        Command::Join(command) => outcome_code(join::join(&command, environment)),
         Command::Invite(command) => {
-            exit_code(invite::invite(&command, &environment).map(|ticket| print_out(&ticket)))
+            exit_code(invite::invite(&command, environment).map(|ticket| print_out(&ticket)))
         }
         Command::Remote(command) => {
             exit_code(remote::remote(&command).map(|done| print_out(&done)))
         }
-        Command::Id => exit_code(id::id(&environment).map(|card| print_out(&card))),
-        Command::Apparmor => apparmor(&environment),
+        Command::Id => exit_code(id::id(environment).map(|card| print_out(&card))),
+        Command::Apparmor => apparmor(environment),
         Command::Threads => exit_code(threads::threads().map(|listing| print_out(&listing))),
         Command::Hook(hook) => {
             if let Some(socket) = &environment.hook_socket {
@@ -175,21 +194,21 @@ fn main() {
             }
             0
         }
-        Command::Mcp => serve_mcp(&environment),
-        Command::Land(command) => landed(&command, &environment),
-        Command::Merge(command) => merged(&command, &environment),
-        Command::Handoff(command) => outcome_code(run::handoff(&command, &environment)),
+        Command::Mcp => serve_mcp(environment),
+        Command::Land(command) => landed(&command, environment),
+        Command::Merge(command) => merged(&command, environment),
+        Command::Handoff(command) => outcome_code(run::handoff(&command, environment)),
         Command::Agent(AgentCommand::Add(command)) => {
-            outcome_code(run::agent_add(&command, &environment))
+            outcome_code(run::agent_add(&command, environment))
         }
-        Command::Resume(command) => outcome_code(run::resume(&command, &environment)),
-        Command::Run(command) => outcome_code(run::run(&command, &environment)),
-    };
-    process::exit(code);
+        Command::Resume(command) => outcome_code(run::resume(&command, environment)),
+        Command::Run(command) => outcome_code(run::run(&command, environment)),
+    }
 }
 
-/// Sets mahi up before a command that needs it, when it is not set up, or exits.
-fn set_up_first(command: &Command, environment: &Environment) {
+/// Sets mahi up before a command that needs it, when it is not set up; returns `false` when
+/// setting up failed, which it reports.
+fn set_up_first(command: &Command, environment: &Environment) -> bool {
     let needs_setup = matches!(
         command,
         Command::Run(_) | Command::Join(_) | Command::Id | Command::Invite(_)
@@ -198,8 +217,9 @@ fn set_up_first(command: &Command, environment: &Environment) {
         && let Err(error) = init::set_up_if_needed(environment, TerminalPrompt::open_interactive)
     {
         report(&error);
-        process::exit(1);
+        return false;
     }
+    true
 }
 
 /// Returns the exit code of a command that ran an agent: the agent's, or 128 plus the signal

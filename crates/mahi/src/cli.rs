@@ -34,6 +34,8 @@ use crate::{
 };
 
 const EXIT_CODES: &str = "\
+With no command, in a git repository and on a terminal, mahi opens the home screen.
+
 Exit codes: mahi run exits with the agent's exit code, or 128 plus the signal that ended it.
 It exits with 1 when it cannot run the agent and 2 on a usage error.";
 
@@ -42,7 +44,7 @@ It exits with 1 when it cannot run the agent and 2 on a usage error.";
 #[command(name = "mahi", version, after_help = EXIT_CODES)]
 pub(crate) struct Cli {
     #[command(subcommand)]
-    pub(crate) command: Command,
+    pub(crate) command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -412,12 +414,21 @@ mod tests {
 
     use super::*;
 
-    fn parse(arguments: &[&str]) -> Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("mahi").chain(arguments.iter().copied()))
+    #[derive(Debug, PartialEq, Eq)]
+    struct Parsed {
+        command: Command,
     }
 
-    fn run(agent: &str, arguments: &[&str]) -> Cli {
-        Cli {
+    fn parse(arguments: &[&str]) -> Result<Parsed, clap::Error> {
+        Cli::try_parse_from(std::iter::once("mahi").chain(arguments.iter().copied())).map(|cli| {
+            Parsed {
+                command: cli.command.expect("a command was given"),
+            }
+        })
+    }
+
+    fn run(agent: &str, arguments: &[&str]) -> Parsed {
+        Parsed {
             command: Command::Run(RunCommand {
                 options: LaunchOptions::default(),
                 command: std::iter::once(agent)
@@ -572,7 +583,7 @@ mod tests {
             odd.clone(),
         ])
         .unwrap();
-        let Command::Run(command) = parsed.command else {
+        let Some(Command::Run(command)) = parsed.command else {
             panic!("expected the run command");
         };
         assert_eq!(command.agent(), odd.as_os_str());
@@ -695,10 +706,16 @@ mod tests {
     }
 
     #[test]
+    fn no_command_is_the_home_screen() {
+        let cli = Cli::try_parse_from(["mahi"]).unwrap();
+        assert_eq!(cli.command, None);
+    }
+
+    #[test]
     fn hook_takes_one_known_event() {
         assert_eq!(
             parse(&["hook", "turn-end"]).unwrap(),
-            Cli {
+            Parsed {
                 command: Command::Hook(HookCommand {
                     kind: HookKind::TurnEnd
                 })
@@ -712,10 +729,6 @@ mod tests {
 
     #[test]
     fn missing_and_unknown_commands_are_usage_errors() {
-        assert_eq!(
-            parse(&[]).unwrap_err().kind(),
-            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        );
         assert_eq!(
             parse(&["run"]).unwrap_err().kind(),
             ErrorKind::MissingRequiredArgument

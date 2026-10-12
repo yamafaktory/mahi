@@ -282,6 +282,8 @@ use crate::{
 };
 
 #[cfg(target_os = "linux")]
+const THREAD_STOP_WAIT: Duration = Duration::from_secs(2);
+const THREAD_POLL: Duration = Duration::from_millis(10);
 const PROGRAM_HEADERS: [&[u8]; 1] = [b"\x7fELF"];
 #[cfg(target_os = "macos")]
 const PROGRAM_HEADERS: [&[u8]; 5] = [
@@ -1936,7 +1938,7 @@ fn finish_run(
         merging,
         prompts,
     } = background;
-    let (code, received) = supervise(
+    let (code, received, _signals) = supervise(
         child,
         raw,
         user,
@@ -1997,20 +1999,61 @@ struct AgentSide {
     merger: Option<Merger>,
 }
 
+/// Passes the stop signals on as events until dropped, then stops listening, so a later
+/// command in the same mahi, such as one run from the home screen, can listen again.
+struct SignalWatch {
+    quit: Option<UnixStream>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl SignalWatch {
+    fn start(termination: TerminationSignals, events: mpsc::Sender<Event>) -> io::Result<Self> {
+        let (quit, quitting) = UnixStream::pair()?;
+        let thread = thread::spawn(move || {
+            loop {
+                match mahi_sandbox::wait_readable(termination.as_fd(), quitting.as_fd()) {
+                    Ok((_, true)) => return,
+                    Ok((false, false)) => continue,
+                    Ok((true, false)) | Err(_) => {}
+                }
+                let Ok(signal) = termination.wait() else {
+                    return;
+                };
+                let _ = events.send(Event::Stopped(signal));
+            }
+        });
+        Ok(Self {
+            quit: Some(quit),
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for SignalWatch {
+    fn drop(&mut self) {
+        drop(self.quit.take());
+        if let Some(thread) = self.thread.take() {
+            join_within(thread, THREAD_STOP_WAIT);
+        }
+    }
+}
+
 fn supervise(
     child: PtyChild,
     raw: Option<RawMode>,
     user: &UserSide,
     termination: TerminationSignals,
     side: AgentSide,
-) -> (Result<Outcome, RunError>, Receiver<Event>) {
+) -> (
+    Result<Outcome, RunError>,
+    Receiver<Event>,
+    Option<SignalWatch>,
+) {
     let (events, received) = mpsc::channel();
-    let stop_events = events.clone();
-    thread::spawn(move || {
-        while let Ok(signal) = termination.wait() {
-            let _ = stop_events.send(Event::Stopped(signal));
-        }
-    });
+    let watch = match SignalWatch::start(termination, events.clone()) {
+        Ok(watch) => Some(watch),
+        Err(error) => return (Err(RunError::Output(error)), received, None),
+    };
     let interactive = raw.is_some() && terminal::is_interactive();
     let AgentSide {
         tap,
@@ -2027,7 +2070,7 @@ fn supervise(
         (Some(prompts), merging, merger),
     );
     drop(raw);
-    (code, received)
+    (code, received, watch)
 }
 
 fn stop_on_signal(
@@ -2492,7 +2535,11 @@ fn relay(
     ));
     let input = palette.map(|(key, _)| (Arc::clone(&screen), KeyScanner::new(key)));
     let (input_writer, input_activity) = (Arc::clone(&writer), Arc::clone(activity));
-    thread::spawn(move || forward_input(&input_writer, input, &input_activity));
+    let (quit, quitting) = UnixStream::pair().map_err(RunError::Output)?;
+    let input_quitting = quitting.try_clone().map_err(RunError::Output)?;
+    let forwarding = thread::spawn(move || {
+        forward_input(&input_writer, input, &input_activity, &input_quitting);
+    });
     let running = Arc::new(AtomicBool::new(palette.is_some()));
     let (tick_screen, ticking) = (Arc::clone(&screen), Arc::clone(&running));
     let told = prompts.clone().zip(palette);
@@ -2532,22 +2579,7 @@ fn relay(
             merger,
         );
     }
-    let resize_tap = tap.clone();
-    let resize_screen = Arc::clone(&screen);
-    thread::spawn(move || {
-        let Ok(changes) = WindowChanges::listen() else {
-            return;
-        };
-        while changes.wait().is_ok() {
-            let Some(size) = repainter.follow() else {
-                break;
-            };
-            let _ = resize_screen.resized();
-            if let Some(tap) = &resize_tap {
-                tap.resize(size);
-            }
-        }
-    });
+    let following = follow_resizes(repainter, Arc::clone(&screen), tap.clone(), quitting);
     let mut reader = child.reader()?;
     let progress = Arc::new(AtomicU64::new(0));
     let output_events = events.clone();
@@ -2570,8 +2602,54 @@ fn relay(
     let outcome = await_outcome(&child, received, (&progress, stop));
     running.store(false, Ordering::SeqCst);
     merge_server.stop();
+    drop(quit);
+    join_within(forwarding, THREAD_STOP_WAIT);
+    join_within(following, THREAD_STOP_WAIT);
     let _ = screen.close();
     outcome
+}
+
+/// Joins `thread` if it ends within `wait`, and otherwise leaves it running: one stuck writing
+/// to a terminal a leftover process still holds must not hang mahi.
+fn join_within(thread: thread::JoinHandle<()>, wait: Duration) {
+    let deadline = Instant::now() + wait;
+    while !thread.is_finished() && Instant::now() < deadline {
+        thread::sleep(THREAD_POLL);
+    }
+    if thread.is_finished() {
+        let _ = thread.join();
+    }
+}
+
+/// Follows the user's terminal size into the agent's, until `quitting` becomes readable.
+fn follow_resizes(
+    repainter: Repainter,
+    screen: Arc<UserScreen>,
+    tap: Option<OutputTap>,
+    quitting: UnixStream,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let Ok(changes) = WindowChanges::listen() else {
+            return;
+        };
+        loop {
+            match mahi_sandbox::wait_readable(changes.as_fd(), quitting.as_fd()) {
+                Ok((_, true)) => break,
+                Ok((false, false)) => continue,
+                Ok((true, false)) | Err(_) => {}
+            }
+            if changes.wait().is_err() {
+                break;
+            }
+            let Some(size) = repainter.follow() else {
+                break;
+            };
+            let _ = screen.resized();
+            if let Some(tap) = &tap {
+                tap.resize(size);
+            }
+        }
+    })
 }
 
 fn arrival_text(arrival: &Arrival, key: PaletteKey, out: &mut String) {
@@ -2799,14 +2877,20 @@ fn forward_input(
     writer: &Mutex<File>,
     mut palette: Option<(Arc<UserScreen>, KeyScanner)>,
     activity: &Activity,
+    quitting: &UnixStream,
 ) {
-    let mut input = io::stdin().lock();
+    let input = io::stdin();
     let mut buffer = [0_u8; 4096];
     let mut last = b'\n';
     loop {
-        let read = match input.read(&mut buffer) {
+        match mahi_sandbox::wait_readable(input.as_fd(), quitting.as_fd()) {
+            Ok((_, true)) => return,
+            Ok((false, false)) => continue,
+            Ok((true, false)) | Err(_) => {}
+        }
+        let read = match rustix::io::read(&input, &mut buffer) {
             Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(rustix::io::Errno::INTR) => continue,
             Err(_) => return,
         };
         let Ok(mut writer) = writer.lock() else {
@@ -2913,6 +2997,12 @@ fn resolve(agent: &OsStr, cwd: &Path, search_path: Option<&OsStr>) -> Result<Age
         program: directory.join(agent),
         canonical,
     })
+}
+
+/// Returns whether `program`, a file name, is an executable in one of `search_path`'s
+/// absolute directories.
+pub(crate) fn is_on_path(program: &str, search_path: Option<&OsStr>) -> bool {
+    absolute_directories(search_path).any(|directory| is_executable(&directory.join(program)))
 }
 
 fn absolute_directories(search_path: Option<&OsStr>) -> impl Iterator<Item = PathBuf> {
@@ -3110,7 +3200,7 @@ impl DraftWriter {
         let (flag, seen) = (Arc::clone(&closing), Arc::clone(&activity));
         thread::spawn(move || hook::serve(&hooks, &flag, &messages, &seen));
         thread::spawn(move || for _ in inputs {});
-        let (code, received) = supervise(
+        let (code, received, _signals) = supervise(
             child,
             raw,
             &UserSide {
