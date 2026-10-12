@@ -7,6 +7,7 @@ mod key;
 mod notify;
 mod output;
 mod scan;
+mod screen;
 mod view;
 
 pub use input::{
@@ -28,6 +29,7 @@ pub use scan::{
     Segment,
     Segments,
 };
+pub use screen::AnsiBackend;
 pub use view::{
     Drawn,
     PaletteItem,

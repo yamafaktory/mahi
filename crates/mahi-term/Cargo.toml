@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 mahi-core = { workspace = true }
+ratatui-core = { workspace = true }
 thiserror = { workspace = true }
 unicode-width = { workspace = true }
 
