@@ -113,6 +113,8 @@ pub(crate) enum InviteError {
         "an invitation needs the live layer: set MAHI_LIVE to local or public, or leave it unset"
     )]
     LiveSetting,
+    #[error("no card was given")]
+    NoCard,
 }
 
 /// Who invites, with which keys, and how the ticket finds this machine.
@@ -129,6 +131,24 @@ pub(crate) fn invite(
     command: &InviteCommand,
     environment: &Environment,
 ) -> Result<String, InviteError> {
+    let Some(card) = command.card() else {
+        return Err(InviteError::NoCard);
+    };
+    let card: ParticipantCard = card.parse()?;
+    with_inviter(environment, |store, inviter| {
+        let ticket = invite_to(store, command.thread, card, inviter, &mut || {
+            TerminalPrompt::open()
+        })?;
+        Ok(format!("{ticket}\n"))
+    })
+}
+
+/// Runs `act` with the repository around the current directory and the user as inviter, with
+/// the keys and the live setting an invitation needs.
+pub(crate) fn with_inviter<R, E: From<InviteError>>(
+    environment: &Environment,
+    act: impl FnOnce(&Store, &Inviter<'_>) -> Result<R, E>,
+) -> Result<R, E> {
     let relays = relays_for(environment.live)?;
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
@@ -136,7 +156,8 @@ pub(crate) fn invite(
     let config = ConfigDir::resolve(
         environment.home.as_deref(),
         environment.xdg_config_home.as_deref(),
-    )?;
+    )
+    .map_err(InviteError::from)?;
     let signing =
         SigningKey::load(&config.signing_key_file()).map_err(InviteError::NotInitialised)?;
     let node_key = NodeKey::load(&config.node_key_file()).map_err(InviteError::NotInitialised)?;
@@ -144,23 +165,20 @@ pub(crate) fn invite(
         .ssh_auth_sock
         .as_deref()
         .ok_or(InviteError::NoSshAgent)?;
-    let signer = AgentSigner::new(SshAgent::new(socket), signing.public_key().clone())?;
-    let store = Store::discover(&cwd)?;
+    let signer = AgentSigner::new(SshAgent::new(socket), signing.public_key().clone())
+        .map_err(InviteError::from)?;
+    let store = Store::discover(&cwd).map_err(InviteError::from)?;
     let inviter = Inviter {
         config: &config,
         signer: &signer,
         node_key: &node_key,
         relays,
     };
-    let card: ParticipantCard = command.card().parse()?;
-    let ticket = invite_to(&store, command.thread, card, &inviter, &mut || {
-        TerminalPrompt::open()
-    })?;
-    Ok(format!("{ticket}\n"))
+    act(&store, &inviter)
 }
 
 /// Returns the relays the invite's host address uses, as `MAHI_LIVE` says.
-fn relays_for(live: LiveMode) -> Result<Relays, InviteError> {
+pub(crate) fn relays_for(live: LiveMode) -> Result<Relays, InviteError> {
     match live {
         LiveMode::Public => Ok(Relays::Public),
         LiveMode::Local => Ok(Relays::Disabled),

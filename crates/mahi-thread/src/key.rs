@@ -3,6 +3,7 @@ use std::fmt;
 use ed25519_dalek::VerifyingKey;
 use ssh_key::{
     Algorithm,
+    HashAlg,
     PublicKey,
     SshSig,
 };
@@ -71,6 +72,12 @@ impl ParticipantKey {
         &self.line
     }
 
+    /// Returns the key's SHA-256 fingerprint, as `ssh-keygen -l` shows it.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        self.key.fingerprint(HashAlg::Sha256).to_string()
+    }
+
     pub(crate) fn public_key(&self) -> &PublicKey {
         &self.key
     }
@@ -108,6 +115,20 @@ mod tests {
 
     fn raw_ed25519(bytes: [u8; 32]) -> PublicKey {
         PublicKey::new(KeyData::Ed25519(Ed25519PublicKey(bytes)), "")
+    }
+
+    #[test]
+    fn the_fingerprint_is_the_one_ssh_keygen_shows() {
+        let private = ed25519();
+        let key = ParticipantKey::from_public_key(private.public_key()).unwrap();
+        assert_eq!(
+            key.fingerprint(),
+            private
+                .public_key()
+                .fingerprint(HashAlg::Sha256)
+                .to_string()
+        );
+        assert!(key.fingerprint().starts_with("SHA256:"));
     }
 
     #[test]

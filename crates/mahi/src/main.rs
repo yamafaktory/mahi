@@ -23,6 +23,7 @@ mod merge;
 mod merge_door;
 mod merged;
 mod network;
+mod pair;
 mod palette;
 mod profile;
 mod prompt;
@@ -179,6 +180,12 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
             }
         },
         Command::Join(command) => outcome_code(join::join(&command, environment)),
+        Command::Invite(command) if command.card().is_none() => exit_code(
+            pair::invite_by_code(command.thread, environment).map(|done| {
+                eprint!("{done}");
+                0
+            }),
+        ),
         Command::Invite(command) => {
             exit_code(invite::invite(&command, environment).map(|ticket| print_out(&ticket)))
         }

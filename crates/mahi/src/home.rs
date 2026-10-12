@@ -57,8 +57,6 @@ const KEY_WAIT: Duration = Duration::from_millis(200);
 const SEQUENCE_WAIT: Duration = Duration::from_millis(30);
 const ESC: u8 = 0x1b;
 const MAX_READ: usize = 1024;
-const PAIRING_LATER: &str = "pairing codes are not built yet: use mahi id, mahi invite <thread> \
-                             <card> and mahi join <ticket>";
 
 /// Opens the home screen in the repository around the current directory and runs the actions
 /// chosen there until the user quits; returns the exit code. Outside a repository, or without
@@ -228,15 +226,16 @@ fn rows(store: &Store) -> Vec<HomeRow> {
 /// Runs the chosen action as its command does, on the normal screen, and returns what the
 /// home screen says about it.
 fn act(action: HomeAction, environment: &Environment) -> String {
-    let words: [String; 2] = match action {
+    let words: Vec<String> = match action {
         HomeAction::New => match agent_to_run(environment) {
-            Ok(agent) => ["run".to_owned(), agent],
+            Ok(agent) => vec!["run".to_owned(), agent],
             Err(told) => return told,
         },
-        HomeAction::Resume(thread) => ["resume".to_owned(), thread],
-        HomeAction::Land(thread) => ["land".to_owned(), thread],
-        HomeAction::End(thread) => ["end".to_owned(), thread],
-        HomeAction::Invite(_) | HomeAction::Join => return PAIRING_LATER.to_owned(),
+        HomeAction::Resume(thread) => vec!["resume".to_owned(), thread],
+        HomeAction::Land(thread) => vec!["land".to_owned(), thread],
+        HomeAction::End(thread) => vec!["end".to_owned(), thread],
+        HomeAction::Invite(thread) => vec!["invite".to_owned(), thread],
+        HomeAction::Join => vec!["join".to_owned()],
         HomeAction::Quit => return String::new(),
     };
     let Ok(Cli {

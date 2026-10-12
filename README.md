@@ -89,9 +89,13 @@ picks the SSH key in ssh-agent that signs your threads (asking which when there 
 agent signs in with that mahi does not have yet (Claude Code's token), and, once per clone,
 whether to push threads to `origin` and whether `origin` is private or public.
 
-To work with teammates, `mahi remote` chooses the remote a thread is pushed to, `mahi id`
-prints the card a thread's owner needs, `mahi invite` turns it into a ticket, and
-`mahi join <ticket>` watches the thread live. `mahi handoff`, `mahi agent` and `mahi merge`
+To work with a teammate, the thread's owner runs `mahi invite <thread>` (or presses `i` on the
+home screen), which shows a short pairing code such as `412-merit-intention`; the teammate runs
+`mahi join` (or presses `j`) in a clone of the project and types it, and once the owner says
+yes, the teammate watches the thread live. Pairing meets through the remote `mahi remote`
+chose. Cards and tickets still work without it: `mahi id` prints the card a thread's owner
+needs, `mahi invite <thread> <card>` turns it into a ticket, and `mahi join <ticket>` uses it.
+`mahi handoff`, `mahi agent` and `mahi merge`
 move work between agents.
 
 ## Agents

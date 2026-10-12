@@ -4,8 +4,11 @@ use std::{
     fs,
     io::{
         self,
-        Read,
         Write,
+    },
+    os::{
+        fd::AsFd as _,
+        unix::net::UnixStream,
     },
     path::Path,
     sync::{
@@ -94,6 +97,10 @@ use crate::{
         LiveMode,
     },
     live,
+    pair::{
+        self,
+        PairingError,
+    },
     prompt::{
         Prompt,
         TerminalPrompt,
@@ -143,6 +150,8 @@ const TYPING_PAUSE: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub(crate) enum JoinError {
+    #[error("cannot pair with the thread's owner")]
+    Pairing(#[from] Box<PairingError>),
     #[error(transparent)]
     Settings(#[from] SettingsError),
     #[error("joining needs the live layer: set MAHI_LIVE to local or public, or leave it unset")]
@@ -491,18 +500,25 @@ impl Peers for JoinPeers {
     }
 }
 
+fn relays_for(live: LiveMode) -> Result<Relays, JoinError> {
+    match live {
+        LiveMode::Public => Ok(Relays::Public),
+        LiveMode::Local => Ok(Relays::Disabled),
+        LiveMode::Off | LiveMode::Unknown => Err(JoinError::LiveSetting),
+    }
+}
+
 /// Joins the thread `command`'s ticket invites to and shows its host's agent until the user
 /// leaves with `q` or Ctrl-C, or mahi is stopped.
 pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<Outcome, JoinError> {
-    let relays = match environment.live {
-        LiveMode::Public => Relays::Public,
-        LiveMode::Local => Relays::Disabled,
-        LiveMode::Off | LiveMode::Unknown => return Err(JoinError::LiveSetting),
-    };
-    let ticket = &command.ticket;
+    let relays = relays_for(environment.live)?;
     if command.agent().is_none() && command.options != LaunchOptions::default() {
         return Err(JoinError::OptionsNeedAgent);
     }
+    let ticket = &command
+        .ticket
+        .clone()
+        .map_or_else(|| pair::join_by_code(environment).map_err(Box::new), Ok)?;
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(JoinError::CurrentDirectory)?;
@@ -703,22 +719,35 @@ fn watch(
     let composer = Composer::new(key, follows.as_str());
     let leave = Arc::new(AtomicBool::new(false));
     let signals = TerminationSignals::listen().map_err(JoinError::Signals)?;
-    {
+    let (quit, quitting) = UnixStream::pair().map_err(JoinError::Terminal)?;
+    let signal_quitting = quitting.try_clone().map_err(JoinError::Terminal)?;
+    let watching = {
         let leave = Arc::clone(&leave);
         thread::spawn(move || {
-            if signals.wait().is_ok() {
-                leave.store(true, Ordering::SeqCst);
+            loop {
+                match mahi_sandbox::wait_readable(signals.as_fd(), signal_quitting.as_fd()) {
+                    Ok((_, true)) => return,
+                    Ok((false, false)) => continue,
+                    Ok((true, false)) | Err(_) => {}
+                }
+                if signals.wait().is_ok() {
+                    leave.store(true, Ordering::SeqCst);
+                }
+                return;
             }
-        });
-    }
+        })
+    };
     let raw = RawMode::enable().map_err(JoinError::Terminal)?;
     let screen = AlternateScreen::enter();
-    let keys = read_keys(&leave);
+    let (keys, reading) = read_keys(&leave, quitting);
     let ended = show(
         (&topic, &mut frames, &mut sender),
         (View::new(follows), composer),
         (&keys, &leave),
     );
+    drop(quit);
+    run::join_within(reading, run::THREAD_STOP_WAIT);
+    run::join_within(watching, run::THREAD_STOP_WAIT);
     drop(screen);
     drop(raw);
     match ended {
@@ -895,18 +924,26 @@ fn watch_resizes() -> Arc<AtomicBool> {
     resized
 }
 
-/// Reads the viewer's keys on a thread of its own and passes them on; the end of the input
-/// leaves the thread.
-fn read_keys(leave: &Arc<AtomicBool>) -> Receiver<Vec<u8>> {
+/// Reads the viewer's keys on a thread of its own and passes them on, until the input ends,
+/// which leaves the thread, or `quitting` becomes readable.
+fn read_keys(
+    leave: &Arc<AtomicBool>,
+    quitting: UnixStream,
+) -> (Receiver<Vec<u8>>, thread::JoinHandle<()>) {
     let (keys, received) = mpsc::sync_channel(KEY_QUEUE);
     let leave = Arc::clone(leave);
-    thread::spawn(move || {
-        let mut input = io::stdin().lock();
+    let reading = thread::spawn(move || {
+        let input = io::stdin();
         let mut buffer = [0_u8; 4096];
         loop {
-            let read = match input.read(&mut buffer) {
+            match mahi_sandbox::wait_readable(input.as_fd(), quitting.as_fd()) {
+                Ok((_, true)) => return,
+                Ok((false, false)) => continue,
+                Ok((true, false)) | Err(_) => {}
+            }
+            let read = match rustix::io::read(&input, &mut buffer) {
                 Ok(read) => read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(rustix::io::Errno::INTR) => continue,
                 Err(_) => 0,
             };
             let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
@@ -918,7 +955,7 @@ fn read_keys(leave: &Arc<AtomicBool>) -> Receiver<Vec<u8>> {
             }
         }
     });
-    received
+    (received, reading)
 }
 
 #[cfg(test)]

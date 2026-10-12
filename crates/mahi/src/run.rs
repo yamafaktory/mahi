@@ -281,7 +281,7 @@ use crate::{
     },
 };
 
-const THREAD_STOP_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const THREAD_STOP_WAIT: Duration = Duration::from_secs(2);
 const THREAD_POLL: Duration = Duration::from_millis(10);
 #[cfg(target_os = "linux")]
 const PROGRAM_HEADERS: [&[u8]; 1] = [b"\x7fELF"];
@@ -2611,7 +2611,7 @@ fn relay(
 
 /// Joins `thread` if it ends within `wait`, and otherwise leaves it running: one stuck writing
 /// to a terminal a leftover process still holds must not hang mahi.
-fn join_within(thread: thread::JoinHandle<()>, wait: Duration) {
+pub(crate) fn join_within(thread: thread::JoinHandle<()>, wait: Duration) {
     let deadline = Instant::now() + wait;
     while !thread.is_finished() && Instant::now() < deadline {
         thread::sleep(THREAD_POLL);

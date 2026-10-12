@@ -1336,6 +1336,22 @@ cat parser.rs
     }
 
     #[test]
+    fn inviting_from_the_home_screen_without_a_remote_says_what_pairing_needs_and_comes_back() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("MAHI_LIVE", "local"),
+            &[
+                (&thread, b"i"),
+                ("pairing needs a remote", b""),
+                ("Press Enter to go back", b"\n"),
+                (&format!("mahi invite {thread} exited with 1"), b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+    }
+
+    #[test]
     fn a_paste_split_after_its_escape_quits_the_home_screen_and_does_nothing_else() {
         let fixture = fixture();
         let (_thread, _claude) = worked_thread(&fixture);
@@ -4757,6 +4773,207 @@ exit 3
                     .success()
             );
             (server, remote)
+        }
+
+        struct Driven {
+            child: PtyChild,
+            terminal: fs::File,
+            output: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl Driven {
+            fn start(child: PtyChild) -> Self {
+                let terminal = child.writer().unwrap();
+                let mut reader = child.reader().unwrap();
+                let output = Arc::new(Mutex::new(Vec::new()));
+                let collected = Arc::clone(&output);
+                thread::spawn(move || {
+                    let mut buffer = [0_u8; 4096];
+                    while let Ok(read) = reader.read(&mut buffer) {
+                        if read == 0 {
+                            break;
+                        }
+                        collected.lock().unwrap().extend_from_slice(&buffer[..read]);
+                    }
+                });
+                Self {
+                    child,
+                    terminal,
+                    output,
+                }
+            }
+
+            fn text(&self) -> String {
+                String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+            }
+
+            fn wait_for(&self, wanted: &str) -> String {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    let text = self.text();
+                    if text.contains(wanted) {
+                        return text;
+                    }
+                    assert!(Instant::now() < deadline, "{wanted:?} never came: {text}");
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            fn type_line(&mut self, line: &str) {
+                self.terminal
+                    .write_all(format!("{line}\n").as_bytes())
+                    .unwrap();
+            }
+
+            fn exit_code(&mut self) -> i32 {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                loop {
+                    if let Some(status) = self.child.try_wait().unwrap() {
+                        return exit_code(status);
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "mahi kept running: {}",
+                        self.text()
+                    );
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        struct Pairing {
+            _server: openssh::OpenSsh,
+            remote: PathBuf,
+            thread: String,
+            owner: Driven,
+            joiner: Driven,
+        }
+
+        fn pair_until_asked(fixture: &Fixture) -> Pairing {
+            let (thread, _claude) = worked_thread(fixture);
+            let (server, remote) = serve_remote(fixture);
+            let bob = teammate(fixture, "bob");
+            let mut authorized =
+                fs::read_to_string(server.dir.path().join("authorized_keys")).unwrap();
+            writeln!(
+                authorized,
+                "command=\"{}\" {}",
+                server.dir.path().join("forced.sh").display(),
+                bob.key.to_openssh()
+            )
+            .unwrap();
+            fs::write(server.dir.path().join("authorized_keys"), authorized).unwrap();
+            fs::create_dir_all(bob.home.join(".ssh")).unwrap();
+            fs::copy(
+                fixture.home.join(".ssh/known_hosts"),
+                bob.home.join(".ssh/known_hosts"),
+            )
+            .unwrap();
+            let config = bob.repo.join(".git/config");
+            let mut text = fs::read_to_string(&config).unwrap();
+            writeln!(text, "[remote \"origin\"]\n\turl = {}", server.url(&remote)).unwrap();
+            fs::write(&config, text).unwrap();
+
+            let owner_config = fixture.home.join(".config");
+            let owner_env: [(&str, &OsStr); 6] = [
+                ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+                ("HOME", fixture.home.as_os_str()),
+                ("XDG_CONFIG_HOME", owner_config.as_os_str()),
+                ("SSH_AUTH_SOCK", fixture.socket.as_os_str()),
+                ("USER", OsStr::new("tester")),
+                ("MAHI_LIVE", OsStr::new("local")),
+            ];
+            let owner = Driven::start(mahi_in_terminal(
+                &fixture.repo,
+                &["invite", &thread],
+                &owner_env,
+            ));
+            let shown = owner.wait_for("Tell it to your teammate");
+            let code = shown
+                .split("Pairing code: ")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap()
+                .to_owned();
+            assert!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]).contains("refs/mahi/pair/"));
+            let bob_config = bob.home.join(".config");
+            let bob_env: [(&str, &OsStr); 6] = [
+                ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+                ("HOME", bob.home.as_os_str()),
+                ("XDG_CONFIG_HOME", bob_config.as_os_str()),
+                ("SSH_AUTH_SOCK", bob.socket.as_os_str()),
+                ("USER", OsStr::new("bob")),
+                ("MAHI_LIVE", OsStr::new("local")),
+            ];
+            let mut joiner = Driven::start(mahi_in_terminal(&bob.repo, &["join"], &bob_env));
+            joiner.wait_for("Pairing code: ");
+            joiner.type_line(&code);
+            joiner.wait_for("The code matched");
+            let asked = owner.wait_for("[y/N]");
+            assert!(asked.contains("Add bob (SHA256:"), "{asked}");
+            assert!(!joiner.text().contains(&code), "{}", joiner.text());
+            Pairing {
+                _server: server,
+                remote,
+                thread,
+                owner,
+                joiner,
+            }
+        }
+
+        fn bob_listed(fixture: &Fixture, thread: &str) -> bool {
+            let store = Store::open(&fixture.repo).unwrap();
+            let thread: ThreadId = thread.parse().unwrap();
+            load_meta(&store, thread, &fixture.owner, 0)
+                .unwrap()
+                .participants()
+                .any(|listed| listed.name().as_str() == "bob")
+        }
+
+        #[test]
+        fn a_teammate_who_types_the_pairing_code_is_added_and_nothing_is_left_on_the_remote() {
+            let fixture = fixture();
+            let mut pairing = pair_until_asked(&fixture);
+            pairing.owner.type_line("y");
+            pairing.owner.wait_for("Passphrase");
+            pairing.owner.type_line(PASSPHRASE);
+            let code = pairing.owner.exit_code();
+            assert_eq!(code, 0, "{}", pairing.owner.text());
+            assert!(
+                pairing.owner.text().contains("added bob"),
+                "{}",
+                pairing.owner.text()
+            );
+            pairing.joiner.wait_for("waiting for the thread's host");
+            let _ = pairing.joiner.child.kill();
+            let _ = pairing.joiner.child.wait();
+            assert!(bob_listed(&fixture, &pairing.thread));
+            assert_eq!(
+                git(&pairing.remote, &["for-each-ref", "refs/mahi/pair/"]),
+                ""
+            );
+            assert!(!fixture.repo.join(".git/mahi/pairing").exists());
+        }
+
+        #[test]
+        fn a_teammate_the_owner_does_not_add_is_told_and_nothing_is_left_on_the_remote() {
+            let fixture = fixture();
+            let mut pairing = pair_until_asked(&fixture);
+            pairing.owner.type_line("n");
+            assert_eq!(pairing.owner.exit_code(), 1, "{}", pairing.owner.text());
+            assert!(pairing.owner.text().contains("you did not add bob"));
+            assert_eq!(pairing.joiner.exit_code(), 1, "{}", pairing.joiner.text());
+            assert!(
+                pairing.joiner.text().contains("the owner did not add you"),
+                "{}",
+                pairing.joiner.text()
+            );
+            assert!(!bob_listed(&fixture, &pairing.thread));
+            assert_eq!(
+                git(&pairing.remote, &["for-each-ref", "refs/mahi/pair/"]),
+                ""
+            );
+            assert!(!fixture.repo.join(".git/mahi/pairing").exists());
         }
 
         fn push_thread_refs(fixture: &Fixture, thread: &str, agent: &Path, remote: &Path) {

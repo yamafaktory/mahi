@@ -202,7 +202,8 @@ impl LiveNode {
 }
 
 /// A connected pairing: messages each way, framed as a two-byte big-endian length and at most
-/// [`MAX_SEALED_BYTES`], each step within [`STEP_WAIT`].
+/// [`MAX_SEALED_BYTES`], each step within [`STEP_WAIT`]. Dropping it closes the connection, so
+/// the other side learns at once that the pairing ended.
 pub struct PairLink<'a> {
     node: &'a LiveNode,
     connection: Connection,
@@ -282,16 +283,41 @@ impl PairLink<'_> {
         })?
     }
 
-    /// Ends the pairing: closes the stream and the connection, giving the other side a moment
-    /// to read what was sent last.
-    pub fn finish(mut self) {
+    /// Waits up to `wait` for the other side to close the connection, after the last message,
+    /// so that its last frames are acknowledged before this side goes.
+    pub fn wait_closed(self, wait: Duration) {
+        let connection = self.connection.clone();
+        let _ = self.node.block_on(async move {
+            let _ = tokio::time::timeout(wait, connection.closed()).await;
+        });
+    }
+
+    /// Returns whether the connection is still open.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.connection.close_reason().is_none()
+    }
+
+    /// Ends the pairing: closes the stream, waits up to [`STEP_WAIT`] for the other side to
+    /// acknowledge everything sent, then closes the connection, and says whether it did.
+    #[must_use]
+    pub fn finish(mut self) -> bool {
         let _ = self.send.finish();
         let send = &mut self.send;
         let connection = self.connection.clone();
-        let _ = self.node.block_on(async move {
-            let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
-            connection.close(VarInt::from_u32(DONE), b"done");
-        });
+        self.node
+            .block_on(async move {
+                let stopped = tokio::time::timeout(STEP_WAIT, send.stopped()).await;
+                connection.close(VarInt::from_u32(DONE), b"done");
+                matches!(stopped, Ok(Ok(None)))
+            })
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for PairLink<'_> {
+    fn drop(&mut self) {
+        self.connection.close(VarInt::from_u32(DONE), b"done");
     }
 }
 
@@ -318,7 +344,7 @@ mod tests {
                 link.send(&vec![0; MAX_SEALED_BYTES + 1]),
                 Err(LiveError::FrameTooLarge)
             ));
-            link.finish();
+            let _ = link.finish();
             joiner
         });
         let mut link = listener.accept(STEP_WAIT).unwrap();
@@ -353,7 +379,7 @@ mod tests {
         let talking = thread::spawn(move || {
             let mut link = joiner.connect_pairing(&owner).unwrap();
             link.send(b"hello").unwrap();
-            link.finish();
+            let _ = link.finish();
             joiner
         });
         let mut link = listener.accept(STEP_WAIT).unwrap();

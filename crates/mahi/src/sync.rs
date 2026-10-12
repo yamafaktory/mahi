@@ -467,6 +467,57 @@ pub(crate) fn transfer_limits(environment: &Environment) -> Settings {
     })
 }
 
+/// Connects to the remote this clone pushes its threads to, with reads bounded by `budget`,
+/// for a command that must write there; `None` when no remote was chosen.
+///
+/// # Errors
+///
+/// Returns [`SetupError`] if the chosen remote cannot be used, or [`ConnectError`] through
+/// [`PairRemoteError`] if it cannot be reached.
+pub(crate) fn connect_chosen(
+    store: &Store,
+    environment: &Environment,
+    budget: ReadBudget,
+    interrupt: &Arc<AtomicBool>,
+) -> Result<Option<(RemoteName, AnyTransport)>, PairRemoteError> {
+    let Some(chosen) = remote::sync_remote(store).map_err(SetupError::from)? else {
+        return Ok(None);
+    };
+    let url = remote::push_url(store, &chosen.name).map_err(SetupError::from)?;
+    let access = Access::gather(environment, &url).map_err(SetupError::Access)?;
+    let transport = access.connect(&url, interrupt, budget)?;
+    Ok(Some((chosen.name, transport)))
+}
+
+/// Connects to where this clone fetches threads from, its chosen remote or else `origin`,
+/// with reads bounded by `budget`; `None` when it has neither.
+///
+/// # Errors
+///
+/// Returns [`PairRemoteError`] if the remote cannot be used or reached.
+pub(crate) fn connect_fetch_source(
+    store: &Store,
+    environment: &Environment,
+    budget: ReadBudget,
+    interrupt: &Arc<AtomicBool>,
+) -> Result<Option<(RemoteName, AnyTransport)>, PairRemoteError> {
+    let Some((name, url, _)) = fetch_source(store).map_err(SetupError::from)? else {
+        return Ok(None);
+    };
+    let access = Access::gather(environment, &url).map_err(SetupError::Access)?;
+    let transport = access.connect(&url, interrupt, budget)?;
+    Ok(Some((name, transport)))
+}
+
+/// A remote a pairing uses cannot be used or reached.
+#[derive(Debug, Error)]
+pub(crate) enum PairRemoteError {
+    #[error(transparent)]
+    Setup(#[from] SetupError),
+    #[error("cannot reach the remote")]
+    Connect(#[from] ConnectError),
+}
+
 /// Returns the remote to fetch from and its URL, and whether it was chosen: the chosen remote
 /// at the URL it pushes to, where its threads are, or else `origin` when it fetches over SSH.
 fn fetch_source(store: &Store) -> Result<Option<(RemoteName, RemoteUrl, bool)>, RemoteError> {

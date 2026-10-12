@@ -105,8 +105,9 @@ pub(crate) enum Command {
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub(crate) struct JoinCommand {
-    /// The ticket `mahi invite` printed for you.
-    pub(crate) ticket: Ticket,
+    /// The ticket `mahi invite` printed for you; without one, mahi asks for the pairing code
+    /// the thread's owner gave you.
+    pub(crate) ticket: Option<Ticket>,
     #[command(flatten)]
     pub(crate) options: LaunchOptions,
     /// Your own agent to run in the thread, and its arguments, after `--`; without one, you
@@ -147,14 +148,15 @@ pub(crate) struct InviteCommand {
     /// The thread to invite to, as `mahi threads` lists it.
     pub(crate) thread: ThreadId,
     /// The teammate's participant card, as `mahi id` printed it; quoting it is optional.
-    #[arg(required = true, num_args = 1.., value_name = "CARD")]
+    /// Without one, mahi shows a pairing code for the teammate to type instead.
+    #[arg(num_args = 0.., value_name = "CARD")]
     card: Vec<String>,
 }
 
 impl InviteCommand {
-    /// Returns the card, its words joined by spaces.
-    pub(crate) fn card(&self) -> String {
-        self.card.join(" ")
+    /// Returns the card, its words joined by spaces, or `None` when none was given.
+    pub(crate) fn card(&self) -> Option<String> {
+        (!self.card.is_empty()).then(|| self.card.join(" "))
     }
 }
 
@@ -549,9 +551,16 @@ mod tests {
                 panic!("not an invite");
             };
             assert_eq!(invite.thread.to_string(), thread);
-            assert_eq!(invite.card(), card);
+            assert_eq!(invite.card().as_deref(), Some(card));
         }
-        assert!(parse(&["invite", thread]).is_err());
+        let Command::Invite(by_code) = parse(&["invite", thread]).unwrap().command else {
+            panic!("not an invite");
+        };
+        assert_eq!(by_code.card(), None);
+        let Command::Join(by_code) = parse(&["join"]).unwrap().command else {
+            panic!("not a join");
+        };
+        assert!(by_code.ticket.is_none() && by_code.agent().is_none());
     }
 
     #[test]
