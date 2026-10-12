@@ -2,6 +2,7 @@
 //! what the user types, the keys the open palette reads, where mahi may draw between the
 //! agent's escape sequences, and drawing the palette.
 
+mod home;
 mod input;
 mod key;
 mod notify;
@@ -10,6 +11,11 @@ mod scan;
 mod screen;
 mod view;
 
+pub use home::{
+    Home,
+    HomeAction,
+    HomeRow,
+};
 pub use input::{
     PaletteInput,
     PaletteKeys,
