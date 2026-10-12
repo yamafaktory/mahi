@@ -20,9 +20,16 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let mut filter = String::new();
     for chunk in [first, second] {
         let used = keys.read(chunk, |key| {
-            if let PaletteInput::Text(c) = key {
-                assert!(!c.is_control() || c == '\n' || c == '\t');
-                filter.push(c);
+            match key {
+                PaletteInput::Text(c) => {
+                    assert!(!c.is_control());
+                    filter.push(c);
+                }
+                PaletteInput::Pasted(c) => {
+                    assert!(!c.is_control() || c == '\n' || c == '\t');
+                    filter.push(c);
+                }
+                _ => {}
             }
             true
         });
@@ -36,7 +43,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     for chunk in [&pasted[..cut], &pasted[cut..]] {
         keys.read(chunk, |key| {
             match key {
-                PaletteInput::Text(_) => {}
+                PaletteInput::Pasted(_) => {}
                 PaletteInput::Escape if cut == 1 => escaped = true,
                 _ => assert!(escaped, "a key inside a paste: {key:?}"),
             }

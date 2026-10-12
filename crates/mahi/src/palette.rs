@@ -291,7 +291,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         let used = keys.read(bytes, |input| {
             match input {
                 PaletteInput::Escape => escaped = true,
-                PaletteInput::Text(character) => {
+                PaletteInput::Text(character) | PaletteInput::Pasted(character) => {
                     filter.push(character);
                     (*selected, *selected_id) = (0, None);
                     changed = true;

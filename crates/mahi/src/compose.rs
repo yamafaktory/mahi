@@ -141,7 +141,7 @@ impl Composer {
                 Segment::Pass(bytes) => {
                     let used = keys.read(bytes, |input| {
                         match input {
-                            PaletteInput::Text(character)
+                            PaletteInput::Text(character) | PaletteInput::Pasted(character)
                                 if text.len() + character.len_utf8() <= MAX_PROMPT_BYTES =>
                             {
                                 text.push(character);
@@ -172,6 +172,7 @@ impl Composer {
                                 typed.changed = true;
                             }
                             PaletteInput::Text(_)
+                            | PaletteInput::Pasted(_)
                             | PaletteInput::Tab
                             | PaletteInput::Reject
                             | PaletteInput::Up

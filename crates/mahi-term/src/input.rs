@@ -12,9 +12,10 @@ const PRIVATE_USE: std::ops::RangeInclusive<char> = '\u{e000}'..='\u{f8ff}';
 /// A key typed while the palette is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteInput {
-    /// A character for the filter line, typed or pasted; only a paste gives a newline or a
-    /// tab.
+    /// A character typed for the filter line.
     Text(char),
+    /// A character of a bracketed paste, which may be a newline or a tab and is never a key.
+    Pasted(char),
     /// Backspace.
     Backspace,
     /// Enter, which accepts.
@@ -85,14 +86,14 @@ impl PaletteKeys {
             return (0, None);
         }
         match byte {
-            b'\r' | b'\n' => return (1, Some(PaletteInput::Text('\n'))),
-            b'\t' => return (1, Some(PaletteInput::Text('\t'))),
+            b'\r' | b'\n' => return (1, Some(PaletteInput::Pasted('\n'))),
+            b'\t' => return (1, Some(PaletteInput::Pasted('\t'))),
             _ => {}
         }
         let (used, character) = character(rest);
         (
             used,
-            character.filter(|c| shown(*c)).map(PaletteInput::Text),
+            character.filter(|c| shown(*c)).map(PaletteInput::Pasted),
         )
     }
 
@@ -273,6 +274,10 @@ mod tests {
         text.chars().map(PaletteInput::Text).collect()
     }
 
+    fn pasted(text: &str) -> Vec<PaletteInput> {
+        text.chars().map(PaletteInput::Pasted).collect()
+    }
+
     #[test]
     fn typed_keys_are_read_as_terminals_send_them() {
         assert_eq!(
@@ -338,9 +343,9 @@ mod tests {
     fn a_paste_gives_only_text_with_its_lines_even_across_reads() {
         assert_eq!(
             inputs(&[b"\x1b[200~fix\r\n\x18\x1b\tit\xe2\x80\x8b", b"!\x1b[201~\r"]),
-            [text("fix\n\n\tit!"), vec![PaletteInput::Enter]].concat()
+            [pasted("fix\n\n\tit!"), vec![PaletteInput::Enter]].concat()
         );
-        assert_eq!(inputs(&[b"\x1b[200~a", b"\r\x1b"]), text("a\n"));
+        assert_eq!(inputs(&[b"\x1b[200~a", b"\r\x1b"]), pasted("a\n"));
         assert_eq!(
             inputs(&[b"\x03\x1b[99;5u"]),
             [PaletteInput::Escape, PaletteInput::Escape]
@@ -366,11 +371,20 @@ mod tests {
                 let keys: Vec<&PaletteInput> = read
                     .iter()
                     .take_while(|input| **input != PaletteInput::Escape)
-                    .filter(|input| !matches!(input, PaletteInput::Text(_)))
+                    .filter(|input| {
+                        !matches!(input, PaletteInput::Text(_) | PaletteInput::Pasted(_))
+                    })
                     .collect();
                 assert!(keys.is_empty(), "{split} {before:?}: {read:?}");
                 if split > 1 {
                     assert!(!read.contains(&PaletteInput::Escape), "{split}: {read:?}");
+                    let typed_before = usize::from(before == b"x");
+                    assert!(
+                        read[typed_before..]
+                            .iter()
+                            .all(|input| matches!(input, PaletteInput::Pasted(_))),
+                        "{split} {before:?}: {read:?}"
+                    );
                 }
             }
         }
