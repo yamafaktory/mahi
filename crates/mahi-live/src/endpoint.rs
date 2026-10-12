@@ -422,16 +422,26 @@ fn builder(
         .map_err(LiveError::SocketAddress)
 }
 
+impl LiveNode {
+    pub(crate) fn block_on<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> Result<F::Output, LiveError> {
+        outside_runtime()?;
+        Ok(self.runtime()?.block_on(future))
+    }
+
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+}
+
 #[cfg(test)]
 impl LiveNode {
     pub(crate) fn run<F: std::future::Future>(&self, future: F) -> F::Output {
         self.runtime()
             .expect("a node in a test is open")
             .block_on(future)
-    }
-
-    pub(crate) fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
     }
 }
 

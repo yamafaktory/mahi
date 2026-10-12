@@ -63,11 +63,18 @@ pub use pair::{
     Confirming,
     Handshake,
     MAX_MESSAGE_BYTES,
+    MAX_PLACE_BYTES,
     MAX_SEALED_BYTES,
     MAX_SLOT,
+    PAIR_ALPN,
     PairError,
+    PairLink,
+    PairListener,
     PairingCode,
     Role,
+    STEP_WAIT,
+    parse_place,
+    place_bytes,
 };
 pub use ticket::{
     AddressError,

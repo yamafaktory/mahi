@@ -10,6 +10,7 @@ mod fetch;
 pub mod fuzzing;
 mod history;
 mod merge;
+mod pairing;
 mod push;
 mod snapshot;
 mod store;
@@ -41,6 +42,11 @@ pub use merge::{
     MAX_MERGE_WRITE_BYTES,
     MAX_MERGED_PATHS,
     Merged,
+};
+pub use pairing::{
+    MAX_PLACE_BYTES,
+    PAIR_PREFIX,
+    PLACE_ENTRY,
 };
 pub use push::Pushed;
 pub use snapshot::{

@@ -68,6 +68,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "pairing-place"
+path = "fuzz_targets/pairing_place.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pairing-code"
 path = "fuzz_targets/pairing_code.rs"
 test = false

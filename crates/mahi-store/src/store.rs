@@ -826,7 +826,7 @@ pub(crate) fn open_options() -> gix::open::Options {
     gix::open::Options::default().config_overrides([DISABLE_REFLOG, REF_LOCK_TIMEOUT, ALLOC_LIMIT])
 }
 
-fn generic_signature() -> Signature {
+pub(crate) fn generic_signature() -> Signature {
     Signature {
         name: COMMITTER_NAME.into(),
         email: COMMITTER_EMAIL.into(),

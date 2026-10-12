@@ -83,14 +83,14 @@ pub enum Pushed {
     TooLarge(u64),
 }
 
-struct Advertisement {
-    wanted: HashMap<String, ObjectId>,
-    tips: HashSet<ObjectId>,
-    atomic: bool,
-    delete_refs: bool,
+pub(crate) struct Advertisement {
+    pub(crate) wanted: HashMap<String, ObjectId>,
+    pub(crate) tips: HashSet<ObjectId>,
+    pub(crate) atomic: bool,
+    pub(crate) delete_refs: bool,
 }
 
-type Command = (String, Option<ObjectId>, ObjectId);
+pub(crate) type Command = (String, Option<ObjectId>, ObjectId);
 type Plan = (Vec<(ThreadRef, Pushed)>, Vec<(usize, Command)>);
 type Report = HashMap<String, Option<String>>;
 
@@ -247,7 +247,7 @@ impl Store {
         Ok(outcome)
     }
 
-    fn send<T: Transport>(
+    pub(crate) fn send<T: Transport>(
         &self,
         transport: &mut T,
         commands: &[Command],
@@ -631,7 +631,7 @@ fn check(interrupt: &AtomicBool) -> Result<(), StoreError> {
     }
 }
 
-fn finish_without_commands<T: Transport>(transport: &mut T) -> Result<(), StoreError> {
+pub(crate) fn finish_without_commands<T: Transport>(transport: &mut T) -> Result<(), StoreError> {
     let writer = transport
         .request(
             WriteMode::OneLfTerminatedLinePerWriteCall,
@@ -643,7 +643,7 @@ fn finish_without_commands<T: Transport>(transport: &mut T) -> Result<(), StoreE
     Ok(())
 }
 
-fn settle(outcome: &mut Pushed, report: &Report, name: &str) {
+pub(crate) fn settle(outcome: &mut Pushed, report: &Report, name: &str) {
     match report.get(name) {
         Some(None) => {}
         Some(Some(reason)) => *outcome = Pushed::Refused(reason.clone()),
@@ -651,7 +651,7 @@ fn settle(outcome: &mut Pushed, report: &Report, name: &str) {
     }
 }
 
-fn advertisement<T: Transport>(
+pub(crate) fn advertisement<T: Transport>(
     transport: &mut T,
     wanted: &dyn Fn(&str) -> bool,
     is_tip: &dyn Fn(&str) -> bool,
