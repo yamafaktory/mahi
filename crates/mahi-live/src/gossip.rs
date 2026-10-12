@@ -296,6 +296,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(viewer_topic.dropped() > 0);
+        let mut settled = viewer_topic.dropped();
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let now = viewer_topic.dropped();
+            if now == settled || Instant::now() >= deadline {
+                break;
+            }
+            settled = now;
+        }
         let mut kept = 0_u64;
         while viewer_topic
             .receive(Duration::from_millis(200))
