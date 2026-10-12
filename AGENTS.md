@@ -30,7 +30,7 @@ just fmt-check  # check formatting
 just clippy     # clippy on all targets, warnings are errors
 just test       # cargo nextest run; extra args pass through, e.g. just test -p mahi
 just build
-just run -- …   # run the mahi binary
+just run …      # run the mahi binary, e.g. just run threads
 just test-git   # the tests that run the git program (not part of just test)
 just test-wsl   # the tests that need WSL 2 (not part of just test; CI runs them on Windows)
 just release v  # check, bump every crate to version v, commit, tag v<v> and push (dry run without --execute)
@@ -133,8 +133,8 @@ Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) an
 - **Async and blocking.** Do not block inside async code. Use `spawn_blocking` or a dedicated
   thread for PTY, filesystem and git work that blocks.
 - **Dependencies.** Prefer well-maintained crates that DESIGN.md already names (`gix`,
-  `rustix`, `vt100`, `iroh`, `age`, …), and `clap` (derive) for the command line. Ask
-  before you add a large dependency that the design does not name.
+  `rustix`, `vt100`, `iroh`, `age`, `ratatui`, `spake2`, …), and `clap` (derive) for the
+  command line. Ask before you add a large dependency that the design does not name.
 
 ## Performance and security
 
