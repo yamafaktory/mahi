@@ -195,13 +195,58 @@ impl TerminationSignals {
         input: BorrowedFd<'_>,
     ) -> Result<Option<Termination>, SignalError> {
         loop {
-            match readable(input, self.0.read_end)? {
+            match readable(input, self.0.read_end, None)? {
                 (_, true) => return self.wait().map(Some),
                 (true, false) => return Ok(None),
                 (false, false) => {}
             }
         }
     }
+}
+
+impl TerminationSignals {
+    /// Waits up to `timeout` until `input` has something to read or one of the signals
+    /// arrives, and says which. It waits with `select`, which works on terminals on macOS too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignalError::Io`] if waiting or reading the pipe fails, including when a
+    /// descriptor is too large for `select`.
+    pub fn wait_for_input_within(
+        &self,
+        input: BorrowedFd<'_>,
+        timeout: Duration,
+    ) -> Result<InputWait, SignalError> {
+        match readable(input, self.0.read_end, Some(timeout))? {
+            (_, true) => self.wait().map(InputWait::Signal),
+            (true, false) => Ok(InputWait::Input),
+            (false, false) => Ok(self
+                .wait_timeout(Duration::ZERO)?
+                .map_or(InputWait::Timeout, InputWait::Signal)),
+        }
+    }
+}
+
+/// Blocks until `first` or `second` has something to read, and says which; both are `false`
+/// when a signal interrupted the wait. It waits with `select`, which works on terminals on
+/// macOS too.
+///
+/// # Errors
+///
+/// Returns an error if `select` fails, including when a descriptor is too large for it.
+pub fn wait_readable(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> io::Result<(bool, bool)> {
+    readable(first, second, None)
+}
+
+/// What a timed wait for input saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputWait {
+    /// The input has something to read.
+    Input,
+    /// One of the signals arrived.
+    Signal(Termination),
+    /// Neither came in time.
+    Timeout,
 }
 
 impl AsFd for TerminationSignals {
@@ -340,15 +385,26 @@ fn restore(index: usize) {
     unsafe_code,
     reason = "rustix has no select, which macOS needs to wait on a terminal"
 )]
-fn readable(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> io::Result<(bool, bool)> {
+fn readable(
+    first: BorrowedFd<'_>,
+    second: BorrowedFd<'_>,
+    timeout: Option<Duration>,
+) -> io::Result<(bool, bool)> {
     let (first, second) = (first.as_raw_fd(), second.as_raw_fd());
+    let mut wait = timeout.map(|timeout| libc::timeval {
+        tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+        tv_usec: libc::suseconds_t::from(i32::try_from(timeout.subsec_micros()).unwrap_or(0)),
+    });
+    let wait = wait
+        .as_mut()
+        .map_or(std::ptr::null_mut(), std::ptr::from_mut);
     let limit = libc::c_int::try_from(libc::FD_SETSIZE).unwrap_or(libc::c_int::MAX);
     if !(0..limit).contains(&first) || !(0..limit).contains(&second) {
         return Err(Errno::INVAL.into());
     }
     // SAFETY: both descriptors are open and below FD_SETSIZE, so FD_SET and FD_ISSET stay inside
-    // the set, which FD_ZERO initialises first. The other sets and the timeout are null, and
-    // select only writes to the set it is given.
+    // the set, which FD_ZERO initialises first. The other sets are null, the timeout is null or
+    // points at a live timeval, and select only writes to the set and the timeout it is given.
     unsafe {
         let mut set: libc::fd_set = std::mem::zeroed();
         libc::FD_ZERO(&raw mut set);
@@ -359,7 +415,7 @@ fn readable(first: BorrowedFd<'_>, second: BorrowedFd<'_>) -> io::Result<(bool, 
             &raw mut set,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            wait,
         );
         if ready < 0 {
             let error = io::Error::last_os_error();
@@ -569,6 +625,38 @@ mod tests {
     }
 
     extern "C" fn foreign_handler(_: libc::c_int) {}
+
+    #[test]
+    fn a_timed_wait_for_input_sees_input_a_signal_or_nothing() {
+        for signal in WATCHED {
+            set_disposition(signal, libc::SIG_DFL).unwrap();
+        }
+        let termination = TerminationSignals::listen().unwrap();
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        let short = Duration::from_millis(20);
+        assert_eq!(
+            termination
+                .wait_for_input_within(reader.as_fd(), short)
+                .unwrap(),
+            InputWait::Timeout
+        );
+        rustix::io::write(&writer, b"x").unwrap();
+        assert_eq!(
+            termination
+                .wait_for_input_within(reader.as_fd(), short)
+                .unwrap(),
+            InputWait::Input
+        );
+        rustix::io::read(&reader, &mut [0_u8; 1]).unwrap();
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
+            .unwrap();
+        assert_eq!(
+            termination
+                .wait_for_input_within(reader.as_fd(), Duration::from_secs(5))
+                .unwrap(),
+            InputWait::Signal(Termination::Terminate)
+        );
+    }
 
     #[test]
     fn a_timed_wait_returns_a_signal_or_nothing() {

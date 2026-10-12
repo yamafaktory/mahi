@@ -41,8 +41,10 @@ pub use userns::{
     check_user_namespaces,
 };
 pub use window::{
+    InputWait,
     SignalError,
     Termination,
     TerminationSignals,
     WindowChanges,
+    wait_readable,
 };
