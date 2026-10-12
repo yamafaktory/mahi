@@ -16,6 +16,7 @@ use crate::{
 };
 
 const CREDENTIALS: &str = "credentials";
+const DECLINED: &str = "declined";
 const LONGEST_NAME: usize = 128;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
 
@@ -119,13 +120,15 @@ impl Credential {
         &self.0
     }
 
-    /// Stores the credential as `name`, once: an existing one is never overwritten.
+    /// Stores the credential as `name`, once: an existing one is never overwritten. A choice to
+    /// go without it, made earlier, is forgotten.
     ///
     /// # Errors
     ///
     /// Returns [`IdentityError::Exists`] if a credential of that name exists, or another
     /// [`IdentityError`] if the directory is not private or writing fails.
     pub fn save(&self, config: &ConfigDir, name: &CredentialName) -> Result<(), IdentityError> {
+        remove_in(config, DECLINED, name)?;
         private_file::write_new(&credential_file(config, name), &self.0)
     }
 
@@ -153,14 +156,52 @@ impl Credential {
 ///
 /// Returns [`IdentityError::Io`] if it cannot be removed.
 pub fn remove_credential(config: &ConfigDir, name: &CredentialName) -> Result<bool, IdentityError> {
-    let directory = config.path().join(CREDENTIALS);
+    remove_in(config, CREDENTIALS, name)
+}
+
+/// Remembers that the user chose to run agents without the credential `name`, so that mahi
+/// does not ask for it again, as an empty file in `declined/` held to the identity files' rules.
+///
+/// # Errors
+///
+/// Returns an [`IdentityError`] if the directory is not private or writing fails.
+pub fn decline_credential(config: &ConfigDir, name: &CredentialName) -> Result<(), IdentityError> {
+    match private_file::write_new(&config.path().join(DECLINED).join(name.as_str()), b"") {
+        Err(IdentityError::Exists(_)) => is_credential_declined(config, name).map(|_| ()),
+        other => other,
+    }
+}
+
+/// Returns whether the user chose to run agents without the credential `name`.
+///
+/// # Errors
+///
+/// Returns an [`IdentityError`] if the file is not an empty private regular file of the user's
+/// in a private directory.
+pub fn is_credential_declined(
+    config: &ConfigDir,
+    name: &CredentialName,
+) -> Result<bool, IdentityError> {
+    match private_file::read(&config.path().join(DECLINED).join(name.as_str()), 0) {
+        Ok(_) => Ok(true),
+        Err(IdentityError::NotFound(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_in(
+    config: &ConfigDir,
+    directory: &str,
+    name: &CredentialName,
+) -> Result<bool, IdentityError> {
+    let directory = config.path().join(directory);
     match fs::symlink_metadata(&directory) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
         Ok(metadata) if !metadata.is_dir() => return Err(IdentityError::NotPrivate(directory)),
         Ok(_) => private_file::check_private_dir(&directory)?,
     }
-    match fs::remove_file(credential_file(config, name)) {
+    match fs::remove_file(directory.join(name.as_str())) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
@@ -203,7 +244,10 @@ fn credential_file(config: &ConfigDir, name: &CredentialName) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{
+        PermissionsExt,
+        symlink,
+    };
 
     use super::*;
 
@@ -274,12 +318,72 @@ mod tests {
     }
 
     #[test]
+    fn a_declined_credential_is_remembered_until_one_is_stored() {
+        let (_dir, config) = config();
+        let name: CredentialName = "claude".parse().unwrap();
+        let other: CredentialName = "codex".parse().unwrap();
+        assert!(!is_credential_declined(&config, &name).unwrap());
+        decline_credential(&config, &name).unwrap();
+        decline_credential(&config, &name).unwrap();
+        assert!(is_credential_declined(&config, &name).unwrap());
+        assert!(!is_credential_declined(&config, &other).unwrap());
+        let file = config.path().join(DECLINED).join("claude");
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        secret("t0ken").save(&config, &name).unwrap();
+        assert!(!is_credential_declined(&config, &name).unwrap());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_declined_mark_others_can_write_or_that_holds_bytes_is_refused() {
+        let (dir, config) = config();
+        let name: CredentialName = "claude".parse().unwrap();
+        decline_credential(&config, &name).unwrap();
+        let file = config.path().join(DECLINED).join("claude");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(matches!(
+            is_credential_declined(&config, &name),
+            Err(IdentityError::NotPrivate(_))
+        ));
+        assert!(matches!(
+            decline_credential(&config, &name),
+            Err(IdentityError::NotPrivate(_))
+        ));
+        fs::remove_file(&file).unwrap();
+        fs::write(&file, "x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            is_credential_declined(&config, &name),
+            Err(IdentityError::Malformed)
+        ));
+        fs::remove_file(&file).unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, "").unwrap();
+        symlink(&outside, &file).unwrap();
+        assert!(matches!(
+            is_credential_declined(&config, &name),
+            Err(IdentityError::NotAFile(_))
+        ));
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        assert!(matches!(
+            decline_credential(&config, &name),
+            Err(IdentityError::NotAFile(_))
+        ));
+        assert!(secret("t0ken").save(&config, &name).is_err());
+        assert!(Credential::load(&config, &name).unwrap().is_none());
+    }
+
+    #[test]
     fn remove_refuses_a_credentials_directory_that_is_a_link() {
         let (dir, config) = config();
         let elsewhere = dir.path().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
         fs::write(elsewhere.join("claude"), "keep").unwrap();
-        std::os::unix::fs::symlink(&elsewhere, config.path().join(CREDENTIALS)).unwrap();
+        symlink(&elsewhere, config.path().join(CREDENTIALS)).unwrap();
         let name: CredentialName = "claude".parse().unwrap();
         assert!(remove_credential(&config, &name).is_err());
         assert!(elsewhere.join("claude").exists());
@@ -299,7 +403,7 @@ mod tests {
         fs::remove_file(&file).unwrap();
         let outside = dir.path().join("outside");
         fs::write(&outside, "stolen").unwrap();
-        std::os::unix::fs::symlink(&outside, &file).unwrap();
+        symlink(&outside, &file).unwrap();
         assert!(matches!(
             Credential::load(&config, &name),
             Err(IdentityError::NotAFile(_))

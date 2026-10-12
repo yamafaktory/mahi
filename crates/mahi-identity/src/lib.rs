@@ -23,6 +23,8 @@ pub use credential::{
     CredentialName,
     CredentialNameError,
     credential_names,
+    decline_credential,
+    is_credential_declined,
     remove_credential,
 };
 pub use identity::{
