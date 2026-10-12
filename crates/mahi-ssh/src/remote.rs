@@ -1,5 +1,6 @@
 use std::fmt;
 
+use mahi_core::is_invisible;
 use thiserror::Error;
 
 const DEFAULT_PORT: u16 = 22;
@@ -24,13 +25,14 @@ pub enum RemoteError {
     /// The host is empty, starts with `-`, or holds characters a host name cannot hold.
     #[error("the remote's host is not a valid host name")]
     InvalidHost,
-    /// The user name is empty, starts with `-`, or holds a space or a control character.
+    /// The user name is empty, starts with `-`, or holds a space, a colon (a password), a
+    /// control character or an invisible one.
     #[error("the remote's user name is not valid")]
     InvalidUser,
     /// The port is not a number from 1 to 65535.
     #[error("the remote's port is not valid")]
     InvalidPort,
-    /// The path is empty, too long, or holds a control character.
+    /// The path is empty, too long, or holds a control character or an invisible one.
     #[error("the remote's path is not valid")]
     InvalidPath,
 }
@@ -203,7 +205,9 @@ fn check_user(user: &str) -> Result<String, RemoteError> {
     let valid = !user.is_empty()
         && user.len() <= MAX_NAME_BYTES
         && !user.starts_with('-')
-        && !user.chars().any(|c| c.is_whitespace() || c.is_control());
+        && !user
+            .chars()
+            .any(|c| c == ':' || c.is_whitespace() || c.is_control() || is_invisible(c));
     if valid {
         Ok(user.to_owned())
     } else {
@@ -245,7 +249,7 @@ fn check_path(path: &str) -> Result<String, RemoteError> {
     let valid = !path.is_empty()
         && !path.starts_with('-')
         && path.len() <= MAX_PATH_BYTES
-        && !path.chars().any(char::is_control);
+        && !path.chars().any(|c| c.is_control() || is_invisible(c));
     if valid {
         Ok(path.to_owned())
     } else {
@@ -342,9 +346,23 @@ mod tests {
             ("host:--upload-pack=touch /tmp/x", RemoteError::InvalidPath),
             ("ssh://host", RemoteError::InvalidPath),
             ("host:repo\nrm", RemoteError::InvalidPath),
+            ("host:r\u{202e}x", RemoteError::InvalidPath),
+            ("ssh://host/r\u{200b}x", RemoteError::InvalidPath),
+            ("ssh://u:pw@host/repo", RemoteError::InvalidUser),
+            ("u\u{202e}@host:repo", RemoteError::InvalidUser),
+            ("ssh://:pw@host/repo", RemoteError::InvalidUser),
+            ("ssh://u:@host/repo", RemoteError::InvalidUser),
+            ("ssh://u\u{200b}@host/repo", RemoteError::InvalidUser),
         ];
         for (url, expected) in cases {
             assert_eq!(SshRemote::parse(url), Err(expected), "{url:?}");
+        }
+        for url in [
+            "host:projets/éléphant",
+            "ssh://host/仓库/代码",
+            "git@host:repos/🦀️",
+        ] {
+            assert!(SshRemote::parse(url).is_ok(), "{url:?}");
         }
     }
 
