@@ -281,9 +281,9 @@ use crate::{
     },
 };
 
-#[cfg(target_os = "linux")]
 const THREAD_STOP_WAIT: Duration = Duration::from_secs(2);
 const THREAD_POLL: Duration = Duration::from_millis(10);
+#[cfg(target_os = "linux")]
 const PROGRAM_HEADERS: [&[u8]; 1] = [b"\x7fELF"];
 #[cfg(target_os = "macos")]
 const PROGRAM_HEADERS: [&[u8]; 5] = [
