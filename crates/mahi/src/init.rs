@@ -74,6 +74,40 @@ pub(crate) fn init(environment: &Environment, prompt: &mut dyn Prompt) -> Result
     Ok(())
 }
 
+/// Sets mahi up as `mahi init` does when one of the files a command needs is missing, asking on
+/// the terminal `open` gives; without a terminal it does nothing, so the command fails as before.
+pub(crate) fn set_up_if_needed<P: Prompt>(
+    environment: &Environment,
+    open: impl FnOnce() -> io::Result<P>,
+) -> Result<(), InitError> {
+    let Ok(config) = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    if is_set_up(&config) {
+        return Ok(());
+    }
+    let Ok(mut prompt) = open() else {
+        return Ok(());
+    };
+    prompt
+        .say("mahi is not set up yet; setting it up")
+        .map_err(InitError::Prompt)?;
+    init(environment, &mut prompt)
+}
+
+fn is_set_up(config: &ConfigDir) -> bool {
+    [
+        config.recipient_file(),
+        config.signing_key_file(),
+        config.node_key_file(),
+    ]
+    .iter()
+    .all(|file| file.symlink_metadata().is_ok())
+}
+
 fn node_id(config: &ConfigDir) -> Result<NodeId, InitError> {
     let path = config.node_key_file();
     let failed = |error| InitError::NodeKey(path.clone(), error);
@@ -342,6 +376,54 @@ mod tests {
         assert!(again.said.iter().any(|line| line.starts_with("mahi key:")));
         assert!(again.said.contains(&format!("node id:     {node}")));
         assert_eq!(session::own_node(&setup.config).unwrap(), node);
+    }
+
+    #[test]
+    fn a_command_sets_mahi_up_first_when_it_is_not() {
+        let key = ed25519();
+        let setup = setup(std::slice::from_ref(&key));
+        let mut opened = 0;
+        set_up_if_needed(&setup.environment, || {
+            opened += 1;
+            Ok(Script {
+                secrets: ["correct horse", "correct horse"].into(),
+                ..Script::default()
+            })
+        })
+        .unwrap();
+        assert_eq!(opened, 1);
+        for file in files(&setup.config) {
+            assert!(file.is_file(), "{}", file.display());
+        }
+        set_up_if_needed(&setup.environment, || -> io::Result<Script> {
+            panic!("a set-up mahi opened the terminal")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_missing_file_alone_is_set_up_again_without_a_passphrase() {
+        let setup = setup(&[ed25519()]);
+        let mut first = Script {
+            secrets: ["correct horse", "correct horse"].into(),
+            ..Script::default()
+        };
+        init(&setup.environment, &mut first).unwrap();
+        std::fs::remove_file(setup.config.node_key_file()).unwrap();
+        set_up_if_needed(&setup.environment, || Ok(Script::default())).unwrap();
+        assert!(setup.config.node_key_file().is_file());
+    }
+
+    #[test]
+    fn without_a_terminal_nothing_is_set_up_and_the_command_goes_on() {
+        let setup = setup(&[ed25519()]);
+        set_up_if_needed(&setup.environment, || -> io::Result<Script> {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        })
+        .unwrap();
+        for file in files(&setup.config) {
+            assert!(!file.exists(), "{}", file.display());
+        }
     }
 
     #[test]

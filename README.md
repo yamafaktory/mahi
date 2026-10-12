@@ -75,13 +75,16 @@ sandbox cannot start Windows programs. CI runs mahi's tests inside WSL 2.
 ## Quick start
 
 ```sh
-mahi init                     # create your mahi key and choose the SSH key that signs threads
 cd my-project                 # any git repository
 mahi run claude               # run an agent in a sandbox, in a new thread
 mahi threads                  # list this repository's threads
 mahi resume <thread>          # pick a thread up again, with the same agent
 mahi land <thread>            # bring the thread's work back as a branch to curate into commits
 ```
+
+The first `mahi run` sets mahi up: it creates your mahi key, asking for its passphrase, and
+picks the SSH key in ssh-agent that signs your threads (asking which when there are several).
+`mahi init` does the same ahead of time.
 
 To work with teammates, `mahi remote` chooses the remote a thread is pushed to, `mahi id`
 prints the card a thread's owner needs, `mahi invite` turns it into a ticket, and

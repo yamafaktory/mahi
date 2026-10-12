@@ -65,6 +65,15 @@ struct Answer<'a> {
 }
 
 impl TerminalPrompt {
+    /// Opens the terminal only when standard input is one too, so mahi asks nothing of a user
+    /// who runs it from a script or with input piped in.
+    pub(crate) fn open_interactive() -> io::Result<Self> {
+        if !rustix::termios::isatty(io::stdin()) {
+            return Err(io::Error::other("standard input is not a terminal"));
+        }
+        Self::open()
+    }
+
     pub(crate) fn open() -> io::Result<Self> {
         let terminal = OpenOptions::new()
             .read(true)

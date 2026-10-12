@@ -878,13 +878,14 @@ content = '{{"bin": "{mahi_bin}"}}'
     }
 
     fn in_terminal_with(command: PtyCommand, passphrase: Option<&str>) -> (i32, String) {
-        in_terminal_answering(
-            command,
-            passphrase.map(|passphrase| ("Passphrase", passphrase)),
-        )
+        let answers: Vec<_> = passphrase
+            .map(|passphrase| ("Passphrase", passphrase))
+            .into_iter()
+            .collect();
+        in_terminal_answering(command, &answers)
     }
 
-    fn in_terminal_answering(command: PtyCommand, answer: Option<(&str, &str)>) -> (i32, String) {
+    fn in_terminal_answering(command: PtyCommand, answers: &[(&str, &str)]) -> (i32, String) {
         let mut mahi = command.spawn().unwrap();
         let mut terminal = mahi.writer().unwrap();
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -901,9 +902,15 @@ content = '{{"bin": "{mahi_bin}"}}'
             }
             let _ = ended.send(());
         });
-        if let Some((question, answer)) = answer {
+        let mut asked_from = 0;
+        for (question, answer) in answers {
             wait_until(question, || {
-                String::from_utf8_lossy(&output.lock().unwrap()).contains(question)
+                let seen = output.lock().unwrap();
+                let found = seen[asked_from..]
+                    .windows(question.len())
+                    .position(|window| window == question.as_bytes())
+                    .map(|at| asked_from + at + question.len());
+                found.inspect(|&end| asked_from = end).is_some()
             });
             terminal
                 .write_all(format!("{answer}\n").as_bytes())
@@ -2222,7 +2229,7 @@ cat parser.rs
         let worktree = fixture.thread_worktrees().pop().unwrap();
         let (code, output) = in_terminal_answering(
             terminal_command(&fixture, &["purge", &thread]),
-            Some(("[y/N]", "n")),
+            &[("[y/N]", "n")],
         );
         assert_eq!(code, 1, "{output}");
         assert!(output.contains("nothing was purged"), "{output}");
@@ -4134,6 +4141,40 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         assert_eq!(output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&output.stderr).contains("not on a local branch"));
         assert!(fixture.threads().is_empty());
+    }
+
+    #[test]
+    fn run_on_a_terminal_sets_mahi_up_first_then_runs_the_agent() {
+        let fixture = fixture();
+        assert!(fixture.threads().is_empty());
+        let fresh = fixture.root.join("fresh-home");
+        fs::create_dir(&fresh).unwrap();
+        let command = terminal_command(&fixture, &["run", "true"])
+            .env("HOME", &fresh)
+            .env("XDG_CONFIG_HOME", fresh.join(".config"));
+        let (code, output) = in_terminal_answering(
+            command,
+            &[
+                ("New passphrase: ", "correct horse battery"),
+                ("Repeat it: ", "correct horse battery"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("mahi is not set up yet; setting it up"),
+            "{output}"
+        );
+        assert!(!output.contains("correct horse"), "{output}");
+        let config = config_dir(&fresh);
+        for file in [
+            config.identity_file(),
+            config.recipient_file(),
+            config.signing_key_file(),
+            config.node_key_file(),
+        ] {
+            assert!(file.is_file(), "{}", file.display());
+        }
+        assert!(!fixture.threads().is_empty());
     }
 
     fn run_with_input(arguments: &[&str], input: &[u8]) -> (Option<i32>, String) {

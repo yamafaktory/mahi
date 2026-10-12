@@ -121,6 +121,7 @@ fn main() {
         .filter_map(|name| name.parse().ok())
         .collect();
     environment.read_optional(&optional);
+    set_up_first(&cli.command, &environment);
     let code = match cli.command {
         Command::Init => match TerminalPrompt::open()
             .map_err(InitError::Prompt)
@@ -185,6 +186,20 @@ fn main() {
         Command::Run(command) => outcome_code(run::run(&command, &environment)),
     };
     process::exit(code);
+}
+
+/// Sets mahi up before a command that needs it, when it is not set up, or exits.
+fn set_up_first(command: &Command, environment: &Environment) {
+    let needs_setup = matches!(
+        command,
+        Command::Run(_) | Command::Join(_) | Command::Id | Command::Invite(_)
+    );
+    if needs_setup
+        && let Err(error) = init::set_up_if_needed(environment, TerminalPrompt::open_interactive)
+    {
+        report(&error);
+        process::exit(1);
+    }
 }
 
 /// Returns the exit code of a command that ran an agent: the agent's, or 128 plus the signal
