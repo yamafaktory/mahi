@@ -8,6 +8,7 @@ pub mod fuzzing;
 mod gossip;
 mod local;
 mod meta;
+mod pair;
 #[cfg(test)]
 mod testing;
 mod ticket;
@@ -55,6 +56,18 @@ pub use local::{
 pub use meta::{
     META_ALPN,
     Peers,
+};
+pub use pair::{
+    Channel,
+    CodeError,
+    Confirming,
+    Handshake,
+    MAX_MESSAGE_BYTES,
+    MAX_SEALED_BYTES,
+    MAX_SLOT,
+    PairError,
+    PairingCode,
+    Role,
 };
 pub use ticket::{
     AddressError,
