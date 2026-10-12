@@ -4271,6 +4271,30 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         assert!(!fixture.threads().is_empty());
     }
 
+    #[test]
+    fn run_offers_origin_once_and_no_turns_pushing_off() {
+        let fixture = fixture();
+        let config = fixture.repo.join(".git/config");
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str("[remote \"origin\"]\n\turl = git@github.com:org/repo.git\n");
+        fs::write(&config, text).unwrap();
+        let (code, output) = in_terminal_answering(
+            terminal_command(&fixture, &["run", "true"]),
+            &[("[p]rivate, p[u]blic or [n]o: ", "")],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("git@github.com:org/repo.git"), "{output}");
+        let shown = fixture.mahi(&["remote"]);
+        assert!(
+            String::from_utf8_lossy(&shown.stdout).contains("(turned off)"),
+            "{shown:?}"
+        );
+        let (code, output) =
+            in_terminal_answering(terminal_command(&fixture, &["run", "true"]), &[]);
+        assert_eq!(code, 0, "{output}");
+        assert!(!output.contains("[p]rivate"), "{output}");
+    }
+
     fn run_with_input(arguments: &[&str], input: &[u8]) -> (Option<i32>, String) {
         let fixture = fixture();
         let mut child = fixture

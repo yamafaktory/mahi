@@ -113,6 +113,20 @@ impl TerminalPrompt {
     }
 }
 
+impl<P: Prompt + ?Sized> Prompt for &mut P {
+    fn say(&mut self, line: &str) -> io::Result<()> {
+        (**self).say(line)
+    }
+
+    fn secret(&mut self, question: &str) -> io::Result<SecretString> {
+        (**self).secret(question)
+    }
+
+    fn answer(&mut self, question: &str) -> io::Result<String> {
+        (**self).answer(question)
+    }
+}
+
 impl Prompt for TerminalPrompt {
     fn say(&mut self, line: &str) -> io::Result<()> {
         writeln!(self.terminal, "{line}")

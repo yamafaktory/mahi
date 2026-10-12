@@ -238,7 +238,10 @@ use crate::{
         Recorder,
         Target,
     },
-    remote::RemoteName,
+    remote::{
+        self,
+        RemoteName,
+    },
     session::{
         self,
         CommitKey,
@@ -501,6 +504,11 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
     )?;
     prepared.palette_key = settings.palette_key;
     prepared.set_thread(live, own_key(&signing)?);
+    if let Err(error) =
+        remote::offer_origin(&prepared.store, &config, TerminalPrompt::open_interactive)
+    {
+        crate::report_with("origin was not offered as the remote", &error);
+    }
     prepared.sync = SyncSetup::gather(&prepared.store, environment, true);
     let agent_name = session::agent_from(Path::new(command.agent()));
     let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;

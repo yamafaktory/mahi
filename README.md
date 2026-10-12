@@ -84,7 +84,9 @@ mahi land <thread>            # bring the thread's work back as a branch to cura
 
 The first `mahi run` sets mahi up: it creates your mahi key, asking for its passphrase, and
 picks the SSH key in ssh-agent that signs your threads (asking which when there are several).
-`mahi init` does the same ahead of time.
+`mahi init` does the same ahead of time. The first `mahi run` also asks, once per agent, for a credential the
+agent signs in with that mahi does not have yet (Claude Code's token), and, once per clone,
+whether to push threads to `origin` and whether `origin` is private or public.
 
 To work with teammates, `mahi remote` chooses the remote a thread is pushed to, `mahi id`
 prints the card a thread's owner needs, `mahi invite` turns it into a ticket, and

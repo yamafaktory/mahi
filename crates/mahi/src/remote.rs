@@ -20,6 +20,10 @@ use mahi_http::{
     HttpsRemote,
     RemoteError as HttpsUrlError,
 };
+use mahi_identity::{
+    ConfigDir,
+    Credential,
+};
 use mahi_ssh::{
     RemoteError as UrlError,
     SshRemote,
@@ -29,7 +33,6 @@ use mahi_store::{
     StoreError,
 };
 use rustix::fs::{
-    AtFlags,
     Mode,
     OFlags,
 };
@@ -38,12 +41,16 @@ use thiserror::Error;
 use crate::{
     cli::RemoteCommand,
     profile,
+    prompt::Prompt,
 };
 
 const SYNC: &str = "sync";
 const REMOTE: &str = "remote";
 const MAX_SETTING_BYTES: u64 = 512;
 const HTTPS: &str = "https://";
+const OFF: &str = "off\n";
+const ORIGIN: &str = "origin";
+const MAX_ASKS: usize = 3;
 
 /// A git remote name, as `mahi remote` takes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +70,13 @@ pub(crate) enum Visibility {
 pub(crate) struct SyncRemote {
     pub(crate) name: RemoteName,
     pub(crate) visibility: Visibility,
+}
+
+/// What the user chose for the clone: no pushing, or a remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Setting {
+    Off,
+    Remote(SyncRemote),
 }
 
 #[derive(Debug, Error)]
@@ -89,6 +103,8 @@ pub(crate) enum RemoteError {
     Io(#[from] io::Error),
     #[error("the remote setting in the git directory is not one mahi wrote")]
     Corrupt,
+    #[error("cannot ask the user")]
+    Prompt(#[source] io::Error),
 }
 
 /// A remote name that holds characters git remote names do not, or starts with `-` or `.`.
@@ -143,7 +159,7 @@ pub(crate) fn remote(command: &RemoteCommand) -> Result<String, RemoteError> {
         .map_err(RemoteError::CurrentDirectory)?;
     let store = Store::discover(&cwd)?;
     if command.off {
-        clear(&store)?;
+        turn_off(&store)?;
         return Ok("threads of this clone are no longer pushed\n".to_owned());
     }
     let chosen = match (&command.name, command.private, command.public) {
@@ -160,12 +176,84 @@ pub(crate) fn remote(command: &RemoteCommand) -> Result<String, RemoteError> {
         save(&store, &setting)?;
         return Ok(describe(&setting, &url));
     }
-    Ok(match sync_remote(&store)? {
-        Some(setting) => describe(&setting, &push_url(&store, &setting.name)?),
+    Ok(match setting(&store)? {
+        Some(Setting::Remote(setting)) => describe(&setting, &push_url(&store, &setting.name)?),
+        Some(Setting::Off) => "threads of this clone are not pushed (turned off); choose a \
+                               remote with mahi remote <name> --private or --public\n"
+            .to_owned(),
         None => "threads of this clone are not pushed; choose a remote with \
                  mahi remote <name> --private or --public\n"
             .to_owned(),
     })
+}
+
+/// Offers `origin` as the remote to push threads to, on the terminal `open` gives, when the
+/// clone has chosen none, was never asked, and `origin` is a remote mahi can push to. An empty
+/// answer is no, so a remote's visibility is never guessed.
+pub(crate) fn offer_origin<P: Prompt>(
+    store: &Store,
+    config: &ConfigDir,
+    open: impl FnOnce() -> io::Result<P>,
+) -> Result<(), RemoteError> {
+    let origin = RemoteName(ORIGIN.to_owned());
+    let Ok(url) = push_url(store, &origin) else {
+        return Ok(());
+    };
+    let Ok(mut prompt) = open() else {
+        return Ok(());
+    };
+    if setting(store)?.is_some() {
+        return Ok(());
+    }
+    let say = |prompt: &mut P, line: &str| prompt.say(line).map_err(RemoteError::Prompt);
+    say(
+        &mut prompt,
+        &format!(
+            "Push this clone's threads to origin ({url}), so teammates and your other machines \
+             can pick them up? The agents' snapshots go only to a private remote."
+        ),
+    )?;
+    if let RemoteUrl::Https(https) = &url
+        && let Some(name) = crate::sync::https_credential(https)
+        && !matches!(Credential::load(config, &name), Ok(Some(_)))
+    {
+        say(
+            &mut prompt,
+            &format!(
+                "Pushing over https uses the credential {name}: store it with mahi credential \
+                 add {name}"
+            ),
+        )?;
+    }
+    for _ in 0..MAX_ASKS {
+        let answer = prompt
+            .answer("[p]rivate, p[u]blic or [n]o: ")
+            .map_err(RemoteError::Prompt)?;
+        let visibility = match answer.trim().to_ascii_lowercase().as_str() {
+            "p" | "private" => Visibility::Private,
+            "u" | "public" => Visibility::Public,
+            "" | "n" | "no" => {
+                turn_off(store)?;
+                return say(
+                    &mut prompt,
+                    "threads of this clone are not pushed; mahi remote chooses a remote later",
+                );
+            }
+            _ => continue,
+        };
+        save(
+            store,
+            &SyncRemote {
+                name: origin,
+                visibility,
+            },
+        )?;
+        return say(
+            &mut prompt,
+            &format!("threads of this clone are pushed to origin, a {visibility} remote"),
+        );
+    }
+    Ok(())
 }
 
 /// Where a remote is reached: over SSH, or over HTTPS.
@@ -241,6 +329,13 @@ fn remote_url(name: &RemoteName, url: Option<String>) -> Result<RemoteUrl, Remot
 
 /// Returns the remote this clone pushes its threads to, if one was chosen.
 pub(crate) fn sync_remote(store: &Store) -> Result<Option<SyncRemote>, RemoteError> {
+    Ok(match setting(store)? {
+        Some(Setting::Remote(remote)) => Some(remote),
+        Some(Setting::Off) | None => None,
+    })
+}
+
+fn setting(store: &Store) -> Result<Option<Setting>, RemoteError> {
     let Some(directory) = existing_sync_dir(store)? else {
         return Ok(None);
     };
@@ -266,17 +361,20 @@ pub(crate) fn sync_remote(store: &Store) -> Result<Option<SyncRemote>, RemoteErr
     parse_setting(&text).map(Some).ok_or(RemoteError::Corrupt)
 }
 
-fn parse_setting(text: &str) -> Option<SyncRemote> {
+fn parse_setting(text: &str) -> Option<Setting> {
+    if text == OFF {
+        return Some(Setting::Off);
+    }
     let (visibility, name) = text.strip_suffix('\n')?.split_once(' ')?;
     let visibility = match visibility {
         "private" => Visibility::Private,
         "public" => Visibility::Public,
         _ => return None,
     };
-    Some(SyncRemote {
+    Some(Setting::Remote(SyncRemote {
         name: name.parse().ok()?,
         visibility,
-    })
+    }))
 }
 
 fn save(store: &Store, setting: &SyncRemote) -> Result<(), RemoteError> {
@@ -285,14 +383,9 @@ fn save(store: &Store, setting: &SyncRemote) -> Result<(), RemoteError> {
     Ok(())
 }
 
-fn clear(store: &Store) -> Result<(), RemoteError> {
-    let Some(directory) = existing_sync_dir(store)? else {
-        return Ok(());
-    };
-    match rustix::fs::unlinkat(&directory, REMOTE, AtFlags::empty()) {
-        Err(error) if error != rustix::io::Errno::NOENT => Err(io::Error::from(error).into()),
-        _ => Ok(()),
-    }
+fn turn_off(store: &Store) -> Result<(), RemoteError> {
+    profile::replace(&sync_dir(store)?, REMOTE, OFF.as_bytes())?;
+    Ok(())
 }
 
 fn existing_sync_dir(store: &Store) -> io::Result<Option<OwnedFd>> {
@@ -322,7 +415,10 @@ fn sync_dir(store: &Store) -> io::Result<OwnedFd> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+    use crate::prompt::tests::Script;
 
     fn store_with(remotes: &str) -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
@@ -340,26 +436,148 @@ mod tests {
     }
 
     #[test]
-    fn the_chosen_remote_is_kept_until_cleared() {
+    fn the_chosen_remote_is_kept_until_turned_off() {
         let (_dir, store) = store_with("");
         assert_eq!(sync_remote(&store).unwrap(), None);
-        clear(&store).unwrap();
-        assert!(!store.common_dir().join("mahi").exists());
-        let setting = SyncRemote {
+        assert_eq!(setting(&store).unwrap(), None);
+        let public = SyncRemote {
             name: name("origin"),
             visibility: Visibility::Public,
         };
-        save(&store, &setting).unwrap();
-        assert_eq!(sync_remote(&store).unwrap(), Some(setting));
+        save(&store, &public).unwrap();
+        assert_eq!(sync_remote(&store).unwrap(), Some(public));
         let private = SyncRemote {
             name: name("backup"),
             visibility: Visibility::Private,
         };
         save(&store, &private).unwrap();
         assert_eq!(sync_remote(&store).unwrap(), Some(private));
-        clear(&store).unwrap();
-        clear(&store).unwrap();
+        turn_off(&store).unwrap();
+        turn_off(&store).unwrap();
         assert_eq!(sync_remote(&store).unwrap(), None);
+        assert_eq!(setting(&store).unwrap(), Some(Setting::Off));
+        assert_eq!(
+            fs::read_to_string(store.common_dir().join("mahi").join(SYNC).join(REMOTE)).unwrap(),
+            "off\n"
+        );
+    }
+
+    const ORIGIN_OVER_SSH: &str = "[remote \"origin\"]\n\turl = git@github.com:org/repo.git\n";
+
+    fn config() -> (tempfile::TempDir, ConfigDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ConfigDir::resolve(Some(dir.path()), Some(dir.path())).unwrap();
+        (dir, config)
+    }
+
+    fn offered(store: &Store, answers: &[&'static str]) -> Script {
+        let (_dir, config) = config();
+        offered_with(store, &config, answers)
+    }
+
+    fn offered_with(store: &Store, config: &ConfigDir, answers: &[&'static str]) -> Script {
+        let mut script = Script {
+            answers: answers.iter().copied().collect(),
+            ..Script::default()
+        };
+        offer_origin(store, config, || Ok(&mut script)).unwrap();
+        assert!(script.answers.is_empty(), "{:?}", script.answers);
+        script
+    }
+
+    #[test]
+    fn origin_is_offered_once_and_no_is_the_default() {
+        let (_dir, store) = store_with(ORIGIN_OVER_SSH);
+        let script = offered(&store, &[""]);
+        assert!(script.said[0].contains("git@github.com:org/repo.git"));
+        assert_eq!(setting(&store).unwrap(), Some(Setting::Off));
+        offered(&store, &[]);
+        assert_eq!(sync_remote(&store).unwrap(), None);
+    }
+
+    #[test]
+    fn origin_is_taken_as_private_or_public_once_the_answer_is_clear() {
+        let (_dir, store) = store_with(ORIGIN_OVER_SSH);
+        let script = offered(&store, &["maybe", "u"]);
+        assert_eq!(
+            sync_remote(&store).unwrap(),
+            Some(SyncRemote {
+                name: name("origin"),
+                visibility: Visibility::Public,
+            })
+        );
+        assert!(
+            script
+                .said
+                .iter()
+                .any(|line| line.contains("a public remote"))
+        );
+        let (_dir, store) = store_with(ORIGIN_OVER_SSH);
+        offered(&store, &["P"]);
+        assert_eq!(
+            sync_remote(&store).unwrap().map(|remote| remote.visibility),
+            Some(Visibility::Private)
+        );
+        let (_dir, store) = store_with(ORIGIN_OVER_SSH);
+        offered(&store, &["x", "y", "z"]);
+        assert_eq!(setting(&store).unwrap(), None);
+    }
+
+    #[test]
+    fn an_https_origin_is_offered_with_the_credential_it_needs() {
+        let https = "[remote \"origin\"]\n\turl = https://git.example.org/r.git\n";
+        let (_dir, store) = store_with(https);
+        let named = |script: &Script| {
+            script
+                .said
+                .iter()
+                .any(|line| line.contains("mahi credential add https-git-example-org"))
+        };
+        assert!(named(&offered(&store, &["n"])));
+        let (_dir, store) = store_with(https);
+        let (_config_dir, config) = config();
+        fs::create_dir_all(config.path()).unwrap();
+        fs::set_permissions(config.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        Credential::new(b"t0ken".to_vec().into())
+            .unwrap()
+            .save(&config, &"https-git-example-org".parse().unwrap())
+            .unwrap();
+        let script = offered_with(&store, &config, &["u"]);
+        assert!(!named(&script), "{:?}", script.said);
+    }
+
+    #[test]
+    fn nothing_is_offered_without_a_usable_origin_a_terminal_or_after_a_choice() {
+        for remotes in [
+            "",
+            "[remote \"origin\"]\n\turl = http://example.org/r.git\n",
+        ] {
+            let (_dir, store) = store_with(remotes);
+            offered(&store, &[]);
+            assert_eq!(setting(&store).unwrap(), None);
+        }
+        let (_dir, store) = store_with(ORIGIN_OVER_SSH);
+        let (_config_dir, config) = config();
+        let no_terminal =
+            || -> io::Result<Script> { Err(io::Error::from(io::ErrorKind::NotFound)) };
+        offer_origin(&store, &config, no_terminal).unwrap();
+        assert_eq!(setting(&store).unwrap(), None);
+        sync_dir(&store).unwrap();
+        let file = store.common_dir().join("mahi").join(SYNC).join(REMOTE);
+        fs::write(&file, "not mahi's\n").unwrap();
+        offer_origin(&store, &config, no_terminal).unwrap();
+        assert!(matches!(
+            offer_origin(&store, &config, || Ok(Script::default())),
+            Err(RemoteError::Corrupt)
+        ));
+        fs::remove_file(&file).unwrap();
+        let backup = SyncRemote {
+            name: name("backup"),
+            visibility: Visibility::Private,
+        };
+        save(&store, &backup).unwrap();
+        offered(&store, &[]);
+        assert_eq!(sync_remote(&store).unwrap(), Some(backup));
     }
 
     #[test]
@@ -371,6 +589,9 @@ mod tests {
             "private -x\n",
             "private a b\n",
         ] {
+            assert_eq!(parse_setting(text), None, "{text:?}");
+        }
+        for text in ["off", "off \n", "OFF\n"] {
             assert_eq!(parse_setting(text), None, "{text:?}");
         }
         let (_dir, store) = store_with("");
