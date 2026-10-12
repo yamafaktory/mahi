@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 
-use mahi_core::is_invisible;
 use ratatui_core::{
     buffer::Buffer,
     layout::{
@@ -9,11 +8,13 @@ use ratatui_core::{
         Rect,
     },
     style::{
-        Color,
         Modifier,
         Style,
     },
-    text::Line,
+    text::{
+        Line,
+        Span,
+    },
     widgets::{
         StatefulWidget,
         Widget,
@@ -21,6 +22,16 @@ use ratatui_core::{
 };
 use ratatui_widgets::{
     block::Block,
+    borders::BorderType,
+    list::{
+        List,
+        ListItem,
+        ListState,
+    },
+    paragraph::{
+        Paragraph,
+        Wrap,
+    },
     table::{
         Row,
         Table,
@@ -28,7 +39,26 @@ use ratatui_widgets::{
     },
 };
 
-use crate::PaletteInput;
+use crate::{
+    Answer,
+    Dialog,
+    PaletteInput,
+    Theme,
+    dialog::shown,
+    key_hints,
+};
+
+const MENU: [(&str, &str); 6] = [
+    ("Threads", "t"),
+    ("New thread", "n"),
+    ("Join with a code", "j"),
+    ("Remote", "m"),
+    ("Help", "?"),
+    ("Quit", "q"),
+];
+const SIDEBAR_WIDTH: u16 = 24;
+const DETAILS_HEIGHT: u16 = 5;
+const ACTIVITY_HEIGHT: u16 = 8;
 
 /// One thread as the home screen lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +71,22 @@ pub struct HomeRow {
     pub worktree: bool,
     /// Whether the user owns it, so it can be resumed.
     pub owned: bool,
+}
+
+/// What the home screen shows besides its threads: the repository, the remote threads go to,
+/// who the user is, and what the last actions printed.
+#[derive(Debug, Clone, Copy)]
+pub struct HomeView<'a> {
+    /// The repository's name.
+    pub repository: &'a str,
+    /// The remote threads are pushed to, or that none is chosen.
+    pub remote: &'a str,
+    /// The user's participant name.
+    pub identity: &'a str,
+    /// The repository's threads.
+    pub rows: &'a [HomeRow],
+    /// What mahi's commands printed, oldest first.
+    pub activity: &'a [String],
 }
 
 /// What the user chose on the home screen; a thread is named by its id.
@@ -60,13 +106,51 @@ pub enum HomeAction {
     Invite(String),
     /// Join a thread with a pairing code.
     Join,
+    /// Choose the remote threads are pushed to.
+    Remote,
 }
 
-/// The home screen: which thread is selected, and an action waiting for its `y`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Focus {
+    Menu,
+    #[default]
+    Threads,
+}
+
+#[derive(Debug)]
+enum Pending {
+    ThreadMenu(String, Vec<ThreadChoice>),
+    Confirm(HomeAction),
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadChoice {
+    Resume,
+    Land,
+    End,
+    Invite,
+}
+
+impl ThreadChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Resume => "Resume it",
+            Self::Land => "Land its work on a branch",
+            Self::End => "End it",
+            Self::Invite => "Invite a teammate",
+        }
+    }
+}
+
+/// The home screen's state: where the focus is, what is selected, and a dialog of its own
+/// that waits for an answer.
 #[derive(Debug, Default)]
 pub struct Home {
+    focus: Focus,
+    menu: usize,
     selected: usize,
-    confirming: Option<HomeAction>,
+    dialog: Option<(Dialog, Pending)>,
     note: Option<&'static str>,
 }
 
@@ -77,112 +161,427 @@ impl Home {
         self.selected
     }
 
+    /// Returns whether one of the home screen's own dialogs is open.
+    #[must_use]
+    pub fn has_dialog(&self) -> bool {
+        self.dialog.is_some()
+    }
+
     /// Keeps the selection on a row that exists after the thread list was read again, and
-    /// drops a confirmation whose thread is no longer the selected one.
+    /// drops a dialog whose thread is no longer the selected one.
     pub fn fit(&mut self, rows: &[HomeRow]) {
         self.selected = self.selected.min(rows.len().saturating_sub(1));
         let selected = rows.get(self.selected).map(|row| row.thread.as_str());
-        if let Some(HomeAction::Land(thread) | HomeAction::End(thread)) = &self.confirming
-            && selected != Some(thread.as_str())
-        {
-            self.confirming = None;
+        let thread = match &self.dialog {
+            Some((
+                _,
+                Pending::ThreadMenu(thread, _)
+                | Pending::Confirm(
+                    HomeAction::Land(thread) | HomeAction::End(thread) | HomeAction::Resume(thread),
+                ),
+            )) => Some(thread),
+            _ => None,
+        };
+        let stale = thread.is_some_and(|thread| selected != Some(thread.as_str()));
+        if stale {
+            self.dialog = None;
         }
     }
 
-    /// Reads one key and returns the action it completes, if any. Landing and ending wait for
-    /// `y`; any other key cancels them, and Escape quits even then. Pasted text is never a key.
+    /// Reads one key and returns the action it completes, if any. Landing and ending ask
+    /// first; Escape closes a dialog, and quits otherwise. Pasted text is never a key.
     pub fn key(&mut self, input: PaletteInput, rows: &[HomeRow]) -> Option<HomeAction> {
         self.fit(rows);
         self.note = None;
-        if input == PaletteInput::Escape {
-            self.confirming = None;
-            return Some(HomeAction::Quit);
-        }
-        if let Some(waiting) = self.confirming.take() {
-            return matches!(input, PaletteInput::Text('y' | 'Y')).then_some(waiting);
+        if let Some((mut dialog, pending)) = self.dialog.take() {
+            return match dialog.key(input) {
+                None => {
+                    self.dialog = Some((dialog, pending));
+                    None
+                }
+                Some(answer) => self.answered(answer, pending),
+            };
         }
         let selected = rows.get(self.selected);
-        let thread = || selected.map(|row| row.thread.clone());
         match input {
-            PaletteInput::Up => self.selected = self.selected.saturating_sub(1),
-            PaletteInput::Down if self.selected + 1 < rows.len() => self.selected += 1,
-            PaletteInput::Text('q') => return Some(HomeAction::Quit),
+            PaletteInput::Escape | PaletteInput::Text('q') => return Some(HomeAction::Quit),
+            PaletteInput::Tab => {
+                self.focus = match self.focus {
+                    Focus::Menu => Focus::Threads,
+                    Focus::Threads => Focus::Menu,
+                };
+            }
+            PaletteInput::Up => self.move_by(false, rows.len()),
+            PaletteInput::Down => self.move_by(true, rows.len()),
+            PaletteInput::Enter => {
+                return match self.focus {
+                    Focus::Menu => self.activate(self.menu, rows),
+                    Focus::Threads => {
+                        self.open_thread_menu(selected);
+                        None
+                    }
+                };
+            }
+            PaletteInput::Text('t') => self.focus = Focus::Threads,
             PaletteInput::Text('n') => return Some(HomeAction::New),
             PaletteInput::Text('j') => return Some(HomeAction::Join),
+            PaletteInput::Text('m') => return Some(HomeAction::Remote),
+            PaletteInput::Text('?') => self.open_help(),
             PaletteInput::Text('r') => match selected {
                 Some(row) if row.owned => return Some(HomeAction::Resume(row.thread.clone())),
                 Some(_) => self.note = Some("only the thread's owner resumes it"),
                 None => {}
             },
-            PaletteInput::Text('i') => return thread().map(HomeAction::Invite),
-            PaletteInput::Text('l') => self.confirming = thread().map(HomeAction::Land),
-            PaletteInput::Text('e') => self.confirming = thread().map(HomeAction::End),
+            PaletteInput::Text('i') => {
+                return selected.map(|row| HomeAction::Invite(row.thread.clone()));
+            }
+            PaletteInput::Text('l') => self.ask(selected, HomeAction::Land),
+            PaletteInput::Text('e') => self.ask(selected, HomeAction::End),
             _ => {}
         }
         None
     }
 
-    /// Draws the home screen for `repository`'s `rows` into `area`, with `status`, the outcome
-    /// of the last action, in the footer.
-    pub fn render(
-        &self,
-        repository: &str,
-        rows: &[HomeRow],
-        status: &str,
-        area: Rect,
-        buffer: &mut Buffer,
-    ) {
-        let [list, footer] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(area);
-        let title = format!(" mahi · {} ", shown(repository));
-        let block = Block::bordered().title(Line::from(title).style(bold()));
-        if rows.is_empty() {
-            let inner = block.inner(list);
-            block.render(list, buffer);
-            Line::from("No threads yet: press n to start one with an agent.").render(inner, buffer);
-        } else {
-            let table = Table::new(
-                rows.iter().map(row),
-                [
-                    Constraint::Length(36),
-                    Constraint::Fill(1),
-                    Constraint::Length(11),
-                    Constraint::Length(9),
-                ],
-            )
-            .header(Row::new(["thread", "agents", "worktree", "owner"]).style(bold()))
-            .block(block)
-            .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("› ");
-            let mut state = TableState::new().with_selected(self.selected);
-            StatefulWidget::render(table, list, buffer, &mut state);
+    fn move_by(&mut self, down: bool, rows: usize) {
+        match (self.focus, down) {
+            (Focus::Menu, false) => self.menu = self.menu.saturating_sub(1),
+            (Focus::Menu, true) => self.menu = (self.menu + 1).min(MENU.len() - 1),
+            (Focus::Threads, false) => self.selected = self.selected.saturating_sub(1),
+            (Focus::Threads, true) if self.selected + 1 < rows => self.selected += 1,
+            (Focus::Threads, true) => {}
         }
-        let [message, keys] =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(footer);
-        let asked;
-        let line = match (&self.confirming, self.note) {
-            (Some(HomeAction::Land(thread)), _) => {
-                asked = format!("Land thread {thread}? [y/N]");
-                asked.as_str()
+    }
+
+    fn activate(&mut self, item: usize, rows: &[HomeRow]) -> Option<HomeAction> {
+        match item {
+            0 => {
+                self.focus = Focus::Threads;
+                if rows.is_empty() {
+                    self.note = Some("no threads yet: press n to start one");
+                }
+                None
             }
-            (Some(HomeAction::End(thread)), _) => {
-                asked = format!("End thread {thread}? [y/N]");
-                asked.as_str()
+            1 => Some(HomeAction::New),
+            2 => Some(HomeAction::Join),
+            3 => Some(HomeAction::Remote),
+            4 => {
+                self.open_help();
+                None
             }
-            (_, Some(note)) => note,
-            _ => status,
+            _ => Some(HomeAction::Quit),
+        }
+    }
+
+    fn open_thread_menu(&mut self, selected: Option<&HomeRow>) {
+        let Some(row) = selected else {
+            self.note = Some("no thread is selected");
+            return;
         };
-        Line::from(shown(line))
-            .style(Style::new().fg(Color::Yellow))
+        let mut choices = Vec::with_capacity(4);
+        if row.owned {
+            choices.push(ThreadChoice::Resume);
+        }
+        choices.extend([ThreadChoice::Land, ThreadChoice::End, ThreadChoice::Invite]);
+        let labels = choices
+            .iter()
+            .map(|choice| choice.label().to_owned())
+            .collect();
+        let dialog = Dialog::choose(
+            "Thread",
+            vec![format!("{} · {}", row.thread, row.agents)],
+            labels,
+        );
+        self.dialog = Some((dialog, Pending::ThreadMenu(row.thread.clone(), choices)));
+    }
+
+    fn ask(&mut self, selected: Option<&HomeRow>, action: fn(String) -> HomeAction) {
+        let Some(row) = selected else {
+            return;
+        };
+        let action = action(row.thread.clone());
+        let question = match &action {
+            HomeAction::Land(thread) => format!(
+                "Land thread {thread}? Its agents' work is merged onto a branch for you to curate."
+            ),
+            HomeAction::End(thread) => format!(
+                "End thread {thread}? Its worktree is recorded in a last snapshot, then removed."
+            ),
+            _ => return,
+        };
+        self.dialog = Some((
+            Dialog::confirm("Confirm", vec![question]),
+            Pending::Confirm(action),
+        ));
+    }
+
+    fn open_help(&mut self) {
+        let lines = [
+            "mahi runs coding agents in a sandbox, in threads you can share.",
+            "",
+            "tab        switch between the menu and the threads",
+            "↑ ↓        move     enter   open the menu of what is selected",
+            "n          start a new thread with an agent",
+            "r l e i    resume, land, end, or invite to the selected thread",
+            "j          join a teammate's thread with their pairing code",
+            "m          choose the remote threads are pushed to",
+            "q / esc    quit",
+        ];
+        let dialog = Dialog::message(
+            "Help",
+            lines.iter().map(|line| (*line).to_owned()).collect(),
+        );
+        self.dialog = Some((dialog, Pending::Help));
+    }
+
+    fn answered(&mut self, answer: Answer, pending: Pending) -> Option<HomeAction> {
+        match (answer, pending) {
+            (Answer::Choice(index), Pending::ThreadMenu(thread, choices)) => {
+                match choices.get(index)? {
+                    ThreadChoice::Resume => Some(HomeAction::Resume(thread)),
+                    ThreadChoice::Invite => Some(HomeAction::Invite(thread)),
+                    ThreadChoice::Land => {
+                        self.ask_for(thread, HomeAction::Land);
+                        None
+                    }
+                    ThreadChoice::End => {
+                        self.ask_for(thread, HomeAction::End);
+                        None
+                    }
+                }
+            }
+            (Answer::Confirmed(true), Pending::Confirm(action)) => Some(action),
+            _ => None,
+        }
+    }
+
+    fn ask_for(&mut self, thread: String, make: fn(String) -> HomeAction) {
+        let row = HomeRow {
+            thread,
+            agents: String::new(),
+            worktree: true,
+            owned: true,
+        };
+        self.ask(Some(&row), make);
+    }
+
+    /// Draws the home screen into `area`, with `status`, the outcome of the last action, above
+    /// the keys.
+    pub fn render(&self, view: &HomeView<'_>, status: &str, area: Rect, buffer: &mut Buffer) {
+        let [header, body, message, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        Self::render_header(view, header, buffer);
+        let [sidebar, main] =
+            Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
+                .areas(body);
+        self.render_menu(sidebar, buffer);
+        let [threads, details, activity] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(DETAILS_HEIGHT),
+            Constraint::Length(ACTIVITY_HEIGHT),
+        ])
+        .areas(main);
+        self.render_threads(view.rows, threads, buffer);
+        self.render_details(view.rows, details, buffer);
+        Self::render_activity(view.activity, activity, buffer);
+        let line = self.note.unwrap_or(status);
+        Line::from(shown(line).into_owned())
+            .style(Style::new().fg(Theme::WARN))
             .render(message, buffer);
-        Line::from("n new · r resume · l land · e end · i invite · j join · ↑↓ select · q quit")
-            .style(Style::new().add_modifier(Modifier::DIM))
-            .render(keys, buffer);
+        Line::from(self.footer_hints()).render(footer, buffer);
+        if let Some((dialog, _)) = &self.dialog {
+            dialog.render(area, buffer);
+        }
+    }
+
+    fn render_header(view: &HomeView<'_>, area: Rect, buffer: &mut Buffer) {
+        let bar = Style::new().bg(ratatui_core::style::Color::Indexed(236));
+        buffer.set_style(area, bar);
+        Line::from(vec![
+            Span::styled(" mahi ", Theme::selected()),
+            Span::styled(
+                format!(" {} ", shown(view.repository)),
+                Theme::title().patch(bar),
+            ),
+            Span::styled("· remote ", Theme::muted().patch(bar)),
+            Span::styled(shown(view.remote).into_owned(), bar),
+            Span::styled("  · you ", Theme::muted().patch(bar)),
+            Span::styled(shown(view.identity).into_owned(), bar),
+        ])
+        .render(area, buffer);
+    }
+
+    fn render_menu(&self, area: Rect, buffer: &mut Buffer) {
+        let focused = self.focus == Focus::Menu;
+        let items: Vec<ListItem<'_>> = MENU
+            .iter()
+            .map(|(label, key)| {
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!(" {label}")),
+                    Span::styled(format!("  {key}"), Theme::muted()),
+                ]))
+            })
+            .collect();
+        let list = List::new(items)
+            .block(panel("Menu", focused))
+            .highlight_style(if focused {
+                Theme::selected()
+            } else {
+                Style::new().add_modifier(Modifier::BOLD)
+            });
+        let mut state = ListState::default().with_selected(Some(self.menu));
+        StatefulWidget::render(list, area, buffer, &mut state);
+    }
+
+    fn render_threads(&self, rows: &[HomeRow], area: Rect, buffer: &mut Buffer) {
+        let focused = self.focus == Focus::Threads;
+        let block = panel(&format!("Threads · {}", rows.len()), focused);
+        if rows.is_empty() {
+            let inner = block.inner(area);
+            block.render(area, buffer);
+            Paragraph::new(vec![
+                Line::default(),
+                Line::from(vec![
+                    Span::raw("  No threads yet. Press "),
+                    Span::styled("n", Theme::title()),
+                    Span::raw(" to start one with an agent, or "),
+                    Span::styled("j", Theme::title()),
+                    Span::raw(" to join a teammate's."),
+                ]),
+            ])
+            .render(inner, buffer);
+            return;
+        }
+        let table = Table::new(
+            rows.iter().map(row),
+            [
+                Constraint::Length(34),
+                Constraint::Fill(1),
+                Constraint::Length(9),
+                Constraint::Length(9),
+            ],
+        )
+        .header(
+            Row::new(["thread", "agents", "worktree", "owner"])
+                .style(Theme::muted().add_modifier(Modifier::BOLD)),
+        )
+        .block(block)
+        .row_highlight_style(if focused {
+            Theme::selected()
+        } else {
+            Style::new().add_modifier(Modifier::REVERSED)
+        })
+        .highlight_symbol("› ");
+        let mut state = TableState::new().with_selected(self.selected);
+        StatefulWidget::render(table, area, buffer, &mut state);
+    }
+
+    fn render_details(&self, rows: &[HomeRow], area: Rect, buffer: &mut Buffer) {
+        let block = panel("Selected", false);
+        let inner = block.inner(area);
+        block.render(area, buffer);
+        let Some(row) = rows.get(self.selected) else {
+            Line::styled("  nothing selected", Theme::muted()).render(inner, buffer);
+            return;
+        };
+        let worktree = if row.worktree {
+            "its worktree is here"
+        } else {
+            "its worktree is gone; resuming rebuilds it"
+        };
+        let owner = if row.owned {
+            "you own it"
+        } else {
+            "a teammate owns it"
+        };
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(format!(" {}", shown(&row.thread)), Theme::title()),
+                Span::styled(format!("  {}", shown(&row.agents)), Style::new()),
+            ]),
+            Line::styled(format!(" {owner} · {worktree}"), Theme::muted()),
+            Line::from(key_hints(&[
+                ("enter", "actions"),
+                ("r", "resume"),
+                ("l", "land"),
+                ("e", "end"),
+                ("i", "invite"),
+            ])),
+        ])
+        .render(inner, buffer);
+    }
+
+    fn render_activity(activity: &[String], area: Rect, buffer: &mut Buffer) {
+        let block = panel("Activity", false);
+        let inner = block.inner(area);
+        block.render(area, buffer);
+        let shown_lines = usize::from(inner.height);
+        let start = activity.len().saturating_sub(shown_lines);
+        let lines: Vec<Line<'_>> = activity
+            .get(start..)
+            .unwrap_or_default()
+            .iter()
+            .map(|line| {
+                let style = if line.contains("failed") || line.contains("cannot") {
+                    Style::new().fg(Theme::ERROR)
+                } else {
+                    Theme::muted()
+                };
+                Line::styled(format!(" {}", shown(line)), style)
+            })
+            .collect();
+        if lines.is_empty() {
+            Line::styled(" what mahi does shows here", Theme::muted()).render(inner, buffer);
+        } else {
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .render(inner, buffer);
+        }
+    }
+
+    fn footer_hints(&self) -> Vec<Span<'static>> {
+        if self.dialog.is_some() {
+            return Vec::new();
+        }
+        match self.focus {
+            Focus::Menu => key_hints(&[
+                ("↑↓", "move"),
+                ("enter", "open"),
+                ("tab", "threads"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]),
+            Focus::Threads => key_hints(&[
+                ("↑↓", "move"),
+                ("enter", "actions"),
+                ("n", "new"),
+                ("j", "join"),
+                ("tab", "menu"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]),
+        }
     }
 }
 
-fn bold() -> Style {
-    Style::new().add_modifier(Modifier::BOLD)
+fn panel<'a>(title: &str, focused: bool) -> Block<'a> {
+    let border = if focused {
+        Style::new().fg(Theme::ACCENT)
+    } else {
+        Theme::muted()
+    };
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border)
+        .title(Line::from(format!(" {title} ")).style(if focused {
+            Theme::title()
+        } else {
+            Style::new().add_modifier(Modifier::BOLD)
+        }))
 }
 
 fn row(row: &HomeRow) -> Row<'_> {
@@ -192,22 +591,6 @@ fn row(row: &HomeRow) -> Row<'_> {
         Cow::Borrowed(if row.worktree { "here" } else { "gone" }),
         Cow::Borrowed(if row.owned { "you" } else { "teammate" }),
     ])
-}
-
-fn shown(text: &str) -> Cow<'_, str> {
-    if text.chars().any(hidden) {
-        Cow::Owned(
-            text.chars()
-                .map(|c| if hidden(c) { '?' } else { c })
-                .collect(),
-        )
-    } else {
-        Cow::Borrowed(text)
-    }
-}
-
-fn hidden(c: char) -> bool {
-    c.is_control() || is_invisible(c)
 }
 
 #[cfg(test)]
@@ -239,9 +622,20 @@ mod tests {
     }
 
     fn screen(home: &Home, rows: &[HomeRow], status: &str) -> String {
-        let area = Rect::new(0, 0, 90, 10);
+        let area = Rect::new(0, 0, 110, 32);
         let mut buffer = Buffer::empty(area);
-        home.render("repo\u{202e}", rows, status, area, &mut buffer);
+        let activity = vec![
+            "mahi: ended t0".to_owned(),
+            "mahi: cannot reach the remote".to_owned(),
+        ];
+        let view = HomeView {
+            repository: "repo\u{202e}",
+            remote: "origin (private)",
+            identity: "davy",
+            rows,
+            activity: &activity,
+        };
+        home.render(&view, status, area, &mut buffer);
         (0..area.height)
             .map(|y| {
                 (0..area.width)
@@ -253,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn arrows_move_the_selection_within_the_list() {
+    fn arrows_move_the_selection_within_the_focused_list() {
         let rows = rows();
         let mut home = Home::default();
         home.key(PaletteInput::Up, &rows);
@@ -263,11 +657,10 @@ mod tests {
         assert_eq!(home.selected(), 1);
         home.fit(&rows[..1]);
         assert_eq!(home.selected(), 0);
-        home.fit(&[]);
-        assert_eq!(home.selected(), 0);
+        home.key(PaletteInput::Tab, &rows);
         home.key(PaletteInput::Down, &rows);
-        assert_eq!(home.selected(), 1);
-        assert!(keys(&mut home, &rows[..1], "r").contains(&HomeAction::Resume("t1".to_owned())));
+        assert_eq!(home.selected(), 0);
+        assert!(screen(&home, &rows, "").contains("enter open"));
     }
 
     #[test]
@@ -275,12 +668,13 @@ mod tests {
         let rows = rows();
         let mut home = Home::default();
         assert_eq!(
-            keys(&mut home, &rows, "nrijq"),
+            keys(&mut home, &rows, "nrijmq"),
             [
                 HomeAction::New,
                 HomeAction::Resume("t1".to_owned()),
                 HomeAction::Invite("t1".to_owned()),
                 HomeAction::Join,
+                HomeAction::Remote,
                 HomeAction::Quit,
             ]
         );
@@ -292,26 +686,64 @@ mod tests {
     }
 
     #[test]
-    fn only_the_owner_resumes_and_is_told_otherwise() {
+    fn the_menu_opens_what_it_names() {
         let rows = rows();
         let mut home = Home::default();
+        home.key(PaletteInput::Tab, &rows);
         home.key(PaletteInput::Down, &rows);
-        assert!(keys(&mut home, &rows, "r").is_empty());
-        assert!(screen(&home, &rows, "").contains("only the thread's owner resumes it"));
+        assert_eq!(home.key(PaletteInput::Enter, &rows), Some(HomeAction::New));
+        home.key(PaletteInput::Down, &rows);
+        home.key(PaletteInput::Down, &rows);
+        assert_eq!(
+            home.key(PaletteInput::Enter, &rows),
+            Some(HomeAction::Remote)
+        );
+        home.key(PaletteInput::Down, &rows);
+        assert_eq!(home.key(PaletteInput::Enter, &rows), None);
+        assert!(home.has_dialog());
+        assert!(screen(&home, &rows, "").contains("Help"));
+        assert_eq!(home.key(PaletteInput::Enter, &rows), None);
+        assert!(!home.has_dialog());
     }
 
     #[test]
-    fn landing_and_ending_wait_for_y_and_anything_else_cancels() {
+    fn enter_on_a_thread_opens_its_actions_and_landing_asks_first() {
+        let rows = rows();
+        let mut home = Home::default();
+        assert_eq!(home.key(PaletteInput::Enter, &rows), None);
+        let menu = screen(&home, &rows, "");
+        assert!(
+            menu.contains("Resume it") && menu.contains("Invite a teammate"),
+            "{menu}"
+        );
+        home.key(PaletteInput::Down, &rows);
+        assert_eq!(home.key(PaletteInput::Enter, &rows), None);
+        assert!(screen(&home, &rows, "").contains("Land thread t1?"));
+        assert_eq!(
+            home.key(PaletteInput::Text('y'), &rows),
+            Some(HomeAction::Land("t1".to_owned()))
+        );
+        home.key(PaletteInput::Down, &rows);
+        home.key(PaletteInput::Enter, &rows);
+        let teammate = screen(&home, &rows, "");
+        assert!(!teammate.contains("Resume it"), "{teammate}");
+        assert_eq!(
+            home.key(PaletteInput::Text('3'), &rows),
+            Some(HomeAction::Invite("t2".to_owned()))
+        );
+    }
+
+    #[test]
+    fn landing_and_ending_wait_for_yes_and_anything_else_cancels() {
         let rows = rows();
         let mut home = Home::default();
         assert!(keys(&mut home, &rows, "l").is_empty());
-        assert!(screen(&home, &rows, "").contains("Land thread t1? [y/N]"));
         assert_eq!(
             keys(&mut home, &rows, "y"),
             [HomeAction::Land("t1".to_owned())]
         );
         assert!(keys(&mut home, &rows, "en").is_empty());
-        assert!(keys(&mut home, &rows, "y").is_empty());
+        assert!(!home.has_dialog());
         home.key(PaletteInput::Down, &rows);
         assert_eq!(
             keys(&mut home, &rows, "eY"),
@@ -319,57 +751,79 @@ mod tests {
         );
         assert!(keys(&mut home, &rows, "e").is_empty());
         assert_eq!(home.key(PaletteInput::Pasted('y'), &rows), None);
-        assert!(keys(&mut home, &rows, "y").is_empty());
+        assert!(home.has_dialog());
+        assert_eq!(home.key(PaletteInput::Escape, &rows), None);
+        assert!(!home.has_dialog());
     }
 
     #[test]
-    fn escape_quits_even_while_a_confirmation_waits() {
-        let rows = rows();
-        let mut home = Home::default();
-        assert!(keys(&mut home, &rows, "e").is_empty());
-        assert_eq!(
-            home.key(PaletteInput::Escape, &rows),
-            Some(HomeAction::Quit)
-        );
-        assert!(keys(&mut home, &rows, "y").is_empty());
-    }
-
-    #[test]
-    fn a_confirmation_is_dropped_when_its_thread_moves_away() {
+    fn a_dialog_is_dropped_when_its_thread_moves_away() {
         let rows = rows();
         let mut home = Home::default();
         home.key(PaletteInput::Down, &rows);
         assert!(keys(&mut home, &rows, "l").is_empty());
-        let reread = vec![rows[0].clone()];
-        home.fit(&reread);
-        assert!(keys(&mut home, &reread, "y").is_empty());
-        let swapped = vec![rows[1].clone(), rows[0].clone()];
-        assert!(keys(&mut home, &rows, "e").is_empty());
-        assert!(keys(&mut home, &swapped, "y").is_empty());
+        home.fit(&[rows[0].clone()]);
+        assert!(!home.has_dialog());
+        assert!(keys(&mut home, &rows, "y").is_empty());
     }
 
     #[test]
     fn pasted_text_is_never_a_key() {
         let rows = rows();
         let mut home = Home::default();
-        for c in "nrleijq".chars() {
+        for c in "nrleijmq?".chars() {
             assert_eq!(home.key(PaletteInput::Pasted(c), &rows), None);
+        }
+        assert!(!home.has_dialog());
+    }
+
+    #[test]
+    fn the_screen_shows_header_menu_threads_details_and_activity() {
+        let rows = rows();
+        let home = Home::default();
+        let drawn = screen(&home, &rows, "resumed t1\u{1b}[2J");
+        for wanted in [
+            "mahi",
+            "repo?",
+            "origin (private)",
+            "davy",
+            "Menu",
+            "New thread",
+            "Threads · 2",
+            "› t1",
+            "you.claude",
+            "teammate",
+            "Selected",
+            "you own it",
+            "Activity",
+            "cannot reach the remote",
+            "resumed t1?[2J",
+            "q quit",
+        ] {
+            assert!(drawn.contains(wanted), "{wanted:?} missing:\n{drawn}");
+        }
+        let empty = screen(&home, &[], "");
+        assert!(empty.contains("No threads yet"), "{empty}");
+        for (width, height) in [(0, 0), (1, 1), (20, 6), (60, 12)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = Buffer::empty(area);
+            let view = HomeView {
+                repository: "r",
+                remote: "none",
+                identity: "me",
+                rows: &rows,
+                activity: &[],
+            };
+            home.render(&view, "", area, &mut buffer);
         }
     }
 
     #[test]
-    fn the_screen_lists_threads_with_their_state_and_shows_hidden_characters_as_marks() {
+    fn only_the_owner_resumes_and_is_told_otherwise() {
         let rows = rows();
-        let home = Home::default();
-        let drawn = screen(&home, &rows, "resumed t1\u{1b}[2J");
-        assert!(drawn.contains("mahi · repo?"), "{drawn}");
-        assert!(drawn.contains("› t1"), "{drawn}");
-        assert!(drawn.contains("you.claude"), "{drawn}");
-        assert!(drawn.contains("gone"), "{drawn}");
-        assert!(drawn.contains("teammate"), "{drawn}");
-        assert!(drawn.contains("resumed t1?[2J"), "{drawn}");
-        assert!(drawn.contains("q quit"), "{drawn}");
-        let empty = screen(&home, &[], "");
-        assert!(empty.contains("press n to start one"), "{empty}");
+        let mut home = Home::default();
+        home.key(PaletteInput::Down, &rows);
+        assert!(keys(&mut home, &rows, "r").is_empty());
+        assert!(screen(&home, &rows, "").contains("only the thread's owner resumes it"));
     }
 }

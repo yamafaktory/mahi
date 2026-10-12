@@ -47,6 +47,12 @@ pub struct PaletteKeys {
 }
 
 impl PaletteKeys {
+    /// Returns whether a bracketed paste has started and not ended.
+    #[must_use]
+    pub fn is_pasting(&self) -> bool {
+        self.pasting
+    }
+
     /// Reads `chunk` and calls `on` with each key it holds, until `on` returns `false`, and
     /// returns how many bytes it read. An escape alone at the end of a chunk is the Escape
     /// key; the start of a bracketed paste split between chunks is still recognised, so

@@ -930,14 +930,27 @@ content = '{{"bin": "{mahi_bin}"}}'
                     .windows(question.len())
                     .position(|window| window == question.as_bytes())
                     .map(|at| asked_from + at + question.len());
-                found.inspect(|&end| asked_from = end).is_some()
+                if found.inspect(|&end| asked_from = end).is_some() {
+                    return true;
+                }
+                let mut screen = vt100::Parser::new(24, 200, 0);
+                screen.process(&seen);
+                let shown = screen.screen().contents().contains(question);
+                if shown {
+                    asked_from = seen.len();
+                }
+                shown
             });
             terminal.write_all(answer).unwrap();
         }
         let mut status = None;
         let deadline = Instant::now() + Duration::from_secs(60);
         while status.is_none() {
-            assert!(Instant::now() < deadline, "mahi did not finish");
+            assert!(
+                Instant::now() < deadline,
+                "mahi did not finish: {}",
+                String::from_utf8_lossy(&output.lock().unwrap())
+            );
             status = mahi.try_wait().unwrap();
             thread::sleep(Duration::from_millis(20));
         }
@@ -1237,9 +1250,9 @@ cat parser.rs
     fn the_home_screen_lists_threads_and_quits_on_q() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);
-        let (code, output) = in_terminal_answering(
+        let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]),
-            &[(&thread, ""), ("q quit", "q")],
+            &[(&thread, b""), ("Threads", b"q")],
         );
         assert_eq!(code, 0, "{output}");
         assert!(
@@ -1260,10 +1273,9 @@ cat parser.rs
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]),
             &[
-                ("q quit", b"e"),
-                (&format!("End thread {thread}? [y/N]"), b"y"),
-                ("Press Enter to go back", b"\n"),
-                (&format!("mahi end {thread} exited with 0"), b"q"),
+                (&thread, b"e"),
+                (&format!("End thread {thread}?"), b"y"),
+                (&format!("mahi end {thread}: done"), b"q"),
             ],
         );
         assert_eq!(code, 0, "{output}");
@@ -1280,15 +1292,14 @@ cat parser.rs
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
-                ("q quit", b"n"),
-                ("Number: ", b"1\n"),
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
                 ("ready", b"first\r"),
-                ("Press Enter to go back", b"\n"),
-                ("q quit", b"n"),
-                ("Number: ", b"1\n"),
+                ("mahi run claude: done", b"n"),
+                ("Which agent should start the thread?", b"1"),
                 ("ready", b"second\r"),
-                ("Press Enter to go back", b"\n"),
-                ("q quit", b"q"),
+                ("got=second", b""),
+                ("Threads", b"q"),
             ],
         );
         assert_eq!(code, 0, "{output}");
@@ -1297,12 +1308,42 @@ cat parser.rs
     }
 
     #[test]
+    fn a_new_user_sets_mahi_up_and_starts_an_agent_without_leaving_the_home_screen() {
+        let fixture = fixture();
+        let fresh = fixture.root.join("fresh-home");
+        fs::create_dir(&fresh).unwrap();
+        let agent = "#!/bin/sh\necho agent-ran token=${CLAUDE_CODE_OAUTH_TOKEN:-none}\n";
+        let claude = script(&fixture, "fresh-agents", "claude", agent);
+        script(&fixture, "fresh-agents", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[])
+                .env("PATH", &path)
+                .env("HOME", &fresh)
+                .env("XDG_CONFIG_HOME", fresh.join(".config")),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("New passphrase", b"correct horse battery\r"),
+                ("Repeat it", b"correct horse battery\r"),
+                ("Token for claude", b"\r"),
+                ("mahi run claude: done", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("agent-ran token=none"), "{output}");
+        assert!(!output.contains("correct horse"), "{output}");
+        assert!(config_dir(&fresh).recipient_file().is_file());
+        assert!(config_dir(&fresh).path().join("declined/claude").is_file());
+    }
+
+    #[test]
     fn a_terminate_signal_leaves_the_home_screen_and_restores_the_terminal() {
         let fixture = fixture();
         let mut mahi = terminal_command(&fixture, &[]).spawn().unwrap();
         let mut reader = mahi.reader().unwrap();
         let mut seen = Vec::new();
-        while !String::from_utf8_lossy(&seen).contains("q quit") {
+        while !String::from_utf8_lossy(&seen).contains("Threads") {
             let mut chunk = [0_u8; 4096];
             let read = reader.read(&mut chunk).unwrap();
             assert_ne!(read, 0);
@@ -1343,16 +1384,17 @@ cat parser.rs
             terminal_command(&fixture, &[]).env("MAHI_LIVE", "local"),
             &[
                 (&thread, b"i"),
-                ("pairing needs a remote", b""),
-                ("Press Enter to go back", b"\n"),
-                (&format!("mahi invite {thread} exited with 1"), b"q"),
+                (
+                    &format!("mahi invite {thread} failed with exit code 1"),
+                    b"q",
+                ),
             ],
         );
         assert_eq!(code, 0, "{output}");
     }
 
     #[test]
-    fn a_paste_split_after_its_escape_quits_the_home_screen_and_does_nothing_else() {
+    fn a_paste_split_after_its_escape_closes_a_question_and_does_nothing_else() {
         let fixture = fixture();
         let (_thread, _claude) = worked_thread(&fixture);
         let worktree = fixture.thread_worktrees().pop().unwrap();
@@ -1360,7 +1402,7 @@ cat parser.rs
         let mut terminal = mahi.writer().unwrap();
         let mut reader = mahi.reader().unwrap();
         let mut seen = Vec::new();
-        while !String::from_utf8_lossy(&seen).contains("q quit") {
+        while !String::from_utf8_lossy(&seen).contains("Threads") {
             let mut chunk = [0_u8; 4096];
             let read = reader.read(&mut chunk).unwrap();
             assert_ne!(read, 0);
@@ -1369,6 +1411,8 @@ cat parser.rs
         terminal.write_all(b"e\x1b").unwrap();
         thread::sleep(Duration::from_millis(300));
         terminal.write_all(b"[200~ey\r\x1b[201~").unwrap();
+        thread::sleep(Duration::from_millis(800));
+        terminal.write_all(b"q").unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         let status = loop {
             if let Some(status) = mahi.try_wait().unwrap() {
@@ -4811,7 +4855,9 @@ exit 3
                 let deadline = Instant::now() + Duration::from_secs(60);
                 loop {
                     let text = self.text();
-                    if text.contains(wanted) {
+                    let mut screen = vt100::Parser::new(24, 200, 0);
+                    screen.process(text.as_bytes());
+                    if text.contains(wanted) || screen.screen().contents().contains(wanted) {
                         return text;
                     }
                     assert!(Instant::now() < deadline, "{wanted:?} never came: {text}");
@@ -4973,6 +5019,29 @@ exit 3
                 git(&pairing.remote, &["for-each-ref", "refs/mahi/pair/"]),
                 ""
             );
+            assert!(!fixture.repo.join(".git/mahi/pairing").exists());
+        }
+
+        #[test]
+        fn inviting_from_the_home_screen_shows_the_code_and_ctrl_c_stops_it_cleanly() {
+            let fixture = fixture();
+            let (thread, _claude) = worked_thread(&fixture);
+            let (_server, remote) = serve_remote(&fixture);
+            let mut home = Driven::start(
+                terminal_command(&fixture, &[])
+                    .env("MAHI_LIVE", "local")
+                    .spawn()
+                    .unwrap(),
+            );
+            home.wait_for(&thread);
+            home.terminal.write_all(b"i").unwrap();
+            home.wait_for("Pairing code:");
+            thread::sleep(Duration::from_secs(1));
+            home.terminal.write_all(b"\x03").unwrap();
+            home.wait_for(&format!("mahi invite {thread} failed"));
+            home.terminal.write_all(b"q").unwrap();
+            assert_eq!(home.exit_code(), 0, "{}", home.text());
+            assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
             assert!(!fixture.repo.join(".git/mahi/pairing").exists());
         }
 

@@ -3573,6 +3573,7 @@ dependencies = [
  "thiserror 2.0.21",
  "unicode-width",
  "vt100",
+ "zeroize",
 ]
 
 [[package]]

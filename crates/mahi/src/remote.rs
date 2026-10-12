@@ -227,7 +227,14 @@ pub(crate) fn offer_origin<P: Prompt>(
     }
     for _ in 0..MAX_ASKS {
         let answer = prompt
-            .answer("[p]rivate, p[u]blic or [n]o: ")
+            .pick(
+                "[p]rivate, p[u]blic or [n]o: ",
+                &[
+                    ("p", "Private: push the agents' snapshots too"),
+                    ("u", "Public: keep the snapshots here"),
+                    ("n", "Don't push threads"),
+                ],
+            )
             .map_err(RemoteError::Prompt)?;
         let visibility = match answer.trim().to_ascii_lowercase().as_str() {
             "p" | "private" => Visibility::Private,
@@ -254,6 +261,37 @@ pub(crate) fn offer_origin<P: Prompt>(
         );
     }
     Ok(())
+}
+
+/// Chooses `name` as the remote the clone pushes its threads to, with `visibility`, as
+/// `mahi remote <name> --private` or `--public` does, and returns what it now does.
+pub(crate) fn choose(
+    store: &Store,
+    name: &RemoteName,
+    visibility: Visibility,
+) -> Result<String, RemoteError> {
+    let url = push_url(store, name)?;
+    let setting = SyncRemote {
+        name: name.clone(),
+        visibility,
+    };
+    save(store, &setting)?;
+    Ok(describe(&setting, &url))
+}
+
+/// Stops pushing the clone's threads, as `mahi remote --off` does.
+pub(crate) fn stop_pushing(store: &Store) -> Result<(), RemoteError> {
+    turn_off(store)
+}
+
+/// Returns a short description of where the clone pushes its threads, for a header.
+pub(crate) fn summary(store: &Store) -> String {
+    match setting(store) {
+        Ok(Some(Setting::Remote(remote))) => format!("{} ({})", remote.name, remote.visibility),
+        Ok(Some(Setting::Off)) => "off".to_owned(),
+        Ok(None) => "none chosen".to_owned(),
+        Err(_) => "unreadable".to_owned(),
+    }
 }
 
 /// Where a remote is reached: over SSH, or over HTTPS.
@@ -483,6 +521,19 @@ mod tests {
         offer_origin(store, config, || Ok(&mut script)).unwrap();
         assert!(script.answers.is_empty(), "{:?}", script.answers);
         script
+    }
+
+    #[test]
+    fn a_remote_chosen_from_the_home_screen_is_kept_and_summarised() {
+        let (_dir, store) = store_with(ORIGIN_OVER_SSH);
+        assert_eq!(summary(&store), "none chosen");
+        let told = choose(&store, &name("origin"), Visibility::Private).unwrap();
+        assert!(told.contains("a private remote"), "{told}");
+        assert_eq!(summary(&store), "origin (private)");
+        stop_pushing(&store).unwrap();
+        assert_eq!(summary(&store), "off");
+        assert!(choose(&store, &name("missing"), Visibility::Public).is_err());
+        assert_eq!(store.remote_names(), ["origin"]);
     }
 
     #[test]

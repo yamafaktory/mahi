@@ -84,6 +84,7 @@ use crate::{
         self,
         PairRemoteError,
     },
+    ui::StopOnSignal,
 };
 
 const PAIRING_WAIT: Duration = Duration::from_mins(10);
@@ -340,6 +341,7 @@ fn owner_pairs(
     (store, thread, inviter): (&Store, ThreadId, &Inviter<'_>),
 ) -> Result<String, PairingError> {
     let mut link = accept_until_stopped(listener, deadline)?;
+    let stop = StopOnSignal::start();
     let (handshake, mine) = Handshake::start(Role::Owner, code);
     let theirs = link.receive(STEP_WAIT)?;
     link.send(&mine)?;
@@ -358,6 +360,7 @@ fn owner_pairs(
         "Add {name} ({}) to thread {thread}? [y/N] ",
         card.participant().key().fingerprint()
     );
+    drop(stop);
     let answer = TerminalPrompt::open()
         .and_then(|mut prompt| prompt.answer(&question))
         .map_err(PairingError::Prompt)?;
@@ -387,6 +390,7 @@ fn owner_pairs(
             return Err(error.into());
         }
     };
+    let _stop = StopOnSignal::start();
     let delivered = channel
         .seal(format!("{TICKET_PREFIX}{ticket}").as_bytes())
         .map_err(PairingError::from)
@@ -450,7 +454,9 @@ pub(crate) fn join_by_code(environment: &Environment) -> Result<Ticket, PairingE
     let owner = parse_place(&place, relays).map_err(PairingError::Place)?;
     let node = LiveNode::bind(node_key.secret(), relays)?;
     let own = node.node()?;
+    let stop = StopOnSignal::start();
     let ticket = joiner_pairs(&node, &owner, &code, card.trim_end(), &mut prompt)?;
+    drop(stop);
     node.close()?;
     if ticket.invitee() != &own {
         return Err(PairingError::NotForThisNode);

@@ -40,6 +40,7 @@ mod terminal;
 mod thread_lock;
 mod threads;
 mod turns;
+mod ui;
 
 use std::{
     error::Error,
@@ -159,6 +160,7 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
                 0
             }
             Ok(end::Ended::Stopped(signal)) => {
+                ui::before_dying();
                 signal.reraise();
                 128 + signal.number()
             }
@@ -235,6 +237,7 @@ fn outcome_code<E: Error>(result: Result<Outcome, E>) -> i32 {
     match result {
         Ok(Outcome::Exited(code)) => code,
         Ok(Outcome::Stopped(signal)) => {
+            ui::before_dying();
             signal.reraise();
             128 + signal.number()
         }
@@ -305,6 +308,7 @@ fn merged(command: &cli::MergeCommand, environment: &Environment) -> i32 {
             if let Some(report) = report {
                 eprint!("{report}");
             }
+            ui::before_dying();
             signal.reraise();
             128 + signal.number()
         }
@@ -333,6 +337,7 @@ fn purged(command: &cli::PurgeCommand, environment: &Environment) -> i32 {
         }
         Ok(purge::Purged::Stopped(signal, done)) => {
             eprint!("{done}");
+            ui::before_dying();
             signal.reraise();
             128 + signal.number()
         }
@@ -361,6 +366,7 @@ fn landed(command: &cli::LandCommand, environment: &Environment) -> i32 {
         }
         Ok(land::Outcome::Stopped(signal, report)) => {
             eprint!("{report}");
+            ui::before_dying();
             signal.reraise();
             128 + signal.number()
         }

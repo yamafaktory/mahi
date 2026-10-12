@@ -378,6 +378,23 @@ impl Store {
         Ok(refs)
     }
 
+    /// Returns the names of the repository's git remotes that are plain names, in order.
+    #[must_use]
+    pub fn remote_names(&self) -> Vec<String> {
+        self.repo
+            .remote_names()
+            .into_iter()
+            .filter_map(|name| std::str::from_utf8(name.as_ref()).ok().map(str::to_owned))
+            .filter(|name| {
+                !name.is_empty()
+                    && !name.starts_with(['-', '.'])
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_')
+                    })
+            })
+            .collect()
+    }
+
     /// Returns the URL the git remote called `name` pushes to when `push` is set, or else
     /// fetches from, after git's `insteadOf` and `pushInsteadOf` rewriting: for a push, its
     /// push URL or else its URL. Returns `None` if the repository has no such remote, or it has

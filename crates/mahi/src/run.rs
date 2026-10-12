@@ -2202,6 +2202,7 @@ fn allowed_hosts(allowed: &[HostName], profile: Option<&Profile>) -> Vec<HostNam
 }
 
 fn stop_now(signal: Termination) -> ! {
+    crate::ui::before_dying();
     signal.reraise();
     process::exit(128 + signal.number())
 }

@@ -32,6 +32,11 @@ use rustix::{
 };
 use zeroize::Zeroizing;
 
+use crate::ui::{
+    self,
+    DialogPrompt,
+};
+
 const MAX_ANSWER_BYTES: usize = 1024;
 const NOT_READY_PAUSE: Duration = Duration::from_millis(10);
 const TERMINAL: &str = "/dev/tty";
@@ -41,6 +46,15 @@ pub(crate) trait Prompt {
     fn say(&mut self, line: &str) -> io::Result<()>;
     fn secret(&mut self, question: &str) -> io::Result<SecretString>;
     fn answer(&mut self, question: &str) -> io::Result<String>;
+
+    /// Asks the user to pick one of `options`, each the answer it stands for and its label,
+    /// and returns the answer: on lines, the options are listed and the answer typed.
+    fn pick(&mut self, question: &str, options: &[(&str, &str)]) -> io::Result<String> {
+        for (answer, label) in options {
+            self.say(&format!("  {answer}) {label}"))?;
+        }
+        self.answer(question)
+    }
 }
 
 /// Asks through `/dev/tty`, so it works while standard input or output are redirected.
@@ -49,8 +63,15 @@ pub(crate) trait Prompt {
 /// turned off for a secret, is turned back on first, then mahi dies of the signal.
 #[derive(Debug)]
 pub(crate) struct TerminalPrompt {
-    terminal: File,
-    input: File,
+    on: On,
+}
+
+/// Where a prompt asks: on the terminal's lines, or in dialogs while a full-screen view owns
+/// the terminal.
+#[derive(Debug)]
+enum On {
+    Lines { terminal: File, input: File },
+    Dialogs(DialogPrompt),
 }
 
 struct EchoOff<'a> {
@@ -75,6 +96,11 @@ impl TerminalPrompt {
     }
 
     pub(crate) fn open() -> io::Result<Self> {
+        if ui::is_showing() {
+            return Ok(Self {
+                on: On::Dialogs(DialogPrompt::default()),
+            });
+        }
         let terminal = OpenOptions::new()
             .read(true)
             .write(true)
@@ -84,13 +110,19 @@ impl TerminalPrompt {
             .read(true)
             .custom_flags((OFlags::NOCTTY | OFlags::NONBLOCK).bits().cast_signed())
             .open(TERMINAL)?;
-        Ok(Self { terminal, input })
+        Ok(Self {
+            on: On::Lines { terminal, input },
+        })
     }
 
-    fn read_answer(&self, question: &str, echo: bool) -> io::Result<Zeroizing<Vec<u8>>> {
+    fn read_answer(
+        (terminal, input): (&File, &File),
+        question: &str,
+        echo: bool,
+    ) -> io::Result<Zeroizing<Vec<u8>>> {
         let signals = TerminationSignals::listen().map_err(io::Error::other)?;
         let mut answer = Answer {
-            input: &self.input,
+            input,
             signals: &signals,
             stopped: None,
         };
@@ -98,13 +130,13 @@ impl TerminalPrompt {
             let _echo_off = if echo {
                 None
             } else {
-                Some(EchoOff::new(&self.terminal)?)
+                Some(EchoOff::new(terminal)?)
             };
-            write!(&self.terminal, "{question}")?;
+            write!(&*terminal, "{question}")?;
             read_line(&mut answer)
         };
         if let Some(signal) = answer.stopped {
-            let _ = writeln!(&self.terminal);
+            let _ = writeln!(&*terminal);
             drop(signals);
             signal.reraise();
             process::exit(128 + signal.number());
@@ -125,24 +157,55 @@ impl<P: Prompt + ?Sized> Prompt for &mut P {
     fn answer(&mut self, question: &str) -> io::Result<String> {
         (**self).answer(question)
     }
+
+    fn pick(&mut self, question: &str, options: &[(&str, &str)]) -> io::Result<String> {
+        (**self).pick(question, options)
+    }
 }
 
 impl Prompt for TerminalPrompt {
     fn say(&mut self, line: &str) -> io::Result<()> {
-        writeln!(self.terminal, "{line}")
+        match &mut self.on {
+            On::Lines { terminal, .. } => writeln!(terminal, "{line}"),
+            On::Dialogs(dialogs) => {
+                dialogs.say(line);
+                Ok(())
+            }
+        }
     }
 
     fn secret(&mut self, question: &str) -> io::Result<SecretString> {
-        let line = self.read_answer(question, false)?;
-        writeln!(self.terminal)?;
-        let text = std::str::from_utf8(&line)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the answer is not UTF-8"))?;
-        Ok(SecretString::from(text.to_owned()))
+        match &mut self.on {
+            On::Lines { terminal, input } => {
+                let line = Self::read_answer((terminal, input), question, false)?;
+                writeln!(terminal)?;
+                let text = std::str::from_utf8(&line).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "the answer is not UTF-8")
+                })?;
+                Ok(SecretString::from(text.to_owned()))
+            }
+            On::Dialogs(dialogs) => dialogs.secret(question),
+        }
     }
 
     fn answer(&mut self, question: &str) -> io::Result<String> {
-        let line = self.read_answer(question, true)?;
-        Ok(String::from_utf8_lossy(&line).trim().to_owned())
+        match &mut self.on {
+            On::Lines { terminal, input } => {
+                let line = Self::read_answer((terminal, input), question, true)?;
+                Ok(String::from_utf8_lossy(&line).trim().to_owned())
+            }
+            On::Dialogs(dialogs) => dialogs.answer(question),
+        }
+    }
+
+    fn pick(&mut self, question: &str, options: &[(&str, &str)]) -> io::Result<String> {
+        if let On::Dialogs(dialogs) = &mut self.on {
+            return dialogs.pick(options);
+        }
+        for (answer, label) in options {
+            self.say(&format!("  {answer}) {label}"))?;
+        }
+        self.answer(question)
     }
 }
 

@@ -205,17 +205,19 @@ fn signing_key(
             prompt
                 .say("Which SSH key should sign your threads?")
                 .map_err(InitError::Prompt)?;
-            for (number, key) in keys.iter().enumerate() {
-                prompt
-                    .say(&format!(
-                        "  {}) {} {}",
-                        number + 1,
-                        key.fingerprint(HashAlg::Sha256),
-                        key.comment()
-                    ))
-                    .map_err(InitError::Prompt)?;
-            }
-            let answer = prompt.answer("Number: ").map_err(InitError::Prompt)?;
+            let numbers: Vec<String> = (1..=keys.len()).map(|number| number.to_string()).collect();
+            let labels: Vec<String> = keys
+                .iter()
+                .map(|key| format!("{} {}", key.fingerprint(HashAlg::Sha256), key.comment()))
+                .collect();
+            let options: Vec<(&str, &str)> = numbers
+                .iter()
+                .map(String::as_str)
+                .zip(labels.iter().map(String::as_str))
+                .collect();
+            let answer = prompt
+                .pick("Number: ", &options)
+                .map_err(InitError::Prompt)?;
             let index = answer
                 .parse::<usize>()
                 .ok()
