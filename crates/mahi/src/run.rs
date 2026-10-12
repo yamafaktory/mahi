@@ -62,6 +62,7 @@ use std::{
     },
 };
 
+use age::secrecy::ExposeSecret;
 use mahi_agent::profile::ProfileCredential;
 use mahi_core::{
     AgentName,
@@ -79,6 +80,7 @@ use mahi_identity::{
     ConfigDir,
     ConfigError,
     Credential,
+    CredentialError,
     CredentialName,
     IdentityError,
     LocalIdentity,
@@ -86,6 +88,8 @@ use mahi_identity::{
     PublicIdentity,
     SigningKey,
     SshAgent,
+    decline_credential,
+    is_credential_declined,
 };
 use mahi_live::{
     HostAddress,
@@ -148,6 +152,7 @@ use rustix::{
 };
 use tempfile::TempDir;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{
     claims::Claims,
@@ -396,6 +401,12 @@ pub(crate) enum RunError {
     NoCredential(CredentialName),
     #[error("cannot read the stored credential {0}")]
     Credential(CredentialName, #[source] IdentityError),
+    #[error("the token for {0} cannot be used")]
+    UnfitCredential(CredentialName, #[source] CredentialError),
+    #[error("cannot keep the credential {0}")]
+    KeepCredential(CredentialName, #[source] IdentityError),
+    #[error("cannot read whether you chose to go without the credential {0}")]
+    DeclinedMark(CredentialName, #[source] IdentityError),
     #[error("{0} is given to the agent more than one way")]
     GivenTwice(String),
     #[error("cannot prepare the agent's state directory")]
@@ -1083,56 +1094,156 @@ struct Handed {
     credential: Credential,
 }
 
-/// Loads the credentials the agent gets: those named with `--credential`, which must exist, and
-/// the profile's, when stored; a variable may be given only one way.
+/// Loads the credentials the agent gets, asking on the terminal for a missing one.
 fn gather_credentials(
     config: &ConfigDir,
     options: &LaunchOptions,
     profile: Option<&Profile>,
     environment: &Environment,
 ) -> Result<Vec<Handed>, RunError> {
+    gather_credentials_with(
+        config,
+        options,
+        profile,
+        environment,
+        TerminalPrompt::open_interactive,
+    )
+}
+
+/// Loads the credentials the agent gets: those named with `--credential`, which must exist, and
+/// the profile's, when stored, or else asked for on the terminal `open` gives when the agent
+/// would otherwise get no value for it; a variable may be given only one way.
+fn gather_credentials_with<P: Prompt>(
+    config: &ConfigDir,
+    options: &LaunchOptions,
+    profile: Option<&Profile>,
+    environment: &Environment,
+    open: impl FnOnce() -> io::Result<P>,
+) -> Result<Vec<Handed>, RunError> {
+    let set_by_profile = profile.map(Profile::set_names).unwrap_or_default();
+    let given_otherwise = |variable: &str| {
+        let passed = environment
+            .pass_env
+            .iter()
+            .any(|passed| passed.required && passed.name.as_str() == variable);
+        if passed || set_by_profile.contains(&variable) || PASSED_ON.contains(&variable) {
+            return Err(RunError::GivenTwice(variable.to_owned()));
+        }
+        Ok(())
+    };
     let mut handed: Vec<Handed> = Vec::new();
-    let mut hand = |variable: &str, credential: Credential| {
+    for binding in options.credentials() {
+        let variable = binding.variable.as_str();
         if handed.iter().any(|earlier| earlier.variable == variable) {
             return Err(RunError::GivenTwice(variable.to_owned()));
         }
+        given_otherwise(variable)?;
+        let credential = Credential::load(config, &binding.name)
+            .map_err(|error| RunError::Credential(binding.name.clone(), error))?
+            .ok_or_else(|| RunError::NoCredential(binding.name.clone()))?;
         handed.push(Handed {
             variable: variable.to_owned(),
             credential,
         });
-        Ok(())
-    };
-    for binding in options.credentials() {
-        let credential = Credential::load(config, &binding.name)
-            .map_err(|error| RunError::Credential(binding.name.clone(), error))?
-            .ok_or_else(|| RunError::NoCredential(binding.name.clone()))?;
-        hand(binding.variable.as_str(), credential)?;
     }
-    if let Some(ProfileCredential { name, variable, .. }) =
-        profile.and_then(|profile| profile.credential.as_ref())
-        && !options
-            .credentials()
+    if let Some(profile) = profile
+        && let Some(wanted) = profile.credential.as_ref()
+        && !handed
             .iter()
-            .any(|binding| binding.variable.as_str() == variable)
-        && let Some(credential) = Credential::load(config, name)
-            .map_err(|error| RunError::Credential(name.clone(), error))?
+            .any(|earlier| earlier.variable == wanted.variable)
     {
-        hand(variable, credential)?;
-    }
-    let set_by_profile = profile.map(Profile::set_names).unwrap_or_default();
-    for handed in &handed {
-        let passed = environment
-            .pass_env
-            .iter()
-            .any(|passed| passed.required && passed.name.as_str() == handed.variable);
-        if passed
-            || set_by_profile.contains(&handed.variable.as_str())
-            || PASSED_ON.contains(&handed.variable.as_str())
-        {
-            return Err(RunError::GivenTwice(handed.variable.clone()));
+        let stored = Credential::load(config, &wanted.name)
+            .map_err(|error| RunError::Credential(wanted.name.clone(), error))?;
+        let credential = match stored {
+            Some(stored) => Some(stored),
+            None if passed_from_environment(wanted, profile, environment) => None,
+            None => {
+                given_otherwise(&wanted.variable)?;
+                ask_for_credential(config, wanted, open)?
+            }
+        };
+        if let Some(credential) = credential {
+            given_otherwise(&wanted.variable)?;
+            handed.push(Handed {
+                variable: wanted.variable.clone(),
+                credential,
+            });
         }
     }
     Ok(handed)
+}
+
+/// Gives no terminal, so a credential missing while a pull request is drafted is not asked for.
+fn no_terminal() -> io::Result<TerminalPrompt> {
+    Err(io::Error::other("drafting asks nothing"))
+}
+
+/// Returns whether the profile's credential variable reaches the agent from mahi's own
+/// environment.
+fn passed_from_environment(
+    wanted: &ProfileCredential,
+    profile: &Profile,
+    environment: &Environment,
+) -> bool {
+    environment.pass_env.iter().any(|passed| {
+        passed.name.as_str() == wanted.variable
+            && (passed.required
+                || (passed.value.is_some() && profile.optional_env.contains(&wanted.variable)))
+    })
+}
+
+/// Asks for the profile's credential, unless the user chose earlier to go without it or there
+/// is no terminal, then stores it; an empty answer is remembered as going without it.
+fn ask_for_credential<P: Prompt>(
+    config: &ConfigDir,
+    wanted: &ProfileCredential,
+    open: impl FnOnce() -> io::Result<P>,
+) -> Result<Option<Credential>, RunError> {
+    let name = &wanted.name;
+    if is_credential_declined(config, name)
+        .map_err(|error| RunError::DeclinedMark(name.clone(), error))?
+    {
+        return Ok(None);
+    }
+    let Ok(mut prompt) = open() else {
+        return Ok(None);
+    };
+    let said = |prompt: &mut P, line: &str| prompt.say(line).map_err(RunError::Terminal);
+    said(
+        &mut prompt,
+        &format!("This agent signs in with the credential {name}, which mahi does not have yet."),
+    )?;
+    if let Some(hint) = &wanted.hint {
+        said(&mut prompt, &format!("To make one: {hint}."))?;
+    }
+    said(
+        &mut prompt,
+        "Press Enter alone to go without it; mahi will not ask again.",
+    )?;
+    let answer = prompt
+        .secret(&format!("Token for {name}: "))
+        .map_err(RunError::Terminal)?;
+    if answer.expose_secret().is_empty() {
+        decline_credential(config, name)
+            .map_err(|error| RunError::KeepCredential(name.clone(), error))?;
+        return Ok(None);
+    }
+    let credential = Credential::new(Zeroizing::new(answer.expose_secret().as_bytes().to_vec()))
+        .map_err(|error| RunError::UnfitCredential(name.clone(), error))?;
+    drop(answer);
+    match credential.save(config, name) {
+        Ok(()) => said(&mut prompt, &format!("stored the credential {name}"))?,
+        Err(IdentityError::Exists(_)) => {
+            said(
+                &mut prompt,
+                &format!("the credential {name} was stored meanwhile; using that one"),
+            )?;
+            return Credential::load(config, name)
+                .map_err(|error| RunError::Credential(name.clone(), error));
+        }
+        Err(error) => return Err(RunError::KeepCredential(name.clone(), error)),
+    }
+    Ok(Some(credential))
 }
 
 /// The agent to run and what it may reach.
@@ -2921,7 +3032,8 @@ impl DraftWriter {
         let profile = options.profile_for(program);
         let hosts = allowed_hosts(options.allow_hosts(), profile);
         let settings = Settings::load(&config)?;
-        let credentials = gather_credentials(&config, options, profile, environment)?;
+        let credentials =
+            gather_credentials_with(&config, options, profile, environment, no_terminal)?;
         let store = Store::discover(&cwd)?;
         let mut prepared = Prepared::new(
             environment,

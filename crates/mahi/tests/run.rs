@@ -76,6 +76,7 @@ mod tests {
         NodeKey,
         PublicIdentity,
         SigningKey,
+        decline_credential,
     };
     use mahi_sandbox::{
         PtyChild,
@@ -196,6 +197,7 @@ mod tests {
         fs::create_dir_all(config.path()).unwrap();
         fs::set_permissions(config.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let identity = LocalIdentity::generate();
+        decline_credential(&config, &"claude".parse().unwrap()).unwrap();
         PublicIdentity::from(&identity)
             .save(&config.recipient_file())
             .unwrap();
@@ -2962,6 +2964,98 @@ echo stray > "$CODEX_HOME/history.jsonl"
         assert_eq!(removed.status.code(), Some(0));
         let listed = fixture.mahi(&["credential", "list"]);
         assert!(listed.stdout.is_empty());
+    }
+
+    fn ask_for_claudes_token_again(fixture: &Fixture) -> PathBuf {
+        fs::remove_file(config_dir(&fixture.home).path().join("declined/claude")).unwrap();
+        fake_claude(fixture)
+    }
+
+    #[test]
+    fn a_missing_claude_token_is_asked_for_once_stored_and_handed_over() {
+        let fixture = fixture();
+        let claude = ask_for_claudes_token_again(&fixture);
+        let (code, output) = in_terminal_answering(
+            terminal_command(&fixture, &["run", claude.to_str().unwrap()]),
+            &[("Token for claude: ", "pasted-token")],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("claude setup-token"), "{output}");
+        let (asked, ran) = output.split_once("stored the credential claude").unwrap();
+        assert!(!asked.contains("pasted-token"), "{output}");
+        assert!(ran.contains("token=pasted-token"), "{output}");
+        let listed = fixture.mahi(&["credential", "list"]);
+        assert_eq!(String::from_utf8_lossy(&listed.stdout), "claude\n");
+        let (code, output) = in_terminal_answering(
+            terminal_command(&fixture, &["run", claude.to_str().unwrap()]),
+            &[],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(!output.contains("Token for claude"), "{output}");
+        assert!(output.contains("token=pasted-token"), "{output}");
+    }
+
+    #[test]
+    fn going_without_claudes_token_is_remembered_until_one_is_added() {
+        let fixture = fixture();
+        let claude = ask_for_claudes_token_again(&fixture);
+        let (code, output) = in_terminal_answering(
+            terminal_command(&fixture, &["run", claude.to_str().unwrap()]),
+            &[("Token for claude: ", "")],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("token=none"), "{output}");
+        let declined = config_dir(&fixture.home).path().join("declined/claude");
+        assert!(declined.is_file());
+        let (code, output) = in_terminal_answering(
+            terminal_command(&fixture, &["run", claude.to_str().unwrap()]),
+            &[],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(!output.contains("Token for claude"), "{output}");
+        let added = credential(&fixture, &["credential", "add", "claude"], b"later-token\n");
+        assert_eq!(added.status.code(), Some(0));
+        assert!(!declined.exists());
+    }
+
+    #[test]
+    fn a_token_in_mahis_environment_or_without_a_terminal_is_not_asked_for() {
+        let fixture = fixture();
+        let claude = ask_for_claudes_token_again(&fixture);
+        let (code, output) = in_terminal_answering(
+            terminal_command(&fixture, &["run", claude.to_str().unwrap()])
+                .env("CLAUDE_CODE_OAUTH_TOKEN", "shell-token"),
+            &[],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(!output.contains("Token for claude"), "{output}");
+        assert!(output.contains("token=shell-token"), "{output}");
+        let (code, output) = in_terminal_answering(
+            terminal_command(
+                &fixture,
+                &[
+                    "run",
+                    "--pass-env",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    claude.to_str().unwrap(),
+                ],
+            ),
+            &[],
+        );
+        assert_eq!(code, 1, "{output}");
+        assert!(!output.contains("Token for claude"), "{output}");
+        let listed = fixture.mahi(&["credential", "list"]);
+        assert!(listed.stdout.is_empty());
+        let piped = fixture.mahi(&["run", claude.to_str().unwrap()]);
+        let stdout = String::from_utf8_lossy(&piped.stdout);
+        assert_eq!(piped.status.code(), Some(0), "{stdout}");
+        assert!(stdout.contains("token=none"), "{stdout}");
+        assert!(
+            !config_dir(&fixture.home)
+                .path()
+                .join("declined/claude")
+                .exists()
+        );
     }
 
     #[test]
