@@ -19,23 +19,30 @@ jobs:
   fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install nightly --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
+          key: shard-${{ matrix.shard }}
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-fuzz
       - uses: actions/cache@v6
         with:
           path: fuzz/corpus
-          key: fuzz-corpus-${{ github.run_id }}
-          restore-keys: fuzz-corpus-
-      - run: just fuzz-all 300
+          key: fuzz-corpus-${{ matrix.shard }}-of-6-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.shard }}-of-6-
+            fuzz-corpus-3
+      - run: just fuzz-shard ${{ matrix.shard }} 6 300
       - if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: fuzz-artifacts
+          name: fuzz-artifacts-${{ matrix.shard }}
           path: fuzz/artifacts

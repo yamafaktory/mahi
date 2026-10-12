@@ -43,6 +43,8 @@ just check      # sweep + fmt-check + clippy + test + deny
 just sweep [g]  # remove target/ or fuzz/target/ once either passes g GiB (40 by default)
 just fuzz <t> [s] # run one fuzz target (nightly, cargo-fuzz) for s seconds
 just fuzz-all [s]  # run every fuzz target in turn
+just fuzz-shard <i> <n> [s] # run shard i of n of the fuzz targets (CI runs 6 in parallel)
+just fuzz-list [i] [n] # list the fuzz targets in shard i of n
 just mutants <crate> [args] # cargo-mutants on one crate, e.g. -f 'crates/mahi-ssh/src/proto/*'
 ```
 

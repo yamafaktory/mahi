@@ -80,13 +80,30 @@ mutants crate *args:
 fuzz target seconds="60":
     cd fuzz && cargo +nightly fuzz run --target "$(rustc +nightly -vV | sed -n 's/^host: //p')" {{target}} -- -max_total_time={{seconds}} -timeout=10
 
-fuzz-all seconds="30":
+fuzz-all seconds="30": (fuzz-shard "0" "1" seconds)
+
+fuzz-shard index count seconds="30":
     #!/usr/bin/env bash
     set -euo pipefail
-    cd fuzz
     host=$(rustc +nightly -vV | sed -n 's/^host: //p')
-    targets=$(cargo +nightly fuzz list)
-    test -n "$targets"
+    targets=$(just fuzz-list {{index}} {{count}})
+    cd fuzz
     for target in $targets; do
         cargo +nightly fuzz run --target "$host" "$target" -- -max_total_time={{seconds}} -timeout=10
     done
+
+fuzz-list index="0" count="1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! [[ "{{index}}" =~ ^[0-9]+$ && "{{count}}" =~ ^[0-9]+$ ]] || (( {{index}} >= {{count}} )); then
+        echo "fuzz-list: index must be a number from 0 to count - 1" >&2
+        exit 2
+    fi
+    cd fuzz
+    all=$(cargo +nightly fuzz list)
+    targets=$(for target in $all; do
+        hash=$(printf %s "$target" | cksum | cut -d ' ' -f 1)
+        if (( hash % {{count}} == {{index}} )); then echo "$target"; fi
+    done)
+    test -n "$targets"
+    echo "$targets"
