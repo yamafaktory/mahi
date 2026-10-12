@@ -37,6 +37,7 @@ use mahi_agent::{
     profile::{
         MAX_PROFILE_BYTES,
         Placeholder,
+        ProfileCredential,
         ProfileError,
         Reader,
         StateFile,
@@ -49,7 +50,6 @@ use mahi_agent::{
 };
 use mahi_identity::{
     ConfigDir,
-    CredentialName,
     IdentityError,
     check_owned_dir,
     read_owned_file,
@@ -114,7 +114,7 @@ pub(crate) struct Profile {
     pub(crate) state_env: Option<String>,
     pub(crate) resume_args: Vec<String>,
     pub(crate) args: Vec<String>,
-    pub(crate) credential: Option<(CredentialName, String)>,
+    pub(crate) credential: Option<ProfileCredential>,
     reader: Option<Reader>,
     pub(crate) takes_prompt: bool,
     pub(crate) tools: Tools,
@@ -168,10 +168,14 @@ fn claude_code_profile() -> Profile {
         state_env: Some("CLAUDE_CONFIG_DIR".to_owned()),
         resume_args: vec!["--continue".to_owned()],
         args: Vec::new(),
-        credential: "claude"
-            .parse()
-            .ok()
-            .map(|name| (name, "CLAUDE_CODE_OAUTH_TOKEN".to_owned())),
+        credential: "claude".parse().ok().map(|name| ProfileCredential {
+            name,
+            variable: "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
+            hint: Some(
+                "run claude setup-token in another terminal and paste the token it prints"
+                    .to_owned(),
+            ),
+        }),
         reader: Some(Reader::ClaudeCode),
         takes_prompt: true,
         tools: Tools::McpFlag("--mcp-config"),
@@ -365,9 +369,7 @@ fn read_profile(path: &Path) -> Result<Profile, LoadError> {
         state_env: user.state_env,
         resume_args: user.resume_args,
         args: user.args,
-        credential: user
-            .credential
-            .map(|credential| (credential.name, credential.variable)),
+        credential: user.credential,
         reader: user.reader,
         takes_prompt: user.first_prompt_arg,
         tools: if user.tool_args.is_empty() {
@@ -880,6 +882,7 @@ env = { CODEX_QUIET = "1" }
 state-env = "CODEX_HOME"
 resume-args = ["resume", "--last"]
 first-prompt-arg = true
+credential = { name = "openai", variable = "OPENAI_TOKEN", hint = "make one at platform.openai.com" }
 
 [tools]
 args = ["--mcp", "{state_dir}/mcp.json"]
@@ -916,6 +919,13 @@ content = "first\n"
         assert_eq!(codex.state_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(codex.set_names(), ["CODEX_QUIET", "CODEX_HOME"]);
         assert!(codex.takes_prompt && codex.session_dir().is_none());
+        assert_eq!(
+            codex
+                .credential
+                .as_ref()
+                .and_then(|credential| credential.hint.as_deref()),
+            Some("make one at platform.openai.com")
+        );
         assert!(
             read_profiles(&dir.path().join("missing"))
                 .unwrap()
@@ -1190,6 +1200,18 @@ content = "first\n"
             ["api.anthropic.com".parse::<HostName>().unwrap()]
         );
         assert_eq!(claude.optional_env, ["CLAUDE_CODE_OAUTH_TOKEN"]);
+        let credential = claude.credential.as_ref().unwrap();
+        assert_eq!(
+            (credential.name.as_str(), credential.variable.as_str()),
+            ("claude", "CLAUDE_CODE_OAUTH_TOKEN")
+        );
+        assert!(
+            credential
+                .hint
+                .as_deref()
+                .unwrap()
+                .contains("claude setup-token")
+        );
         for (name, _) in &claude.env {
             assert!(!name.contains("API_KEY") && !name.contains("AUTH_TOKEN"));
         }

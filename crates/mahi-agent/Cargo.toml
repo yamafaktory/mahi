@@ -10,6 +10,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+mahi-core = { workspace = true }
 mahi-identity = { workspace = true }
 mahi-proxy = { workspace = true }
 mahi-thread = { workspace = true }

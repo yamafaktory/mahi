@@ -62,6 +62,7 @@ use std::{
     },
 };
 
+use mahi_agent::profile::ProfileCredential;
 use mahi_core::{
     AgentName,
     AgentSlot,
@@ -1107,7 +1108,8 @@ fn gather_credentials(
             .ok_or_else(|| RunError::NoCredential(binding.name.clone()))?;
         hand(binding.variable.as_str(), credential)?;
     }
-    if let Some((name, variable)) = profile.and_then(|profile| profile.credential.as_ref())
+    if let Some(ProfileCredential { name, variable, .. }) =
+        profile.and_then(|profile| profile.credential.as_ref())
         && !options
             .credentials()
             .iter()

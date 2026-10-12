@@ -28,6 +28,7 @@ const MAX_ENV_NAME_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_COMPONENT_BYTES: usize = 200;
 const MAX_DEPTH: usize = 8;
+const MAX_HINT_CHARS: usize = 200;
 
 /// A profile's name: 1 to 32 lowercase letters, digits and dashes, not starting or ending
 /// with a dash.
@@ -151,6 +152,8 @@ pub struct ProfileCredential {
     pub name: CredentialName,
     /// The variable the agent gets it as.
     pub variable: String,
+    /// How to make the credential, shown when mahi asks for it.
+    pub hint: Option<String>,
 }
 
 /// A user-written agent profile, checked.
@@ -254,6 +257,7 @@ struct RawProfile {
 struct RawCredential {
     name: String,
     variable: String,
+    hint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +309,19 @@ fn value(field: &'static str, text: &str) -> Result<String, ProfileError> {
         Ok(text.to_owned())
     } else {
         Err(invalid(field, text))
+    }
+}
+
+fn hint(text: &str) -> Result<String, ProfileError> {
+    let printable = !text.trim().is_empty()
+        && text.chars().count() <= MAX_HINT_CHARS
+        && !text
+            .chars()
+            .any(|c| c.is_control() || mahi_core::is_invisible(c));
+    if printable {
+        Ok(text.to_owned())
+    } else {
+        Err(invalid("credential.hint", text))
     }
 }
 
@@ -532,6 +549,7 @@ impl UserProfile {
                         .parse()
                         .map_err(|_| invalid("credential.name", &raw.name))?,
                     variable: env_name("credential.variable", &raw.variable)?,
+                    hint: raw.hint.as_deref().map(hint).transpose()?,
                 })
             })
             .transpose()?;
@@ -600,7 +618,7 @@ env = { CODEX_QUIET = "1" }
 state-env = "CODEX_HOME"
 resume-args = ["resume", "--last"]
 args = ["-c", "sandbox_mode=\"danger-full-access\""]
-credential = { name = "openai", variable = "OPENAI_TOKEN" }
+credential = { name = "openai", variable = "OPENAI_TOKEN", hint = "make one at platform.openai.com" }
 first-prompt-arg = true
 reader = "claude-code"
 
@@ -629,7 +647,12 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
         assert_eq!(profile.state_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(profile.resume_args, ["resume", "--last"]);
         assert_eq!(profile.args, ["-c", "sandbox_mode=\"danger-full-access\""]);
-        assert_eq!(profile.credential.unwrap().variable, "OPENAI_TOKEN");
+        let credential = profile.credential.unwrap();
+        assert_eq!(credential.variable, "OPENAI_TOKEN");
+        assert_eq!(
+            credential.hint.as_deref(),
+            Some("make one at platform.openai.com")
+        );
         assert!(profile.first_prompt_arg);
         assert_eq!(profile.reader, Some(Reader::ClaudeCode));
         let codex = UserProfile::parse(&FULL.replace("\"claude-code\"", "\"codex\"")).unwrap();
@@ -680,6 +703,35 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
         ] {
             assert!(template("t", bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_hint_that_is_empty_long_or_hides_text_is_refused() {
+        let long = "h".repeat(201);
+        for hint in ["", "   ", "a\\u001b[2Jb", "a\\u202eb", "a\\u200bb", &long] {
+            let text = format!(
+                "name = \"x\"\nprogram = \"x\"\n\
+                 credential = {{ name = \"t\", variable = \"T\", hint = \"{hint}\" }}\n"
+            );
+            let error = UserProfile::parse(&text).unwrap_err();
+            assert!(
+                error.to_string().contains("credential.hint"),
+                "{hint}: {error}"
+            );
+        }
+        let longest = "h".repeat(200);
+        let text = format!(
+            "name = \"x\"\nprogram = \"x\"\n\
+             credential = {{ name = \"t\", variable = \"T\", hint = \"{longest}\" }}\n"
+        );
+        assert!(
+            UserProfile::parse(&text)
+                .unwrap()
+                .credential
+                .unwrap()
+                .hint
+                .is_some()
+        );
     }
 
     #[test]

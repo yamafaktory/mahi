@@ -43,6 +43,10 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         return;
     };
     assert!(!profile.program.is_empty() && !profile.program.contains('/'));
+    if let Some(hint) = profile.credential.as_ref().and_then(|credential| credential.hint.as_ref()) {
+        assert!((1..=200).contains(&hint.chars().count()) && !hint.trim().is_empty());
+        assert!(!hint.chars().any(|c| c.is_control() || mahi_core::is_invisible(c)));
+    }
     let folded: Vec<String> = profile
         .files
         .iter()
