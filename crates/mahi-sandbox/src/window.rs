@@ -64,6 +64,11 @@ pub struct WindowChanges(Watch);
 #[derive(Debug)]
 pub struct TerminationSignals(Watch);
 
+/// What runs when a termination listener starts, and when it ends.
+type ListeningHooks = (fn(), fn());
+
+static LISTENING_HOOKS: OnceLock<ListeningHooks> = OnceLock::new();
+
 /// A signal that asks the process to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Termination {
@@ -137,7 +142,17 @@ impl TerminationSignals {
     /// [`SignalError::ForeignHandler`] if something else handles one of the signals, or
     /// [`SignalError::Io`] if the pipe or a handler cannot be set up.
     pub fn listen() -> Result<Self, SignalError> {
-        Watch::start(&TERMINATION_PIPE, TERMINATION, &TERMINATION_LISTENING).map(Self)
+        let watch = Watch::start(&TERMINATION_PIPE, TERMINATION, &TERMINATION_LISTENING)?;
+        if let Some((started, _)) = LISTENING_HOOKS.get() {
+            started();
+        }
+        Ok(Self(watch))
+    }
+
+    /// Sets what runs each time a listener starts and after it ends, once per process: a
+    /// full-screen view uses it to let keys make signals only while something listens.
+    pub fn on_listening(started: fn(), ended: fn()) {
+        let _ = LISTENING_HOOKS.set((started, ended));
     }
 
     /// Blocks until one of the signals arrives, and says which.
@@ -247,6 +262,14 @@ pub enum InputWait {
     Signal(Termination),
     /// Neither came in time.
     Timeout,
+}
+
+impl Drop for TerminationSignals {
+    fn drop(&mut self) {
+        if let Some((_, ended)) = LISTENING_HOOKS.get() {
+            ended();
+        }
+    }
 }
 
 impl AsFd for TerminationSignals {
