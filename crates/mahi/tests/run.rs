@@ -1402,14 +1402,12 @@ cat parser.rs
         let mut terminal = mahi.writer().unwrap();
         let mut reader = mahi.reader().unwrap();
         let mut seen = Vec::new();
-        while !String::from_utf8_lossy(&seen).contains("Threads") {
-            let mut chunk = [0_u8; 4096];
-            let read = reader.read(&mut chunk).unwrap();
-            assert_ne!(read, 0);
-            seen.extend_from_slice(&chunk[..read]);
-        }
-        terminal.write_all(b"e\x1b").unwrap();
-        thread::sleep(Duration::from_millis(300));
+        read_until(&mut reader, &mut seen, "Threads");
+        terminal.write_all(b"e").unwrap();
+        read_until(&mut reader, &mut seen, "End thread");
+        terminal.write_all(b"\x1b").unwrap();
+        seen.clear();
+        read_until(&mut reader, &mut seen, "actions");
         terminal.write_all(b"[200~ey\r\x1b[201~").unwrap();
         thread::sleep(Duration::from_millis(800));
         terminal.write_all(b"q").unwrap();
@@ -1423,6 +1421,15 @@ cat parser.rs
         };
         assert_eq!(exit_code(status), 0);
         assert!(worktree.exists());
+    }
+
+    fn read_until(reader: &mut impl Read, seen: &mut Vec<u8>, text: &str) {
+        while !String::from_utf8_lossy(seen).contains(text) {
+            let mut chunk = [0_u8; 4096];
+            let read = reader.read(&mut chunk).unwrap();
+            assert_ne!(read, 0);
+            seen.extend_from_slice(&chunk[..read]);
+        }
     }
 
     #[test]
