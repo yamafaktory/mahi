@@ -2273,13 +2273,37 @@ struct Launch<'a> {
 }
 
 impl Launch<'_> {
+    /// Returns whether the agent is asked to continue a conversation it has none of here: its
+    /// arguments are its profile's resume arguments, and its state holds no session log for
+    /// the worktree.
+    fn continues_nothing(&self, state: Option<&Path>) -> bool {
+        let (Some(profile), Some(state)) = (self.profile, state) else {
+            return false;
+        };
+        let resuming = self.arguments.len() == profile.resume_args.len()
+            && self
+                .arguments
+                .iter()
+                .zip(&profile.resume_args)
+                .all(|(given, resume)| given == resume.as_str());
+        resuming && !profile.resume_args.is_empty() && !profile.has_session(state, self.worktree)
+    }
+
     /// Adds the agent's arguments: the user's, then those its profile always adds, then, when
     /// mahi serves the agent its tools, what its profile adds for them (a flag and the file in
     /// its state directory `state` that tells it where `mahi mcp` is, or the profile's tool
     /// arguments), then the user's after `--` and the first prompt of a handoff, after those
     /// so it is not taken as one of their values.
     fn agent_arguments(&self, mut pty: PtyCommand, state: Option<&Path>) -> PtyCommand {
-        let (before, after) = split_at_separator(self.arguments);
+        let arguments = if self.continues_nothing(state) {
+            eprintln!(
+                "mahi: the agent has no conversation here to continue, so it starts a new one"
+            );
+            &[][..]
+        } else {
+            self.arguments
+        };
+        let (before, after) = split_at_separator(arguments);
         for argument in before {
             pty = pty.arg(argument);
         }

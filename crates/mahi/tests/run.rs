@@ -2988,6 +2988,45 @@ echo stray > "$CODEX_HOME/history.jsonl"
     }
 
     #[test]
+    fn resuming_claude_with_no_conversation_to_continue_starts_a_new_one() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let claude = script(&fixture, "silent", "claude", "#!/bin/sh\necho args=[$*]\n");
+        let first = fixture
+            .command(&["run", claude.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert_eq!(first.status.code(), Some(0), "{stderr}");
+        let thread = thread_of(&worktree_of(&stderr));
+        let tools = claude.parent().unwrap().display().to_string();
+        let command = PtyCommand::new(
+            mahi_binary().as_path(),
+            &fixture.repo,
+            WindowSize {
+                rows: 24,
+                cols: 200,
+            },
+        )
+        .arg("resume")
+        .arg(&thread)
+        .env("PATH", format!("{tools}:/usr/bin:/bin:/usr"))
+        .env("HOME", &fixture.home)
+        .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+        .env("SSH_AUTH_SOCK", &fixture.socket)
+        .env("USER", "tester")
+        .env("MAHI_LIVE", "off");
+        let (code, output) = in_terminal_with(command, Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("args=[--mcp-config "), "{output}");
+        assert!(!output.contains("--continue"), "{output}");
+        assert!(
+            output.contains("has no conversation here to continue"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn resuming_claude_continues_its_conversation_in_the_same_state() {
         let fixture = fixture();
         save_identity(&fixture);

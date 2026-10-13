@@ -72,6 +72,9 @@ use crate::environment::{
     PASSED_ON,
 };
 
+const CODEX_LOG_DEPTH: usize = 3;
+const MOST_SESSION_ENTRIES: usize = 10_000;
+
 /// Reads one line of an agent's own session log.
 pub(crate) type ReadLogLine = fn(&[u8]) -> Option<LogLine>;
 
@@ -429,6 +432,28 @@ impl Profile {
         })
     }
 
+    /// Returns whether the agent's state directory `state` holds a session log of its for
+    /// `worktree`, looking only as deep as the agent keeps them (at the top of Claude Code's
+    /// project directory, three dated directories down Codex's), at no more than 10,000
+    /// entries, and following no symbolic link inside it. When mahi cannot tell, because it has
+    /// no reader for the agent, cannot name its session directory or cannot read it, the agent
+    /// counts as having one, so its resume arguments are kept.
+    pub(crate) fn has_session(&self, state: &Path, worktree: &Path) -> bool {
+        let (Some(dir), Some(is_log)) = (self.session_dir(), self.is_session_log()) else {
+            return true;
+        };
+        let Some(dir) = dir(worktree) else {
+            return true;
+        };
+        let depth = match self.reader {
+            Some(Reader::Codex) => CODEX_LOG_DEPTH,
+            _ => 0,
+        };
+        let mut left = MOST_SESSION_ENTRIES;
+        let mut path = String::new();
+        holds_log(&state.join(dir), (&mut path, depth), is_log, &mut left).unwrap_or(true)
+    }
+
     /// Returns how one line of the agent's session log reads, when mahi has a reader for it.
     pub(crate) fn log_line(&self) -> Option<ReadLogLine> {
         self.reader.map(|reader| match reader {
@@ -751,6 +776,52 @@ fn install_claude_code(
     let mut bytes = serde_json::to_vec_pretty(&state_json).map_err(io::Error::other)?;
     bytes.push(b'\n');
     create_if_missing(state, ".claude.json", &bytes)
+}
+
+/// Returns whether `dir`, whose path in the session directory is `path`, holds a session log
+/// `depth` directories down, where the agent keeps them, going into no other directory and
+/// following no symbolic link; `None` when it cannot be read, or holds more entries than
+/// `left`, but not when it is missing.
+fn holds_log(
+    dir: &Path,
+    (path, depth): (&mut String, usize),
+    is_log: IsSessionLog,
+    left: &mut usize,
+) -> Option<bool> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    let kept = path.len();
+    for entry in entries {
+        *left = left.checked_sub(1)?;
+        let entry = entry.ok()?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        path.truncate(kept);
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(name);
+        let found = if depth == 0 {
+            kind.is_file() && is_log(path)
+        } else if kind.is_dir() {
+            holds_log(&entry.path(), (path, depth - 1), is_log, left)?
+        } else {
+            false
+        };
+        if found {
+            return Some(true);
+        }
+    }
+    path.truncate(kept);
+    Some(false)
 }
 
 fn create_if_missing(directory: &OwnedFd, name: &str, contents: &[u8]) -> io::Result<()> {
@@ -1142,6 +1213,48 @@ content = "first\n"
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_session_is_found_only_where_the_agent_keeps_its_logs_for_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let worktree = Path::new("/w/thread.claude");
+        let claude = claude_code_profile();
+        assert!(!claude.has_session(state, worktree));
+        let project = state.join("projects/-w-thread-claude");
+        fs::create_dir_all(project.join("nested")).unwrap();
+        fs::write(project.join("nested/deep.jsonl"), "").unwrap();
+        fs::write(project.join("notes.txt"), "").unwrap();
+        assert!(!claude.has_session(state, worktree));
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::write(elsewhere.path().join("real.jsonl"), "{}").unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("real.jsonl"),
+            project.join("link.jsonl"),
+        )
+        .unwrap();
+        assert!(!claude.has_session(state, worktree));
+        let long = Path::new("/w").join("x".repeat(220));
+        assert!(claude.has_session(state, &long));
+        fs::write(project.join("s.jsonl"), "{}").unwrap();
+        assert!(claude.has_session(state, worktree));
+        assert!(!claude.has_session(state, Path::new("/w/other.claude")));
+        let codex = codex_profile();
+        assert!(!codex.has_session(state, worktree));
+        fs::create_dir_all(state.join("sessions/2026")).unwrap();
+        fs::write(state.join("sessions/rollout-0.jsonl"), "").unwrap();
+        fs::write(state.join("sessions/2026/rollout-0.jsonl"), "").unwrap();
+        assert!(!codex.has_session(state, worktree));
+        let day = state.join("sessions/2026/10/13");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("rollout-1.jsonl"), "").unwrap();
+        assert!(codex.has_session(state, worktree));
+        let bare = Profile {
+            reader: None,
+            ..codex_profile()
+        };
+        assert!(bare.has_session(state, worktree));
     }
 
     #[test]
