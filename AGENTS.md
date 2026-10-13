@@ -31,6 +31,8 @@ just clippy     # clippy on all targets, warnings are errors
 just test       # cargo nextest run; extra args pass through, e.g. just test -p mahi
 just build
 just run …      # run the mahi binary, e.g. just run threads
+just try …      # build mahi and run it in a scratch repo with its own config and data
+just try-reset  # remove try's scratch repo, config and data to start fresh
 just test-git   # the tests that run the git program (not part of just test)
 just test-wsl   # the tests that need WSL 2 (not part of just test; CI runs them on Windows)
 just release v  # check, bump every crate to version v, commit, tag v<v> and push (dry run without --execute)
