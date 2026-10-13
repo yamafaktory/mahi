@@ -78,6 +78,7 @@ pub(crate) struct Environment {
     pub(crate) term: Option<String>,
     pub(crate) term_program: Option<String>,
     pub(crate) tmux: bool,
+    pub(crate) colorterm: Option<String>,
     pub(crate) kitty: bool,
     pub(crate) vte: bool,
 }
@@ -210,6 +211,7 @@ impl Environment {
             term: text("TERM"),
             term_program: text("TERM_PROGRAM"),
             tmux: value("TMUX").is_some(),
+            colorterm: text("COLORTERM"),
             kitty: value("KITTY_WINDOW_ID").is_some(),
             vte: value("VTE_VERSION").is_some(),
             passed_on: PASSED_ON

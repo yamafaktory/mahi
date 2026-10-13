@@ -47,6 +47,7 @@ pub struct AnsiBackend<W: Write> {
     pending: Vec<u8>,
     size: Size,
     cursor: Position,
+    true_color: bool,
 }
 
 /// The colours and attributes the terminal was last told to draw with.
@@ -76,7 +77,16 @@ impl<W: Write> AnsiBackend<W> {
             pending: Vec::new(),
             size: Size::new(columns, rows),
             cursor: Position::ORIGIN,
+            true_color: true,
         }
+    }
+
+    /// Draws colours given as red, green and blue with the nearest of the terminal's 256
+    /// colours instead, for a terminal that does not draw 24-bit colour.
+    #[must_use]
+    pub fn without_true_color(mut self) -> Self {
+        self.true_color = false;
+        self
     }
 
     /// Records the terminal's new size, which the next draw fills.
@@ -107,10 +117,52 @@ impl<W: Write> AnsiBackend<W> {
                 write!(self.pending, ";{code}")?;
             }
         }
-        write_color(&mut self.pending, pen.fg, 30)?;
-        write_color(&mut self.pending, pen.bg, 40)?;
+        let (fg, bg) = (self.fitted(pen.fg), self.fitted(pen.bg));
+        write_color(&mut self.pending, fg, 30)?;
+        write_color(&mut self.pending, bg, 40)?;
         self.pending.push(b'm');
         Ok(())
+    }
+}
+
+impl<W: Write> AnsiBackend<W> {
+    fn fitted(&self, color: Color) -> Color {
+        match color {
+            Color::Rgb(red, green, blue) if !self.true_color => {
+                Color::Indexed(nearest_indexed(red, green, blue))
+            }
+            color => color,
+        }
+    }
+}
+
+/// Returns the colour of the xterm 256-colour palette's cube or grey ramp nearest to `red`,
+/// `green` and `blue`.
+fn nearest_indexed(red: u8, green: u8, blue: u8) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let level = |value: u8| {
+        LEVELS
+            .iter()
+            .zip(0_u8..)
+            .min_by_key(|(level, _)| level.abs_diff(value))
+            .map_or((0, 0), |(&level, index)| (index, level))
+    };
+    let distance = |(r, g, b): (u8, u8, u8)| {
+        [(r, red), (g, green), (b, blue)]
+            .iter()
+            .map(|(a, b)| u32::from(a.abs_diff(*b)).pow(2))
+            .sum::<u32>()
+    };
+    let (r, g, b) = (level(red), level(green), level(blue));
+    let average = (u16::from(red) + u16::from(green) + u16::from(blue)) / 3;
+    let grey_step = u8::try_from(average.saturating_sub(3) / 10)
+        .unwrap_or(23)
+        .min(23);
+    let grey = 8 + 10 * grey_step;
+    if distance((grey, grey, grey)) < distance((r.1, g.1, b.1)) {
+        232 + grey_step
+    } else {
+        16 + 36 * r.0 + 6 * g.0 + b.0
     }
 }
 
@@ -271,6 +323,29 @@ mod tests {
         assert_eq!(screen.contents_between(0, 0, 0, 7), "threads");
         assert_eq!(screen.contents_between(3, 2, 3, 8), "q quit");
         assert_eq!(screen.contents_between(1, 0, 1, 20).trim(), "");
+    }
+
+    #[test]
+    fn colours_given_as_rgb_take_the_nearest_of_256_without_true_color() {
+        assert_eq!(nearest_indexed(0x83, 0x21, 0x61), 89);
+        assert_eq!(nearest_indexed(0xd8, 0x64, 0xaf), 169);
+        assert_eq!(nearest_indexed(0, 0, 0), 16);
+        assert_eq!(nearest_indexed(255, 255, 255), 231);
+        assert_eq!(nearest_indexed(128, 128, 128), 244);
+        assert_eq!(nearest_indexed(240, 240, 240), 255);
+        assert_eq!(nearest_indexed(2, 2, 2), 16);
+        assert_eq!(nearest_indexed(8, 8, 8), 232);
+        assert_eq!(nearest_indexed(95, 95, 95), 59);
+        assert_eq!(nearest_indexed(95, 95, 100), 241);
+        let mut out = Vec::new();
+        let mut backend = AnsiBackend::new(&mut out, 1, 4).without_true_color();
+        let mut cell = ratatui_core::buffer::Cell::new("x");
+        cell.set_fg(Color::Rgb(0x83, 0x21, 0x61));
+        backend.draw([(0, 0, &cell)].into_iter()).unwrap();
+        Backend::flush(&mut backend).unwrap();
+        let written = String::from_utf8(out).unwrap();
+        assert!(written.contains(";38;5;89"), "{written:?}");
+        assert!(!written.contains(";38;2;"), "{written:?}");
     }
 
     #[test]

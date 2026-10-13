@@ -36,7 +36,6 @@ use mahi_sandbox::{
 };
 use mahi_store::Store;
 use mahi_term::{
-    AnsiBackend,
     Answer,
     Dialog,
     Home,
@@ -108,6 +107,10 @@ pub(crate) fn home(environment: &Environment) -> i32 {
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let identity = session::participant_from(environment.user.as_deref())
         .map_or_else(|_| "unknown".to_owned(), |name| name.to_string());
+    ui::set_true_color(matches!(
+        environment.colorterm.as_deref(),
+        Some("truecolor" | "24bit")
+    ));
     let saved = rustix::termios::tcgetattr(io::stdin()).ok();
     let screen = match Screen::enter() {
         Ok(screen) => screen,
@@ -226,7 +229,7 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
     let signals = TerminationSignals::listen().map_err(io::Error::other)?;
     ui::keys_make_signals(false);
     let mut size = terminal::size();
-    let mut terminal = Terminal::new(AnsiBackend::new(io::stdout(), size.rows, size.cols))?;
+    let mut terminal = Terminal::new(ui::backend(size.rows, size.cols))?;
     terminal.clear()?;
     let mut keys = PaletteKeys::default();
     let mut rows = rows(place.store, place.own);

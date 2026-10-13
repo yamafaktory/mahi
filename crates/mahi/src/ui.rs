@@ -67,6 +67,7 @@ const CLEAR_FOR_AGENT: &[u8] = b"\x1b[H\x1b[2J\x1b[?25h";
 const LEAVE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l";
 
 static SHOWING: AtomicBool = AtomicBool::new(false);
+static TRUE_COLOR: AtomicBool = AtomicBool::new(true);
 static BACKDROP: Mutex<Option<Buffer>> = Mutex::new(None);
 static SAVED: Mutex<Option<Termios>> = Mutex::new(None);
 static SAVED_STDERR: Mutex<Option<OwnedFd>> = Mutex::new(None);
@@ -93,6 +94,23 @@ pub(crate) fn clear_for_agent() -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(CLEAR_FOR_AGENT)?;
     stdout.flush()
+}
+
+/// Says whether the terminal draws 24-bit colour, as `COLORTERM` tells; dialogs then draw
+/// mahi's colours exactly, and otherwise with the nearest of 256.
+pub(crate) fn set_true_color(true_color: bool) {
+    TRUE_COLOR.store(true_color, Ordering::SeqCst);
+}
+
+/// Returns a backend that draws on standard output, in 24-bit colour only when the terminal
+/// draws it.
+pub(crate) fn backend(rows: u16, columns: u16) -> AnsiBackend<io::Stdout> {
+    let backend = AnsiBackend::new(io::stdout(), rows, columns);
+    if TRUE_COLOR.load(Ordering::SeqCst) {
+        backend
+    } else {
+        backend.without_true_color()
+    }
 }
 
 /// Returns whether a full-screen view owns the terminal, so questions are asked in dialogs.
@@ -455,7 +473,7 @@ fn clipboard_sequence(text: &str) -> Vec<u8> {
 /// Draws `dialog` over the full-screen view's last frame.
 fn show(dialog: &Dialog) -> io::Result<()> {
     let size = terminal::size();
-    let mut screen = Terminal::new(AnsiBackend::new(io::stdout(), size.rows, size.cols))?;
+    let mut screen = Terminal::new(backend(size.rows, size.cols))?;
     screen.clear()?;
     screen.draw(|frame| {
         let area = frame.area();

@@ -62,8 +62,11 @@ const MASK: char = '•';
 pub struct Theme;
 
 impl Theme {
-    /// Titles, selections and the keys shown in hints.
-    pub const ACCENT: Color = Color::Cyan;
+    /// Titles, borders and the keys shown in hints: Royal Plum lightened, to read on a dark
+    /// terminal.
+    pub const ACCENT: Color = Color::Rgb(0xd8, 0x64, 0xaf);
+    /// The selected row and mahi's badge: Royal Plum, #832161.
+    pub const PLUM: Color = Color::Rgb(0x83, 0x21, 0x61);
     /// Text that matters less.
     pub const MUTED: Color = Color::DarkGray;
     /// A question that waits for the user.
@@ -77,8 +80,8 @@ impl Theme {
     #[must_use]
     pub fn selected() -> Style {
         Style::new()
-            .fg(Color::Black)
-            .bg(Self::ACCENT)
+            .fg(Color::White)
+            .bg(Self::PLUM)
             .add_modifier(Modifier::BOLD)
     }
 

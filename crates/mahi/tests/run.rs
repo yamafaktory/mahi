@@ -1266,6 +1266,27 @@ cat parser.rs
     }
 
     #[test]
+    fn the_home_screen_draws_royal_plum_exactly_only_where_the_terminal_draws_24_bit_colour() {
+        let fixture = fixture();
+        let (_, _claude) = worked_thread(&fixture);
+        let (code, exact) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("COLORTERM", "truecolor"),
+            &[("Threads", b"q")],
+        );
+        assert_eq!(code, 0, "{exact}");
+        assert!(exact.contains(";48;2;131;33;97"), "{exact:?}");
+        let (code, nearest) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("COLORTERM", ""),
+            &[("Threads", b"?"), ("Help", b"\r"), ("Threads", b"q")],
+        );
+        assert_eq!(code, 0, "{nearest}");
+        assert!(nearest.contains(";48;5;89"), "{nearest:?}");
+        let help = nearest.find("Help").unwrap();
+        assert!(nearest[help..].contains(";38;5;169"), "{nearest:?}");
+        assert!(!nearest.contains(";2;131;33;97"), "{nearest:?}");
+    }
+
+    #[test]
     fn the_home_screen_ends_a_thread_after_its_confirmation_and_comes_back() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);
