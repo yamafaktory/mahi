@@ -114,6 +114,8 @@ pub enum HomeAction {
     Handoff(String),
     /// Merge another agent's work into one of the user's agents in the thread.
     Merge(String),
+    /// Push the thread's landed commits, with its trailers.
+    Push(String),
     /// Join a thread with a pairing code.
     Join,
     /// Choose the remote threads are pushed to.
@@ -145,6 +147,7 @@ enum ThreadChoice {
     Handoff,
     Merge,
     Land,
+    Push,
     End,
     Purge,
     Invite,
@@ -158,6 +161,7 @@ impl ThreadChoice {
             Self::Handoff => "Hand off: start your agent on another agent's latest work",
             Self::Merge => "Merge: bring another agent's work into one of yours",
             Self::Land => "Land: merge its agents' work onto a branch to commit",
+            Self::Push => "Push: add the thread's trailers to your commits and push the branch",
             Self::End => "End: save its work in a last snapshot and remove its worktrees",
             Self::Purge => "Purge: delete it here and on the remote, for good",
             Self::Invite => {
@@ -317,7 +321,7 @@ impl Home {
             self.note = Some("no thread is selected");
             return;
         };
-        let mut choices = Vec::with_capacity(8);
+        let mut choices = Vec::with_capacity(9);
         if row.owned {
             choices.push(ThreadChoice::Resume);
         }
@@ -326,6 +330,7 @@ impl Home {
             ThreadChoice::Handoff,
             ThreadChoice::Merge,
             ThreadChoice::Land,
+            ThreadChoice::Push,
             ThreadChoice::End,
             ThreadChoice::Invite,
             ThreadChoice::Purge,
@@ -350,8 +355,8 @@ impl Home {
         let question = match &action {
             HomeAction::Land(thread) => format!(
                 "Land thread {thread}? Its agents' work is merged into a landing worktree on a \
-                 branch, where you turn it into commits with git, then push them with \
-                 `mahi land {thread} --push`."
+                 branch, where you turn it into commits with git, then push them with Push in \
+                 the thread's menu."
             ),
             HomeAction::End(thread) => format!(
                 "End thread {thread}? Its worktrees are recorded in a last snapshot, then removed. \
@@ -436,6 +441,7 @@ impl Home {
                     ThreadChoice::AddAgent => Some(HomeAction::AddAgent(thread)),
                     ThreadChoice::Handoff => Some(HomeAction::Handoff(thread)),
                     ThreadChoice::Merge => Some(HomeAction::Merge(thread)),
+                    ThreadChoice::Push => Some(HomeAction::Push(thread)),
                     ThreadChoice::Invite => Some(HomeAction::Invite(thread)),
                     ThreadChoice::Purge => Some(HomeAction::Purge(thread)),
                     ThreadChoice::Land => {
@@ -893,6 +899,7 @@ mod tests {
             ('2', HomeAction::AddAgent("t1".to_owned())),
             ('3', HomeAction::Handoff("t1".to_owned())),
             ('4', HomeAction::Merge("t1".to_owned())),
+            ('6', HomeAction::Push("t1".to_owned())),
         ] {
             assert_eq!(home.key(PaletteInput::Text(digit), &rows), Some(action));
             home.key(PaletteInput::Enter, &rows);
@@ -908,12 +915,12 @@ mod tests {
         let teammate = screen(&home, &rows, "");
         assert!(!teammate.contains("Resume:"), "{teammate}");
         assert_eq!(
-            home.key(PaletteInput::Text('6'), &rows),
+            home.key(PaletteInput::Text('7'), &rows),
             Some(HomeAction::Invite("t2".to_owned()))
         );
         home.key(PaletteInput::Enter, &rows);
         assert_eq!(
-            home.key(PaletteInput::Text('7'), &rows),
+            home.key(PaletteInput::Text('8'), &rows),
             Some(HomeAction::Purge("t2".to_owned()))
         );
         assert_eq!(

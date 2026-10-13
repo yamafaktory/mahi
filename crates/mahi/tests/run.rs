@@ -1876,6 +1876,42 @@ printf 'fn parse() { codex }\n' > parser.rs
     }
 
     #[test]
+    fn the_home_screen_pushes_a_landing_from_the_thread_menu() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                (&thread, b"\r"),
+                ("Push: add the thread's trailers", b"6"),
+                (&format!("thread {thread} is not landed here yet"), b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        let writer = script(&fixture, "home-push", "claude", "#!/bin/sh\n");
+        let path = format!("{}:/usr/bin:/bin:/usr", writer.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                (&thread, b"\r"),
+                ("Push: add the thread's trailers", b"6"),
+                ("Just push", b"1"),
+                ("no remote is chosen", b""),
+                (&format!("mahi land {thread} --push failed"), b"\r"),
+                ("Push: add the thread's trailers", b"6"),
+                ("Push, then let claude rewrite the pull request draft", b"2"),
+                (
+                    &format!("mahi land {thread} --push --with claude failed"),
+                    b"q",
+                ),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+    }
+
+    #[test]
     fn the_home_screen_hands_a_thread_over_to_another_agent() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);
