@@ -62,6 +62,7 @@ const KEY_WAIT: Duration = Duration::from_millis(500);
 const ESC: u8 = 0x1b;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
+const CLEAR_FOR_AGENT: &[u8] = b"\x1b[H\x1b[2J\x1b[?25h";
 const LEAVE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l";
 
 static SHOWING: AtomicBool = AtomicBool::new(false);
@@ -80,6 +81,17 @@ pub(crate) fn keep_backdrop(frame: &Buffer) {
     if let Ok(mut kept) = BACKDROP.lock() {
         *kept = Some(frame.clone());
     }
+}
+
+/// Gives an agent a blank screen with the cursor shown at its top left when a full-screen
+/// view owns the terminal, so the agent does not draw over the view's last frame.
+pub(crate) fn clear_for_agent() -> io::Result<()> {
+    if !is_showing() {
+        return Ok(());
+    }
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(CLEAR_FOR_AGENT)?;
+    stdout.flush()
 }
 
 /// Returns whether a full-screen view owns the terminal, so questions are asked in dialogs.

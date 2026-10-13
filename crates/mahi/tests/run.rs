@@ -1308,6 +1308,32 @@ cat parser.rs
     }
 
     #[test]
+    fn an_agent_started_from_the_home_screen_gets_a_blank_screen() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nread line\n";
+        let claude = script(&fixture, "blank-agents", "claude", agent);
+        script(&fixture, "blank-agents", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("agent-ready", b"\r"),
+                ("mahi run claude: done", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let ready = output.find("agent-ready").unwrap() + "agent-ready".len();
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        parser.process(&output.as_bytes()[..ready]);
+        let screen = parser.screen().contents();
+        assert!(screen.starts_with("agent-ready"), "{screen}");
+        assert!(!screen.contains("Threads"), "{screen}");
+        assert!(!parser.screen().hide_cursor());
+    }
+
+    #[test]
     fn a_new_user_sets_mahi_up_and_starts_an_agent_without_leaving_the_home_screen() {
         let fixture = fixture();
         let fresh = fixture.root.join("fresh-home");

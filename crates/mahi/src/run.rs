@@ -2480,6 +2480,7 @@ impl Launch<'_> {
         }
         let pty = pty.sandbox(sandbox);
         let raw = RawMode::enable().map_err(RunError::Terminal)?;
+        crate::ui::clear_for_agent().map_err(RunError::Terminal)?;
         let mut child = pty.spawn()?;
         let proxy = network
             .map(|network| network.start(child.take_loopback_listener()))
