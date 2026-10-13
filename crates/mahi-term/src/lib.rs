@@ -2,16 +2,19 @@
 //! what the user types, the keys the open palette reads, where mahi may draw between the
 //! agent's escape sequences, and drawing the palette.
 
+mod agent_screen;
 mod dialog;
 mod home;
 mod input;
 mod key;
 mod notify;
 mod output;
+mod pane;
 mod scan;
 mod screen;
 mod view;
 
+pub use agent_screen::AgentScreen;
 pub use dialog::{
     Answer,
     Dialog,
@@ -38,6 +41,7 @@ pub use notify::{
     TerminalHints,
 };
 pub use output::OutputTracker;
+pub use pane::AgentFrame;
 pub use scan::{
     KeyScanner,
     Segment,

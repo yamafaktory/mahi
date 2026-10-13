@@ -1063,7 +1063,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         session.wait_for("ready");
         assert!(session.text().contains("Ctrl-Space opens mahi's palette"));
         session.type_keys(b"\0");
-        session.wait_for_screen("╭─ mahi");
+        session.wait_for_screen("╭─ Teammates' prompts");
         session.type_keys(b"abc");
         session.wait_for_screen("› abc");
         session.type_keys(b"\x1b");
@@ -1089,7 +1089,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         );
         session.wait_for("ready");
         session.type_keys(b"\0");
-        session.wait_for_screen("╭─ mahi");
+        session.wait_for_screen("╭─ Teammates' prompts");
         let (code, text) = session.finish();
         assert_eq!(code, 0, "{text}");
         let box_at = text.find('╭').unwrap();
@@ -1116,7 +1116,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         session.type_keys(b"\0\r");
         session.wait_for("^@");
         session.type_keys(b"\x1b[15~");
-        session.wait_for_screen("╭─ mahi");
+        session.wait_for_screen("╭─ Teammates' prompts");
         session.type_keys(b"\x1b[15~");
         session.type_keys(b"x\r");
         let (code, text) = session.finish();
@@ -1329,11 +1329,11 @@ cat parser.rs
     }
 
     #[test]
-    fn an_agent_started_from_the_home_screen_gets_a_blank_screen() {
+    fn an_agent_started_from_the_home_screen_runs_in_a_pane_between_mahis_header_and_keys() {
         let fixture = fixture();
-        let agent = "#!/bin/sh\necho agent-ready\nread line\n";
-        let claude = script(&fixture, "blank-agents", "claude", agent);
-        script(&fixture, "blank-agents", "codex", agent);
+        let agent = "#!/bin/sh\necho agent-ready $(stty size)\nread line\n";
+        let claude = script(&fixture, "pane-agents", "claude", agent);
+        script(&fixture, "pane-agents", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
@@ -1345,13 +1345,22 @@ cat parser.rs
             ],
         );
         assert_eq!(code, 0, "{output}");
-        let ready = output.find("agent-ready").unwrap() + "agent-ready".len();
+        let ready = output.find("agent-ready").unwrap();
+        let end = ready + output[ready..].find("\x1b[?1049h").unwrap();
         let mut parser = vt100::Parser::new(24, 200, 0);
-        parser.process(&output.as_bytes()[..ready]);
-        let screen = parser.screen().contents();
-        assert!(screen.starts_with("agent-ready"), "{screen}");
-        assert!(!screen.contains("Threads"), "{screen}");
-        assert!(!parser.screen().hide_cursor());
+        parser.process(&output.as_bytes()[..end]);
+        let screen = parser.screen();
+        let rows: Vec<String> = screen.rows(0, 200).collect();
+        assert!(
+            rows[0].starts_with(" mahi  tester.claude · thread "),
+            "{rows:#?}"
+        );
+        assert!(rows[1].starts_with("╭──"), "{rows:#?}");
+        assert!(rows[2].starts_with("│agent-ready 20 198"), "{rows:#?}");
+        assert!(rows[22].starts_with("╰──"), "{rows:#?}");
+        assert!(rows[23].contains("back to the threads"), "{rows:#?}");
+        assert!(!screen.contents().contains("Menu"), "{rows:#?}");
+        assert_eq!(screen.cursor_position().1, 1);
     }
 
     #[test]
@@ -1378,7 +1387,10 @@ cat parser.rs
             ],
         );
         assert_eq!(code, 0, "{output}");
-        assert!(output.contains("agent-ran token=none"), "{output}");
+        assert!(
+            pane_at(&output, "agent-ran").contains("│agent-ran token=none"),
+            "{output}"
+        );
         assert!(!output.contains("correct horse"), "{output}");
         assert!(config_dir(&fresh).recipient_file().is_file());
         assert!(config_dir(&fresh).path().join("declined/claude").is_file());
@@ -1606,6 +1618,18 @@ cat parser.rs
         };
         assert_eq!(exit_code(status), 0);
         assert!(worktree.exists());
+    }
+
+    /// Returns the screen, as text, of the agent's pane that showed `marker`, before the home
+    /// screen came back.
+    fn pane_at(output: &str, marker: &str) -> String {
+        let at = output.find(marker).unwrap();
+        let end = output[at..]
+            .find("\x1b[?1049h")
+            .map_or(output.len(), |back| at + back);
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        parser.process(&output.as_bytes()[..end]);
+        parser.screen().contents()
     }
 
     fn read_until(reader: &mut impl Read, seen: &mut Vec<u8>, text: &str) {
@@ -1953,7 +1977,10 @@ printf 'fn parse() { codex }\n' > parser.rs
             ],
         );
         assert_eq!(code, 0, "{output}");
-        assert!(output.contains("fn parse() {}"), "{output}");
+        assert!(
+            pane_at(&output, "parse()").contains("│fn parse() {}"),
+            "{output}"
+        );
     }
 
     #[test]

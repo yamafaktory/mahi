@@ -37,18 +37,57 @@ use crate::{
         Decision,
         Prompts,
     },
-    terminal,
 };
 
 const MAX_HELD_BYTES: usize = 1024 * 1024;
-const TITLE: &str = "mahi";
-const EMPTY: &str = "No prompts waiting";
+const TITLE: &str = "Teammates' prompts";
+const EMPTY: &str = "None yet: teammates watching this thread send them here";
 const HINT_READ: &str = "PgDn reads on · Ctrl-X rejects · Esc closes";
 const HINT_DECIDE: &str = "Enter accepts · Tab always · Ctrl-X rejects · Esc closes";
 const NO_TEAMMATES: &str = "Teammates cannot watch this run, so no prompts come";
 const CLEAR: &[u8] = b"\x1b[2J";
 const REPAINT_PAUSE: Duration = Duration::from_millis(100);
 const DETAIL_CHARS: usize = 200;
+
+/// Where the screen writes the agent's output and mahi's palette: straight to the user's
+/// terminal, or into a pane mahi draws.
+pub(crate) trait ScreenOut: Write {
+    /// Writes mahi's own `notice` as it is, past what the agent's output goes through.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error writing gives.
+    fn pass_through(&mut self, notice: &[u8]) -> io::Result<()> {
+        self.write_all(notice)
+    }
+
+    /// Takes the agent's terminal's new `size` before the agent draws for it.
+    fn resize(&mut self, _size: WindowSize) {}
+
+    /// Stops drawing, since the agent ended: what comes later is dropped.
+    fn finish(&mut self) {}
+
+    /// Returns whether the palette is drawn over the agent's screen as a layer of its own,
+    /// so the agent keeps drawing beneath it and nothing has to be redrawn when it closes.
+    fn overlays(&self) -> bool {
+        false
+    }
+
+    /// Returns where the palette is drawn.
+    fn palette_out(&mut self) -> &mut dyn Write
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    /// Takes the palette away from the screen, where it is a layer of its own.
+    fn close_palette(&mut self) {}
+}
+
+impl ScreenOut for io::Stdout {}
+
+impl ScreenOut for Vec<u8> {}
 
 /// The user's terminal as the palette needs it: its size, and a way to make the agent redraw
 /// its screen.
@@ -72,8 +111,13 @@ impl Repainter {
     /// Gives the agent's terminal the user's terminal's size, and returns it; `None` when the
     /// agent's terminal is gone.
     pub(crate) fn follow(&self) -> Option<WindowSize> {
+        self.follow_to(crate::ui::agent_size())
+    }
+
+    /// Gives the agent's terminal `size`, and returns it; `None` when the agent's terminal is
+    /// gone.
+    pub(crate) fn follow_to(&self, size: WindowSize) -> Option<WindowSize> {
         let resizer = self.0.lock().ok()?;
-        let size = terminal::size();
         resizer.resize(size).ok()?;
         Some(size)
     }
@@ -81,12 +125,12 @@ impl Repainter {
 
 impl AgentTerminal for Repainter {
     fn size(&self) -> WindowSize {
-        terminal::size()
+        crate::ui::agent_size()
     }
 
     fn repaint(&self) {
         if let Ok(resizer) = self.0.lock() {
-            let size = terminal::size();
+            let size = crate::ui::agent_size();
             let _ = resizer.resize(WindowSize {
                 rows: size.rows.saturating_sub(1).max(1),
                 cols: size.cols,
@@ -134,7 +178,7 @@ enum Mode {
     Open,
 }
 
-impl<W: Write, T: AgentTerminal> Screen<W, T> {
+impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
     /// Starts a screen that writes to `out`, with the palette closed; the palette lists the
     /// teammates' `prompts`, when teammates can send any.
     pub(crate) fn new(out: W, terminal: T, key: PaletteKey, prompts: Option<Arc<Prompts>>) -> Self {
@@ -172,6 +216,12 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
     /// Returns the error writing to the screen gives.
     pub(crate) fn output(&self, bytes: &[u8]) -> io::Result<()> {
         let mut state = self.lock()?;
+        if state.out.overlays() {
+            state.tracker.feed(bytes);
+            state.out.write_all(bytes)?;
+            write_notice(&mut state)?;
+            return state.out.flush();
+        }
         match state.mode {
             Mode::Agent => {
                 state.tracker.feed(bytes);
@@ -211,7 +261,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         state.notice.extend_from_slice(notice);
         if state.mode == Mode::Open {
             let pending = std::mem::take(&mut state.notice);
-            state.out.write_all(&pending)?;
+            state.out.pass_through(&pending)?;
         } else if state.mode == Mode::Agent {
             write_notice(&mut state)?;
         }
@@ -239,7 +289,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         if state.mode != Mode::Agent {
             return Ok(());
         }
-        if state.tracker.can_draw() {
+        if state.out.overlays() || state.tracker.can_draw() {
             state.mode = Mode::Open;
             self.draw(&mut state)?;
         } else {
@@ -357,7 +407,11 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
     pub(crate) fn resized(&self) -> io::Result<()> {
         let mut state = self.lock()?;
         if state.mode == Mode::Open {
-            state.out.write_all(CLEAR)?;
+            if state.out.overlays() {
+                state.out.close_palette();
+            } else {
+                state.out.write_all(CLEAR)?;
+            }
             self.draw(&mut state)?;
         }
         state.out.flush()
@@ -376,6 +430,35 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         state.out.flush()
     }
 
+    /// Closes the palette and stops drawing for good, since the agent ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error writing to the screen gives.
+    pub(crate) fn finish(&self) -> io::Result<()> {
+        let closed = self.close();
+        let mut state = self.lock()?;
+        state.out.finish();
+        closed
+    }
+
+    /// Gives the output the agent's terminal's new `size` and then, under the same lock, lets
+    /// `follow` resize the agent's terminal, so every byte the agent writes for the new size
+    /// is read at that size; returns what `follow` returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the screen's lock is poisoned.
+    pub(crate) fn follow_size<R>(
+        &self,
+        size: WindowSize,
+        follow: impl FnOnce() -> R,
+    ) -> io::Result<R> {
+        let mut state = self.lock()?;
+        state.out.resize(size);
+        Ok(follow())
+    }
+
     fn release(&self, state: &mut State<W>) -> io::Result<()> {
         let was_open = state.mode == Mode::Open;
         let held = std::mem::take(&mut state.held);
@@ -389,7 +472,8 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         state.keys = PaletteKeys::default();
         state.out.write_all(&held)?;
         write_notice(state)?;
-        if was_open {
+        state.out.close_palette();
+        if was_open && !state.out.overlays() {
             self.terminal.repaint();
         }
         Ok(())
@@ -442,7 +526,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
                 scroll: state.scroll,
             }),
         };
-        let drawn = view.draw(size.rows, size.cols, &mut state.out)?;
+        let drawn = view.draw(size.rows, size.cols, &mut state.out.palette_out())?;
         state.page = drawn.page;
         state.scroll = state.scroll.min(drawn.lines.saturating_sub(drawn.page));
         if text.is_some() && drawn.page > 0 && drawn.shows_end(state.scroll) {
@@ -523,7 +607,7 @@ fn contains_ignoring_case(text: &str, part: &str) -> bool {
             .any(|window| window.eq_ignore_ascii_case(part.as_bytes()))
 }
 
-impl<W: Write, T: AgentTerminal> AgentInput for Screen<W, T> {
+impl<W: ScreenOut, T: AgentTerminal> AgentInput for Screen<W, T> {
     fn palette_open(&self) -> bool {
         self.is_open()
     }
@@ -534,12 +618,12 @@ impl<W: Write, T: AgentTerminal> AgentInput for Screen<W, T> {
     }
 }
 
-fn write_notice<W: Write>(state: &mut State<W>) -> io::Result<()> {
+fn write_notice<W: ScreenOut>(state: &mut State<W>) -> io::Result<()> {
     if state.notice.is_empty() || !state.tracker.is_ground() {
         return Ok(());
     }
     let notice = std::mem::take(&mut state.notice);
-    state.out.write_all(&notice)
+    state.out.pass_through(&notice)
 }
 
 fn push_age(out: &mut String, age: Duration) {
@@ -591,6 +675,129 @@ mod tests {
 
     fn has_box(bytes: &[u8]) -> bool {
         String::from_utf8_lossy(bytes).contains('╭')
+    }
+
+    #[derive(Debug, Default)]
+    struct Recording {
+        drawn: Vec<u8>,
+        passed: Vec<u8>,
+        events: Arc<Mutex<Vec<String>>>,
+        finished: bool,
+        overlay: Option<Vec<u8>>,
+        overlays: bool,
+    }
+
+    impl Write for Recording {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.finished {
+                self.drawn.extend_from_slice(bytes);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ScreenOut for Recording {
+        fn pass_through(&mut self, notice: &[u8]) -> io::Result<()> {
+            self.passed.extend_from_slice(notice);
+            Ok(())
+        }
+
+        fn resize(&mut self, size: WindowSize) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("resize {}x{}", size.rows, size.cols));
+        }
+
+        fn finish(&mut self) {
+            self.finished = true;
+            self.events.lock().unwrap().push("finish".to_owned());
+        }
+
+        fn overlays(&self) -> bool {
+            self.overlays
+        }
+
+        fn palette_out(&mut self) -> &mut dyn Write {
+            if self.overlays {
+                self.overlay.get_or_insert_with(Vec::new)
+            } else {
+                self
+            }
+        }
+
+        fn close_palette(&mut self) {
+            self.overlay = None;
+        }
+    }
+
+    #[test]
+    fn a_palette_drawn_over_the_agent_lets_it_draw_and_closes_without_a_repaint() {
+        let terminal = FakeTerminal::default();
+        let screen = Screen::new(
+            Recording {
+                overlays: true,
+                ..Recording::default()
+            },
+            &terminal,
+            PaletteKey::CTRL_SPACE,
+            None,
+        );
+        screen.output(b"\x1b]2;unfinished").unwrap();
+        screen.open().unwrap();
+        assert!(!screen.is_opening());
+        assert!(screen.is_open());
+        screen.output(b"\x07more").unwrap();
+        {
+            let state = screen.lock().unwrap();
+            assert_eq!(state.out.drawn, b"\x1b]2;unfinished\x07more");
+            assert!(has_box(state.out.overlay.as_deref().unwrap()));
+        }
+        screen.resized().unwrap();
+        assert!(has_box(
+            screen.lock().unwrap().out.overlay.as_deref().unwrap()
+        ));
+        screen.typed(b"\x1b").unwrap();
+        assert!(!screen.is_open());
+        assert!(screen.lock().unwrap().out.overlay.is_none());
+        assert_eq!(terminal.repaints.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn notices_skip_the_agents_screen_and_a_resize_reaches_it_before_the_agent() {
+        let terminal = FakeTerminal::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let screen = Screen::new(
+            Recording {
+                events: Arc::clone(&events),
+                ..Recording::default()
+            },
+            &terminal,
+            PaletteKey::CTRL_SPACE,
+            None,
+        );
+        screen.output(b"agent").unwrap();
+        screen.notify(b"\x1b]9;hi\x07").unwrap();
+        let followed = screen
+            .follow_size(WindowSize { rows: 3, cols: 4 }, || {
+                events.lock().unwrap().push("follow".to_owned());
+                7
+            })
+            .unwrap();
+        assert_eq!(followed, 7);
+        {
+            let state = screen.lock().unwrap();
+            assert_eq!(state.out.drawn, b"agent");
+            assert_eq!(state.out.passed, b"\x1b]9;hi\x07");
+        }
+        screen.finish().unwrap();
+        screen.output(b"late").unwrap();
+        assert_eq!(screen.lock().unwrap().out.drawn, b"agent");
+        assert_eq!(*events.lock().unwrap(), ["resize 3x4", "follow", "finish"]);
     }
 
     #[test]

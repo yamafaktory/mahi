@@ -15,10 +15,8 @@ ratatui-core = { workspace = true }
 ratatui-widgets = { workspace = true }
 thiserror = { workspace = true }
 unicode-width = { workspace = true }
-zeroize = { workspace = true }
-
-[dev-dependencies]
 vt100 = { workspace = true }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

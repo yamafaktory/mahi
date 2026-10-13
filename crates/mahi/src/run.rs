@@ -218,7 +218,9 @@ use crate::{
         AgentTerminal,
         Repainter,
         Screen,
+        ScreenOut,
     },
+    pane::Out,
     profile::{
         self,
         Profile,
@@ -322,6 +324,9 @@ const STOP_POLL: Duration = Duration::from_millis(50);
 const KILL_GRACE: Duration = Duration::from_secs(2);
 const PALETTE_WAIT: Duration = Duration::from_millis(200);
 const PALETTE_POLL: Duration = Duration::from_millis(10);
+const OUTPUT_READ: usize = 8192;
+const MOST_QUEUED_REPLIES: usize = 64;
+const OUTPUT_BATCH: usize = 8 * OUTPUT_READ;
 const PALETTE_TICK: Duration = Duration::from_secs(1);
 const BROKEN_PIPE_CODE: i32 = 128 + 13;
 
@@ -1525,21 +1530,21 @@ impl Prepared {
             (&self.git_dir, config.clone()),
             &started,
         );
-        let merging = Merging::open(door, recorder.as_ref(), &started);
         let outcome = finish_run(
             child,
             raw,
             &UserSide {
+                title: format!("{} · thread {}", started.slot, started.thread),
                 palette_key: self.palette_key,
                 activity,
                 notice: notice(environment),
             },
             termination,
             Background {
+                merging: Merging::open(door, recorder.as_ref(), &started),
                 recorder,
                 turns,
                 pusher,
-                merging,
                 prompts,
             },
             proxy,
@@ -1917,6 +1922,7 @@ fn finish_turns(turns: Option<TurnWorker>) {
 /// What the user's side of a run needs: the key that opens the palette, and what the agent
 /// and the user did last, to tell when the agent is idle.
 struct UserSide {
+    title: String,
     palette_key: PaletteKey,
     activity: Arc<Activity>,
     notice: Notice,
@@ -2063,6 +2069,7 @@ fn supervise(
     } = side;
     let code = relay(
         child,
+        &user.title,
         interactive.then_some((user.palette_key, user.notice)),
         &user.activity,
         (events, &received),
@@ -2423,8 +2430,8 @@ impl Launch<'_> {
         if let Some(network) = &network {
             sandbox.open_loopback_port(network.port())?;
         }
-        let pty =
-            PtyCommand::new(&self.agent.program, self.worktree, terminal::size()).hold_terminal();
+        let pty = PtyCommand::new(&self.agent.program, self.worktree, crate::ui::agent_size())
+            .hold_terminal();
         let mut pty = self.agent_arguments(pty, state.as_deref());
         for (name, value) in &self.environment.passed_on {
             pty = pty.env(name, value);
@@ -2480,7 +2487,6 @@ impl Launch<'_> {
         }
         let pty = pty.sandbox(sandbox);
         let raw = RawMode::enable().map_err(RunError::Terminal)?;
-        crate::ui::clear_for_agent().map_err(RunError::Terminal)?;
         let mut child = pty.spawn()?;
         let proxy = network
             .map(|network| network.start(child.take_loopback_listener()))
@@ -2520,6 +2526,7 @@ impl Host {
 
 fn relay(
     child: PtyChild,
+    title: &str,
     palette: Option<(PaletteKey, Notice)>,
     activity: &Arc<Activity>,
     (events, received): (mpsc::Sender<Event>, &Receiver<Event>),
@@ -2529,10 +2536,25 @@ fn relay(
     let (stop, stopped) = UnixStream::pair().map_err(RunError::Output)?;
     let writer = Arc::new(Mutex::new(child.writer()?));
     let repainter = Repainter::new(child.resizer()?);
+    let palette_key = palette.map(|(key, _)| key).unwrap_or_default();
+    let (replies, answers) = mpsc::sync_channel::<Vec<u8>>(MOST_QUEUED_REPLIES);
+    let answering = Arc::clone(&writer);
+    thread::spawn(move || {
+        for reply in answers {
+            let Ok(mut writer) = answering.lock() else {
+                return;
+            };
+            if writer.write_all(&reply).is_err() {
+                return;
+            }
+        }
+    });
+    let shown_key = palette.map(|(key, _)| key.to_string());
+    let out = Out::for_agent(title, shown_key.as_deref(), replies).map_err(RunError::Output)?;
     let screen = Arc::new(Screen::new(
-        io::stdout(),
+        out,
         repainter.clone(),
-        palette.map(|(key, _)| key).unwrap_or_default(),
+        palette_key,
         prompts.clone(),
     ));
     let input = palette.map(|(key, _)| (Arc::clone(&screen), KeyScanner::new(key)));
@@ -2607,7 +2629,7 @@ fn relay(
     drop(quit);
     join_within(forwarding, THREAD_STOP_WAIT);
     join_within(following, THREAD_STOP_WAIT);
-    let _ = screen.close();
+    let _ = screen.finish();
     outcome
 }
 
@@ -2643,7 +2665,9 @@ fn follow_resizes(
             if changes.wait().is_err() {
                 break;
             }
-            let Some(size) = repainter.follow() else {
+            let size = crate::ui::agent_size();
+            let followed = screen.follow_size(size, || repainter.follow_to(size));
+            let Ok(Some(size)) = followed else {
                 break;
             };
             let _ = screen.resized();
@@ -2785,9 +2809,9 @@ fn copy_output(
     (reader, stop): (&mut (impl Read + AsFd), &UnixStream),
     progress: &AtomicU64,
     tap: Option<&OutputTap>,
-    screen: (&Screen<impl Write, impl AgentTerminal>, &Activity),
+    screen: (&Screen<impl ScreenOut, impl AgentTerminal>, &Activity),
 ) -> io::Result<()> {
-    let mut buffer = [0_u8; 8192];
+    let mut buffer = vec![0_u8; OUTPUT_BATCH];
     loop {
         match wait_for_output(reader, stop)? {
             Ready::Output => {
@@ -2810,23 +2834,41 @@ fn copy_output(
 }
 
 fn copy_chunk(
-    reader: &mut impl Read,
+    reader: &mut (impl Read + AsFd),
     buffer: &mut [u8],
     (progress, tap, (screen, activity)): (
         &AtomicU64,
         Option<&OutputTap>,
-        (&Screen<impl Write, impl AgentTerminal>, &Activity),
+        (&Screen<impl ScreenOut, impl AgentTerminal>, &Activity),
     ),
 ) -> io::Result<bool> {
-    let read = reader.read(buffer)?;
-    let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
+    let mut filled = 0;
+    while let Some(free) = buffer.get_mut(filled..(filled + OUTPUT_READ).min(buffer.len())) {
+        let read = match reader.read(free) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if filled > 0 => {
+                screen.output(buffer.get(..filled).unwrap_or_default())?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(tap) = tap
+            && let Some(piece) = buffer.get(filled..filled + read)
+        {
+            tap.output(piece);
+        }
+        filled += read;
+        if filled + OUTPUT_READ > buffer.len() || !output_waiting(reader).unwrap_or(false) {
+            break;
+        }
+    }
+    let Some(chunk) = buffer.get(..filled).filter(|chunk| !chunk.is_empty()) else {
         return Ok(false);
     };
     activity.touched();
     screen.output(chunk)?;
-    if let Some(tap) = tap {
-        tap.output(chunk);
-    }
     progress.fetch_add(1, Ordering::Relaxed);
     Ok(true)
 }
@@ -2873,7 +2915,7 @@ fn output_waiting(reader: &impl AsFd) -> io::Result<bool> {
     }
 }
 
-type UserScreen = Screen<io::Stdout, Repainter>;
+type UserScreen = Screen<Out, Repainter>;
 
 fn forward_input(
     writer: &Mutex<File>,
@@ -3206,6 +3248,7 @@ impl DraftWriter {
             child,
             raw,
             &UserSide {
+                title: "writing the pull request draft".to_owned(),
                 palette_key: prepared.palette_key,
                 activity,
                 notice: notice(environment),
@@ -3289,6 +3332,8 @@ mod tests {
         written: Arc<Mutex<Vec<u8>>>,
         stall: Option<Duration>,
     }
+
+    impl ScreenOut for StallingOnce {}
 
     impl Write for StallingOnce {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {

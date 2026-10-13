@@ -25,6 +25,7 @@ mod merged;
 mod network;
 mod pair;
 mod palette;
+mod pane;
 mod profile;
 mod prompt;
 mod prompts;

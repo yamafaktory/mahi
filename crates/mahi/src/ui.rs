@@ -26,8 +26,10 @@ use base64::Engine as _;
 use mahi_sandbox::{
     InputWait,
     TerminationSignals,
+    WindowSize,
 };
 use mahi_term::{
+    AgentFrame,
     AnsiBackend,
     Answer,
     Dialog,
@@ -63,7 +65,6 @@ const KEY_WAIT: Duration = Duration::from_millis(500);
 const ESC: u8 = 0x1b;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
-const CLEAR_FOR_AGENT: &[u8] = b"\x1b[H\x1b[2J\x1b[?25h";
 const LEAVE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l";
 
 static SHOWING: AtomicBool = AtomicBool::new(false);
@@ -85,15 +86,15 @@ pub(crate) fn keep_backdrop(frame: &Buffer) {
     }
 }
 
-/// Gives an agent a blank screen with the cursor shown at its top left when a full-screen
-/// view owns the terminal, so the agent does not draw over the view's last frame.
-pub(crate) fn clear_for_agent() -> io::Result<()> {
+/// Returns the size of the agent's terminal: the user's whole terminal, or, while the home
+/// screen owns it, the pane the agent is drawn in.
+pub(crate) fn agent_size() -> WindowSize {
+    let size = terminal::size();
     if !is_showing() {
-        return Ok(());
+        return size;
     }
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(CLEAR_FOR_AGENT)?;
-    stdout.flush()
+    let (rows, cols) = AgentFrame::agent_size(size.rows, size.cols);
+    WindowSize { rows, cols }
 }
 
 /// Says whether the terminal draws 24-bit colour, as `COLORTERM` tells; dialogs then draw
