@@ -37,7 +37,10 @@ use mahi_term::{
 use ratatui_core::terminal::Terminal;
 
 use crate::{
-    cli::Cli,
+    cli::{
+        Cli,
+        Command,
+    },
     environment::Environment,
     profile::Profile,
     remote::{
@@ -367,6 +370,7 @@ fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> Stri
         HomeAction::Land(thread) => vec!["land".to_owned(), thread],
         HomeAction::End(thread) => vec!["end".to_owned(), thread],
         HomeAction::Invite(thread) => vec!["invite".to_owned(), thread],
+        HomeAction::Purge(thread) => vec!["purge".to_owned(), thread],
         HomeAction::Join => vec!["join".to_owned()],
         HomeAction::Remote => return choose_remote(store),
         HomeAction::Card => vec!["id".to_owned()],
@@ -380,7 +384,14 @@ fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> Stri
         return format!("{shown} is not a command mahi knows");
     };
     eprintln!("› {shown}");
-    match run_command(command, environment) {
+    let code = match command {
+        Command::Purge(purge) => match crate::purge_unless_declined(&purge, environment) {
+            Some(code) => code,
+            None => return format!("{shown}: nothing was purged"),
+        },
+        command => run_command(command, environment),
+    };
+    match code {
         0 => format!("{shown}: done"),
         code => format!("{shown} failed with exit code {code}; see the activity"),
     }

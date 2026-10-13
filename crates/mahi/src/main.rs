@@ -353,15 +353,24 @@ fn merged(command: &cli::MergeCommand, environment: &Environment) -> i32 {
 
 /// Runs `mahi purge`, prints its report, and returns its exit code.
 fn purged(command: &cli::PurgeCommand, environment: &Environment) -> i32 {
-    match purge::purge(command, environment) {
+    purge_unless_declined(command, environment).unwrap_or_else(|| {
+        eprintln!("mahi: nothing was purged");
+        1
+    })
+}
+
+/// Runs `mahi purge`, prints its report, and returns its exit code, or `None` when the user
+/// declined the purge.
+pub(crate) fn purge_unless_declined(
+    command: &cli::PurgeCommand,
+    environment: &Environment,
+) -> Option<i32> {
+    Some(match purge::purge(command, environment) {
         Ok(purge::Purged::Done(done)) => {
             eprint!("{done}");
             0
         }
-        Ok(purge::Purged::Kept) => {
-            eprintln!("mahi: nothing was purged");
-            1
-        }
+        Ok(purge::Purged::Kept) => return None,
         Ok(purge::Purged::Failed(done, error)) => {
             eprint!("{done}");
             report(&error);
@@ -377,7 +386,7 @@ fn purged(command: &cli::PurgeCommand, environment: &Environment) -> i32 {
             report(&error);
             1
         }
-    }
+    })
 }
 
 /// Runs `mahi land`, prints its report, and returns its exit code.

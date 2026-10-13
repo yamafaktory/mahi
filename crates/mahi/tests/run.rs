@@ -1505,6 +1505,26 @@ cat parser.rs
     }
 
     #[test]
+    fn the_home_screen_purges_a_thread_once_the_purge_is_confirmed() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let worktree = fixture.thread_worktrees().pop().unwrap();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                (&thread, b"py"),
+                ("good.", b"n"),
+                (&format!("mahi purge {thread}: nothing was purged"), b"p"),
+                ("good.", b"y"),
+                (&format!("mahi purge {thread}: done"), b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(!worktree.exists(), "{output}");
+        assert_eq!(fixture.threads(), [format!("refs/threads/{thread}/meta")]);
+    }
+
+    #[test]
     fn a_paste_split_after_its_escape_closes_a_question_and_does_nothing_else() {
         let fixture = fixture();
         let (_thread, _claude) = worked_thread(&fixture);

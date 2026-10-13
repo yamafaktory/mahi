@@ -105,6 +105,8 @@ pub enum HomeAction {
     End(String),
     /// Invite a teammate to the thread.
     Invite(String),
+    /// Purge the thread here and on the remote; the purge asks first.
+    Purge(String),
     /// Join a thread with a pairing code.
     Join,
     /// Choose the remote threads are pushed to.
@@ -132,6 +134,7 @@ enum ThreadChoice {
     Resume,
     Land,
     End,
+    Purge,
     Invite,
 }
 
@@ -141,6 +144,7 @@ impl ThreadChoice {
             Self::Resume => "Resume: start your agent again where it stopped",
             Self::Land => "Land: merge its agents' work onto a branch for you to commit",
             Self::End => "End: save its work in a last snapshot and remove its worktrees",
+            Self::Purge => "Purge: delete it here and on the remote, for good",
             Self::Invite => {
                 "Invite: show a pairing code so a teammate can watch and prompt it live"
             }
@@ -243,6 +247,9 @@ impl Home {
             }
             PaletteInput::Text('l') => self.ask(selected, HomeAction::Land),
             PaletteInput::Text('e') => self.ask(selected, HomeAction::End),
+            PaletteInput::Text('p') => {
+                return selected.map(|row| HomeAction::Purge(row.thread.clone()));
+            }
             _ => {}
         }
         None
@@ -284,11 +291,16 @@ impl Home {
             self.note = Some("no thread is selected");
             return;
         };
-        let mut choices = Vec::with_capacity(4);
+        let mut choices = Vec::with_capacity(5);
         if row.owned {
             choices.push(ThreadChoice::Resume);
         }
-        choices.extend([ThreadChoice::Land, ThreadChoice::End, ThreadChoice::Invite]);
+        choices.extend([
+            ThreadChoice::Land,
+            ThreadChoice::End,
+            ThreadChoice::Invite,
+            ThreadChoice::Purge,
+        ]);
         let labels = choices
             .iter()
             .map(|choice| choice.label().to_owned())
@@ -328,7 +340,8 @@ impl Home {
         let lines = [
             "mahi runs coding agents in a sandbox. A thread is one piece of work: its agents, \
              each in its own worktree, and the history of what they did.",
-            "Ending a thread keeps its history; resuming brings its worktrees back.",
+            "Ending a thread keeps its history; resuming brings its worktrees back. Purging \
+             deletes it.",
         ];
         let rows = [
             ["tab", "switch", "move between the menu and the threads"],
@@ -349,6 +362,11 @@ impl Home {
                 "e",
                 "end",
                 "save its work in a snapshot and remove its worktrees",
+            ],
+            [
+                "p",
+                "purge",
+                "delete the thread here and on the remote, for good",
             ],
             [
                 "i",
@@ -387,6 +405,7 @@ impl Home {
                 match choices.get(index)? {
                     ThreadChoice::Resume => Some(HomeAction::Resume(thread)),
                     ThreadChoice::Invite => Some(HomeAction::Invite(thread)),
+                    ThreadChoice::Purge => Some(HomeAction::Purge(thread)),
                     ThreadChoice::Land => {
                         self.ask_for(thread, HomeAction::Land);
                         None
@@ -557,6 +576,7 @@ impl Home {
                 ("r", "resume"),
                 ("l", "land"),
                 ("e", "end"),
+                ("p", "purge"),
                 ("i", "invite"),
             ])),
         ])
@@ -792,6 +812,7 @@ mod tests {
             "r       resume  start your agent in the thread again where it stopped",
             "i       invite  show a code so a teammate can watch and prompt it live",
             "u       card    show the line a thread's owner invites you with",
+            "p       purge   delete the thread here and on the remote, for good",
             "q esc   quit    leave mahi",
         ] {
             assert!(narrow.contains(row), "{narrow}");
@@ -835,6 +856,16 @@ mod tests {
             home.key(PaletteInput::Text('3'), &rows),
             Some(HomeAction::Invite("t2".to_owned()))
         );
+        home.key(PaletteInput::Enter, &rows);
+        assert_eq!(
+            home.key(PaletteInput::Text('4'), &rows),
+            Some(HomeAction::Purge("t2".to_owned()))
+        );
+        assert_eq!(
+            home.key(PaletteInput::Text('p'), &rows),
+            Some(HomeAction::Purge("t2".to_owned()))
+        );
+        assert!(keys(&mut Home::default(), &[], "p").is_empty());
     }
 
     #[test]
@@ -875,7 +906,7 @@ mod tests {
     fn pasted_text_is_never_a_key() {
         let rows = rows();
         let mut home = Home::default();
-        for c in "nrleijmuq?".chars() {
+        for c in "nrleipjmuq?".chars() {
             assert_eq!(home.key(PaletteInput::Pasted(c), &rows), None);
         }
         assert!(!home.has_dialog());

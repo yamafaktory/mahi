@@ -76,7 +76,7 @@ sandbox cannot start Windows programs. CI runs mahi's tests inside WSL 2.
 
 ```sh
 cd my-project                 # any git repository
-mahi                          # the home screen: your threads, and keys to start, resume, land or end them
+mahi                          # the home screen: your threads, and keys to start, resume, land, end or purge them
 mahi run claude               # run an agent in a sandbox, in a new thread
 mahi threads                  # list this repository's threads
 mahi resume <thread>          # pick a thread up again, with the same agent
