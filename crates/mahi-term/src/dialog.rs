@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cell,
     fmt,
 };
 
@@ -114,6 +115,8 @@ enum Kind {
     Table {
         header: [String; 3],
         rows: Vec<[String; 3]>,
+        offset: usize,
+        last_offset: cell::Cell<usize>,
     },
     Notice,
     Confirm {
@@ -180,7 +183,16 @@ impl Dialog {
         header: [String; 3],
         rows: Vec<[String; 3]>,
     ) -> Self {
-        Self::with(title, lines, Kind::Table { header, rows })
+        Self::with(
+            title,
+            lines,
+            Kind::Table {
+                header,
+                rows,
+                offset: 0,
+                last_offset: cell::Cell::new(usize::MAX),
+            },
+        )
     }
 
     /// Makes a dialog that shows `lines` while mahi works, answering no key: what a command
@@ -235,9 +247,23 @@ impl Dialog {
             return Some(Answer::Cancelled);
         }
         match &mut self.kind {
-            Kind::Message | Kind::Table { .. } => {
-                (input == PaletteInput::Enter).then_some(Answer::Ok)
-            }
+            Kind::Message => (input == PaletteInput::Enter).then_some(Answer::Ok),
+            Kind::Table {
+                offset,
+                last_offset,
+                ..
+            } => match input {
+                PaletteInput::Up | PaletteInput::Text('k') => {
+                    *offset = (*offset).min(last_offset.get()).saturating_sub(1);
+                    None
+                }
+                PaletteInput::Down | PaletteInput::Text('j') => {
+                    *offset = (*offset + 1).min(last_offset.get());
+                    None
+                }
+                PaletteInput::Enter => Some(Answer::Ok),
+                _ => None,
+            },
             Kind::Notice => None,
             Kind::Confirm { yes } => match input {
                 PaletteInput::Text('y' | 'Y') => Some(Answer::Confirmed(true)),
@@ -304,9 +330,9 @@ impl Dialog {
             Kind::Choose { items, .. } => items.len() + 1,
             Kind::Table { rows, .. } => rows.len() + 2,
         };
-        let hints = self.hints();
         let tight = text_rows + extra_rows + 3;
         let room = usize::from(area.height.saturating_sub(2));
+        let hints = self.hints(tight > room);
         let gap = u16::from(!hints.is_empty() && tight < room);
         let wanted = tight + usize::from(gap);
         let height = u16::try_from(wanted)
@@ -334,9 +360,21 @@ impl Dialog {
         let inner = block.inner(boxed);
         block.render(boxed, buffer);
         let extra = u16::try_from(extra_rows).unwrap_or(u16::MAX);
+        let [words_size, below_size] = if matches!(self.kind, Kind::Table { .. }) {
+            [
+                Constraint::Length(
+                    u16::try_from(text_rows)
+                        .unwrap_or(u16::MAX)
+                        .min(inner.height.saturating_sub(gap + 4)),
+                ),
+                Constraint::Fill(1),
+            ]
+        } else {
+            [Constraint::Fill(1), Constraint::Max(extra)]
+        };
         let [words, below, _, hints_area] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Max(extra),
+            words_size,
+            below_size,
             Constraint::Length(gap),
             Constraint::Length(1),
         ])
@@ -355,7 +393,7 @@ impl Dialog {
                 .enumerate()
                 .map(|(index, item)| digits(index + 1) + Span::raw(shown(item)).width() + 7)
                 .max(),
-            Kind::Table { header, rows } => {
+            Kind::Table { header, rows, .. } => {
                 let [first, second, third] = column_widths(header, rows);
                 Some(first + second + third + 2 * TABLE_GAP + 4)
             }
@@ -370,16 +408,28 @@ impl Dialog {
         let [_, rest] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
         match &self.kind {
             Kind::Message | Kind::Notice => {}
-            Kind::Table { header, rows } => {
+            Kind::Table {
+                header,
+                rows,
+                offset,
+                last_offset,
+            } => {
+                let shown_rows = usize::from(rest.height.saturating_sub(1));
+                let last = rows.len().saturating_sub(shown_rows);
+                last_offset.set(last);
+                let first = (*offset).min(last);
                 let widths = column_widths(header, rows)
                     .map(|width| Constraint::Length(u16::try_from(width).unwrap_or(u16::MAX)));
                 Widget::render(
-                    Table::new(rows.iter().map(table_row), widths)
-                        .header(
-                            Row::new(header.iter().map(|name| Cell::from(shown(name))))
-                                .style(Theme::muted()),
-                        )
-                        .column_spacing(u16::try_from(TABLE_GAP).unwrap_or(1)),
+                    Table::new(
+                        rows.iter().skip(first).take(shown_rows).map(table_row),
+                        widths,
+                    )
+                    .header(
+                        Row::new(header.iter().map(|name| Cell::from(shown(name))))
+                            .style(Theme::muted()),
+                    )
+                    .column_spacing(u16::try_from(TABLE_GAP).unwrap_or(1)),
                     rest,
                     buffer,
                 );
@@ -419,8 +469,9 @@ impl Dialog {
         }
     }
 
-    fn hints(&self) -> Vec<Span<'static>> {
+    fn hints(&self, cramped: bool) -> Vec<Span<'static>> {
         let pairs: &[(&str, &str)] = match self.kind {
+            Kind::Table { .. } if cramped => &[("↑↓ jk", "scroll"), ("enter", "close")],
             Kind::Message | Kind::Table { .. } => &[("enter", "close")],
             Kind::Notice => &[],
             Kind::Confirm { .. } => &[
@@ -711,6 +762,98 @@ mod tests {
     }
 
     #[test]
+    fn a_table_taller_than_the_screen_keeps_its_text_and_scrolls_its_rows() {
+        let mut dialog = Dialog::table(
+            "Help",
+            vec!["What the keys do".to_owned()],
+            ["key", "action", "what it does"].map(str::to_owned),
+            (0..30)
+                .map(|row| [format!("k{row}"), "act".to_owned(), format!("row {row}")])
+                .collect(),
+        );
+        let area = Rect::new(0, 0, 80, 24);
+        let draw = |dialog: &Dialog| {
+            let mut buffer = Buffer::empty(area);
+            dialog.render(area, &mut buffer);
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect::<String>()
+        };
+        let top = draw(&dialog);
+        for wanted in [
+            "What the keys do",
+            "key",
+            "row 0 ",
+            "↑↓ jk scroll",
+            "enter close",
+        ] {
+            assert!(top.contains(wanted), "{wanted}: {top}");
+        }
+        assert!(!top.contains("row 29"), "{top}");
+        assert!(top.contains("row 15") && !top.contains("row 16"), "{top}");
+        for _ in 0..40 {
+            assert_eq!(dialog.key(PaletteInput::Text('j')), None);
+        }
+        let bottom = draw(&dialog);
+        assert!(bottom.contains("row 29"), "{bottom}");
+        assert!(!bottom.contains("row 0 "), "{bottom}");
+        assert!(bottom.contains("What the keys do"), "{bottom}");
+        dialog.key(PaletteInput::Up);
+        let up = draw(&dialog);
+        assert!(!up.contains("row 29"), "{up}");
+        assert!(up.contains("row 28"), "{up}");
+        for _ in 0..40 {
+            dialog.key(PaletteInput::Text('k'));
+        }
+        assert_eq!(draw(&dialog), top);
+        let short = Rect::new(0, 0, 80, 9);
+        let mut buffer = Buffer::empty(short);
+        dialog.render(short, &mut buffer);
+        let cramped: String = (0..short.height)
+            .map(|y| {
+                (0..short.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            cramped.contains("row 0 ") && cramped.contains("scroll"),
+            "{cramped}"
+        );
+        for _ in 0..40 {
+            dialog.key(PaletteInput::Down);
+        }
+        let tall = Rect::new(0, 0, 80, 30);
+        let mut buffer = Buffer::empty(tall);
+        dialog.render(tall, &mut buffer);
+        let grown: String = (0..tall.height)
+            .map(|y| {
+                (0..tall.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(grown.contains("row 29"), "{grown}");
+        dialog.key(PaletteInput::Up);
+        let mut buffer = Buffer::empty(tall);
+        dialog.render(tall, &mut buffer);
+        let moved: String = (0..tall.height)
+            .map(|y| {
+                (0..tall.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(!moved.contains("row 29"), "{moved}");
+        assert_eq!(dialog.key(PaletteInput::Enter), Some(Answer::Ok));
+    }
+
+    #[test]
     fn a_table_lines_up_its_columns_widens_to_fit_and_closes_on_enter() {
         let about = "a description long enough to need more than the usual width of a dialog";
         let mut dialog = Dialog::table(
@@ -749,6 +892,7 @@ mod tests {
             "{screen}"
         );
         assert!(rows[last + 2].contains("enter close"), "{screen}");
+        assert!(!screen.contains("scroll"), "{screen}");
         assert_eq!(dialog.key(PaletteInput::Text('q')), None);
         assert_eq!(dialog.key(PaletteInput::Enter), Some(Answer::Ok));
     }
