@@ -304,7 +304,11 @@ impl Dialog {
             Kind::Choose { items, .. } => items.len() + 1,
             Kind::Table { rows, .. } => rows.len() + 2,
         };
-        let wanted = text_rows + extra_rows + 3;
+        let hints = self.hints();
+        let tight = text_rows + extra_rows + 3;
+        let room = usize::from(area.height.saturating_sub(2));
+        let gap = u16::from(!hints.is_empty() && tight < room);
+        let wanted = tight + usize::from(gap);
         let height = u16::try_from(wanted)
             .unwrap_or(u16::MAX)
             .min(area.height.saturating_sub(2))
@@ -330,9 +334,10 @@ impl Dialog {
         let inner = block.inner(boxed);
         block.render(boxed, buffer);
         let extra = u16::try_from(extra_rows).unwrap_or(u16::MAX);
-        let [words, below, hints] = Layout::vertical([
+        let [words, below, _, hints_area] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Max(extra),
+            Constraint::Length(gap),
             Constraint::Length(1),
         ])
         .areas(inner);
@@ -340,7 +345,7 @@ impl Dialog {
             .wrap(Wrap { trim: false })
             .render(words, buffer);
         self.render_below(below, buffer);
-        Line::from(self.hints()).render(hints, buffer);
+        Line::from(hints).render(hints_area, buffer);
     }
 
     fn wanted_width(&self) -> u16 {
@@ -734,7 +739,16 @@ mod tests {
             screen.contains(&format!("q esc  quit    {about}")),
             "{screen}"
         );
-        assert!(screen.contains("enter close"), "{screen}");
+        let rows: Vec<&str> = screen.lines().collect();
+        let last = rows
+            .iter()
+            .position(|row| row.contains("q esc  quit"))
+            .unwrap();
+        assert!(
+            rows[last + 1].trim_matches([' ', '│']).is_empty(),
+            "{screen}"
+        );
+        assert!(rows[last + 2].contains("enter close"), "{screen}");
         assert_eq!(dialog.key(PaletteInput::Text('q')), None);
         assert_eq!(dialog.key(PaletteInput::Enter), Some(Answer::Ok));
     }
@@ -796,6 +810,10 @@ mod tests {
             ["key", "action", "what it does"].map(str::to_owned),
             vec![["q esc", "quit", "leave mahi"].map(str::to_owned); 30],
         );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 7));
+        input.render(buffer.area, &mut buffer);
+        let short: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(short.contains('›'), "{short}");
         for dialog in [input, table] {
             for (width, height) in [(0, 0), (1, 1), (6, 3), (20, 5)] {
                 let area = Rect::new(0, 0, width, height);
