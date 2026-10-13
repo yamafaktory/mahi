@@ -259,7 +259,7 @@ impl Dialog {
     /// Draws the dialog centred in `area`, over whatever is drawn there, sized to its text as
     /// wrapped, with a list that scrolls to its selected item.
     pub fn render(&self, area: Rect, buffer: &mut Buffer) {
-        let width = area.width.saturating_sub(4).min(MAX_WIDTH);
+        let width = area.width.saturating_sub(4).min(self.wanted_width());
         let text_width = usize::from(width.saturating_sub(4)).max(1);
         let text: Vec<Line<'_>> = self
             .lines
@@ -315,6 +315,20 @@ impl Dialog {
         Line::from(self.hints()).render(hints, buffer);
     }
 
+    fn wanted_width(&self) -> u16 {
+        let Kind::Choose { items, .. } = &self.kind else {
+            return MAX_WIDTH;
+        };
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| digits(index + 1) + Span::raw(shown(item)).width() + 7)
+            .max()
+            .map_or(MAX_WIDTH, |widest| {
+                u16::try_from(widest).unwrap_or(u16::MAX).max(MAX_WIDTH)
+            })
+    }
+
     fn render_below(&self, area: Rect, buffer: &mut Buffer) {
         let [_, rest] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
         match &self.kind {
@@ -341,9 +355,12 @@ impl Dialog {
                 .render(rest, buffer);
             }
             Kind::Choose { items, selected } => {
-                let list = List::new(items.iter().enumerate().map(|(index, item)| {
-                    ListItem::new(format!(" {} {} ", index + 1, shown(item)))
-                }))
+                let list = List::new(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| ListItem::new(choice(index, item))),
+                )
                 .highlight_style(Theme::selected());
                 let mut state = ListState::default().with_selected(Some(*selected));
                 StatefulWidget::render(list, rest, buffer, &mut state);
@@ -380,6 +397,14 @@ pub fn key_hints(pairs: &[(&str, &str)]) -> Vec<Span<'static>> {
         spans.push(Span::styled(format!(" {what}"), Theme::muted()));
     }
     spans
+}
+
+fn digits(number: usize) -> usize {
+    number.checked_ilog10().map_or(1, |log| log as usize + 1)
+}
+
+fn choice(index: usize, item: &str) -> Line<'static> {
+    Line::from(format!(" {} {} ", index + 1, shown(item)))
 }
 
 fn button(label: &str, on: bool) -> Span<'static> {
@@ -533,6 +558,30 @@ mod tests {
             confirm.key(PaletteInput::Enter),
             Some(Answer::Confirmed(false))
         );
+    }
+
+    #[test]
+    fn a_list_widens_to_show_its_longest_choice_on_a_wide_screen() {
+        let key = "SHA256:9lCADCGWTRLnYe6Xfuxf/iM1fm8hgVyG6H4+uAqsdLE someone@a-long-host.example";
+        let dialog = Dialog::choose("mahi asks", vec![], vec![key.to_owned()]);
+        let area = Rect::new(0, 0, 120, 12);
+        let mut buffer = Buffer::empty(area);
+        dialog.render(area, &mut buffer);
+        let screen: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(screen.contains(key), "{screen}");
+        assert_eq!(
+            [digits(1), digits(9), digits(10), digits(100)],
+            [1, 1, 2, 3]
+        );
+        let narrow = Rect::new(0, 0, 40, 12);
+        let mut buffer = Buffer::empty(narrow);
+        dialog.render(narrow, &mut buffer);
     }
 
     #[test]
