@@ -34,6 +34,7 @@ use mahi_term::{
     PaletteInput,
     PaletteKeys,
 };
+use mahi_thread::ParticipantKey;
 use ratatui_core::terminal::Terminal;
 
 use crate::{
@@ -108,8 +109,10 @@ pub(crate) fn home(environment: &Environment) -> i32 {
     let mut home = Home::default();
     let mut status = String::new();
     let outcome = loop {
+        let own = threads::own_key(environment);
         let place = Place {
             store: &store,
+            own: own.as_ref(),
             repository: &repository,
             identity: &identity,
             captured: captured.as_ref(),
@@ -146,6 +149,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
 /// What the home screen shows around its threads.
 struct Place<'a> {
     store: &'a Store,
+    own: Option<&'a ParticipantKey>,
     repository: &'a str,
     identity: &'a str,
     captured: Option<&'a Captured>,
@@ -213,7 +217,7 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
     let mut terminal = Terminal::new(AnsiBackend::new(io::stdout(), size.rows, size.cols))?;
     terminal.clear()?;
     let mut keys = PaletteKeys::default();
-    let mut rows = rows(place.store);
+    let mut rows = rows(place.store, place.own);
     let mut remote = remote::summary(place.store);
     home.fit(&rows);
     let mut activity = activity(place.captured);
@@ -224,7 +228,7 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
     let mut ignore_until = None;
     loop {
         if read_at.elapsed() >= REREAD {
-            let fresh = self::rows(place.store);
+            let fresh = self::rows(place.store, place.own);
             if fresh != rows {
                 rows = fresh;
                 home.fit(&rows);
@@ -354,8 +358,8 @@ fn read_input(buffer: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn rows(store: &Store) -> Vec<HomeRow> {
-    threads::home_rows(store).unwrap_or_default()
+fn rows(store: &Store, own: Option<&ParticipantKey>) -> Vec<HomeRow> {
+    threads::home_rows(store, own).unwrap_or_default()
 }
 
 /// Runs the chosen action as its command does, without leaving the alternate screen, and

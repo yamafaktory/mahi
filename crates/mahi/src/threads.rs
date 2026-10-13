@@ -14,16 +14,25 @@ use mahi_core::{
     RefKind,
     ThreadId,
 };
+use mahi_identity::{
+    ConfigDir,
+    SigningKey,
+};
 use mahi_store::{
     Store,
     StoreError,
 };
 use mahi_term::HomeRow;
-use mahi_thread::remembered_owner;
+use mahi_thread::{
+    ParticipantKey,
+    remembered_owner,
+};
 use thiserror::Error;
 
 use crate::{
+    environment::Environment,
     landed_branch::BranchRecord,
+    purge,
     session,
 };
 
@@ -40,23 +49,49 @@ pub(crate) enum ThreadsError {
 struct ThreadSummary {
     agents: BTreeSet<AgentSlot>,
     worktree: bool,
+    purged: bool,
+    leftover: bool,
 }
 
-/// Returns the repository's threads as the home screen lists them; a thread whose remembered
-/// owner cannot be read counts as a teammate's.
-pub(crate) fn home_rows(store: &Store) -> Result<Vec<HomeRow>, StoreError> {
-    Ok(summarise(store)?
+/// Returns the user's own key, which signs the threads they own, when mahi is set up.
+pub(crate) fn own_key(environment: &Environment) -> Option<ParticipantKey> {
+    let config = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )
+    .ok()?;
+    let signing = SigningKey::load(&config.signing_key_file()).ok()?;
+    ParticipantKey::from_public_key(signing.public_key()).ok()
+}
+
+/// Returns the repository's threads as the home screen lists them, leaving out a thread purged
+/// here; a thread whose remembered owner cannot be read counts as a teammate's.
+pub(crate) fn home_rows(
+    store: &Store,
+    own: Option<&ParticipantKey>,
+) -> Result<Vec<HomeRow>, StoreError> {
+    Ok(summarise(store, own)?
         .into_iter()
         .map(|(thread, summary)| HomeRow {
             thread: thread.to_string(),
-            agents: agents_of(&summary),
+            agents: agents_of(&summary, None),
             worktree: summary.worktree,
             owned: matches!(remembered_owner(store, thread), Ok(None)),
         })
         .collect())
 }
 
-fn agents_of(summary: &ThreadSummary) -> String {
+/// Lists a thread's agents, or says it was purged by its owner and how to purge what is left
+/// here: with `mahi purge` when the `thread` is given, for the command line.
+fn agents_of(summary: &ThreadSummary, thread: Option<ThreadId>) -> String {
+    if summary.purged {
+        return match thread {
+            Some(thread) => {
+                format!("purged by its owner; mahi purge {thread} removes what is left here")
+            }
+            None => "purged by its owner; purging removes what is left here".to_owned(),
+        };
+    }
     if summary.agents.is_empty() {
         return "no agent".to_owned();
     }
@@ -71,19 +106,20 @@ fn agents_of(summary: &ThreadSummary) -> String {
 }
 
 /// Lists the threads of the repository around the current directory, with their agents and
-/// whether their worktree is still there. Reads no encrypted content.
-pub(crate) fn threads() -> Result<String, ThreadsError> {
+/// whether their worktree is still there, leaving out a thread purged here. Reads no encrypted
+/// content.
+pub(crate) fn threads(environment: &Environment) -> Result<String, ThreadsError> {
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(ThreadsError::CurrentDirectory)?;
     let store = Store::discover(&cwd)?;
-    let summaries = summarise(&store)?;
+    let summaries = summarise(&store, own_key(environment).as_ref())?;
     if summaries.is_empty() {
         return Ok("no threads in this repository\n".to_owned());
     }
     let mut listing = String::new();
     for (thread, summary) in summaries {
-        let agents = agents_of(&summary);
+        let agents = agents_of(&summary, Some(thread));
         let worktree = if summary.worktree {
             "worktree"
         } else {
@@ -103,10 +139,17 @@ pub(crate) fn threads() -> Result<String, ThreadsError> {
     Ok(listing)
 }
 
-/// Groups the repository's thread refs by thread, keeping only threads that have a `meta` ref.
-fn summarise(store: &Store) -> Result<BTreeMap<ThreadId, ThreadSummary>, StoreError> {
+/// Groups the repository's thread refs by thread, keeping only threads that have a `meta` ref
+/// and leaving out those whose `meta` is the owner's tombstone with nothing else left here: no
+/// other ref, fetched ref, worktree or agents' state.
+/// The owner of a thread with no remembered owner is `own`, the user.
+fn summarise(
+    store: &Store,
+    own: Option<&ParticipantKey>,
+) -> Result<BTreeMap<ThreadId, ThreadSummary>, StoreError> {
     let mut with_meta = BTreeMap::new();
     let mut agents: BTreeMap<ThreadId, BTreeSet<AgentSlot>> = BTreeMap::new();
+    let mut with_state = BTreeSet::new();
     for (thread_ref, _) in store.thread_refs()? {
         let thread = thread_ref.thread();
         match thread_ref.kind() {
@@ -116,14 +159,36 @@ fn summarise(store: &Store) -> Result<BTreeMap<ThreadId, ThreadSummary>, StoreEr
             RefKind::Snapshots(slot) | RefKind::Transcript(slot) | RefKind::Session(slot) => {
                 agents.entry(thread).or_default().insert(slot.clone());
             }
-            RefKind::State => {}
+            RefKind::State => {
+                with_state.insert(thread);
+            }
         }
     }
     for (thread, summary) in &mut with_meta {
         summary.agents = agents.remove(thread).unwrap_or_default();
         summary.worktree = session::has_thread_worktree(store, *thread)?;
+        summary.purged = purged(store, *thread, own);
+        summary.leftover = summary.purged
+            && (!summary.agents.is_empty()
+                || summary.worktree
+                || with_state.contains(thread)
+                || !store
+                    .fetched_refs(*thread)
+                    .is_ok_and(|refs| refs.is_empty())
+                || session::state_root(store, *thread).exists());
     }
+    with_meta.retain(|_, summary| !summary.purged || summary.leftover);
     Ok(with_meta)
+}
+
+fn purged(store: &Store, thread: ThreadId, own: Option<&ParticipantKey>) -> bool {
+    let Ok(remembered) = remembered_owner(store, thread) else {
+        return false;
+    };
+    remembered
+        .as_ref()
+        .or(own)
+        .is_some_and(|owner| purge::ended_here(store, thread, owner))
 }
 
 #[cfg(test)]
@@ -162,7 +227,7 @@ mod tests {
         ] {
             store.append(&thread_ref, None, tree, "test").unwrap();
         }
-        let summaries = summarise(&store).unwrap();
+        let summaries = summarise(&store, None).unwrap();
         assert_eq!(summaries.len(), 1);
         let summary = &summaries[&listed];
         assert_eq!(summary.agents.iter().collect::<Vec<_>>(), [&alice, &bob]);

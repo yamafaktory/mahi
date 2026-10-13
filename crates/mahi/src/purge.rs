@@ -398,12 +398,14 @@ fn signed_by(store: &Store, thread: ThreadId, key: &ParticipantKey) -> bool {
         .is_some_and(|encoded| MetaDocument::decode(&encoded, thread, key).is_ok())
 }
 
-fn ended_here(store: &Store, thread: ThreadId, owner: &ParticipantKey) -> bool {
+/// Returns whether the thread's `meta` here is the tombstone `owner` signed when they purged it.
+pub(crate) fn ended_here(store: &Store, thread: ThreadId, owner: &ParticipantKey) -> bool {
     read_meta(store, thread).is_some_and(|encoded| {
-        matches!(
-            MetaDocument::decode(&encoded, thread, owner),
-            Ok(MetaDocument::Purged(_))
-        )
+        MetaDocument::claims_purged(&encoded)
+            && matches!(
+                MetaDocument::decode(&encoded, thread, owner),
+                Ok(MetaDocument::Purged(_))
+            )
     })
 }
 

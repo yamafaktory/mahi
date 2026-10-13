@@ -544,6 +544,16 @@ impl MetaDocument {
         VerifiedMeta::decode_body(envelope.body, thread, trusted_owner).map(Self::Live)
     }
 
+    /// Returns whether `encoded` says it is a tombstone, without checking its signature or
+    /// anything else, so a caller can skip [`MetaDocument::decode`] for a live document; only
+    /// that decode tells whether the thread was purged.
+    #[must_use]
+    pub fn claims_purged(encoded: &[u8]) -> bool {
+        encoded.len() <= MAX_META_BYTES
+            && decode_exact::<WireEnvelope<'_>>(encoded)
+                .is_ok_and(|envelope| envelope.version == TOMBSTONE_VERSION)
+    }
+
     /// Returns the thread the document describes.
     #[must_use]
     pub fn thread(&self) -> ThreadId {
@@ -1011,6 +1021,22 @@ mod tests {
     fn body_of(encoded: &[u8]) -> Vec<u8> {
         let envelope: WireEnvelope<'_> = postcard::from_bytes(encoded).unwrap();
         envelope.body.to_vec()
+    }
+
+    #[test]
+    fn only_a_tombstone_claims_to_be_one_and_the_claim_is_not_checked() {
+        let alice = Person::new("alice");
+        let draft = draft(&alice, &[]);
+        let encoded = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
+        let live = VerifiedMeta::decode(&encoded, draft.thread, &alice.key()).unwrap();
+        let tombstone = Tombstone::sign(&live, &alice.private).unwrap();
+        assert!(MetaDocument::claims_purged(&tombstone));
+        assert!(!MetaDocument::claims_purged(&encoded));
+        assert!(!MetaDocument::claims_purged(b"not a document"));
+        assert!(!MetaDocument::claims_purged(&[]));
+        let mut longer = tombstone.clone();
+        longer.push(0);
+        assert!(!MetaDocument::claims_purged(&longer));
     }
 
     #[test]

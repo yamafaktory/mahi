@@ -1516,7 +1516,8 @@ cat parser.rs
                 ("good.", b"n"),
                 (&format!("mahi purge {thread}: nothing was purged"), b"p"),
                 ("good.", b"y"),
-                (&format!("mahi purge {thread}: done"), b"q"),
+                (&format!("mahi purge {thread}: done"), b""),
+                ("Threads · 0", b"q"),
             ],
         );
         assert_eq!(code, 0, "{output}");
@@ -2596,6 +2597,38 @@ cat parser.rs
         }
         assert!(!worktree.exists());
         assert_eq!(fixture.threads(), [format!("refs/threads/{thread}/meta")]);
+        let listed = fixture.mahi(&["threads"]);
+        assert_eq!(
+            String::from_utf8_lossy(&listed.stdout),
+            "no threads in this repository\n"
+        );
+        let store = Store::open(&fixture.repo).unwrap();
+        let left = ThreadRef::new(
+            thread.parse().unwrap(),
+            RefKind::Snapshots(AgentSlot::new(
+                ParticipantName::new("bob").unwrap(),
+                AgentName::new("codex").unwrap(),
+            )),
+        );
+        let tree = store.write_tree(&[]).unwrap();
+        let state = ThreadRef::new(thread.parse().unwrap(), RefKind::State);
+        let kept = store.append(&state, None, tree, "state").unwrap();
+        let listed = fixture.mahi(&["threads"]);
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            listed.starts_with(&format!(
+                "{thread}  purged by its owner; mahi purge {thread} removes what is left here"
+            )),
+            "{listed}"
+        );
+        store.remove(&state, kept).unwrap();
+        store.append(&left, None, tree, "left").unwrap();
+        let listed = fixture.mahi(&["threads"]);
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            listed.starts_with(&format!("{thread}  purged by its owner")),
+            "{listed}"
+        );
         let (code, output) = in_terminal(&fixture, &["resume", &thread], None);
         assert_eq!(code, 1, "{output}");
         let again = fixture.mahi(&["purge", &thread, "--yes"]);
