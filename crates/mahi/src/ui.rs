@@ -420,6 +420,20 @@ fn cancelled() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "the question was cancelled")
 }
 
+#[cfg(not(target_vendor = "apple"))]
+fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    Ok(rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?)
+}
+
+#[cfg(target_vendor = "apple")]
+fn cloexec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (reader, writer) = rustix::pipe::pipe()?;
+    for end in [&reader, &writer] {
+        rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC)?;
+    }
+    Ok((reader, writer))
+}
+
 /// Sends what mahi writes to standard error into the activity while it lives, so commands run
 /// from a full-screen view do not write over it; standard error is put back when it ends.
 #[derive(Debug)]
@@ -432,7 +446,7 @@ pub(crate) struct Captured {
 impl Captured {
     pub(crate) fn start() -> io::Result<Self> {
         let saved = io::stderr().as_fd().try_clone_to_owned()?;
-        let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        let (reader, writer) = cloexec_pipe()?;
         rustix::stdio::dup2_stderr(&writer)?;
         drop(writer);
         if let Ok(mut kept) = SAVED_STDERR.lock() {
@@ -507,6 +521,15 @@ fn collect(reader: OwnedFd, lines: &Mutex<Vec<String>>, generation: &AtomicU64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_ends_of_the_capture_pipe_close_on_exec() {
+        let (reader, writer) = cloexec_pipe().unwrap();
+        for end in [&reader, &writer] {
+            let flags = rustix::io::fcntl_getfd(end).unwrap();
+            assert!(flags.contains(rustix::io::FdFlags::CLOEXEC));
+        }
+    }
 
     #[test]
     fn only_the_tail_of_a_paste_whose_start_is_missing_is_dropped() {
