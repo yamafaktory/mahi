@@ -214,7 +214,7 @@ impl Dialog {
                 PaletteInput::Tab
                 | PaletteInput::Up
                 | PaletteInput::Down
-                | PaletteInput::Text('h' | 'l') => {
+                | PaletteInput::Text('h' | 'j' | 'k' | 'l') => {
                     *yes = !*yes;
                     None
                 }
@@ -236,11 +236,11 @@ impl Dialog {
                 _ => None,
             },
             Kind::Choose { items, selected } => match input {
-                PaletteInput::Up => {
+                PaletteInput::Up | PaletteInput::Text('k') => {
                     *selected = selected.saturating_sub(1);
                     None
                 }
-                PaletteInput::Down if *selected + 1 < items.len() => {
+                PaletteInput::Down | PaletteInput::Text('j') if *selected + 1 < items.len() => {
                     *selected += 1;
                     None
                 }
@@ -362,7 +362,7 @@ impl Dialog {
                 ("esc", "cancel"),
             ],
             Kind::Input { .. } => &[("enter", "done"), ("esc", "cancel")],
-            Kind::Choose { .. } => &[("↑↓", "move"), ("enter", "pick"), ("esc", "cancel")],
+            Kind::Choose { .. } => &[("↑↓ jk", "move"), ("enter", "pick"), ("esc", "cancel")],
         };
         key_hints(pairs)
     }
@@ -507,6 +507,32 @@ mod tests {
         );
         let mut empty = Dialog::choose("Nothing", vec![], Vec::new());
         assert_eq!(empty.key(PaletteInput::Enter), None);
+    }
+
+    #[test]
+    fn vim_keys_move_through_a_list_and_toggle_a_confirmation() {
+        let items = vec!["claude".to_owned(), "codex".to_owned()];
+        let mut dialog = Dialog::choose("New thread", vec![], items);
+        assert_eq!(dialog.key(PaletteInput::Text('j')), None);
+        assert_eq!(dialog.key(PaletteInput::Text('j')), None);
+        assert_eq!(dialog.key(PaletteInput::Enter), Some(Answer::Choice(1)));
+        assert_eq!(dialog.key(PaletteInput::Text('k')), None);
+        assert_eq!(dialog.key(PaletteInput::Text('k')), None);
+        assert_eq!(dialog.key(PaletteInput::Enter), Some(Answer::Choice(0)));
+        assert_eq!(dialog.key(PaletteInput::Pasted('j')), None);
+        assert_eq!(dialog.key(PaletteInput::Enter), Some(Answer::Choice(0)));
+        assert!(drawn(&dialog).contains("↑↓ jk move"));
+        let mut confirm = Dialog::confirm("Land", vec![]);
+        assert_eq!(confirm.key(PaletteInput::Text('j')), None);
+        assert_eq!(
+            confirm.key(PaletteInput::Enter),
+            Some(Answer::Confirmed(true))
+        );
+        assert_eq!(confirm.key(PaletteInput::Text('k')), None);
+        assert_eq!(
+            confirm.key(PaletteInput::Enter),
+            Some(Answer::Confirmed(false))
+        );
     }
 
     #[test]

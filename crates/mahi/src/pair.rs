@@ -220,7 +220,7 @@ fn show_code(prompt: &mut TerminalPrompt, code: &PairingCode) -> Result<(), Pair
     say(prompt, &format!("Pairing code: {code}"))?;
     say(
         prompt,
-        "Tell it to your teammate, who runs mahi join (or presses j on mahi's home screen) in a \
+        "Tell it to your teammate, who runs mahi join (or presses c on mahi's home screen) in a \
          clone of this project and types it. Waiting up to 10 minutes; Ctrl-C stops.",
     )
 }

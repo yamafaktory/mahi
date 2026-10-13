@@ -51,7 +51,7 @@ use crate::{
 const MENU: [(&str, &str); 6] = [
     ("Threads", "t"),
     ("New thread", "n"),
-    ("Join with a code", "j"),
+    ("Join with a code", "c"),
     ("Remote", "m"),
     ("Help", "?"),
     ("Quit", "q"),
@@ -211,8 +211,8 @@ impl Home {
                     Focus::Threads => Focus::Menu,
                 };
             }
-            PaletteInput::Up => self.move_by(false, rows.len()),
-            PaletteInput::Down => self.move_by(true, rows.len()),
+            PaletteInput::Up | PaletteInput::Text('k') => self.move_by(false, rows.len()),
+            PaletteInput::Down | PaletteInput::Text('j') => self.move_by(true, rows.len()),
             PaletteInput::Enter => {
                 return match self.focus {
                     Focus::Menu => self.activate(self.menu, rows),
@@ -224,7 +224,7 @@ impl Home {
             }
             PaletteInput::Text('t') => self.focus = Focus::Threads,
             PaletteInput::Text('n') => return Some(HomeAction::New),
-            PaletteInput::Text('j') => return Some(HomeAction::Join),
+            PaletteInput::Text('c') => return Some(HomeAction::Join),
             PaletteInput::Text('m') => return Some(HomeAction::Remote),
             PaletteInput::Text('?') => self.open_help(),
             PaletteInput::Text('r') => match selected {
@@ -319,10 +319,10 @@ impl Home {
             "mahi runs coding agents in a sandbox, in threads you can share.",
             "",
             "tab        switch between the menu and the threads",
-            "↑ ↓        move     enter   open the menu of what is selected",
+            "↑ ↓ j k    move     enter   open the menu of what is selected",
             "n          start a new thread with an agent",
             "r l e i    resume, land, end, or invite to the selected thread",
-            "j          join a teammate's thread with their pairing code",
+            "c          join a teammate's thread with their pairing code",
             "m          choose the remote threads are pushed to",
             "q / esc    quit",
         ];
@@ -449,7 +449,7 @@ impl Home {
                     Span::raw("  No threads yet. Press "),
                     Span::styled("n", Theme::title()),
                     Span::raw(" to start one with an agent, or "),
-                    Span::styled("j", Theme::title()),
+                    Span::styled("c", Theme::title()),
                     Span::raw(" to join a teammate's."),
                 ]),
             ])
@@ -549,17 +549,17 @@ impl Home {
         }
         match self.focus {
             Focus::Menu => key_hints(&[
-                ("↑↓", "move"),
+                ("↑↓ jk", "move"),
                 ("enter", "open"),
                 ("tab", "threads"),
                 ("?", "help"),
                 ("q", "quit"),
             ]),
             Focus::Threads => key_hints(&[
-                ("↑↓", "move"),
+                ("↑↓ jk", "move"),
                 ("enter", "actions"),
                 ("n", "new"),
-                ("j", "join"),
+                ("c", "join"),
                 ("tab", "menu"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -664,11 +664,33 @@ mod tests {
     }
 
     #[test]
+    fn vim_keys_move_the_selection_and_c_joins() {
+        let rows = rows();
+        let mut home = Home::default();
+        assert_eq!(home.key(PaletteInput::Text('j'), &rows), None);
+        assert_eq!(home.selected(), 1);
+        home.key(PaletteInput::Text('j'), &rows);
+        assert_eq!(home.selected(), 1);
+        home.key(PaletteInput::Text('k'), &rows);
+        assert_eq!(home.selected(), 0);
+        home.key(PaletteInput::Tab, &rows);
+        home.key(PaletteInput::Text('j'), &rows);
+        home.key(PaletteInput::Text('j'), &rows);
+        home.key(PaletteInput::Text('k'), &rows);
+        assert_eq!(home.key(PaletteInput::Enter, &rows), Some(HomeAction::New));
+        assert_eq!(
+            home.key(PaletteInput::Text('c'), &rows),
+            Some(HomeAction::Join)
+        );
+        assert!(screen(&home, &rows, "").contains("↑↓ jk move"));
+    }
+
+    #[test]
     fn keys_choose_actions_on_the_selected_thread() {
         let rows = rows();
         let mut home = Home::default();
         assert_eq!(
-            keys(&mut home, &rows, "nrijmq"),
+            keys(&mut home, &rows, "nricmq"),
             [
                 HomeAction::New,
                 HomeAction::Resume("t1".to_owned()),

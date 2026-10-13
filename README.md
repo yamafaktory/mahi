@@ -91,7 +91,7 @@ whether to push threads to `origin` and whether `origin` is private or public.
 
 To work with a teammate, the thread's owner runs `mahi invite <thread>` (or presses `i` on the
 home screen), which shows a short pairing code such as `412-merit-intention`; the teammate runs
-`mahi join` (or presses `j`) in a clone of the project and types it, and once the owner says
+`mahi join` (or presses `c`) in a clone of the project and types it, and once the owner says
 yes, the teammate watches the thread live. Pairing meets through the remote `mahi remote`
 chose. Cards and tickets still work without it: `mahi id` prints the card a thread's owner
 needs, `mahi invite <thread> <card>` turns it into a ticket, and `mahi join <ticket>` uses it.
