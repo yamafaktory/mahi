@@ -20,6 +20,8 @@ specification. If a change goes against it, update the design in the same commit
 - Tests run with [cargo-nextest](https://nexte.st), not `cargo test`.
 - Commands are in the `justfile`. Use `just <recipe>` instead of calling cargo directly, so
   every agent and person runs the same flags.
+- A recipe that needs more than a few lines of shell calls a bash script in `scripts/`, so
+  `just shellcheck` checks it. Do not write multi-line shebang recipes in the `justfile`.
 
 ## Commands
 
@@ -41,7 +43,8 @@ just apparmor-parse # parse mahi apparmor's profile (needs apparmor_parser and s
 just deb        # build the .deb (cargo-deb) into target/debian/
 just deb-check  # CI only: install the .deb on Ubuntu 24.04 and run mahi from /usr/bin
 just deny       # cargo-deny: advisories, licenses, banned crates, unknown sources
-just check      # sweep + fmt-check + clippy + test + deny
+just shellcheck # shellcheck on scripts/ and the .deb's maintainer scripts
+just check      # sweep + fmt-check + clippy + test + deny + shellcheck
 just sweep [g]  # remove target/ or fuzz/target/ once either passes g GiB (40 by default)
 just fuzz <t> [s] # run one fuzz target (nightly, cargo-fuzz) for s seconds
 just fuzz-all [s]  # run every fuzz target in turn
@@ -51,8 +54,8 @@ just mutants <crate> [args] # cargo-mutants on one crate, e.g. -f 'crates/mahi-s
 ```
 
 CI (`.github/workflows/checks.yml`) runs `just fmt-check`, `just clippy`,
-`just test --profile ci` with `just test-git --profile ci`, and `just deny` as separate
-jobs. A `wsl` job runs `just test`, `just test-git` and `just test-wsl` inside an Ubuntu
+`just test --profile ci` with `just test-git --profile ci`, `just deny` and `just shellcheck`
+as separate jobs. A `wsl` job runs `just test`, `just test-git` and `just test-wsl` inside an Ubuntu
 WSL 2 distribution on a Windows runner. Change a check in the `justfile`, not in the
 workflow, so that CI and local runs stay the same.
 

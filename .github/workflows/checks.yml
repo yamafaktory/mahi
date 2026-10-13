@@ -115,6 +115,15 @@ jobs:
           tool: just,cargo-deny
       - run: just deny
 
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just shellcheck
+
   fuzz:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04

@@ -49,6 +49,10 @@ deb-check:
 deny:
     cargo deny --locked check
 
+# Check every shell script: the ones in scripts/ and the .deb's maintainer scripts
+shellcheck:
+    shellcheck scripts/*.sh packaging/deb/postinst packaging/deb/postrm packaging/deb/prerm
+
 build:
     cargo build --workspace --locked
 
@@ -58,45 +62,17 @@ run *args:
 # Build mahi and run it in a scratch git repository with its own config and data, kept until try-reset
 [positional-arguments]
 try *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --locked -p mahi
-    target=$(cargo metadata --locked --format-version 1 --no-deps | grep -o '"target_directory":"[^"]*"' | cut -d '"' -f 4)
-    binary="$target/debug/mahi"
-    root="${XDG_CACHE_HOME:-$HOME/.cache}/mahi-try"
-    mkdir -p "$root/project" "$root/config" "$root/data"
-    cd "$root/project"
-    if ! git rev-parse -q --verify HEAD > /dev/null 2>&1; then
-        git init -q
-        git -c user.name=mahi -c user.email=try@mahi.social -c commit.gpgsign=false commit -q --allow-empty -m init
-    fi
-    if [ "$(uname -s)" = Darwin ]; then
-        mkdir -p "$root/home"
-        export HOME="$root/home"
-    fi
-    XDG_CONFIG_HOME="$root/config" XDG_DATA_HOME="$root/data" exec "$binary" "$@"
+    @scripts/try.sh "$@"
 
 # Remove the scratch repository, config and data that try uses
 try-reset:
     rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/mahi-try"
 
+[positional-arguments]
 sweep max_gib="40":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! [[ "{{max_gib}}" =~ ^[0-9]+$ ]]; then
-        echo "sweep takes a whole number of GiB, not {{max_gib}}" >&2
-        exit 2
-    fi
-    for dir in target fuzz/target; do
-        test -d "$dir" || continue
-        used=$(du -sk "$dir" | cut -f1)
-        if [ "$used" -gt $(( {{max_gib}} * 1024 * 1024 )) ]; then
-            echo "removing $dir: $(( used / 1024 / 1024 )) GiB is over {{max_gib}} GiB"
-            rm -rf "$dir"
-        fi
-    done
+    @scripts/sweep.sh "$1"
 
-check: sweep fmt-check clippy test deny
+check: sweep fmt-check clippy test deny shellcheck
 
 [positional-arguments]
 mutants crate *args:
@@ -107,28 +83,10 @@ fuzz target seconds="60":
 
 fuzz-all seconds="30": (fuzz-shard "0" "1" seconds)
 
+[positional-arguments]
 fuzz-shard index count seconds="30":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    host=$(rustc +nightly -vV | sed -n 's/^host: //p')
-    targets=$(just fuzz-list {{index}} {{count}})
-    cd fuzz
-    for target in $targets; do
-        cargo +nightly fuzz run --target "$host" "$target" -- -max_total_time={{seconds}} -timeout=10
-    done
+    @scripts/fuzz-shard.sh "$1" "$2" "$3"
 
+[positional-arguments]
 fuzz-list index="0" count="1":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! [[ "{{index}}" =~ ^[0-9]+$ && "{{count}}" =~ ^[0-9]+$ ]] || (( {{index}} >= {{count}} )); then
-        echo "fuzz-list: index must be a number from 0 to count - 1" >&2
-        exit 2
-    fi
-    cd fuzz
-    all=$(cargo +nightly fuzz list)
-    targets=$(for target in $all; do
-        hash=$(printf %s "$target" | cksum | cut -d ' ' -f 1)
-        if (( hash % {{count}} == {{index}} )); then echo "$target"; fi
-    done)
-    test -n "$targets"
-    echo "$targets"
+    @scripts/fuzz-list.sh "$1" "$2"
