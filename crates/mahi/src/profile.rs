@@ -440,7 +440,9 @@ impl Profile {
     /// Writes the profile's files into the agent's state directory, open as `state` and found
     /// at `state_path`, replacing what the agent may have left there without following any
     /// symbolic link it planted; with `tools`, the mahi binary and the socket its tools are
-    /// served at, they also tell the agent to start `mahi mcp`.
+    /// served at, they also tell the agent to start `mahi mcp`. An agent that asks whether to
+    /// trust its folder is told, in its state only, that it trusts `worktree`, which the
+    /// sandbox confines it to.
     ///
     /// # Errors
     ///
@@ -450,10 +452,11 @@ impl Profile {
         &self,
         state: &OwnedFd,
         state_path: &Path,
+        worktree: &Path,
         tools: Option<(&str, &str)>,
     ) -> io::Result<()> {
         match &self.install {
-            Install::ClaudeCode => install_claude_code(state, tools),
+            Install::ClaudeCode => install_claude_code(state, worktree, tools),
             Install::Codex => replace(state, CODEX_HOOKS_FILE, CODEX_HOOKS.as_bytes()),
             Install::Files(files) => install_files(files, state, state_path, tools),
         }
@@ -713,9 +716,11 @@ const CODEX_HOOKS: &str = r#"{
 }
 "#;
 
-const CLAUDE_CODE_STATE: &str = "{\"hasCompletedOnboarding\": true}\n";
-
-fn install_claude_code(state: &OwnedFd, tools: Option<(&str, &str)>) -> io::Result<()> {
+fn install_claude_code(
+    state: &OwnedFd,
+    worktree: &Path,
+    tools: Option<(&str, &str)>,
+) -> io::Result<()> {
     replace(state, "settings.json", CLAUDE_CODE_SETTINGS.as_bytes())?;
     if let Some((mahi, socket)) = tools {
         let config = serde_json::json!({
@@ -732,7 +737,20 @@ fn install_claude_code(state: &OwnedFd, tools: Option<(&str, &str)>) -> io::Resu
         bytes.push(b'\n');
         replace(state, MCP_CONFIG, &bytes)?;
     }
-    create_if_missing(state, ".claude.json", CLAUDE_CODE_STATE.as_bytes())
+    let mut projects = serde_json::Map::new();
+    if let Some(worktree) = worktree.to_str().filter(|_| worktree.is_absolute()) {
+        projects.insert(
+            worktree.to_owned(),
+            serde_json::json!({ "hasTrustDialogAccepted": true }),
+        );
+    }
+    let state_json = serde_json::json!({
+        "hasCompletedOnboarding": true,
+        "projects": projects,
+    });
+    let mut bytes = serde_json::to_vec_pretty(&state_json).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    create_if_missing(state, ".claude.json", &bytes)
 }
 
 fn create_if_missing(directory: &OwnedFd, name: &str, contents: &[u8]) -> io::Result<()> {
@@ -1027,7 +1045,9 @@ content = "first\n"
         let codex = read_profiles(dir.path()).unwrap().remove(0);
         let state_dir = tempfile::tempdir().unwrap();
         let state = state_dir.path();
-        codex.install(&open_dir(state), state, None).unwrap();
+        codex
+            .install(&open_dir(state), state, Path::new(""), None)
+            .unwrap();
         assert_eq!(
             fs::read_to_string(state.join("hooks/notify.toml")).unwrap(),
             "command = [\"$MAHI_BIN\", \"hook\", \"turn-end\"]\n"
@@ -1035,7 +1055,9 @@ content = "first\n"
         assert!(!state.join("mcp.json").exists());
         fs::write(state.join("seen.txt"), "kept\n").unwrap();
         let tools = ("/usr/bin/mahi", "/tmp/m/mcp.sock");
-        codex.install(&open_dir(state), state, Some(tools)).unwrap();
+        codex
+            .install(&open_dir(state), state, Path::new(""), Some(tools))
+            .unwrap();
         assert_eq!(
             fs::read_to_string(state.join("seen.txt")).unwrap(),
             "kept\n"
@@ -1054,7 +1076,7 @@ content = "first\n"
         let unsafe_mahi = ("/opt/\"x\"/mahi", "/tmp/s");
         assert!(
             codex
-                .install(&open_dir(state), state, Some(unsafe_mahi))
+                .install(&open_dir(state), state, Path::new(""), Some(unsafe_mahi))
                 .is_err()
         );
 
@@ -1063,7 +1085,12 @@ content = "first\n"
         std::os::unix::fs::symlink(outside.path(), planted.path().join("hooks")).unwrap();
         assert!(
             codex
-                .install(&open_dir(planted.path()), planted.path(), None)
+                .install(
+                    &open_dir(planted.path()),
+                    planted.path(),
+                    Path::new(""),
+                    None
+                )
                 .is_err()
         );
         assert!(!outside.path().join("notify.toml").exists());
@@ -1096,7 +1123,7 @@ content = "first\n"
     fn claude_code_hooks_report_prompts_tools_and_turn_ends_to_mahi() {
         let dir = tempfile::tempdir().unwrap();
         claude_code_profile()
-            .install(&open_dir(dir.path()), Path::new(""), None)
+            .install(&open_dir(dir.path()), Path::new(""), Path::new(""), None)
             .unwrap();
         let settings = fs::read_to_string(dir.path().join("settings.json")).unwrap();
         for (event, kind) in [
@@ -1122,13 +1149,34 @@ content = "first\n"
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         fs::create_dir(&state).unwrap();
+        let worktree = Path::new("/work/tree \"quoted\"");
         claude_code_profile()
-            .install(&open_dir(&state), Path::new(""), None)
+            .install(&open_dir(&state), Path::new(""), worktree, None)
             .unwrap();
+        let seeded: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(state.join(".claude.json")).unwrap()).unwrap();
         assert_eq!(
-            fs::read_to_string(state.join(".claude.json")).unwrap(),
-            CLAUDE_CODE_STATE
+            seeded,
+            serde_json::json!({
+                "hasCompletedOnboarding": true,
+                "projects": { "/work/tree \"quoted\"": { "hasTrustDialogAccepted": true } },
+            })
         );
+        for unusable in [
+            Path::new("relative/tree"),
+            Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/w/\xff")),
+        ] {
+            let other = dir.path().join("other");
+            let _ = fs::remove_dir_all(&other);
+            fs::create_dir(&other).unwrap();
+            claude_code_profile()
+                .install(&open_dir(&other), Path::new(""), unusable, None)
+                .unwrap();
+            let seeded: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(other.join(".claude.json")).unwrap())
+                    .unwrap();
+            assert_eq!(seeded["projects"], serde_json::json!({}));
+        }
         let mode = fs::metadata(state.join(".claude.json"))
             .unwrap()
             .permissions()
@@ -1137,7 +1185,7 @@ content = "first\n"
         assert!(!state.join(".claude.json.mahi").exists());
         fs::write(state.join(".claude.json"), "{\"kept\": true}").unwrap();
         claude_code_profile()
-            .install(&open_dir(&state), Path::new(""), None)
+            .install(&open_dir(&state), Path::new(""), Path::new(""), None)
             .unwrap();
         assert_eq!(
             fs::read_to_string(state.join(".claude.json")).unwrap(),
@@ -1148,7 +1196,7 @@ content = "first\n"
         fs::create_dir(&linked).unwrap();
         std::os::unix::fs::symlink(&outside, linked.join(".claude.json")).unwrap();
         claude_code_profile()
-            .install(&open_dir(&linked), Path::new(""), None)
+            .install(&open_dir(&linked), Path::new(""), Path::new(""), None)
             .unwrap();
         assert!(!outside.exists());
         assert!(
@@ -1168,10 +1216,10 @@ content = "first\n"
         std::os::unix::fs::symlink(&outside, state.join("settings.json")).unwrap();
         std::os::unix::fs::symlink(&outside, state.join(".settings.json.mahi")).unwrap();
         claude_code_profile()
-            .install(&open_dir(&state), Path::new(""), None)
+            .install(&open_dir(&state), Path::new(""), Path::new(""), None)
             .unwrap();
         claude_code_profile()
-            .install(&open_dir(&state), Path::new(""), None)
+            .install(&open_dir(&state), Path::new(""), Path::new(""), None)
             .unwrap();
         assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
         let settings = state.join("settings.json");
@@ -1229,6 +1277,7 @@ content = "first\n"
             .install(
                 &open_dir(dir.path()),
                 Path::new(""),
+                Path::new(""),
                 Some(("/opt/mahi \"x\"/mahi", "/tmp/s/mcp.sock")),
             )
             .unwrap();
@@ -1261,7 +1310,7 @@ content = "first\n"
         fs::write(&outside, "untouched").unwrap();
         std::os::unix::fs::symlink(&outside, state.join("hooks.json")).unwrap();
         codex_profile()
-            .install(&open_dir(&state), Path::new(""), None)
+            .install(&open_dir(&state), Path::new(""), Path::new(""), None)
             .unwrap();
         assert_eq!(fs::read_to_string(&outside).unwrap(), "untouched");
         let hooks: serde_json::Value =
@@ -1358,7 +1407,9 @@ content = "first\n"
         assert_eq!(mode & 0o777, 0o600);
 
         fs::write(second.join(CODEX_CONFIG), "[tui]\nx = 1\n").unwrap();
-        codex.install(&open_dir(&second), &second, None).unwrap();
+        codex
+            .install(&open_dir(&second), &second, Path::new(""), None)
+            .unwrap();
         codex
             .seed_hook_trust(&open_dir(&second), &second, &config)
             .unwrap();

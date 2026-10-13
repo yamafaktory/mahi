@@ -2373,7 +2373,7 @@ impl Launch<'_> {
             .ok_or_else(not_private)?;
         let state_path = parent.join(name);
         profile
-            .install(&directory, &state_path, self.tools_config())
+            .install(&directory, &state_path, self.worktree, self.tools_config())
             .map_err(RunError::State)?;
         if let Ok(config) = ConfigDir::resolve(
             self.environment.home.as_deref(),
