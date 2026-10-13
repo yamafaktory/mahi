@@ -1526,6 +1526,38 @@ cat parser.rs
     }
 
     #[test]
+    fn the_home_screen_stores_a_credential_masked_and_removes_it_after_asking() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let stored = config_dir(&fixture.home).path().join("credentials/claude");
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("Threads", b"s"),
+                ("None", b"1"),
+                ("Its name", b"-Claude\r"),
+                ("inner hyphens", b"s"),
+                ("None", b"1"),
+                ("Its name", b"claude\r"),
+                ("Token for claude", b"sekret-token-value\r"),
+                ("mahi credential add claude: done", b"s"),
+                ("another.", b"1"),
+                ("Its name", b"claude\r"),
+                ("remove it first to replace it", b"s"),
+                ("another.", b"2"),
+                ("again.", b"n"),
+                ("kept the credential claude", b"s"),
+                ("another.", b"2"),
+                ("again.", b"y"),
+                ("mahi credential remove claude: done", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(!output.contains("sekret"), "{output}");
+        assert!(!stored.exists());
+    }
+
+    #[test]
     fn a_paste_split_after_its_escape_closes_a_question_and_does_nothing_else() {
         let fixture = fixture();
         let (_thread, _claude) = worked_thread(&fixture);

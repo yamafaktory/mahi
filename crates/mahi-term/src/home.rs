@@ -48,11 +48,12 @@ use crate::{
     key_hints,
 };
 
-const MENU: [(&str, &str); 7] = [
+const MENU: [(&str, &str); 8] = [
     ("Threads", "t"),
     ("New thread", "n"),
     ("Join with a code", "c"),
     ("Remote", "m"),
+    ("Credentials", "s"),
     ("Your card", "u"),
     ("Help", "?"),
     ("Quit", "q"),
@@ -113,6 +114,8 @@ pub enum HomeAction {
     Remote,
     /// Show the user's participant card, which a thread's owner invites them with.
     Card,
+    /// Add or remove the tokens agents and remotes sign in with.
+    Credentials,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,7 +145,7 @@ impl ThreadChoice {
     fn label(self) -> &'static str {
         match self {
             Self::Resume => "Resume: start your agent again where it stopped",
-            Self::Land => "Land: merge its agents' work onto a branch for you to commit",
+            Self::Land => "Land: merge its agents' work onto a branch to commit",
             Self::End => "End: save its work in a last snapshot and remove its worktrees",
             Self::Purge => "Purge: delete it here and on the remote, for good",
             Self::Invite => {
@@ -236,6 +239,7 @@ impl Home {
             PaletteInput::Text('c') => return Some(HomeAction::Join),
             PaletteInput::Text('m') => return Some(HomeAction::Remote),
             PaletteInput::Text('u') => return Some(HomeAction::Card),
+            PaletteInput::Text('s') => return Some(HomeAction::Credentials),
             PaletteInput::Text('?') => self.open_help(),
             PaletteInput::Text('r') => match selected {
                 Some(row) if row.owned => return Some(HomeAction::Resume(row.thread.clone())),
@@ -277,8 +281,9 @@ impl Home {
             1 => Some(HomeAction::New),
             2 => Some(HomeAction::Join),
             3 => Some(HomeAction::Remote),
-            4 => Some(HomeAction::Card),
-            5 => {
+            4 => Some(HomeAction::Credentials),
+            5 => Some(HomeAction::Card),
+            6 => {
                 self.open_help();
                 None
             }
@@ -348,21 +353,13 @@ impl Home {
             ["↑↓ j k", "move", "go up and down the focused list"],
             ["enter", "open", "open the menu of what is selected"],
             ["n", "new", "start a thread with an agent"],
-            [
-                "r",
-                "resume",
-                "start your agent in the thread again where it stopped",
-            ],
+            ["r", "resume", "start your agent again where it stopped"],
             [
                 "l",
                 "land",
-                "merge its agents' work onto a branch for you to commit",
+                "merge its agents' work onto a branch to commit",
             ],
-            [
-                "e",
-                "end",
-                "save its work in a snapshot and remove its worktrees",
-            ],
+            ["e", "end", "snapshot its work and remove its worktrees"],
             [
                 "p",
                 "purge",
@@ -371,17 +368,18 @@ impl Home {
             [
                 "i",
                 "invite",
-                "show a code so a teammate can watch and prompt it live",
+                "show a code so a teammate can watch and prompt it",
             ],
-            [
-                "c",
-                "join",
-                "type a teammate's code to watch and prompt their agent",
-            ],
+            ["c", "join", "type a teammate's code to join their thread"],
             [
                 "m",
                 "remote",
                 "choose or add where threads are pushed to be shared",
+            ],
+            [
+                "s",
+                "credentials",
+                "keep the tokens agents and remotes sign in with",
             ],
             [
                 "u",
@@ -761,13 +759,14 @@ mod tests {
         let rows = rows();
         let mut home = Home::default();
         assert_eq!(
-            keys(&mut home, &rows, "nricmuq"),
+            keys(&mut home, &rows, "nricmsuq"),
             [
                 HomeAction::New,
                 HomeAction::Resume("t1".to_owned()),
                 HomeAction::Invite("t1".to_owned()),
                 HomeAction::Join,
                 HomeAction::Remote,
+                HomeAction::Credentials,
                 HomeAction::Card,
                 HomeAction::Quit,
             ]
@@ -793,6 +792,11 @@ mod tests {
             Some(HomeAction::Remote)
         );
         home.key(PaletteInput::Down, &rows);
+        assert_eq!(
+            home.key(PaletteInput::Enter, &rows),
+            Some(HomeAction::Credentials)
+        );
+        home.key(PaletteInput::Down, &rows);
         assert_eq!(home.key(PaletteInput::Enter, &rows), Some(HomeAction::Card));
         home.key(PaletteInput::Down, &rows);
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
@@ -800,22 +804,32 @@ mod tests {
         let help = screen(&home, &rows, "");
         assert!(help.contains("Help"), "{help}");
         for row in [
-            "key     action  what it does",
-            "l       land    merge its agents' work onto a branch for you to commit",
-            "e       end     save its work in a snapshot and remove its worktrees",
-            "q esc   quit    leave mahi",
+            "key     action       what it does",
+            "l       land         merge its agents' work onto a branch to commit",
+            "e       end          snapshot its work and remove its worktrees",
+            "q esc   quit         leave mahi",
         ] {
             assert!(help.contains(row), "{help}");
         }
         let narrow = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
         for row in [
-            "r       resume  start your agent in the thread again where it stopped",
-            "i       invite  show a code so a teammate can watch and prompt it live",
-            "u       card    show the line a thread's owner invites you with",
-            "p       purge   delete the thread here and on the remote, for good",
-            "q esc   quit    leave mahi",
+            "r       resume       start your agent again where it stopped",
+            "i       invite       show a code so a teammate can watch and prompt it",
+            "↑↓ jk scroll",
         ] {
             assert!(narrow.contains(row), "{narrow}");
+        }
+        for _ in 0..20 {
+            assert_eq!(home.key(PaletteInput::Text('j'), &rows), None);
+        }
+        let scrolled = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
+        for row in [
+            "s       credentials  keep the tokens agents and remotes sign in with",
+            "u       card         show the line a thread's owner invites you with",
+            "p       purge        delete the thread here and on the remote, for good",
+            "q esc   quit         leave mahi",
+        ] {
+            assert!(scrolled.contains(row), "{scrolled}");
         }
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
         assert!(!home.has_dialog());
@@ -906,7 +920,7 @@ mod tests {
     fn pasted_text_is_never_a_key() {
         let rows = rows();
         let mut home = Home::default();
-        for c in "nrleipjmuq?".chars() {
+        for c in "nrleipjmsuq?".chars() {
             assert_eq!(home.key(PaletteInput::Pasted(c), &rows), None);
         }
         assert!(!home.has_dialog());

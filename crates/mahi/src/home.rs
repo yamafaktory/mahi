@@ -17,6 +17,12 @@ use clap::{
     CommandFactory,
     Parser,
 };
+use mahi_identity::{
+    ConfigDir,
+    CredentialName,
+    CredentialNameError,
+    credential_names,
+};
 use mahi_sandbox::{
     InputWait,
     Termination,
@@ -378,6 +384,10 @@ fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> Stri
         HomeAction::Join => vec!["join".to_owned()],
         HomeAction::Remote => return choose_remote(store),
         HomeAction::Card => vec!["id".to_owned()],
+        HomeAction::Credentials => match credential_words(environment) {
+            Ok(words) => words,
+            Err(told) => return told,
+        },
         HomeAction::Quit => return String::new(),
     };
     let shown = format!("mahi {}", words.join(" "));
@@ -398,6 +408,83 @@ fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> Stri
     match code {
         0 => format!("{shown}: done"),
         code => format!("{shown} failed with exit code {code}; see the activity"),
+    }
+}
+
+/// Asks in a dialog whether to add a credential or remove a stored one, and returns the
+/// command that does it, or what to say when there is nothing to do; the command asks for the
+/// token itself, masked.
+fn credential_words(environment: &Environment) -> Result<Vec<String>, String> {
+    let names = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )
+    .ok()
+    .and_then(|config| credential_names(&config).ok())
+    .ok_or_else(|| "cannot read the stored credentials".to_owned())?;
+    let mut items = Vec::with_capacity(names.len() + 1);
+    items.push("Add a credential".to_owned());
+    items.extend(names.iter().map(|name| format!("Remove {name}")));
+    let stored = if names.is_empty() {
+        "None is stored yet."
+    } else {
+        "Pick one to remove it, or add another."
+    };
+    let dialog = Dialog::choose(
+        "Credentials",
+        vec![
+            "Tokens agents sign in with, and remotes over HTTPS, kept in files only you can \
+             read (not encrypted); mahi never shows them."
+                .to_owned(),
+            stored.to_owned(),
+        ],
+        items,
+    );
+    let mut prompt = DialogPrompt::default();
+    let Ok(Answer::Choice(index)) = prompt.ask(dialog) else {
+        return Err(String::new());
+    };
+    let Some(name) = index.checked_sub(1).and_then(|index| names.get(index)) else {
+        let typed = match prompt.ask(Dialog::input(
+            "Add a credential",
+            vec![
+                "Its name: the agent's, such as `claude` or `codex`, or the `https-…` name \
+                 `mahi remote` gives an HTTPS remote. mahi then asks for the token."
+                    .to_owned(),
+            ],
+            false,
+        )) {
+            Ok(Answer::Text(text)) => text.trim().to_owned(),
+            _ => return Err(String::new()),
+        };
+        let name: CredentialName = typed.parse().map_err(|_: CredentialNameError| {
+            "that is not a credential name: use lowercase letters, digits and inner hyphens"
+                .to_owned()
+        })?;
+        if names.contains(&name) {
+            return Err(format!(
+                "a credential named {name} exists; remove it first to replace it"
+            ));
+        }
+        return Ok(vec![
+            "credential".to_owned(),
+            "add".to_owned(),
+            name.to_string(),
+        ]);
+    };
+    let confirmed = prompt.ask(Dialog::confirm(
+        "Credentials",
+        vec![format!(
+            "Remove the credential {name}? What signs in with it has to be given a token again."
+        )],
+    ));
+    match confirmed {
+        Ok(Answer::Confirmed(true)) => Ok(vec![
+            "credential".to_owned(),
+            "remove".to_owned(),
+            name.to_string(),
+        ]),
+        _ => Err(format!("kept the credential {name}")),
     }
 }
 
