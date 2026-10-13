@@ -105,6 +105,10 @@ pub(crate) enum RemoteError {
     Corrupt,
     #[error("cannot ask the user")]
     Prompt(#[source] io::Error),
+    #[error("that is not a remote name")]
+    InvalidName(#[source] RemoteNameError),
+    #[error("cannot add the git remote {0}")]
+    Add(RemoteName, #[source] Box<StoreError>),
 }
 
 /// A remote name that holds characters git remote names do not, or starts with `-` or `.`.
@@ -119,6 +123,8 @@ impl FromStr for RemoteName {
         let plain = !name.is_empty()
             && name.len() <= 100
             && !name.starts_with(['-', '.'])
+            && !name.contains("..")
+            && !name.as_bytes().ends_with(b".lock")
             && name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'));
@@ -279,6 +285,15 @@ pub(crate) fn choose(
     Ok(describe(&setting, &url))
 }
 
+/// Adds the git remote `name` at `url` to the repository, once `url` reads as an SSH or
+/// HTTPS remote mahi can push to.
+pub(crate) fn add(store: &mut Store, name: &RemoteName, url: &str) -> Result<(), RemoteError> {
+    parse_remote_url(name, url)?;
+    store
+        .add_remote(name.as_str(), url)
+        .map_err(|error| RemoteError::Add(name.clone(), Box::new(error)))
+}
+
 /// Stops pushing the clone's threads, as `mahi remote --off` does.
 pub(crate) fn stop_pushing(store: &Store) -> Result<(), RemoteError> {
     turn_off(store)
@@ -349,15 +364,19 @@ pub(crate) fn fetch_url(store: &Store, name: &RemoteName) -> Result<RemoteUrl, R
 
 fn remote_url(name: &RemoteName, url: Option<String>) -> Result<RemoteUrl, RemoteError> {
     let url = url.ok_or_else(|| RemoteError::NoSuchRemote(name.clone()))?;
+    parse_remote_url(name, &url)
+}
+
+fn parse_remote_url(name: &RemoteName, url: &str) -> Result<RemoteUrl, RemoteError> {
     if url.starts_with(HTTPS) {
-        return HttpsRemote::parse(&url)
+        return HttpsRemote::parse(url)
             .map(RemoteUrl::Https)
             .map_err(|source| RemoteError::NotHttps {
                 name: name.clone(),
                 source,
             });
     }
-    SshRemote::parse(&url)
+    SshRemote::parse(url)
         .map(RemoteUrl::Ssh)
         .map_err(|source| RemoteError::NotSsh {
             name: name.clone(),
@@ -693,7 +712,7 @@ mod tests {
             "{told}"
         );
         assert!(!told.contains("token@"), "{told}");
-        for bad in ["", "-o", ".x", "a/b", "git@host:x"] {
+        for bad in ["", "-o", ".x", "a/b", "git@host:x", "a..b", "x.lock"] {
             assert!(bad.parse::<RemoteName>().is_err(), "{bad}");
         }
     }

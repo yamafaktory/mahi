@@ -76,6 +76,8 @@ const SIGNATURE_HEADER: &str = "gpgsig";
 pub(crate) const MAX_TREE_BYTES: u64 = 1024 * 1024;
 const DISABLE_REFLOG: &str = "core.logAllRefUpdates=false";
 const REF_LOCK_TIMEOUT: &str = "core.filesRefLockTimeout=5000";
+const CONFIG_FILE: &str = "config";
+const CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const ALLOC_LIMIT: &str = "gitoxide.objects.allocLimit=536870912";
 
 /// The project's git repository, seen through the objects and refs mahi writes.
@@ -170,6 +172,15 @@ pub enum StoreError {
     /// A remote name holds characters git remote names do not, or starts with `-` or `.`.
     #[error("invalid remote name {0:?}")]
     InvalidRemoteName(String),
+    /// The repository's configuration file cannot be parsed.
+    #[error("the repository's config file cannot be parsed")]
+    UnreadableConfig,
+    /// A remote's URL is empty or holds a control character.
+    #[error("the url given for remote {0} is empty or holds a control character")]
+    InvalidRemoteUrl(String),
+    /// The repository already has a remote of that name.
+    #[error("this repository already has a remote called {0}")]
+    RemoteExists(String),
     /// A remote's URL is not UTF-8.
     #[error("the url of remote {0} is not UTF-8")]
     NonUtf8Url(String),
@@ -385,13 +396,7 @@ impl Store {
             .remote_names()
             .into_iter()
             .filter_map(|name| std::str::from_utf8(name.as_ref()).ok().map(str::to_owned))
-            .filter(|name| {
-                !name.is_empty()
-                    && !name.starts_with(['-', '.'])
-                    && name.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_')
-                    })
-            })
+            .filter(|name| is_plain_remote_name(name))
             .collect()
     }
 
@@ -406,12 +411,7 @@ impl Store {
     /// [`StoreError::NonUtf8Url`] if the URL is not UTF-8, or [`StoreError::Git`] if the
     /// remote's configuration cannot be read.
     pub fn remote_url(&self, name: &str, push: bool) -> Result<Option<String>, StoreError> {
-        let plain = !name.is_empty()
-            && !name.starts_with(['-', '.'])
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'));
-        if !plain {
+        if !is_plain_remote_name(name) {
             return Err(StoreError::InvalidRemoteName(name.to_owned()));
         }
         let Some(remote) = self.repo.try_find_remote(name) else {
@@ -430,6 +430,67 @@ impl Store {
         std::str::from_utf8(&bytes)
             .map(|text| Some(text.to_owned()))
             .map_err(|_| StoreError::NonUtf8Url(name.to_owned()))
+    }
+
+    /// Adds the git remote `name`, fetching and pushing at `url` with git's default refspec, to
+    /// the repository's configuration file, as `git remote add` does, keeping the file's mode
+    /// and writing through a symbolic link, then reopens the repository so this store reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidRemoteName`] if `name` is not a plain remote name git
+    /// takes, [`StoreError::InvalidRemoteUrl`] if `url` is empty or holds a control character,
+    /// [`StoreError::RemoteExists`] if any configuration already has a remote called `name`,
+    /// [`StoreError::UnreadableConfig`] if the configuration file cannot be parsed,
+    /// [`StoreError::Io`] if it cannot be locked, read or written, or [`StoreError::Git`] if
+    /// the repository cannot be reopened once it is written.
+    pub fn add_remote(&mut self, name: &str, url: &str) -> Result<(), StoreError> {
+        let refspec_target = format!("refs/remotes/{name}/HEAD");
+        let usable = is_plain_remote_name(name)
+            && gix_validate::reference::name(refspec_target.as_str().into()).is_ok();
+        if !usable {
+            return Err(StoreError::InvalidRemoteName(name.to_owned()));
+        }
+        if url.is_empty() || url.chars().any(char::is_control) {
+            return Err(StoreError::InvalidRemoteUrl(name.to_owned()));
+        }
+        let taken = self.repo.try_find_remote(name).is_some()
+            || self
+                .repo
+                .remote_names()
+                .iter()
+                .any(|known| AsRef::<[u8]>::as_ref(known) == name.as_bytes());
+        if taken {
+            return Err(StoreError::RemoteExists(name.to_owned()));
+        }
+        let path = self.repo.common_dir().join(CONFIG_FILE);
+        let original = std::fs::metadata(&path)?.permissions();
+        let keep_mode = move |_| original.clone();
+        let mut lock = gix_lock::File::acquire(
+            &path,
+            gix_lock::acquire::Fail::AfterDurationWithBackoff(CONFIG_LOCK_TIMEOUT),
+            Some(self.repo.common_dir().to_path_buf()),
+            Some(&gix_lock::acquire::resolve_symlink),
+            Some(&keep_mode),
+        )
+        .map_err(std::io::Error::other)?;
+        let mut bytes = std::fs::read(lock.resource_path())?;
+        let mut file = gix::config::File::from_bytes_owned(
+            &mut bytes,
+            gix::config::file::Metadata::from(gix::config::Source::Local),
+            gix::config::file::init::Options::default(),
+        )
+        .map_err(|_| StoreError::UnreadableConfig)?;
+        if file.section("remote", Some(name.into())).is_ok() {
+            return Err(StoreError::RemoteExists(name.to_owned()));
+        }
+        add_remote_section(&mut file, name, url)?;
+        file.write_to(&mut lock)?;
+        lock.with_mut(|file| file.sync_all())?;
+        lock.commit()
+            .map_err(|error| std::io::Error::other(error.error))?;
+        self.repo = gix::open_opts(self.repo.path(), open_options())?;
+        Ok(())
     }
 
     /// Returns the repository's common git directory, shared by all its worktrees.
@@ -837,6 +898,32 @@ impl Store {
             Err(StoreError::WrongObject { id, expected })
         }
     }
+}
+
+fn is_plain_remote_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '.'])
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+}
+
+fn add_remote_section(
+    file: &mut gix::config::File,
+    name: &str,
+    url: &str,
+) -> Result<(), StoreError> {
+    let fetch = format!("+refs/heads/*:refs/remotes/{name}/*");
+    let mut section = file
+        .new_section("remote", Some(name.into()))
+        .map_err(|_| StoreError::InvalidRemoteName(name.to_owned()))?;
+    section
+        .push("url", Some(url.into()))
+        .map_err(|_| StoreError::InvalidRemoteUrl(name.to_owned()))?;
+    section
+        .push("fetch", Some(fetch.as_str().into()))
+        .map_err(|_| StoreError::InvalidRemoteName(name.to_owned()))?;
+    Ok(())
 }
 
 pub(crate) fn open_options() -> gix::open::Options {
@@ -1342,6 +1429,135 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn an_added_remote_is_read_at_once_and_written_to_the_configuration() {
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        let config = dir.path().join(".git").join("config");
+        let before = std::fs::read_to_string(&config).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store
+            .add_remote("origin", "git@github.com:org/repo.git")
+            .unwrap();
+        store
+            .add_remote("odd", "ssh://git@example.org/a;b#c\\d\"e.git")
+            .unwrap();
+        assert_eq!(store.remote_names(), ["odd", "origin"]);
+        assert_eq!(
+            store.remote_url("origin", true).unwrap().as_deref(),
+            Some("git@github.com:org/repo.git")
+        );
+        let reopened = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.remote_url("odd", false).unwrap().as_deref(),
+            Some("ssh://git@example.org/a;b#c\\d\"e.git")
+        );
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert!(after.starts_with(&before), "{after}");
+        assert!(
+            after.contains("fetch = +refs/heads/*:refs/remotes/origin/*"),
+            "{after}"
+        );
+        assert!(!dir.path().join(".git").join("config.lock").exists());
+    }
+
+    #[test]
+    fn adding_a_remote_keeps_the_config_files_text_mode_and_link() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        let git = dir.path().join(".git");
+        let kept = git.join("kept-config");
+        let mut text = std::fs::read_to_string(git.join("config")).unwrap();
+        text.push_str(
+            "# mine\n[include]\n\tpath = extra\n[alias]\n\tco = \"checkout \\\n\t--quiet\"\n",
+        );
+        std::fs::write(&kept, &text).unwrap();
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(git.join("config")).unwrap();
+        std::os::unix::fs::symlink("kept-config", git.join("config")).unwrap();
+        std::fs::write(
+            git.join("extra"),
+            "[remote \"included\"]\n\turl = me@host:inc\n",
+        )
+        .unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        assert!(matches!(
+            store.add_remote("included", "me@host:other"),
+            Err(StoreError::RemoteExists(_))
+        ));
+        store.add_remote("origin", "me@host:repo").unwrap();
+        assert!(
+            std::fs::symlink_metadata(git.join("config"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let after = std::fs::read_to_string(&kept).unwrap();
+        assert!(after.starts_with(&text), "{after}");
+        assert_eq!(
+            std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            store.remote_url("origin", true).unwrap().as_deref(),
+            Some("me@host:repo")
+        );
+    }
+
+    #[test]
+    fn adding_a_remote_waits_for_a_held_config_lock_then_fails_and_leaves_it() {
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        let lock = dir.path().join(".git").join("config.lock");
+        std::fs::write(&lock, "git's").unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        assert!(matches!(
+            store.add_remote("origin", "me@host:repo"),
+            Err(StoreError::Io(_))
+        ));
+        assert_eq!(std::fs::read(&lock).unwrap(), b"git's");
+        assert!(store.remote_names().is_empty());
+    }
+
+    #[test]
+    fn adding_a_remote_refuses_a_taken_or_unsafe_name_and_a_url_with_a_newline() {
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.add_remote("origin", "me@host:repo").unwrap();
+        assert!(matches!(
+            store.add_remote("origin", "other@host:repo"),
+            Err(StoreError::RemoteExists(_))
+        ));
+        for name in [
+            "", "-x", ".x", "a b", "a\"b", "a]b", "a..b", "x.lock", "a@{b",
+        ] {
+            assert!(
+                matches!(
+                    store.add_remote(name, "me@host:repo"),
+                    Err(StoreError::InvalidRemoteName(_))
+                ),
+                "{name:?}"
+            );
+        }
+        for url in ["", "me@host:repo\n[core]\n\tbare = true", "a\rb"] {
+            assert!(
+                matches!(
+                    store.add_remote("fresh", url),
+                    Err(StoreError::InvalidRemoteUrl(_))
+                ),
+                "{url:?}"
+            );
+        }
+        assert_eq!(
+            store.remote_url("origin", true).unwrap().as_deref(),
+            Some("me@host:repo")
+        );
+        assert_eq!(store.remote_names(), ["origin"]);
     }
 
     #[test]

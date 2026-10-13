@@ -81,7 +81,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
         .and_then(fs::canonicalize)
         .ok()
         .and_then(|cwd| Store::discover(&cwd).ok());
-    let Some(store) = store.filter(|_| terminal::is_interactive()) else {
+    let Some(mut store) = store.filter(|_| terminal::is_interactive()) else {
         let _ = Cli::command().write_help(&mut io::stderr());
         return 2;
     };
@@ -104,18 +104,18 @@ pub(crate) fn home(environment: &Environment) -> i32 {
     let captured = Captured::start().ok();
     let mut home = Home::default();
     let mut status = String::new();
-    let place = Place {
-        store: &store,
-        repository: &repository,
-        identity: &identity,
-        captured: captured.as_ref(),
-    };
     let outcome = loop {
+        let place = Place {
+            store: &store,
+            repository: &repository,
+            identity: &identity,
+            captured: captured.as_ref(),
+        };
         match choose(&place, &mut home, &status) {
             Ok(Chosen::Quit) => break Ok(()),
             Ok(Chosen::Stopped(signal)) => break Err(Ended::Stopped(signal)),
             Ok(Chosen::Action(action)) => {
-                status = act(action, &store, environment);
+                status = act(action, &mut store, environment);
                 ui::keys_make_signals(false);
                 if let Err(error) = Screen::restore() {
                     break Err(Ended::Failed(error));
@@ -357,7 +357,7 @@ fn rows(store: &Store) -> Vec<HomeRow> {
 
 /// Runs the chosen action as its command does, without leaving the alternate screen, and
 /// returns what the home screen says about it.
-fn act(action: HomeAction, store: &Store, environment: &Environment) -> String {
+fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> String {
     let words: Vec<String> = match action {
         HomeAction::New => match agent_to_run(environment) {
             Ok(agent) => vec!["run".to_owned(), agent],
@@ -415,37 +415,61 @@ fn agent_to_run(environment: &Environment) -> Result<String, String> {
     }
 }
 
-/// Asks in a dialog which remote threads are pushed to, and whether it is private.
-fn choose_remote(store: &Store) -> String {
+/// What the Remote dialog can do with one of its items.
+enum RemoteChoice {
+    Push(RemoteName, Visibility),
+    Add,
+    Off,
+}
+
+/// Asks in a dialog which remote threads are pushed to, and whether it is private, or which
+/// git remote to add to the repository first.
+fn choose_remote(store: &mut Store) -> String {
     let names = store.remote_names();
-    let mut items = Vec::with_capacity(names.len() * 2 + 1);
-    let mut choices = Vec::with_capacity(names.len() * 2 + 1);
+    let mut items = Vec::with_capacity(names.len() * 2 + 2);
+    let mut choices = Vec::with_capacity(names.len() * 2 + 2);
     for name in &names {
         let Ok(remote) = name.parse::<RemoteName>() else {
             continue;
         };
         items.push(format!("{name} · private: push the agents' snapshots too"));
-        choices.push(Some((remote.clone(), Visibility::Private)));
+        choices.push(RemoteChoice::Push(remote.clone(), Visibility::Private));
         items.push(format!("{name} · public: keep the snapshots here"));
-        choices.push(Some((remote, Visibility::Public)));
+        choices.push(RemoteChoice::Push(remote, Visibility::Public));
     }
+    items.push("Add a git remote to this repository".to_owned());
+    choices.push(RemoteChoice::Add);
     items.push("Don't push threads".to_owned());
-    choices.push(None);
-    let dialog = Dialog::choose(
-        "Remote",
-        vec![
-            format!("Threads are pushed to: {}", remote::summary(store)),
-            "Teammates and your other machines pick threads up from there.".to_owned(),
-        ],
-        items,
-    );
+    choices.push(RemoteChoice::Off);
+    let mut lines = vec![
+        format!("Threads are pushed to: {}", remote::summary(store)),
+        "Teammates and your other machines pick threads up from there.".to_owned(),
+    ];
+    if choices.len() == 2 {
+        lines.push(
+            "This repository has no git remote yet: add one, such as the GitHub repository \
+             your team shares."
+                .to_owned(),
+        );
+    }
+    let dialog = Dialog::choose("Remote", lines, items);
     let picked = match DialogPrompt::default().ask(dialog) {
-        Ok(Answer::Choice(index)) => choices.get(index).cloned(),
+        Ok(Answer::Choice(index)) => choices.into_iter().nth(index),
         _ => return String::new(),
     };
     let told = match picked {
-        Some(Some((name, visibility))) => remote::choose(store, &name, visibility),
-        Some(None) => remote::stop_pushing(store).map(|()| "threads are not pushed".to_owned()),
+        Some(RemoteChoice::Push(name, visibility)) => remote::choose(store, &name, visibility),
+        Some(RemoteChoice::Add) => match add_remote(store) {
+            Ok(Added::Chosen(name, visibility)) => remote::choose(store, &name, visibility),
+            Ok(Added::NotChosen(name)) => {
+                return format!("added the git remote {name}; threads are not pushed to it yet");
+            }
+            Ok(Added::Nothing) => return String::new(),
+            Err(error) => Err(error),
+        },
+        Some(RemoteChoice::Off) => {
+            remote::stop_pushing(store).map(|()| "threads are not pushed".to_owned())
+        }
         None => return String::new(),
     };
     match told {
@@ -458,4 +482,55 @@ fn choose_remote(store: &Store) -> String {
             "the remote was not changed; see the activity".to_owned()
         }
     }
+}
+
+/// What adding a git remote from the Remote dialog did.
+enum Added {
+    Nothing,
+    NotChosen(RemoteName),
+    Chosen(RemoteName, Visibility),
+}
+
+/// Asks for the name and URL of a git remote, adds it to the repository, and asks whether
+/// it is private.
+fn add_remote(store: &mut Store) -> Result<Added, remote::RemoteError> {
+    let mut prompt = DialogPrompt::default();
+    let name = match prompt.ask(Dialog::input(
+        "Add a git remote",
+        vec!["Its name, as git calls it; empty for `origin`.".to_owned()],
+        false,
+    )) {
+        Ok(Answer::Text(text)) if text.trim().is_empty() => "origin".to_owned(),
+        Ok(Answer::Text(text)) => text.trim().to_owned(),
+        _ => return Ok(Added::Nothing),
+    };
+    let name = name
+        .parse::<RemoteName>()
+        .map_err(remote::RemoteError::InvalidName)?;
+    let url = match prompt.ask(Dialog::input(
+        "Add a git remote",
+        vec![
+            format!("The URL of {name}, over SSH or HTTPS, such as:"),
+            "`git@github.com:team/project.git` or `https://github.com/team/project.git`".to_owned(),
+        ],
+        false,
+    )) {
+        Ok(Answer::Text(text)) => text.trim().to_owned(),
+        _ => return Ok(Added::Nothing),
+    };
+    remote::add(store, &name, &url)?;
+    eprintln!("added the git remote {name}");
+    let visibility = match prompt.ask(Dialog::choose(
+        "Remote",
+        vec![format!("Push threads to {name}?")],
+        vec![
+            "Private: push the agents' snapshots too".to_owned(),
+            "Public: keep the snapshots here".to_owned(),
+        ],
+    )) {
+        Ok(Answer::Choice(0)) => Visibility::Private,
+        Ok(Answer::Choice(1)) => Visibility::Public,
+        _ => return Ok(Added::NotChosen(name)),
+    };
+    Ok(Added::Chosen(name, visibility))
 }

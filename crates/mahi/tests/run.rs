@@ -1420,6 +1420,64 @@ cat parser.rs
     }
 
     #[test]
+    fn the_home_screen_adds_a_git_remote_and_pushes_threads_to_it() {
+        let fixture = fixture();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("Threads", b"m"),
+                ("no git remote yet", b"1"),
+                ("Its name", b"\r"),
+                ("The URL of origin", b"git@example.org:team/project.git\r"),
+                ("Push threads to origin?", b"1"),
+                ("remote: origin (private)", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let store = Store::open(&fixture.repo).unwrap();
+        assert_eq!(
+            store.remote_url("origin", true).unwrap().as_deref(),
+            Some("git@example.org:team/project.git")
+        );
+        let shown = fixture.mahi(&["remote"]);
+        assert!(
+            String::from_utf8_lossy(&shown.stdout).contains("pushed to origin"),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn the_home_screen_refuses_a_remote_url_mahi_cannot_push_to_and_adds_one_left_unchosen() {
+        let fixture = fixture();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("Threads", b"m"),
+                ("no git remote yet", b"1"),
+                ("Its name", b"team\r"),
+                ("The URL of team", b"http://example.org/project.git\r"),
+                ("the remote was not changed", b"m"),
+                ("no git remote yet", b"1"),
+                ("Its name", b"team\r"),
+                ("The URL of team", b"git@example.org:team/project.git\r"),
+                ("Push threads to team?", b"\x1b"),
+                (
+                    "added the git remote team; threads are not pushed to it yet",
+                    b"q",
+                ),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let store = Store::open(&fixture.repo).unwrap();
+        assert_eq!(store.remote_names(), ["team"]);
+        let shown = fixture.mahi(&["remote"]);
+        assert!(
+            String::from_utf8_lossy(&shown.stdout).contains("not pushed"),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
     fn a_paste_split_after_its_escape_closes_a_question_and_does_nothing_else() {
         let fixture = fixture();
         let (_thread, _claude) = worked_thread(&fixture);

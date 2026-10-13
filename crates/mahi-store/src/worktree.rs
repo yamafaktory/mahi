@@ -692,6 +692,28 @@ mod tests {
     }
 
     #[test]
+    fn a_store_opened_in_a_linked_worktree_adds_a_remote_to_the_shared_config() {
+        let (dir, store) = store();
+        let base = sample_commit(&store);
+        let path = store
+            .add_worktree(
+                "agent",
+                &dir.path().join("wt"),
+                base,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let mut linked = Store::open(&path).unwrap();
+        linked.add_remote("origin", "me@host:repo").unwrap();
+        assert_eq!(
+            linked.remote_url("origin", true).unwrap().as_deref(),
+            Some("me@host:repo")
+        );
+        let main = Store::open(&dir.path().join("repo")).unwrap();
+        assert_eq!(main.remote_names(), ["origin"]);
+    }
+
+    #[test]
     fn checks_out_files_modes_and_links() {
         let (dir, store) = store();
         let base = sample_commit(&store);

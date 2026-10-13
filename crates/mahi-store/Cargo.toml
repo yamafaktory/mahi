@@ -15,6 +15,7 @@ fuzzing = []
 [dependencies]
 gix = { workspace = true }
 gix-imara-diff = { workspace = true }
+gix-lock = { workspace = true }
 gix-validate = { workspace = true }
 gix-pack = { workspace = true }
 mahi-core = { workspace = true }
