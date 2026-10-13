@@ -812,7 +812,11 @@ mod tests {
         );
         let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 7));
         input.render(buffer.area, &mut buffer);
-        let short: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        let short: String = buffer
+            .content()
+            .iter()
+            .map(ratatui_core::buffer::Cell::symbol)
+            .collect();
         assert!(short.contains('›'), "{short}");
         for dialog in [input, table] {
             for (width, height) in [(0, 0), (1, 1), (6, 3), (20, 5)] {
