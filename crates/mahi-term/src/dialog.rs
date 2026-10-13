@@ -41,6 +41,11 @@ use ratatui_widgets::{
         Paragraph,
         Wrap,
     },
+    table::{
+        Cell,
+        Row,
+        Table,
+    },
 };
 use zeroize::Zeroizing;
 
@@ -48,6 +53,7 @@ use crate::PaletteInput;
 
 const MAX_INPUT_CHARS: usize = 1024;
 const MAX_WIDTH: u16 = 76;
+const TABLE_GAP: usize = 2;
 const MASK: char = '•';
 
 /// The colours mahi's full-screen views use.
@@ -94,8 +100,9 @@ impl Theme {
     }
 }
 
-/// A modal dialog drawn over a full-screen view: a message, a yes or no question, a line to
-/// type, masked or not, or a list to pick from. What is typed never shows in `Debug` output.
+/// A modal dialog drawn over a full-screen view: a message, a table to read, a yes or no
+/// question, a line to type, masked or not, or a list to pick from. What is typed never shows
+/// in `Debug` output.
 pub struct Dialog {
     title: String,
     lines: Vec<String>,
@@ -104,6 +111,10 @@ pub struct Dialog {
 
 enum Kind {
     Message,
+    Table {
+        header: [String; 3],
+        rows: Vec<[String; 3]>,
+    },
     Notice,
     Confirm {
         yes: bool,
@@ -160,6 +171,18 @@ impl Dialog {
         Self::with(title, lines, Kind::Message)
     }
 
+    /// Makes a dialog that shows `lines` above a table of three columns, `header` naming them,
+    /// until the user presses Enter or Escape.
+    #[must_use]
+    pub fn table(
+        title: &str,
+        lines: Vec<String>,
+        header: [String; 3],
+        rows: Vec<[String; 3]>,
+    ) -> Self {
+        Self::with(title, lines, Kind::Table { header, rows })
+    }
+
     /// Makes a dialog that shows `lines` while mahi works, answering no key: what a command
     /// says during a long step, such as a pairing code while it waits.
     #[must_use]
@@ -212,7 +235,9 @@ impl Dialog {
             return Some(Answer::Cancelled);
         }
         match &mut self.kind {
-            Kind::Message => (input == PaletteInput::Enter).then_some(Answer::Ok),
+            Kind::Message | Kind::Table { .. } => {
+                (input == PaletteInput::Enter).then_some(Answer::Ok)
+            }
             Kind::Notice => None,
             Kind::Confirm { yes } => match input {
                 PaletteInput::Text('y' | 'Y') => Some(Answer::Confirmed(true)),
@@ -277,6 +302,7 @@ impl Dialog {
             Kind::Message | Kind::Notice => 0,
             Kind::Confirm { .. } | Kind::Input { .. } => 2,
             Kind::Choose { items, .. } => items.len() + 1,
+            Kind::Table { rows, .. } => rows.len() + 2,
         };
         let wanted = text_rows + extra_rows + 3;
         let height = u16::try_from(wanted)
@@ -318,23 +344,41 @@ impl Dialog {
     }
 
     fn wanted_width(&self) -> u16 {
-        let Kind::Choose { items, .. } = &self.kind else {
-            return MAX_WIDTH;
+        let widest = match &self.kind {
+            Kind::Choose { items, .. } => items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| digits(index + 1) + Span::raw(shown(item)).width() + 7)
+                .max(),
+            Kind::Table { header, rows } => {
+                let [first, second, third] = column_widths(header, rows);
+                Some(first + second + third + 2 * TABLE_GAP + 4)
+            }
+            _ => None,
         };
-        items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| digits(index + 1) + Span::raw(shown(item)).width() + 7)
-            .max()
-            .map_or(MAX_WIDTH, |widest| {
-                u16::try_from(widest).unwrap_or(u16::MAX).max(MAX_WIDTH)
-            })
+        widest.map_or(MAX_WIDTH, |widest| {
+            u16::try_from(widest).unwrap_or(u16::MAX).max(MAX_WIDTH)
+        })
     }
 
     fn render_below(&self, area: Rect, buffer: &mut Buffer) {
         let [_, rest] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
         match &self.kind {
             Kind::Message | Kind::Notice => {}
+            Kind::Table { header, rows } => {
+                let widths = column_widths(header, rows)
+                    .map(|width| Constraint::Length(u16::try_from(width).unwrap_or(u16::MAX)));
+                Widget::render(
+                    Table::new(rows.iter().map(table_row), widths)
+                        .header(
+                            Row::new(header.iter().map(|name| Cell::from(shown(name))))
+                                .style(Theme::muted()),
+                        )
+                        .column_spacing(u16::try_from(TABLE_GAP).unwrap_or(1)),
+                    rest,
+                    buffer,
+                );
+            }
             Kind::Confirm { yes } => {
                 Line::from(vec![
                     button("Yes", *yes),
@@ -372,7 +416,7 @@ impl Dialog {
 
     fn hints(&self) -> Vec<Span<'static>> {
         let pairs: &[(&str, &str)] = match self.kind {
-            Kind::Message => &[("enter", "close")],
+            Kind::Message | Kind::Table { .. } => &[("enter", "close")],
             Kind::Notice => &[],
             Kind::Confirm { .. } => &[
                 ("y", "yes"),
@@ -399,6 +443,28 @@ pub fn key_hints(pairs: &[(&str, &str)]) -> Vec<Span<'static>> {
         spans.push(Span::styled(format!(" {what}"), Theme::muted()));
     }
     spans
+}
+
+fn table_row(row: &[String; 3]) -> Row<'_> {
+    let [key, action, about] = row;
+    Row::new([
+        Cell::from(Span::styled(shown(key), Theme::title())),
+        Cell::from(Span::styled(
+            shown(action),
+            Style::new().add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::raw(shown(about))),
+    ])
+}
+
+fn column_widths(header: &[String; 3], rows: &[[String; 3]]) -> [usize; 3] {
+    let mut widths = [0; 3];
+    for row in std::iter::once(header).chain(rows) {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(Span::raw(shown(cell)).width());
+        }
+    }
+    widths
 }
 
 fn digits(number: usize) -> usize {
@@ -640,6 +706,40 @@ mod tests {
     }
 
     #[test]
+    fn a_table_lines_up_its_columns_widens_to_fit_and_closes_on_enter() {
+        let about = "a description long enough to need more than the usual width of a dialog";
+        let mut dialog = Dialog::table(
+            "Help",
+            vec!["What the keys do".to_owned()],
+            ["key", "action", "what it does"].map(str::to_owned),
+            vec![
+                ["n", "new", "start a thread"].map(str::to_owned),
+                ["q esc", "quit", about].map(str::to_owned),
+            ],
+        );
+        let area = Rect::new(0, 0, 120, 14);
+        let mut buffer = Buffer::empty(area);
+        dialog.render(area, &mut buffer);
+        let screen: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("key    action  what it does"), "{screen}");
+        assert!(screen.contains("n      new     start a thread"), "{screen}");
+        assert!(
+            screen.contains(&format!("q esc  quit    {about}")),
+            "{screen}"
+        );
+        assert!(screen.contains("enter close"), "{screen}");
+        assert_eq!(dialog.key(PaletteInput::Text('q')), None);
+        assert_eq!(dialog.key(PaletteInput::Enter), Some(Answer::Ok));
+    }
+
+    #[test]
     fn a_message_closes_on_enter_and_shows_hidden_characters_as_marks() {
         let mut dialog = Dialog::message("Done", vec!["ended t1\u{1b}[2J".to_owned()]);
         assert!(drawn(&dialog).contains("ended t1?[2J"));
@@ -689,11 +789,19 @@ mod tests {
 
     #[test]
     fn a_tiny_area_draws_without_panicking() {
-        let dialog = Dialog::input("t", vec!["a long line ".repeat(20)], false);
-        for (width, height) in [(0, 0), (1, 1), (6, 3), (20, 5)] {
-            let area = Rect::new(0, 0, width, height);
-            let mut buffer = Buffer::empty(area);
-            dialog.render(area, &mut buffer);
+        let input = Dialog::input("t", vec!["a long line ".repeat(20)], false);
+        let table = Dialog::table(
+            "t",
+            vec!["a long line ".repeat(20)],
+            ["key", "action", "what it does"].map(str::to_owned),
+            vec![["q esc", "quit", "leave mahi"].map(str::to_owned); 30],
+        );
+        for dialog in [input, table] {
+            for (width, height) in [(0, 0), (1, 1), (6, 3), (20, 5)] {
+                let area = Rect::new(0, 0, width, height);
+                let mut buffer = Buffer::empty(area);
+                dialog.render(area, &mut buffer);
+            }
         }
     }
 }

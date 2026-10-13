@@ -135,10 +135,12 @@ enum ThreadChoice {
 impl ThreadChoice {
     fn label(self) -> &'static str {
         match self {
-            Self::Resume => "Resume it",
-            Self::Land => "Land its work on a branch",
-            Self::End => "End it",
-            Self::Invite => "Invite a teammate",
+            Self::Resume => "Resume: start your agent again where it stopped",
+            Self::Land => "Land: merge its agents' work onto a branch for you to commit",
+            Self::End => "End: save its work in a last snapshot and remove its worktrees",
+            Self::Invite => {
+                "Invite: show a pairing code so a teammate can watch and prompt it live"
+            }
         }
     }
 }
@@ -301,10 +303,13 @@ impl Home {
         let action = action(row.thread.clone());
         let question = match &action {
             HomeAction::Land(thread) => format!(
-                "Land thread {thread}? Its agents' work is merged onto a branch for you to curate."
+                "Land thread {thread}? Its agents' work is merged into a landing worktree on a \
+                 branch, where you turn it into commits with git, then push them with \
+                 `mahi land {thread} --push`."
             ),
             HomeAction::End(thread) => format!(
-                "End thread {thread}? Its worktree is recorded in a last snapshot, then removed."
+                "End thread {thread}? Its worktrees are recorded in a last snapshot, then removed. \
+                 Its history stays, and resuming it brings the worktrees back."
             ),
             _ => return,
         };
@@ -316,19 +321,52 @@ impl Home {
 
     fn open_help(&mut self) {
         let lines = [
-            "mahi runs coding agents in a sandbox, in threads you can share.",
-            "",
-            "tab        switch between the menu and the threads",
-            "↑ ↓ j k    move     enter   open the menu of what is selected",
-            "n          start a new thread with an agent",
-            "r l e i    resume, land, end, or invite to the selected thread",
-            "c          join a teammate's thread with their pairing code",
-            "m          choose the remote threads are pushed to",
-            "q / esc    quit",
+            "mahi runs coding agents in a sandbox. A thread is one piece of work: its agents, \
+             each in its own worktree, and the history of what they did.",
+            "Ending a thread keeps its history; resuming brings its worktrees back.",
         ];
-        let dialog = Dialog::message(
+        let rows = [
+            ["tab", "switch", "move between the menu and the threads"],
+            ["↑↓ j k", "move", "go up and down the focused list"],
+            ["enter", "open", "open the menu of what is selected"],
+            ["n", "new", "start a thread with an agent"],
+            [
+                "r",
+                "resume",
+                "start your agent in the thread again where it stopped",
+            ],
+            [
+                "l",
+                "land",
+                "merge its agents' work onto a branch for you to commit",
+            ],
+            [
+                "e",
+                "end",
+                "save its work in a snapshot and remove its worktrees",
+            ],
+            [
+                "i",
+                "invite",
+                "show a code so a teammate can watch and prompt it live",
+            ],
+            [
+                "c",
+                "join",
+                "type a teammate's code to watch and prompt their agent",
+            ],
+            [
+                "m",
+                "remote",
+                "choose where threads are pushed to be shared",
+            ],
+            ["q esc", "quit", "leave mahi"],
+        ];
+        let dialog = Dialog::table(
             "Help",
             lines.iter().map(|line| (*line).to_owned()).collect(),
+            ["key", "action", "what it does"].map(str::to_owned),
+            rows.iter().map(|row| row.map(str::to_owned)).collect(),
         );
         self.dialog = Some((dialog, Pending::Help));
     }
@@ -622,7 +660,10 @@ mod tests {
     }
 
     fn screen(home: &Home, rows: &[HomeRow], status: &str) -> String {
-        let area = Rect::new(0, 0, 110, 32);
+        screen_in(home, rows, status, Rect::new(0, 0, 110, 32))
+    }
+
+    fn screen_in(home: &Home, rows: &[HomeRow], status: &str, area: Rect) -> String {
         let mut buffer = Buffer::empty(area);
         let activity = vec![
             "mahi: ended t0".to_owned(),
@@ -723,9 +764,33 @@ mod tests {
         home.key(PaletteInput::Down, &rows);
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
         assert!(home.has_dialog());
-        assert!(screen(&home, &rows, "").contains("Help"));
+        let help = screen(&home, &rows, "");
+        assert!(help.contains("Help"), "{help}");
+        for row in [
+            "key     action  what it does",
+            "l       land    merge its agents' work onto a branch for you to commit",
+            "e       end     save its work in a snapshot and remove its worktrees",
+            "q esc   quit    leave mahi",
+        ] {
+            assert!(help.contains(row), "{help}");
+        }
+        let narrow = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
+        for row in [
+            "r       resume  start your agent in the thread again where it stopped",
+            "i       invite  show a code so a teammate can watch and prompt it live",
+            "q esc   quit    leave mahi",
+        ] {
+            assert!(narrow.contains(row), "{narrow}");
+        }
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
         assert!(!home.has_dialog());
+        home.key(PaletteInput::Tab, &rows);
+        assert_eq!(home.key(PaletteInput::Enter, &rows), None);
+        let menu = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
+        assert!(
+            menu.contains("Invite: show a pairing code so a teammate can watch and prompt it "),
+            "{menu}"
+        );
     }
 
     #[test]
@@ -735,7 +800,10 @@ mod tests {
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
         let menu = screen(&home, &rows, "");
         assert!(
-            menu.contains("Resume it") && menu.contains("Invite a teammate"),
+            menu.contains("Resume: start")
+                && menu.contains(
+                    "Invite: show a pairing code so a teammate can watch and prompt it live"
+                ),
             "{menu}"
         );
         home.key(PaletteInput::Down, &rows);
@@ -748,7 +816,7 @@ mod tests {
         home.key(PaletteInput::Down, &rows);
         home.key(PaletteInput::Enter, &rows);
         let teammate = screen(&home, &rows, "");
-        assert!(!teammate.contains("Resume it"), "{teammate}");
+        assert!(!teammate.contains("Resume:"), "{teammate}");
         assert_eq!(
             home.key(PaletteInput::Text('3'), &rows),
             Some(HomeAction::Invite("t2".to_owned()))
