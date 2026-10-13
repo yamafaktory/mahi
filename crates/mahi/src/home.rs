@@ -369,6 +369,7 @@ fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> Stri
         HomeAction::Invite(thread) => vec!["invite".to_owned(), thread],
         HomeAction::Join => vec!["join".to_owned()],
         HomeAction::Remote => return choose_remote(store),
+        HomeAction::Card => vec!["id".to_owned()],
         HomeAction::Quit => return String::new(),
     };
     let shown = format!("mahi {}", words.join(" "));

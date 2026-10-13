@@ -1478,6 +1478,33 @@ cat parser.rs
     }
 
     #[test]
+    fn the_home_screen_shows_your_card_and_puts_it_on_the_clipboard() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("Threads", b"u"),
+                ("who invites you with it", b"\r"),
+                ("mahi id: done", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let start = output.find("\x1b]52;c;").unwrap() + "\x1b]52;c;".len();
+        let end = start + output[start..].find('\x07').unwrap();
+        let copied = String::from_utf8(STANDARD.decode(&output[start..end]).unwrap()).unwrap();
+        assert!(
+            copied.starts_with("mahi-participant tester age1"),
+            "{copied}"
+        );
+        assert!(!copied.contains('\n'), "{copied}");
+        for word in copied.split(' ') {
+            assert!(output.contains(word), "{word} not shown: {output}");
+        }
+        assert!(output.contains("clipboard,"), "{output}");
+    }
+
+    #[test]
     fn a_paste_split_after_its_escape_closes_a_question_and_does_nothing_else() {
         let fixture = fixture();
         let (_thread, _claude) = worked_thread(&fixture);

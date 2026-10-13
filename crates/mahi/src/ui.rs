@@ -22,6 +22,7 @@ use std::{
 };
 
 use age::secrecy::SecretString;
+use base64::Engine as _;
 use mahi_sandbox::{
     InputWait,
     TerminationSignals,
@@ -407,6 +408,50 @@ fn read_input(buffer: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// Shows `text`, which a command prints, in a dialog titled `title` under `intro`, until the
+/// user presses Enter. Text `to_send` to someone, such as a card or a ticket, also goes to the
+/// clipboard through the terminal when it is one line, since copying it off the screen would
+/// take the dialog's border and line breaks with it; the dialog shows even if that fails.
+pub(crate) fn show_printed(title: &str, intro: &str, text: &str, to_send: bool) -> io::Result<()> {
+    let mut lines = Vec::with_capacity(text.lines().count() + 2);
+    if !intro.is_empty() {
+        lines.push(intro.to_owned());
+    }
+    lines.extend(text.lines().map(str::to_owned));
+    if let Some(only) = only_line(text).filter(|_| to_send) {
+        let mut out = io::stdout().lock();
+        let copied = out
+            .write_all(&clipboard_sequence(only))
+            .and_then(|()| out.flush())
+            .is_ok();
+        if copied {
+            lines.push(
+                "It is also on your clipboard, if your terminal lets mahi put it there.".to_owned(),
+            );
+        }
+    }
+    DialogPrompt::default()
+        .ask(Dialog::message(title, lines))
+        .map(|_| ())
+}
+
+fn only_line(text: &str) -> Option<&str> {
+    let mut written = text.lines().filter(|line| !line.is_empty());
+    match (written.next(), written.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
+}
+
+fn clipboard_sequence(text: &str) -> Vec<u8> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut sequence = Vec::with_capacity(encoded.len() + 8);
+    sequence.extend_from_slice(b"\x1b]52;c;");
+    sequence.extend_from_slice(encoded.as_bytes());
+    sequence.push(0x07);
+    sequence
+}
+
 /// Draws `dialog` over the full-screen view's last frame.
 fn show(dialog: &Dialog) -> io::Result<()> {
     let size = terminal::size();
@@ -533,6 +578,23 @@ fn collect(reader: OwnedFd, lines: &Mutex<Vec<String>>, generation: &AtomicU64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_text_of_one_line_is_put_on_the_clipboard_whatever_blank_lines_surround_it() {
+        assert_eq!(only_line(""), None);
+        assert_eq!(only_line("\n\n"), None);
+        assert_eq!(only_line("card\n"), Some("card"));
+        assert_eq!(only_line("\ncard\n\n"), Some("card"));
+        assert_eq!(only_line("a\nb\n"), None);
+    }
+
+    #[test]
+    fn the_clipboard_gets_the_text_base64_encoded_in_one_terminal_sequence() {
+        assert_eq!(
+            clipboard_sequence("mahi card \u{1b}]0;x\u{7}"),
+            b"\x1b]52;c;bWFoaSBjYXJkIBtdMDt4Bw==\x07"
+        );
+    }
 
     #[test]
     fn both_ends_of_the_capture_pipe_close_on_exec() {

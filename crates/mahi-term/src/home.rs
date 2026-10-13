@@ -48,11 +48,12 @@ use crate::{
     key_hints,
 };
 
-const MENU: [(&str, &str); 6] = [
+const MENU: [(&str, &str); 7] = [
     ("Threads", "t"),
     ("New thread", "n"),
     ("Join with a code", "c"),
     ("Remote", "m"),
+    ("Your card", "u"),
     ("Help", "?"),
     ("Quit", "q"),
 ];
@@ -108,6 +109,8 @@ pub enum HomeAction {
     Join,
     /// Choose the remote threads are pushed to.
     Remote,
+    /// Show the user's participant card, which a thread's owner invites them with.
+    Card,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -228,6 +231,7 @@ impl Home {
             PaletteInput::Text('n') => return Some(HomeAction::New),
             PaletteInput::Text('c') => return Some(HomeAction::Join),
             PaletteInput::Text('m') => return Some(HomeAction::Remote),
+            PaletteInput::Text('u') => return Some(HomeAction::Card),
             PaletteInput::Text('?') => self.open_help(),
             PaletteInput::Text('r') => match selected {
                 Some(row) if row.owned => return Some(HomeAction::Resume(row.thread.clone())),
@@ -266,7 +270,8 @@ impl Home {
             1 => Some(HomeAction::New),
             2 => Some(HomeAction::Join),
             3 => Some(HomeAction::Remote),
-            4 => {
+            4 => Some(HomeAction::Card),
+            5 => {
                 self.open_help();
                 None
             }
@@ -358,7 +363,12 @@ impl Home {
             [
                 "m",
                 "remote",
-                "choose where threads are pushed to be shared",
+                "choose or add where threads are pushed to be shared",
+            ],
+            [
+                "u",
+                "card",
+                "show the line a thread's owner invites you with",
             ],
             ["q esc", "quit", "leave mahi"],
         ];
@@ -731,13 +741,14 @@ mod tests {
         let rows = rows();
         let mut home = Home::default();
         assert_eq!(
-            keys(&mut home, &rows, "nricmq"),
+            keys(&mut home, &rows, "nricmuq"),
             [
                 HomeAction::New,
                 HomeAction::Resume("t1".to_owned()),
                 HomeAction::Invite("t1".to_owned()),
                 HomeAction::Join,
                 HomeAction::Remote,
+                HomeAction::Card,
                 HomeAction::Quit,
             ]
         );
@@ -762,6 +773,8 @@ mod tests {
             Some(HomeAction::Remote)
         );
         home.key(PaletteInput::Down, &rows);
+        assert_eq!(home.key(PaletteInput::Enter, &rows), Some(HomeAction::Card));
+        home.key(PaletteInput::Down, &rows);
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
         assert!(home.has_dialog());
         let help = screen(&home, &rows, "");
@@ -778,6 +791,7 @@ mod tests {
         for row in [
             "r       resume  start your agent in the thread again where it stopped",
             "i       invite  show a code so a teammate can watch and prompt it live",
+            "u       card    show the line a thread's owner invites you with",
             "q esc   quit    leave mahi",
         ] {
             assert!(narrow.contains(row), "{narrow}");
@@ -861,7 +875,7 @@ mod tests {
     fn pasted_text_is_never_a_key() {
         let rows = rows();
         let mut home = Home::default();
-        for c in "nrleijmq?".chars() {
+        for c in "nrleijmuq?".chars() {
             assert_eq!(home.key(PaletteInput::Pasted(c), &rows), None);
         }
         assert!(!home.has_dialog());

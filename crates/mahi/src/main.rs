@@ -171,7 +171,12 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
         },
         Command::Purge(command) => purged(&command, environment),
         Command::Credential(command) => match credentials::credential(&command, environment) {
-            Ok(done) if command == CredentialCommand::List => print_out(&done),
+            Ok(done) if command == CredentialCommand::List => print_out(
+                &done,
+                "Credentials",
+                "The credentials mahi keeps, by name:",
+                false,
+            ),
             Ok(done) => {
                 eprint!("{done}");
                 0
@@ -189,14 +194,30 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
             }),
         ),
         Command::Invite(command) => {
-            exit_code(invite::invite(&command, environment).map(|ticket| print_out(&ticket)))
+            exit_code(invite::invite(&command, environment).map(|ticket| {
+                print_out(
+                    &ticket,
+                    "Ticket",
+                    "Send this ticket to your teammate, who joins with `mahi join <ticket>`:",
+                    true,
+                )
+            }))
         }
         Command::Remote(command) => {
-            exit_code(remote::remote(&command).map(|done| print_out(&done)))
+            exit_code(remote::remote(&command).map(|done| print_out(&done, "Remote", "", false)))
         }
-        Command::Id => exit_code(id::id(environment).map(|card| print_out(&card))),
+        Command::Id => exit_code(id::id(environment).map(|card| {
+            print_out(
+                &card,
+                "Your card",
+                "Send this line to a thread's owner, who invites you with it:",
+                true,
+            )
+        })),
         Command::Apparmor => apparmor(environment),
-        Command::Threads => exit_code(threads::threads().map(|listing| print_out(&listing))),
+        Command::Threads => {
+            exit_code(threads::threads().map(|listing| print_out(&listing, "Threads", "", false)))
+        }
         Command::Hook(hook) => {
             if let Some(socket) = &environment.hook_socket {
                 let _ = hook::send(socket, hook.kind, io::stdin().lock());
@@ -263,7 +284,7 @@ fn apparmor(environment: &Environment) -> i32 {
         .as_deref()
         .and_then(mahi_sandbox::apparmor_profile);
     if let Some(profile) = profile {
-        return print_out(&profile.text);
+        return print_out(&profile.text, "AppArmor", "", false);
     }
     eprintln!(
         "mahi: cannot write a profile for this mahi: its path is unknown or holds a character \
@@ -272,8 +293,19 @@ fn apparmor(environment: &Environment) -> i32 {
     1
 }
 
-/// Writes `text` to standard output, where a reader that stopped early is not an error.
-fn print_out(text: &str) -> i32 {
+/// Writes `text` to standard output, where a reader that stopped early is not an error; while
+/// the home screen owns the terminal, shows it in a dialog titled `title` under `intro`, and
+/// puts it on the clipboard too when it is a line `to_send` to someone.
+fn print_out(text: &str, title: &str, intro: &str, to_send: bool) -> i32 {
+    if ui::is_showing() {
+        return match ui::show_printed(title, intro, text, to_send) {
+            Ok(()) => 0,
+            Err(error) => {
+                report(&error);
+                1
+            }
+        };
+    }
     match io::stdout().lock().write_all(text.as_bytes()) {
         Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
             report(&error);
