@@ -172,7 +172,7 @@ fn claude_code_profile() -> Profile {
             name,
             variable: "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
             hint: Some(
-                "run claude setup-token in another terminal and paste the token it prints"
+                "run `claude setup-token` in another terminal and paste the token it prints"
                     .to_owned(),
             ),
         }),

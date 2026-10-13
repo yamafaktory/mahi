@@ -81,6 +81,12 @@ impl Theme {
         Style::new().fg(Self::ACCENT).add_modifier(Modifier::BOLD)
     }
 
+    /// Returns the style of a command or a name the user types, written between backticks.
+    #[must_use]
+    pub fn code() -> Style {
+        Style::new().fg(Self::WARN).add_modifier(Modifier::BOLD)
+    }
+
     /// Returns the style of quieter text.
     #[must_use]
     pub fn muted() -> Style {
@@ -261,15 +267,11 @@ impl Dialog {
     pub fn render(&self, area: Rect, buffer: &mut Buffer) {
         let width = area.width.saturating_sub(4).min(self.wanted_width());
         let text_width = usize::from(width.saturating_sub(4)).max(1);
-        let text: Vec<Line<'_>> = self
-            .lines
-            .iter()
-            .map(|line| Line::from(shown(line)))
-            .collect();
+        let text: Vec<Line<'_>> = self.lines.iter().map(|line| marked(line)).collect();
         let text_rows: usize = self
             .lines
             .iter()
-            .map(|line| wrapped_rows(line, text_width))
+            .map(|line| wrapped_rows(line, text_width, has_marks(line)))
             .sum();
         let extra_rows = match &self.kind {
             Kind::Message | Kind::Notice => 0,
@@ -416,9 +418,34 @@ fn button(label: &str, on: bool) -> Span<'static> {
     }
 }
 
-fn wrapped_rows(line: &str, width: usize) -> usize {
+fn has_marks(line: &str) -> bool {
+    let marks = line.matches('`').count();
+    marks > 0 && marks.is_multiple_of(2)
+}
+
+fn marked(line: &str) -> Line<'_> {
+    if !has_marks(line) {
+        return Line::from(shown(line));
+    }
+    Line::from(
+        line.split('`')
+            .enumerate()
+            .filter(|(_, part)| !part.is_empty())
+            .map(|(index, part)| {
+                if index.is_multiple_of(2) {
+                    Span::raw(shown(part))
+                } else {
+                    Span::styled(shown(part), Theme::code())
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn wrapped_rows(line: &str, width: usize, marks: bool) -> usize {
     let width_of = |text: &str| -> usize {
         text.chars()
+            .filter(|c| !(marks && *c == '`'))
             .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
             .sum()
     };
@@ -585,6 +612,34 @@ mod tests {
     }
 
     #[test]
+    fn text_between_backticks_is_highlighted_without_its_marks() {
+        let dialog = Dialog::message(
+            "Token",
+            vec![
+                "run `claude setup-token` in another terminal".to_owned(),
+                "a lone ` stays".to_owned(),
+            ],
+        );
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buffer = Buffer::empty(area);
+        dialog.render(area, &mut buffer);
+        let screen = drawn(&dialog);
+        assert!(
+            screen.contains("run claude setup-token in another"),
+            "{screen}"
+        );
+        assert!(screen.contains("a lone ` stays"), "{screen}");
+        let highlighted = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&position| buffer[position].style().fg == Theme::code().fg)
+            .map(|position| buffer[position].symbol().to_owned())
+            .collect::<String>();
+        assert_eq!(highlighted, "claude setup-token");
+        assert_eq!(wrapped_rows("`ab` cd", 5, true), 1);
+        assert_eq!(wrapped_rows("`ab` cd", 5, false), 2);
+    }
+
+    #[test]
     fn a_message_closes_on_enter_and_shows_hidden_characters_as_marks() {
         let mut dialog = Dialog::message("Done", vec!["ended t1\u{1b}[2J".to_owned()]);
         assert!(drawn(&dialog).contains("ended t1?[2J"));
@@ -606,12 +661,12 @@ mod tests {
         );
         let screen = drawn(&dialog);
         assert!(screen.contains("Don't push threads"), "{screen}");
-        assert_eq!(wrapped_rows("aaa bbb", 3), 2);
+        assert_eq!(wrapped_rows("aaa bbb", 3, false), 2);
         assert_eq!(
-            wrapped_rows("a https://example.org/a/very/long/path", 10),
+            wrapped_rows("a https://example.org/a/very/long/path", 10, false),
             5
         );
-        assert_eq!(wrapped_rows("", 10), 1);
+        assert_eq!(wrapped_rows("", 10, false), 1);
         assert!(screen.contains("enter pick"), "{screen}");
         let many: Vec<String> = (0..40).map(|index| format!("key {index}")).collect();
         let mut list = Dialog::choose("Keys", vec![], many);
