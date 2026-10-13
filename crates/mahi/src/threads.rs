@@ -139,6 +139,26 @@ pub(crate) fn threads(environment: &Environment) -> Result<String, ThreadsError>
     Ok(listing)
 }
 
+/// Returns the agents `thread` has refs of here, in order.
+///
+/// # Errors
+///
+/// Returns the [`StoreError`] of reading the refs.
+pub(crate) fn thread_agents(store: &Store, thread: ThreadId) -> Result<Vec<AgentSlot>, StoreError> {
+    let agents: BTreeSet<AgentSlot> = store
+        .thread_refs()?
+        .into_iter()
+        .filter(|(thread_ref, _)| thread_ref.thread() == thread)
+        .filter_map(|(thread_ref, _)| match thread_ref.kind() {
+            RefKind::Snapshots(slot) | RefKind::Transcript(slot) | RefKind::Session(slot) => {
+                Some(slot.clone())
+            }
+            RefKind::Meta | RefKind::State => None,
+        })
+        .collect();
+    Ok(agents.into_iter().collect())
+}
+
 /// Groups the repository's thread refs by thread, keeping only threads that have a `meta` ref
 /// and leaving out those whose `meta` is the owner's tombstone with nothing else left here: no
 /// other ref, fetched ref, worktree or agents' state.
@@ -206,6 +226,33 @@ mod tests {
             ParticipantName::new(participant).unwrap(),
             AgentName::new(agent).unwrap(),
         )
+    }
+
+    #[test]
+    fn a_threads_agents_come_from_its_own_agent_refs_once_each_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let tree = store.write_tree(&[]).unwrap();
+        let thread = ThreadId::random().unwrap();
+        let other = ThreadId::random().unwrap();
+        let (alice, bob) = (slot("alice", "claude"), slot("bob", "codex"));
+        for thread_ref in [
+            ThreadRef::new(thread, RefKind::Meta),
+            ThreadRef::new(thread, RefKind::State),
+            ThreadRef::new(thread, RefKind::Transcript(bob.clone())),
+            ThreadRef::new(thread, RefKind::Snapshots(bob.clone())),
+            ThreadRef::new(thread, RefKind::Session(alice.clone())),
+            ThreadRef::new(other, RefKind::Snapshots(slot("carol", "claude"))),
+        ] {
+            store.append(&thread_ref, None, tree, "test").unwrap();
+        }
+        assert_eq!(thread_agents(&store, thread).unwrap(), [alice, bob]);
+        assert!(
+            thread_agents(&store, ThreadId::random().unwrap())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

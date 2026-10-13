@@ -1844,6 +1844,62 @@ printf 'fn parse() { codex }\n' > parser.rs
     }
 
     #[test]
+    fn the_home_screen_adds_an_agent_from_another_ones_work_then_merges_it_back() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let codex = script(&fixture, "home-merging", "codex", CODEX_WRITES);
+        let path = format!("{}:/usr/bin:/bin:/usr", codex.parent().unwrap().display());
+        let passphrase = format!("{PASSPHRASE}\r");
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                (&thread, b"a"),
+                ("What should its worktree start from?", b"2"),
+                ("Passphrase", passphrase.as_bytes()),
+                (
+                    &format!("mahi agent add {thread} --from tester.claude -- codex: done"),
+                    b"g",
+                ),
+                ("Whose latest work should be merged?", b"2"),
+                (
+                    &format!("mahi merge {thread} --from tester.codex --into claude: done"),
+                    b"q",
+                ),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let claude_tree = worktree_named(&fixture, &format!("{thread}.claude"));
+        assert_eq!(
+            fs::read_to_string(claude_tree.join("codex.txt")).unwrap(),
+            "from codex\n"
+        );
+    }
+
+    #[test]
+    fn the_home_screen_hands_a_thread_over_to_another_agent() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        assert!(fixture.mahi(&["end", &thread]).status.success());
+        let taker = script(&fixture, "home-taking", "codex", TAKER);
+        let path = format!("{}:/usr/bin:/bin:/usr", taker.parent().unwrap().display());
+        let passphrase = format!("{PASSPHRASE}\r");
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                (&thread, b"h"),
+                ("Whose work should your agent take over?", b"1"),
+                ("Passphrase", passphrase.as_bytes()),
+                (
+                    &format!("mahi handoff {thread} --from tester.claude -- codex: done"),
+                    b"q",
+                ),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("fn parse() {}"), "{output}");
+    }
+
+    #[test]
     fn another_agents_work_is_merged_into_a_stopped_agent_once_with_markers_where_both_changed() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);

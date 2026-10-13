@@ -108,6 +108,12 @@ pub enum HomeAction {
     Invite(String),
     /// Purge the thread here and on the remote; the purge asks first.
     Purge(String),
+    /// Run another of the user's agents in the thread.
+    AddAgent(String),
+    /// Start the user's agent on another agent's work in the thread.
+    Handoff(String),
+    /// Merge another agent's work into one of the user's agents in the thread.
+    Merge(String),
     /// Join a thread with a pairing code.
     Join,
     /// Choose the remote threads are pushed to.
@@ -135,6 +141,9 @@ enum Pending {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThreadChoice {
     Resume,
+    AddAgent,
+    Handoff,
+    Merge,
     Land,
     End,
     Purge,
@@ -145,6 +154,9 @@ impl ThreadChoice {
     fn label(self) -> &'static str {
         match self {
             Self::Resume => "Resume: start your agent again where it stopped",
+            Self::AddAgent => "Add an agent: run another of yours in it, in its own worktree",
+            Self::Handoff => "Hand off: start your agent on another agent's latest work",
+            Self::Merge => "Merge: bring another agent's work into one of yours",
             Self::Land => "Land: merge its agents' work onto a branch to commit",
             Self::End => "End: save its work in a last snapshot and remove its worktrees",
             Self::Purge => "Purge: delete it here and on the remote, for good",
@@ -254,6 +266,15 @@ impl Home {
             PaletteInput::Text('p') => {
                 return selected.map(|row| HomeAction::Purge(row.thread.clone()));
             }
+            PaletteInput::Text('a') => {
+                return selected.map(|row| HomeAction::AddAgent(row.thread.clone()));
+            }
+            PaletteInput::Text('h') => {
+                return selected.map(|row| HomeAction::Handoff(row.thread.clone()));
+            }
+            PaletteInput::Text('g') => {
+                return selected.map(|row| HomeAction::Merge(row.thread.clone()));
+            }
             _ => {}
         }
         None
@@ -296,11 +317,14 @@ impl Home {
             self.note = Some("no thread is selected");
             return;
         };
-        let mut choices = Vec::with_capacity(5);
+        let mut choices = Vec::with_capacity(8);
         if row.owned {
             choices.push(ThreadChoice::Resume);
         }
         choices.extend([
+            ThreadChoice::AddAgent,
+            ThreadChoice::Handoff,
+            ThreadChoice::Merge,
             ThreadChoice::Land,
             ThreadChoice::End,
             ThreadChoice::Invite,
@@ -354,6 +378,13 @@ impl Home {
             ["enter", "open", "open the menu of what is selected"],
             ["n", "new", "start a thread with an agent"],
             ["r", "resume", "start your agent again where it stopped"],
+            ["a", "add agent", "run another of your agents in the thread"],
+            [
+                "h",
+                "hand off",
+                "start your agent on another agent's latest work",
+            ],
+            ["g", "merge", "bring another agent's work into one of yours"],
             [
                 "l",
                 "land",
@@ -402,6 +433,9 @@ impl Home {
             (Answer::Choice(index), Pending::ThreadMenu(thread, choices)) => {
                 match choices.get(index)? {
                     ThreadChoice::Resume => Some(HomeAction::Resume(thread)),
+                    ThreadChoice::AddAgent => Some(HomeAction::AddAgent(thread)),
+                    ThreadChoice::Handoff => Some(HomeAction::Handoff(thread)),
+                    ThreadChoice::Merge => Some(HomeAction::Merge(thread)),
                     ThreadChoice::Invite => Some(HomeAction::Invite(thread)),
                     ThreadChoice::Purge => Some(HomeAction::Purge(thread)),
                     ThreadChoice::Land => {
@@ -855,8 +889,15 @@ mod tests {
                 ),
             "{menu}"
         );
-        home.key(PaletteInput::Down, &rows);
-        assert_eq!(home.key(PaletteInput::Enter, &rows), None);
+        for (digit, action) in [
+            ('2', HomeAction::AddAgent("t1".to_owned())),
+            ('3', HomeAction::Handoff("t1".to_owned())),
+            ('4', HomeAction::Merge("t1".to_owned())),
+        ] {
+            assert_eq!(home.key(PaletteInput::Text(digit), &rows), Some(action));
+            home.key(PaletteInput::Enter, &rows);
+        }
+        assert_eq!(home.key(PaletteInput::Text('5'), &rows), None);
         assert!(screen(&home, &rows, "").contains("Land thread t1?"));
         assert_eq!(
             home.key(PaletteInput::Text('y'), &rows),
@@ -867,12 +908,12 @@ mod tests {
         let teammate = screen(&home, &rows, "");
         assert!(!teammate.contains("Resume:"), "{teammate}");
         assert_eq!(
-            home.key(PaletteInput::Text('3'), &rows),
+            home.key(PaletteInput::Text('6'), &rows),
             Some(HomeAction::Invite("t2".to_owned()))
         );
         home.key(PaletteInput::Enter, &rows);
         assert_eq!(
-            home.key(PaletteInput::Text('4'), &rows),
+            home.key(PaletteInput::Text('7'), &rows),
             Some(HomeAction::Purge("t2".to_owned()))
         );
         assert_eq!(
@@ -880,6 +921,15 @@ mod tests {
             Some(HomeAction::Purge("t2".to_owned()))
         );
         assert!(keys(&mut Home::default(), &[], "p").is_empty());
+        assert_eq!(
+            keys(&mut home, &rows, "ahg"),
+            [
+                HomeAction::AddAgent("t2".to_owned()),
+                HomeAction::Handoff("t2".to_owned()),
+                HomeAction::Merge("t2".to_owned()),
+            ]
+        );
+        assert!(keys(&mut Home::default(), &[], "ahg").is_empty());
     }
 
     #[test]
@@ -920,7 +970,7 @@ mod tests {
     fn pasted_text_is_never_a_key() {
         let rows = rows();
         let mut home = Home::default();
-        for c in "nrleipjmsuq?".chars() {
+        for c in "nrleipahgjmsuq?".chars() {
             assert_eq!(home.key(PaletteInput::Pasted(c), &rows), None);
         }
         assert!(!home.has_dialog());

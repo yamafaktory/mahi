@@ -6,6 +6,7 @@ use std::{
         Write,
     },
     os::fd::AsFd,
+    path::Path,
     process,
     time::{
         Duration,
@@ -16,6 +17,11 @@ use std::{
 use clap::{
     CommandFactory,
     Parser,
+};
+use mahi_core::{
+    AgentSlot,
+    ParticipantName,
+    ThreadId,
 };
 use mahi_identity::{
     ConfigDir,
@@ -372,7 +378,11 @@ fn rows(store: &Store, own: Option<&ParticipantKey>) -> Vec<HomeRow> {
 /// returns what the home screen says about it.
 fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> String {
     let words: Vec<String> = match action {
-        HomeAction::New => match agent_to_run(environment) {
+        HomeAction::New => match agent_to_run(
+            environment,
+            ("New thread", "Which agent should start the thread?"),
+            &[],
+        ) {
             Ok(agent) => vec!["run".to_owned(), agent],
             Err(told) => return told,
         },
@@ -381,6 +391,18 @@ fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> Stri
         HomeAction::End(thread) => vec!["end".to_owned(), thread],
         HomeAction::Invite(thread) => vec!["invite".to_owned(), thread],
         HomeAction::Purge(thread) => vec!["purge".to_owned(), thread],
+        HomeAction::AddAgent(thread) => match agent_add_words(store, thread, environment) {
+            Ok(words) => words,
+            Err(told) => return told,
+        },
+        HomeAction::Handoff(thread) => match handoff_words(store, thread, environment) {
+            Ok(words) => words,
+            Err(told) => return told,
+        },
+        HomeAction::Merge(thread) => match merge_words(store, &thread, environment) {
+            Ok(words) => words,
+            Err(told) => return told,
+        },
         HomeAction::Join => vec!["join".to_owned()],
         HomeAction::Remote => return choose_remote(store),
         HomeAction::Card => vec!["id".to_owned()],
@@ -490,17 +512,28 @@ fn credential_words(environment: &Environment) -> Result<Vec<String>, String> {
 
 /// Returns the agent to start a thread with: the one mahi has a profile for that is on `PATH`,
 /// or the one the user picks in a dialog when there are several.
-fn agent_to_run(environment: &Environment) -> Result<String, String> {
+fn agent_to_run(
+    environment: &Environment,
+    (title, question): (&str, &str),
+    taken: &[&AgentSlot],
+) -> Result<String, String> {
     let found: Vec<&str> = Profile::programs()
         .filter(|program| run::is_on_path(program, environment.path.as_deref()))
+        .filter(|program| {
+            let agent = session::agent_from(Path::new(program));
+            !taken.iter().any(|slot| slot.agent() == &agent)
+        })
         .collect();
     match found.as_slice() {
-        [] => Err("no agent mahi has a profile for is on PATH; run mahi run <agent>".to_owned()),
+        [] if taken.is_empty() => {
+            Err("no agent mahi has a profile for is on PATH; run mahi run <agent>".to_owned())
+        }
+        [] => Err("each agent mahi has a profile for on PATH is already yours here".to_owned()),
         [only] => Ok((*only).to_owned()),
         several => {
             let dialog = Dialog::choose(
-                "New thread",
-                vec!["Which agent should start the thread?".to_owned()],
+                title,
+                vec![question.to_owned()],
                 several
                     .iter()
                     .map(|program| (*program).to_owned())
@@ -516,6 +549,188 @@ fn agent_to_run(environment: &Environment) -> Result<String, String> {
             }
         }
     }
+}
+
+/// Returns the agents the thread named `thread` has work of here.
+fn agents_of(store: &Store, thread: &str) -> Result<Vec<AgentSlot>, String> {
+    let parsed: ThreadId = thread
+        .parse()
+        .map_err(|_| format!("{thread} is not a thread id"))?;
+    threads::thread_agents(store, parsed)
+        .map_err(|error| format!("cannot read thread {thread}'s refs: {error}"))
+}
+
+/// Returns the user's own agents among `slots`.
+fn own_agents<'a>(slots: &'a [AgentSlot], me: &ParticipantName) -> Vec<&'a AgentSlot> {
+    slots
+        .iter()
+        .filter(|slot| slot.participant() == me)
+        .collect()
+}
+
+/// Returns the agents whose work a merge can take: all of them, but the user's own when it is
+/// their only agent, since it would merge into itself.
+fn merge_sources<'a>(slots: &'a [AgentSlot], mine: &[&AgentSlot]) -> Vec<&'a AgentSlot> {
+    slots
+        .iter()
+        .filter(|slot| !matches!(mine, [only] if *only == *slot))
+        .collect()
+}
+
+/// Picks one of `slots` in a dialog, after `first` when it is given, which picks `None`;
+/// returns `Err` with an empty status when the user stopped asking.
+fn pick_agent<'a>(
+    title: &str,
+    question: &str,
+    first: Option<&str>,
+    slots: &[&'a AgentSlot],
+    item: impl Fn(&AgentSlot) -> String,
+) -> Result<Option<&'a AgentSlot>, String> {
+    let mut items = Vec::with_capacity(slots.len() + 1);
+    items.extend(first.map(str::to_owned));
+    items.extend(slots.iter().map(|slot| item(slot)));
+    let dialog = Dialog::choose(title, vec![question.to_owned()], items);
+    let index = match DialogPrompt::default().ask(dialog) {
+        Ok(Answer::Choice(index)) => index,
+        Ok(_) => return Err(String::new()),
+        Err(error) => return Err(format!("cannot ask which agent: {error}")),
+    };
+    Ok(match (first, index) {
+        (Some(_), 0) => None,
+        (Some(_), index) => slots.get(index - 1).copied(),
+        (None, index) => slots.get(index).copied(),
+    })
+}
+
+fn me(environment: &Environment) -> Result<ParticipantName, String> {
+    session::participant_from(environment.user.as_deref())
+        .map_err(|error| format!("USER does not give a participant name: {error}"))
+}
+
+/// Asks which agent to add to the thread and what it starts from, and returns the command.
+fn agent_add_words(
+    store: &Store,
+    thread: String,
+    environment: &Environment,
+) -> Result<Vec<String>, String> {
+    let slots = agents_of(store, &thread)?;
+    let me = me(environment)?;
+    let mine = own_agents(&slots, &me);
+    let program = agent_to_run(
+        environment,
+        (
+            "Add an agent",
+            "Which of your agents should join the thread?",
+        ),
+        &mine,
+    )?;
+    let from = if slots.is_empty() {
+        None
+    } else {
+        let all: Vec<&AgentSlot> = slots.iter().collect();
+        pick_agent(
+            "Add an agent",
+            "What should its worktree start from?",
+            Some("The thread's base, as its first agent started"),
+            &all,
+            |slot| format!("{slot}'s latest snapshot"),
+        )?
+    };
+    let mut words = vec!["agent".to_owned(), "add".to_owned(), thread];
+    if let Some(slot) = from {
+        words.extend(["--from".to_owned(), slot.to_string()]);
+    }
+    words.extend(["--".to_owned(), program]);
+    Ok(words)
+}
+
+/// Asks whose work the user's agent takes over and which agent that is, and returns the
+/// command.
+fn handoff_words(
+    store: &Store,
+    thread: String,
+    environment: &Environment,
+) -> Result<Vec<String>, String> {
+    let slots = agents_of(store, &thread)?;
+    if slots.is_empty() {
+        return Err(format!("thread {thread} has no agent's work to take over"));
+    }
+    let me = me(environment)?;
+    let all: Vec<&AgentSlot> = slots.iter().collect();
+    let from = pick_agent(
+        "Hand off",
+        "Whose work should your agent take over?",
+        None,
+        &all,
+        ToString::to_string,
+    )?
+    .ok_or_else(|| "no agent was chosen".to_owned())?
+    .to_string();
+    let program = agent_to_run(
+        environment,
+        ("Hand off", "Which of your agents should take it over?"),
+        &own_agents(&slots, &me),
+    )?;
+    Ok(vec![
+        "handoff".to_owned(),
+        thread,
+        "--from".to_owned(),
+        from,
+        "--".to_owned(),
+        program,
+    ])
+}
+
+/// Asks whose work to merge and, when the user has several agents in the thread, into which,
+/// and returns the command.
+fn merge_words(
+    store: &Store,
+    thread: &str,
+    environment: &Environment,
+) -> Result<Vec<String>, String> {
+    let slots = agents_of(store, thread)?;
+    let me = me(environment)?;
+    let mine = own_agents(&slots, &me);
+    if mine.is_empty() {
+        return Err(format!(
+            "you have no agent in thread {thread} to merge into"
+        ));
+    }
+    let sources = merge_sources(&slots, &mine);
+    if sources.is_empty() {
+        return Err(format!(
+            "thread {thread} has no other agent's work to merge"
+        ));
+    }
+    let from = pick_agent(
+        "Merge",
+        "Whose latest work should be merged?",
+        None,
+        &sources,
+        ToString::to_string,
+    )?
+    .ok_or_else(|| "no agent was chosen".to_owned())?;
+    let targets: Vec<&AgentSlot> = mine.into_iter().filter(|slot| *slot != from).collect();
+    let into = match targets.as_slice() {
+        [] => return Err(format!("{from} is your only agent in thread {thread}")),
+        [only] => *only,
+        several => pick_agent(
+            "Merge",
+            "Into which of your agents?",
+            None,
+            several,
+            ToString::to_string,
+        )?
+        .ok_or_else(|| "no agent was chosen".to_owned())?,
+    };
+    Ok(vec![
+        "merge".to_owned(),
+        thread.to_owned(),
+        "--from".to_owned(),
+        from.to_string(),
+        "--into".to_owned(),
+        into.agent().to_string(),
+    ])
 }
 
 /// What the Remote dialog can do with one of its items.
@@ -636,4 +851,37 @@ fn add_remote(store: &mut Store) -> Result<Added, remote::RemoteError> {
         _ => return Ok(Added::NotChosen(name)),
     };
     Ok(Added::Chosen(name, visibility))
+}
+
+#[cfg(test)]
+mod tests {
+    use mahi_core::AgentName;
+
+    use super::*;
+
+    fn slot(participant: &str, agent: &str) -> AgentSlot {
+        AgentSlot::new(
+            ParticipantName::new(participant).unwrap(),
+            AgentName::new(agent).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_merge_takes_any_agents_work_but_never_the_users_only_agent_into_itself() {
+        let slots = [
+            slot("alice", "codex"),
+            slot("bob", "claude"),
+            slot("bob", "codex"),
+        ];
+        let bob = ParticipantName::new("bob").unwrap();
+        let mine = own_agents(&slots, &bob);
+        assert_eq!(mine, [&slots[1], &slots[2]]);
+        assert_eq!(merge_sources(&slots, &mine).len(), 3);
+        let alone = [slot("alice", "codex"), slot("bob", "claude")];
+        let mine = own_agents(&alone, &bob);
+        assert_eq!(merge_sources(&alone, &mine), [&alone[0]]);
+        let carol = ParticipantName::new("carol").unwrap();
+        assert!(own_agents(&alone, &carol).is_empty());
+        assert_eq!(merge_sources(&alone, &[]).len(), 2);
+    }
 }
