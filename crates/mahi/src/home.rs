@@ -33,6 +33,7 @@ use mahi_sandbox::{
     InputWait,
     Termination,
     TerminationSignals,
+    WindowSize,
 };
 use mahi_store::Store;
 use mahi_term::{
@@ -43,8 +44,11 @@ use mahi_term::{
     HomeAction,
     HomeRow,
     HomeView,
+    ListPlace,
     PaletteInput,
     PaletteKeys,
+    TabBar,
+    ThreadView,
 };
 use mahi_thread::ParticipantKey;
 use ratatui_core::terminal::Terminal;
@@ -56,6 +60,10 @@ use crate::{
     },
     environment::Environment,
     profile::Profile,
+    prompt::{
+        Prompt,
+        TerminalPrompt,
+    },
     remote::{
         self,
         RemoteName,
@@ -64,6 +72,7 @@ use crate::{
     run,
     run_command,
     session,
+    settings::Settings,
     terminal::{
         self,
         RawMode,
@@ -74,6 +83,11 @@ use crate::{
         Captured,
         DialogPrompt,
         Showing,
+    },
+    unlocked,
+    workspace::{
+        Moved,
+        Workspace,
     },
 };
 
@@ -86,6 +100,7 @@ const SEQUENCE_WAIT: Duration = Duration::from_millis(30);
 const ESC: u8 = 0x1b;
 const MAX_READ: usize = 1024;
 const AFTER_ESCAPE: Duration = Duration::from_millis(500);
+const CHILD_WAIT: Duration = Duration::from_millis(15);
 
 /// Opens the home screen in the repository around the current directory and runs the actions
 /// chosen there until the user quits; returns the exit code. Everything happens on its
@@ -124,6 +139,17 @@ pub(crate) fn home(environment: &Environment) -> i32 {
     let captured = Captured::start().ok();
     let mut home = Home::default();
     let mut status = String::new();
+    let config = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )
+    .ok();
+    let palette_key = config
+        .as_ref()
+        .and_then(|config| Settings::load(config).ok())
+        .map(|settings| settings.palette_key)
+        .unwrap_or_default();
+    let mut workspace = Workspace::new(palette_key);
     let outcome = loop {
         let own = threads::own_key(environment);
         let place = Place {
@@ -133,9 +159,25 @@ pub(crate) fn home(environment: &Environment) -> i32 {
             identity: &identity,
             captured: captured.as_ref(),
         };
-        match choose(&place, &mut home, &status) {
-            Ok(Chosen::Quit) => break Ok(()),
+        match choose(&place, &mut home, &mut status, &mut workspace) {
+            Ok(Chosen::Quit) if workspace.is_running() => {
+                "agents are running in their tabs: end them before quitting"
+                    .clone_into(&mut status);
+            }
+            Ok(Chosen::Quit | Chosen::InputEnded) => break Ok(()),
             Ok(Chosen::Stopped(signal)) => break Err(Ended::Stopped(signal)),
+            Ok(Chosen::Action(action)) if runs_agent(&action) => {
+                let identity_file = config.as_ref().map(ConfigDir::identity_file);
+                if let Err(told) = open_agent(
+                    action,
+                    &mut store,
+                    environment,
+                    &mut workspace,
+                    identity_file.as_deref(),
+                ) {
+                    status = told;
+                }
+            }
             Ok(Chosen::Action(action)) => {
                 status = act(action, &mut store, environment);
                 ui::keys_make_signals(false);
@@ -181,6 +223,7 @@ enum Ended {
 /// How the home screen was left.
 enum Chosen {
     Quit,
+    InputEnded,
     Action(HomeAction),
     Stopped(Termination),
 }
@@ -227,7 +270,12 @@ fn write_screen(bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Shows the home screen until the user chooses an action, quits, or a signal stops mahi.
-fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen> {
+fn choose(
+    place: &Place<'_>,
+    home: &mut Home,
+    status: &mut String,
+    workspace: &mut Workspace,
+) -> io::Result<Chosen> {
     let signals = TerminationSignals::listen().map_err(io::Error::other)?;
     ui::keys_make_signals(false);
     let mut size = terminal::size();
@@ -243,7 +291,10 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
     let mut buffer = [0_u8; MAX_READ];
     let mut dirty = true;
     let mut ignore_until = None;
+    let mut passed = Vec::new();
+    let mut for_threads = Vec::with_capacity(MAX_READ);
     loop {
+        dirty |= follow_children(workspace, status, &mut passed)?;
         if read_at.elapsed() >= REREAD {
             let fresh = self::rows(place.store, place.own);
             if fresh != rows {
@@ -272,6 +323,7 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
             terminal.autoresize()?;
             dirty = true;
         }
+        workspace.resize(agents_size(size));
         if dirty {
             let view = HomeView {
                 repository: place.repository,
@@ -280,32 +332,28 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
                 rows: &rows,
                 activity: &activity,
             };
-            draw(&mut terminal, home, &view, status)?;
+            draw(&mut terminal, home, &view, status, workspace)?;
             dirty = false;
         }
-        match wait(&signals, KEY_WAIT)? {
+        match wait(&signals, key_wait(workspace))? {
             InputWait::Timeout => continue,
             InputWait::Signal(signal) => return Ok(Chosen::Stopped(signal)),
             InputWait::Input => {}
         }
         let read = match read_chunk(&signals, &mut buffer)? {
             Chunk::Read(read) => read,
-            Chunk::End => return Ok(Chosen::Quit),
+            Chunk::End => return Ok(Chosen::InputEnded),
             Chunk::Stopped(signal) => return Ok(Chosen::Stopped(signal)),
         };
-        if ignore_until.is_some_and(|until| Instant::now() < until) {
+        dirty |= route_keys(
+            workspace,
+            buffer.get(..read).unwrap_or_default(),
+            &mut for_threads,
+        );
+        if for_threads.is_empty() || ignore_until.is_some_and(|until| Instant::now() < until) {
             continue;
         }
-        let mut chosen = None;
-        let mut escaped = false;
-        keys.read(buffer.get(..read).unwrap_or_default(), |input| {
-            escaped |= input == PaletteInput::Escape;
-            if let Some(action) = home.key(input, &rows) {
-                chosen = Some(action);
-                return false;
-            }
-            input != PaletteInput::Escape
-        });
+        let (chosen, escaped) = thread_list_keys(&mut keys, home, &rows, &for_threads);
         if escaped {
             ignore_until = Some(Instant::now() + AFTER_ESCAPE);
         }
@@ -320,11 +368,83 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
                     rows: &rows,
                     activity: &activity,
                 };
-                draw(&mut terminal, home, &view, status)?;
+                draw(&mut terminal, home, &view, status, workspace)?;
                 return Ok(Chosen::Action(action));
             }
             None => {}
         }
+    }
+}
+
+/// Takes in what the workspace's children wrote, writing out what the shown one asks of the
+/// terminal itself, and the children that ended, telling the last one's outcome in `status`;
+/// returns whether the screen must be drawn again.
+fn follow_children(
+    workspace: &mut Workspace,
+    status: &mut String,
+    passed: &mut Vec<u8>,
+) -> io::Result<bool> {
+    let mut changed = workspace.take_output(passed);
+    let (told, ended) = workspace.take_ended();
+    if let Some(told) = told {
+        *status = told;
+    }
+    changed |= ended;
+    workspace.apply_shown(passed);
+    if !passed.is_empty() {
+        write_screen(passed)?;
+        passed.clear();
+    }
+    Ok(changed)
+}
+
+/// Reads the thread list's keys from `typed`, and returns the action they choose, if any, and
+/// whether Escape was among them.
+fn thread_list_keys(
+    keys: &mut PaletteKeys,
+    home: &mut Home,
+    rows: &[HomeRow],
+    typed: &[u8],
+) -> (Option<HomeAction>, bool) {
+    let mut chosen = None;
+    let mut escaped = false;
+    keys.read(typed, |input| {
+        escaped |= input == PaletteInput::Escape;
+        if let Some(action) = home.key(input, rows) {
+            chosen = Some(action);
+            return false;
+        }
+        input != PaletteInput::Escape
+    });
+    (chosen, escaped)
+}
+
+/// Returns how long to wait for a key before looking again: briefly while agents run, whose
+/// output must be drawn as it comes.
+fn key_wait(workspace: &Workspace) -> Duration {
+    if workspace.is_running() {
+        CHILD_WAIT
+    } else {
+        KEY_WAIT
+    }
+}
+
+/// Returns the size of an agent's terminal in a thread's tab on a terminal of `size`.
+fn agents_size(size: WindowSize) -> WindowSize {
+    let (rows, cols) = ThreadView::agent_size(size.rows, size.cols, ListPlace::shown_at(size.cols));
+    WindowSize { rows, cols }
+}
+
+/// Gives what was `typed` to the workspace, which keeps its own keys and the shown agent's,
+/// and leaves in `for_threads` what the thread list reads; returns whether another tab is
+/// shown.
+fn route_keys(workspace: &mut Workspace, typed: &[u8], for_threads: &mut Vec<u8>) -> bool {
+    for_threads.clear();
+    if workspace.has_tabs() {
+        workspace.type_keys(typed, for_threads) == Moved::Tab
+    } else {
+        for_threads.extend_from_slice(typed);
+        false
     }
 }
 
@@ -334,9 +454,21 @@ fn draw(
     home: &Home,
     view: &HomeView<'_>,
     status: &str,
+    workspace: &Workspace,
 ) -> io::Result<()> {
     let drawn = terminal.draw(|frame| {
-        home.render(view, status, frame.area(), frame.buffer_mut());
+        let area = frame.area();
+        if !workspace.has_tabs() {
+            home.render(view, status, area, frame.buffer_mut());
+            return;
+        }
+        let (bar, body) = TabBar::split(area);
+        let cursor = workspace.render(bar, body, frame.buffer_mut());
+        if workspace.shows_threads() {
+            home.render(view, status, body, frame.buffer_mut());
+        } else if let Some(cursor) = cursor {
+            frame.set_cursor_position(cursor);
+        }
     })?;
     ui::keep_backdrop(drawn.buffer);
     Ok(())
@@ -404,45 +536,105 @@ fn rows(store: &Store, own: Option<&ParticipantKey>) -> Vec<HomeRow> {
 /// Runs the chosen action as its command does, without leaving the alternate screen, and
 /// returns what the home screen says about it.
 fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> String {
+    match command_words(action, store, environment) {
+        Ok(words) => run_words(&words, environment),
+        Err(told) => told,
+    }
+}
+
+/// Returns whether the action runs an agent, which the workspace runs in a thread's tab.
+fn runs_agent(action: &HomeAction) -> bool {
+    matches!(
+        action,
+        HomeAction::New | HomeAction::Resume(_) | HomeAction::AddAgent(_) | HomeAction::Handoff(_)
+    )
+}
+
+/// Starts the agent `action` runs in its thread's tab of the workspace, with the user's mahi
+/// key unlocked first when the agent needs it, from the `identity_file`; returns what to tell
+/// the user when it does not start.
+fn open_agent(
+    action: HomeAction,
+    store: &mut Store,
+    environment: &Environment,
+    workspace: &mut Workspace,
+    identity_file: Option<&Path>,
+) -> Result<(), String> {
+    let (title, resumes) = match &action {
+        HomeAction::Resume(thread) => (short(thread), true),
+        HomeAction::AddAgent(thread) | HomeAction::Handoff(thread) => (short(thread), false),
+        _ => ("new".to_owned(), false),
+    };
+    let needs_key = !matches!(action, HomeAction::New);
+    let words = command_words(action, store, environment)?;
+    let name = if resumes {
+        "agent".to_owned()
+    } else {
+        words.last().cloned().unwrap_or_default()
+    };
+    let key = match identity_file {
+        Some(file) if needs_key => Some(unlocked::identity(
+            file,
+            || {
+                TerminalPrompt::open()
+                    .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
+                    .map_err(|error| format!("the passphrase cannot be asked: {error}"))
+            },
+            |error| format!("the mahi key cannot be unlocked: {error}"),
+        )?),
+        Some(file) => unlocked::current(file),
+        None => None,
+    };
+    let shown = format!("mahi {}", words.join(" "));
+    workspace.open(
+        environment,
+        (&title, &name, &shown),
+        (&words, title == "new"),
+        key.as_ref(),
+    )
+}
+
+fn short(thread: &str) -> String {
+    thread.chars().take(8).collect()
+}
+
+/// Returns the words of the mahi command that does `action`, asking in dialogs what it needs,
+/// or what to tell the user when there is nothing to run.
+fn command_words(
+    action: HomeAction,
+    store: &mut Store,
+    environment: &Environment,
+) -> Result<Vec<String>, String> {
     let words: Vec<String> = match action {
-        HomeAction::New => match agent_to_run(
-            environment,
-            ("New thread", "Which agent should start the thread?"),
-            &[],
-        ) {
-            Ok(agent) => vec!["run".to_owned(), agent],
-            Err(told) => return told,
-        },
+        HomeAction::New => vec![
+            "run".to_owned(),
+            agent_to_run(
+                environment,
+                ("New thread", "Which agent should start the thread?"),
+                &[],
+            )?,
+        ],
         HomeAction::Resume(thread) => vec!["resume".to_owned(), thread],
         HomeAction::Land(thread) => vec!["land".to_owned(), thread],
         HomeAction::End(thread) => vec!["end".to_owned(), thread],
         HomeAction::Invite(thread) => vec!["invite".to_owned(), thread],
         HomeAction::Purge(thread) => vec!["purge".to_owned(), thread],
-        HomeAction::AddAgent(thread) => match agent_add_words(store, thread, environment) {
-            Ok(words) => words,
-            Err(told) => return told,
-        },
-        HomeAction::Handoff(thread) => match handoff_words(store, thread, environment) {
-            Ok(words) => words,
-            Err(told) => return told,
-        },
-        HomeAction::Merge(thread) => match merge_words(store, &thread, environment) {
-            Ok(words) => words,
-            Err(told) => return told,
-        },
-        HomeAction::Push(thread) => match push_words(store, thread, environment) {
-            Ok(words) => words,
-            Err(told) => return told,
-        },
+        HomeAction::AddAgent(thread) => agent_add_words(store, thread, environment)?,
+        HomeAction::Handoff(thread) => handoff_words(store, thread, environment)?,
+        HomeAction::Merge(thread) => merge_words(store, &thread, environment)?,
+        HomeAction::Push(thread) => push_words(store, thread, environment)?,
         HomeAction::Join => vec!["join".to_owned()],
-        HomeAction::Remote => return choose_remote(store),
+        HomeAction::Remote => return Err(choose_remote(store)),
         HomeAction::Card => vec!["id".to_owned()],
-        HomeAction::Credentials => match credential_words(environment) {
-            Ok(words) => words,
-            Err(told) => return told,
-        },
-        HomeAction::Quit => return String::new(),
+        HomeAction::Credentials => credential_words(environment)?,
+        HomeAction::Quit => return Err(String::new()),
     };
+    Ok(words)
+}
+
+/// Runs the mahi command `words` as it would run on its own, without leaving the alternate
+/// screen, and returns what the home screen says about it.
+fn run_words(words: &[String], environment: &Environment) -> String {
     let shown = format!("mahi {}", words.join(" "));
     let Ok(Cli {
         command: Some(command),

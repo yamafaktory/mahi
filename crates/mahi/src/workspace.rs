@@ -26,7 +26,25 @@ use mahi_sandbox::{
     WindowSize,
     exit_code,
 };
-use mahi_term::AgentScreen;
+use mahi_term::{
+    AgentScreen,
+    AgentState,
+    KeyScanner,
+    ListPlace,
+    PaletteKey,
+    Segment,
+    TabBar,
+    ThreadView,
+    WorkspaceAgent,
+    WorkspaceTab,
+};
+use ratatui_core::{
+    buffer::Buffer,
+    layout::{
+        Position,
+        Rect,
+    },
+};
 
 use crate::environment::{
     Environment,
@@ -44,6 +62,12 @@ const TERMINAL_OWN: [&str; 6] = [
     "COLUMNS",
 ];
 const CHILD_TERM: &str = "xterm-256color";
+const FAILED_HINTS: [(&str, &str); 2] = [("any key", "close it"), ("palette key 0", "threads")];
+const HINTS: [(&str, &str); 3] = [
+    ("palette key ←/→", "tab"),
+    ("palette key 0-9", "tab by number"),
+    ("palette key twice", "to the agent"),
+];
 
 /// What the thread reading a child's terminal tells the workspace.
 #[derive(Debug)]
@@ -62,6 +86,7 @@ pub(crate) struct Child {
     writes: mpsc::SyncSender<Vec<u8>>,
     screen: AgentScreen,
     replies: Vec<u8>,
+    hidden: Vec<u8>,
     status: Option<i32>,
 }
 
@@ -151,16 +176,23 @@ impl Child {
             writes,
             screen: AgentScreen::new(size.rows, size.cols),
             replies: Vec::new(),
+            hidden: Vec::new(),
             status: None,
         })
     }
 
     /// Draws what the child wrote into its screen, answers the queries the child made of its
-    /// terminal, and adds to `passed` what the child asks of the user's terminal itself. The
+    /// terminal, and adds to `passed`, when the child is shown, what it asks of the user's
+    /// terminal itself; a hidden child's asks are dropped, its key modes left unapplied. The
     /// answers to a child that has stopped reading what it was sent are dropped.
-    pub(crate) fn feed(&mut self, bytes: &[u8], passed: &mut Vec<u8>) {
+    pub(crate) fn feed(&mut self, bytes: &[u8], passed: Option<&mut Vec<u8>>) {
         self.screen.feed(bytes);
-        self.screen.take_passed(passed);
+        if let Some(passed) = passed {
+            self.screen.take_passed(passed);
+        } else {
+            self.screen.undo(&mut self.hidden);
+            self.hidden.clear();
+        }
         self.screen.take_replies(&mut self.replies);
         if !self.replies.is_empty() {
             let _ = self.writes.try_send(std::mem::take(&mut self.replies));
@@ -193,6 +225,18 @@ impl Child {
         Ok(())
     }
 
+    /// Writes into `out` what applies the child's key modes to the user's terminal, once it
+    /// is shown.
+    pub(crate) fn show(&mut self, out: &mut Vec<u8>) {
+        self.screen.take_passed(out);
+    }
+
+    /// Writes into `out` what takes the child's key modes off the user's terminal, once it is
+    /// no longer shown.
+    pub(crate) fn hide(&mut self, out: &mut Vec<u8>) {
+        self.screen.undo(out);
+    }
+
     /// Returns the child's screen.
     pub(crate) fn screen(&self) -> &vt100::Screen {
         self.screen.screen()
@@ -214,6 +258,471 @@ impl Child {
             }
         }
         Ok(self.status)
+    }
+}
+
+/// What the workspace shows: the thread list, tab 0, and a tab for each thread whose agents
+/// run as its children, with the keys that move between them.
+#[derive(Debug)]
+pub(crate) struct Workspace {
+    tabs: Vec<Tab>,
+    selected: usize,
+    events: mpsc::Receiver<ChildEvent>,
+    sender: mpsc::SyncSender<ChildEvent>,
+    next_id: usize,
+    scanner: KeyScanner,
+    armed: bool,
+    size: WindowSize,
+    passed: Vec<u8>,
+    applied: Option<usize>,
+    pending: Vec<u8>,
+}
+
+/// A thread's tab: the agents the workspace runs for it.
+#[derive(Debug)]
+struct Tab {
+    title: String,
+    agents: Vec<Running>,
+    selected: usize,
+}
+
+/// An agent the workspace runs, as the mahi command that runs it.
+#[derive(Debug)]
+struct Running {
+    id: usize,
+    name: String,
+    shown: String,
+    child: Child,
+    closed: bool,
+    ending: Ending,
+}
+
+/// How far an agent whose command ended is from leaving its tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Running,
+    Drawn,
+    Failed,
+    Closed,
+}
+
+/// What a workspace key did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
+    /// Nothing the screen shows changed.
+    Nothing,
+    /// Another tab is shown.
+    Tab,
+}
+
+impl Workspace {
+    /// Starts a workspace with no thread open, whose keys follow `palette_key`.
+    pub(crate) fn new(palette_key: PaletteKey) -> Self {
+        let (sender, events) = mpsc::sync_channel(QUEUED_WRITES);
+        Self {
+            tabs: Vec::new(),
+            selected: 0,
+            events,
+            sender,
+            next_id: 0,
+            scanner: KeyScanner::new(palette_key),
+            armed: false,
+            size: WindowSize { rows: 2, cols: 2 },
+            passed: Vec::new(),
+            applied: None,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Returns whether a thread's tab is open.
+    pub(crate) fn has_tabs(&self) -> bool {
+        !self.tabs.is_empty()
+    }
+
+    /// Returns whether an agent runs in a thread's tab, one whose command has not ended.
+    pub(crate) fn is_running(&self) -> bool {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.agents.iter())
+            .any(|running| running.ending == Ending::Running)
+    }
+
+    /// Returns whether the thread list is shown.
+    pub(crate) fn shows_threads(&self) -> bool {
+        self.selected == 0
+    }
+
+    /// Starts the mahi command `words`, shown to the user as `shown`, as the agent `name` in the
+    /// tab of the thread `title`, which opens if it is not open yet, or in a tab of its own
+    /// when the thread is `new`, and shows it; the child gets the user's unlocked mahi `key`, if
+    /// any.
+    ///
+    /// # Errors
+    ///
+    /// Returns what to tell the user when the command cannot be started.
+    pub(crate) fn open(
+        &mut self,
+        environment: &Environment,
+        (title, name, shown): (&str, &str, &str),
+        (words, new): (&[String], bool),
+        key: Option<&LocalIdentity>,
+    ) -> Result<(), String> {
+        let failed = |error: &dyn std::fmt::Display| format!("{shown} cannot start: {error}");
+        let cwd = std::env::current_dir().map_err(|error| failed(&error))?;
+        let words: Vec<&OsStr> = words.iter().map(OsStr::new).collect();
+        let command = Child::mahi(environment, &words, (&cwd, self.size), key)
+            .map_err(|error| failed(&error))?
+            .ok_or_else(|| failed(&"mahi cannot find its own program"))?;
+        let id = self.next_id;
+        let child =
+            Child::start(command, self.size, id, &self.sender).map_err(|error| failed(&error))?;
+        self.next_id += 1;
+        let running = Running {
+            id,
+            name: name.to_owned(),
+            shown: shown.to_owned(),
+            child,
+            closed: false,
+            ending: Ending::Running,
+        };
+        let open = (!new)
+            .then(|| self.tabs.iter().position(|tab| tab.title == title))
+            .flatten();
+        let index = if let Some(index) = open {
+            index
+        } else {
+            self.tabs.push(Tab {
+                title: title.to_owned(),
+                agents: Vec::new(),
+                selected: 0,
+            });
+            self.tabs.len() - 1
+        };
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.agents.push(running);
+            tab.selected = tab.agents.len() - 1;
+        }
+        self.selected = index + 1;
+        Ok(())
+    }
+
+    /// Draws what the children wrote since the last call into their screens, and writes to
+    /// `out` what the shown agent asks of the user's terminal itself; returns whether the
+    /// shown agent's screen changed.
+    pub(crate) fn take_output(&mut self, out: &mut Vec<u8>) -> bool {
+        let shown = self.shown_id().filter(|&id| self.applied == Some(id));
+        let mut changed = false;
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                ChildEvent::Output(id, bytes) => {
+                    let mut passed = std::mem::take(&mut self.passed);
+                    passed.clear();
+                    let is_shown = shown == Some(id);
+                    if let Some(running) = self.running_mut(id) {
+                        running.child.feed(&bytes, is_shown.then_some(&mut passed));
+                    }
+                    if is_shown {
+                        out.extend_from_slice(&passed);
+                        changed = true;
+                    }
+                    self.passed = passed;
+                }
+                ChildEvent::Closed(id) => {
+                    if let Some(running) = self.running_mut(id) {
+                        running.closed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Takes away the agents whose command succeeded, once their last screen was drawn, and
+    /// those whose command failed, once the user closed them, and the tabs left without any;
+    /// returns what to tell the user about the last one to end, and whether what the screen
+    /// shows changed.
+    pub(crate) fn take_ended(&mut self) -> (Option<String>, bool) {
+        let mut told = None;
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            for running in &mut tab.agents {
+                let Some(code) = running.child.exited().unwrap_or(Some(1)) else {
+                    continue;
+                };
+                if !running.closed {
+                    continue;
+                }
+                let ending = match (running.ending, code) {
+                    (Ending::Running, 0) => Ending::Drawn,
+                    (Ending::Drawn, _) => {
+                        told = Some(format!("{}: done", running.shown));
+                        Ending::Closed
+                    }
+                    (Ending::Running, code) => {
+                        told = Some(format!(
+                            "{} failed with exit code {code}; a key in its pane closes it",
+                            running.shown
+                        ));
+                        Ending::Failed
+                    }
+                    (ending, _) => ending,
+                };
+                changed |= ending != running.ending;
+                running.ending = ending;
+            }
+            if tab
+                .agents
+                .iter()
+                .any(|running| running.ending == Ending::Closed)
+            {
+                changed = true;
+                let selected = tab.agents.get(tab.selected).map(|running| running.id);
+                for running in &mut tab.agents {
+                    if running.ending == Ending::Closed && self.applied == Some(running.id) {
+                        running.child.hide(&mut self.pending);
+                        self.applied = None;
+                    }
+                }
+                tab.agents
+                    .retain(|running| running.ending != Ending::Closed);
+                tab.selected = selected
+                    .and_then(|id| tab.agents.iter().position(|running| running.id == id))
+                    .unwrap_or_else(|| tab.selected.min(tab.agents.len().saturating_sub(1)));
+            }
+        }
+        if self.tabs.iter().any(|tab| tab.agents.is_empty()) {
+            let selected = self
+                .selected
+                .checked_sub(1)
+                .filter(|&index| {
+                    self.tabs
+                        .get(index)
+                        .is_some_and(|tab| !tab.agents.is_empty())
+                })
+                .map_or(0, |index| {
+                    1 + self
+                        .tabs
+                        .iter()
+                        .take(index)
+                        .filter(|tab| !tab.agents.is_empty())
+                        .count()
+                });
+            self.tabs.retain(|tab| !tab.agents.is_empty());
+            self.selected = selected;
+            if self.tabs.is_empty() {
+                self.armed = false;
+            }
+        }
+        (told, changed)
+    }
+
+    /// Writes into `out` what puts the user's terminal in the key modes of the agent shown
+    /// now, taking off those of the one shown before.
+    pub(crate) fn apply_shown(&mut self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.pending);
+        self.pending.clear();
+        let shown = self.shown_id();
+        if shown == self.applied {
+            return;
+        }
+        if let Some(old) = self.applied.take()
+            && let Some(running) = self.running_mut(old)
+        {
+            running.child.hide(out);
+        }
+        if let Some(new) = shown
+            && let Some(running) = self.running_mut(new)
+        {
+            running.child.show(out);
+        }
+        self.applied = shown;
+    }
+
+    /// Gives every agent's terminal `size`.
+    pub(crate) fn resize(&mut self, size: WindowSize) {
+        if size == self.size {
+            return;
+        }
+        self.size = size;
+        for running in self.tabs.iter_mut().flat_map(|tab| tab.agents.iter_mut()) {
+            let _ = running.child.resize(size);
+        }
+    }
+
+    /// Takes what the user typed: the workspace's own keys, which follow the palette key, and
+    /// on a thread's tab the rest, for its shown agent; on the thread list the rest goes to
+    /// `threads`.
+    pub(crate) fn type_keys(&mut self, typed: &[u8], threads: &mut Vec<u8>) -> Moved {
+        let mut moved = Moved::Nothing;
+        let shown = self.selected;
+        let mut scanner =
+            std::mem::replace(&mut self.scanner, KeyScanner::new(PaletteKey::default()));
+        for segment in scanner.scan(typed) {
+            match segment {
+                Segment::Palette(key) => {
+                    if self.armed {
+                        self.armed = false;
+                        self.send(key);
+                    } else {
+                        self.armed = true;
+                    }
+                }
+                Segment::Pass(bytes) if self.armed => {
+                    self.armed = false;
+                    let (step, rest) = workspace_key(bytes);
+                    if let Some(step) = step {
+                        self.step(step);
+                    }
+                    self.pass(rest, threads);
+                }
+                Segment::Pass(bytes) => self.pass(bytes, threads),
+            }
+        }
+        self.scanner = scanner;
+        if self.selected != shown {
+            moved = Moved::Tab;
+        }
+        moved
+    }
+
+    fn pass(&mut self, bytes: &[u8], threads: &mut Vec<u8>) {
+        if self.selected == 0 {
+            threads.extend_from_slice(bytes);
+        } else {
+            self.send(bytes);
+        }
+    }
+
+    fn send(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(running) = self.shown_mut() {
+            if running.ending == Ending::Failed {
+                running.ending = Ending::Closed;
+            } else {
+                let _ = running.child.send(bytes);
+            }
+        }
+    }
+
+    fn step(&mut self, step: Step) {
+        let last = self.tabs.len();
+        self.selected = match step {
+            Step::To(index) if index <= last => index,
+            Step::To(_) => self.selected,
+            Step::Next => (self.selected + 1) % (last + 1),
+            Step::Previous => (self.selected + last) % (last + 1),
+        };
+    }
+
+    /// Draws the row of tabs into `bar` and, on a thread's tab, the tab into `body`; returns
+    /// where the shown agent's cursor is.
+    pub(crate) fn render(&self, bar: Rect, body: Rect, buffer: &mut Buffer) -> Option<Position> {
+        let tabs: Vec<WorkspaceTab<'_>> = self
+            .tabs
+            .iter()
+            .map(|tab| WorkspaceTab {
+                title: &tab.title,
+                asks: false,
+            })
+            .collect();
+        TabBar {
+            tabs: &tabs,
+            selected: self.selected,
+        }
+        .render(bar, buffer);
+        let tab = self.tabs.get(self.selected.checked_sub(1)?)?;
+        let agents: Vec<WorkspaceAgent<'_>> = tab
+            .agents
+            .iter()
+            .map(|running| WorkspaceAgent {
+                owner: None,
+                name: &running.name,
+                state: if running.ending == Ending::Failed {
+                    AgentState::Failed
+                } else {
+                    AgentState::Working
+                },
+            })
+            .collect();
+        let shown = tab.agents.get(tab.selected);
+        let failed = shown.is_some_and(|running| running.ending == Ending::Failed);
+        ThreadView {
+            agents: &agents,
+            selected: tab.selected,
+            prompts: 0,
+            list: ListPlace::shown_at(body.width),
+            hints: if failed { &FAILED_HINTS } else { &HINTS },
+        }
+        .render(shown.map(|running| running.child.screen()), body, buffer)
+    }
+
+    fn shown_id(&self) -> Option<usize> {
+        let tab = self.tabs.get(self.selected.checked_sub(1)?)?;
+        tab.agents.get(tab.selected).map(|running| running.id)
+    }
+
+    fn shown_mut(&mut self) -> Option<&mut Running> {
+        let tab = self.tabs.get_mut(self.selected.checked_sub(1)?)?;
+        tab.agents.get_mut(tab.selected)
+    }
+
+    fn running_mut(&mut self, id: usize) -> Option<&mut Running> {
+        self.tabs
+            .iter_mut()
+            .flat_map(|tab| tab.agents.iter_mut())
+            .find(|running| running.id == id)
+    }
+}
+
+/// A move the workspace's keys make between tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    To(usize),
+    Next,
+    Previous,
+}
+
+/// Reads the workspace key at the start of `bytes`, typed after the palette key, and returns
+/// the move it makes, if any, and what follows it.
+fn workspace_key(bytes: &[u8]) -> (Option<Step>, &[u8]) {
+    for (sequence, step) in [
+        (&b"\x1b[C"[..], Step::Next),
+        (b"\x1bOC", Step::Next),
+        (b"\x1b[D", Step::Previous),
+        (b"\x1bOD", Step::Previous),
+    ] {
+        if let Some(rest) = bytes.strip_prefix(sequence) {
+            return (Some(step), rest);
+        }
+    }
+    match bytes.split_first() {
+        Some((digit @ b'0'..=b'9', rest)) => (Some(Step::To(usize::from(digit - b'0'))), rest),
+        _ => (None, bytes.get(key_length(bytes)..).unwrap_or_default()),
+    }
+}
+
+/// Returns how many bytes the key at the start of `bytes` takes: an escape sequence (CSI up
+/// to its final byte, SS3 and the byte after it, or Escape and one byte), a character in
+/// UTF-8, or one byte.
+fn key_length(bytes: &[u8]) -> usize {
+    match bytes {
+        [0x1b, b'[', rest @ ..] => {
+            2 + rest
+                .iter()
+                .position(|byte| (0x40..=0x7e).contains(byte))
+                .map_or(rest.len(), |at| at + 1)
+        }
+        [0x1b, b'O', _, ..] => 3,
+        [0x1b, _, ..] => 2,
+        [first, ..] => match first.leading_ones() {
+            2..=4 => usize::try_from(first.leading_ones())
+                .unwrap_or(1)
+                .min(bytes.len()),
+            _ => 1,
+        },
+        [] => 0,
     }
 }
 
@@ -272,11 +781,144 @@ mod tests {
             assert!(Instant::now() < deadline, "{}", child.screen().contents());
             child.exited().unwrap();
             match events.recv_timeout(Duration::from_millis(50)) {
-                Ok(ChildEvent::Output(0, bytes)) => child.feed(&bytes, &mut passed),
+                Ok(ChildEvent::Output(0, bytes)) => child.feed(&bytes, Some(&mut passed)),
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+    }
+
+    #[test]
+    fn a_workspace_key_after_the_palette_key_is_read_from_the_start_of_what_follows() {
+        assert_eq!(workspace_key(b"\x1b[Cxy"), (Some(Step::Next), &b"xy"[..]));
+        assert_eq!(workspace_key(b"\x1bOD"), (Some(Step::Previous), &b""[..]));
+        assert_eq!(workspace_key(b"3rest"), (Some(Step::To(3)), &b"rest"[..]));
+        assert_eq!(workspace_key(b"zrest"), (None, &b"rest"[..]));
+        assert_eq!(workspace_key(b"\x1b[Arest"), (None, &b"rest"[..]));
+        assert_eq!(workspace_key(b"\x1b[1;5Arest"), (None, &b"rest"[..]));
+        assert_eq!(workspace_key("érest".as_bytes()), (None, &b"rest"[..]));
+        assert_eq!(workspace_key(b""), (None, &b""[..]));
+    }
+
+    fn running(workspace: &mut Workspace, script: &str) -> Running {
+        let id = workspace.next_id;
+        workspace.next_id += 1;
+        Running {
+            id,
+            name: "agent".to_owned(),
+            shown: format!("mahi run agent{id}"),
+            child: Child::start(shell(script), SIZE, id, &workspace.sender).unwrap(),
+            closed: false,
+            ending: Ending::Running,
+        }
+    }
+
+    fn tab(title: &str, agents: Vec<Running>) -> Tab {
+        Tab {
+            title: title.to_owned(),
+            agents,
+            selected: 0,
+        }
+    }
+
+    fn settle(workspace: &mut Workspace, out: &mut Vec<u8>, done: impl Fn(&Workspace) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(workspace) {
+            assert!(Instant::now() < deadline);
+            workspace.take_output(out);
+            workspace.take_ended();
+            workspace.apply_shown(out);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn moving_between_tabs_wraps_and_a_tab_that_is_not_there_is_ignored() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        for title in ["a", "b"] {
+            let agent = running(&mut workspace, "sleep 5");
+            workspace.tabs.push(tab(title, vec![agent]));
+        }
+        let mut threads = Vec::new();
+        assert_eq!(workspace.type_keys(b"\x002", &mut threads), Moved::Tab);
+        assert_eq!(workspace.selected, 2);
+        assert_eq!(workspace.type_keys(b"\x00\x1b[C", &mut threads), Moved::Tab);
+        assert_eq!(workspace.selected, 0);
+        assert_eq!(workspace.type_keys(b"\x00\x1b[D", &mut threads), Moved::Tab);
+        assert_eq!(workspace.selected, 2);
+        assert_eq!(workspace.type_keys(b"\x009", &mut threads), Moved::Nothing);
+        assert_eq!(workspace.selected, 2);
+        workspace.type_keys(b"\x000jk", &mut threads);
+        assert_eq!(threads, b"jk");
+    }
+
+    #[test]
+    fn a_hidden_agents_key_modes_reach_the_terminal_only_while_it_is_shown() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        let agent = running(&mut workspace, "printf '\\033[?1hready'; sleep 5");
+        workspace.tabs.push(tab("a", vec![agent]));
+        let mut out = Vec::new();
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .contains("ready")
+        });
+        assert!(
+            !String::from_utf8_lossy(&out).contains("\x1b[?1h"),
+            "{out:?}"
+        );
+        workspace.selected = 1;
+        workspace.apply_shown(&mut out);
+        assert!(
+            String::from_utf8_lossy(&out).contains("\x1b[?1h"),
+            "{out:?}"
+        );
+        out.clear();
+        workspace.selected = 0;
+        workspace.apply_shown(&mut out);
+        assert!(
+            String::from_utf8_lossy(&out).contains("\x1b[?1l"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_ends_leaves_the_selection_on_the_one_that_was_selected() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        let first = running(&mut workspace, "exit 0");
+        let second = running(&mut workspace, "sleep 5");
+        let kept = second.id;
+        let mut both = tab("a", vec![first, second]);
+        both.selected = 1;
+        workspace.tabs.push(both);
+        workspace.selected = 1;
+        let mut out = Vec::new();
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents.len() == 1
+        });
+        assert_eq!(workspace.shown_id(), Some(kept));
+    }
+
+    #[test]
+    fn closing_a_failed_agent_changes_the_screen_and_ends_the_workspaces_own_keys() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        let agent = running(&mut workspace, "exit 3");
+        workspace.tabs.push(tab("a", vec![agent]));
+        workspace.selected = 1;
+        let mut out = Vec::new();
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0].ending == Ending::Failed
+        });
+        assert!(!workspace.is_running());
+        let mut threads = Vec::new();
+        workspace.type_keys(b"x\x00", &mut threads);
+        assert!(workspace.armed);
+        assert_eq!(workspace.take_ended(), (None, true));
+        assert!(!workspace.has_tabs());
+        assert!(!workspace.armed);
+        assert_eq!(workspace.selected, 0);
     }
 
     #[test]
@@ -412,7 +1054,7 @@ mod tests {
             assert!(Instant::now() < deadline, "{}", child.screen().contents());
             child.exited().unwrap();
             match events.recv_timeout(Duration::from_millis(50)) {
-                Ok(ChildEvent::Output(_, bytes)) => child.feed(&bytes, &mut passed),
+                Ok(ChildEvent::Output(_, bytes)) => child.feed(&bytes, Some(&mut passed)),
                 Ok(ChildEvent::Closed(0)) => break,
                 Ok(ChildEvent::Closed(_)) | Err(_) => {}
             }
@@ -438,7 +1080,7 @@ mod tests {
         );
         let mut passed = Vec::new();
         for _ in 0..1000 {
-            child.feed(b"\x1b[6n", &mut passed);
+            child.feed(b"\x1b[6n", Some(&mut passed));
         }
         assert!(started.elapsed() < Duration::from_secs(2));
     }

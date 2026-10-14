@@ -121,13 +121,6 @@ pub(crate) fn forget() {
 
 /// Returns the key the home screen keeps unlocked for `file`, if it keeps one, counting this
 /// as a use of it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the workspace hands it to the children it starts, next"
-    )
-)]
 pub(crate) fn current(file: &Path) -> Option<LocalIdentity> {
     take_kept(file, Instant::now())
 }

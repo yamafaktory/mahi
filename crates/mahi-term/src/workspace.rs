@@ -46,6 +46,8 @@ pub enum AgentState {
     AsksYou,
     /// A teammate's agent whose host is not connected.
     Offline,
+    /// The command that ran it failed; its last screen stays until the user closes it.
+    Failed,
 }
 
 impl AgentState {
@@ -55,6 +57,7 @@ impl AgentState {
             Self::Done => Span::styled("✓ done", Style::new().fg(Theme::OK)),
             Self::AsksYou => Span::styled("! asks you", Theme::code()),
             Self::Offline => Span::styled("○ offline", Theme::muted()),
+            Self::Failed => Span::styled("✗ failed", Style::new().fg(Theme::ERROR)),
         }
     }
 }

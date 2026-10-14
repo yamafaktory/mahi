@@ -43,13 +43,6 @@ mod threads;
 mod turns;
 mod ui;
 mod unlocked;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the workspace's screen loop, its next piece, runs these children"
-    )
-)]
 mod workspace;
 
 use std::{

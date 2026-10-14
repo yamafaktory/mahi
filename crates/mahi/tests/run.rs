@@ -1329,7 +1329,7 @@ cat parser.rs
     }
 
     #[test]
-    fn an_agent_started_from_the_home_screen_runs_in_a_pane_between_mahis_header_and_keys() {
+    fn an_agent_started_from_the_home_screen_runs_in_a_threads_tab_beside_its_agents() {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho agent-ready $(stty size)\nread line\n";
         let claude = script(&fixture, "pane-agents", "claude", agent);
@@ -1346,21 +1346,71 @@ cat parser.rs
         );
         assert_eq!(code, 0, "{output}");
         let ready = output.find("agent-ready").unwrap();
-        let end = ready + output[ready..].find("\x1b[?1049h").unwrap();
+        let home = ready + output[ready..].find("· remote").unwrap();
+        let end = output[..home]
+            .rfind("\x1b[1;1H")
+            .filter(|&back| back > ready)
+            .unwrap_or(home);
         let mut parser = vt100::Parser::new(24, 200, 0);
         parser.process(&output.as_bytes()[..end]);
         let screen = parser.screen();
         let rows: Vec<String> = screen.rows(0, 200).collect();
+        assert!(rows[0].starts_with(" ⌂ threads │ new │ + "), "{rows:#?}");
+        assert!(rows[1].starts_with("╭ claude "), "{rows:#?}");
         assert!(
-            rows[0].starts_with(" mahi  tester.claude · thread "),
+            rows.iter()
+                .any(|row| row.starts_with("│agent-ready 20 174")),
             "{rows:#?}"
         );
-        assert!(rows[1].starts_with("╭──"), "{rows:#?}");
-        assert!(rows[2].starts_with("│agent-ready 20 198"), "{rows:#?}");
+        assert!(rows[3].contains("claude ● working"), "{rows:#?}");
         assert!(rows[22].starts_with("╰──"), "{rows:#?}");
-        assert!(rows[23].contains("back to the threads"), "{rows:#?}");
-        assert!(!screen.contents().contains("Menu"), "{rows:#?}");
+        assert!(rows[23].contains("tab by number"), "{rows:#?}");
         assert_eq!(screen.cursor_position().1, 1);
+    }
+
+    #[test]
+    fn the_palette_key_moves_between_the_thread_list_and_a_threads_tab() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nread line\necho got=$line\n";
+        let claude = script(&fixture, "tab-agents", "claude", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("agent-ready", b"\x000"),
+                ("Menu", b"q"),
+                ("end them before quitting", b"\x001"),
+                ("tab by number", b"hello\r"),
+                ("mahi run claude: done", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("got=hello"), "{output}");
+    }
+
+    #[test]
+    fn a_command_that_fails_in_a_tab_stays_until_a_key_closes_it() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho broken-agent\nexit 3\n";
+        let claude = script(&fixture, "failing-agents", "claude", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("close it", b"x"),
+                ("Menu", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            pane_at(&output, "close it").contains("broken-agent"),
+            "{output}"
+        );
+        assert!(output.contains("✗ failed"), "{output}");
     }
 
     #[test]
@@ -1678,8 +1728,10 @@ cat parser.rs
     /// screen came back.
     fn pane_at(output: &str, marker: &str) -> String {
         let at = output.find(marker).unwrap();
-        let end = output[at..]
-            .find("\x1b[?1049h")
+        let end = ["\x1b[?1049h", "· remote"]
+            .iter()
+            .filter_map(|next| output[at..].find(next))
+            .min()
             .map_or(output.len(), |back| at + back);
         let mut parser = vt100::Parser::new(24, 200, 0);
         parser.process(&output.as_bytes()[..end]);
