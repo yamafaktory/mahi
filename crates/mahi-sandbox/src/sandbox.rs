@@ -136,8 +136,9 @@ impl Sandbox {
     /// programs, and Homebrew on Apple Silicon) as they are on the host, each either bound
     /// read-only or recreated as the same symbolic link. On macOS the data package managers
     /// keep for their services, such as `/opt/homebrew/var`, stays unreadable, and the
-    /// developer directory `xcode-select` chose is readable, with the files `xcrun` checks
-    /// Xcode's license against, so `/usr/bin/git` and the tools beside it start.
+    /// developer directory `xcode-select` chose is readable, all of an Xcode app's `Contents`
+    /// when it is one, with Xcode's preferences, so `/usr/bin/git` and the tools beside it
+    /// start.
     ///
     /// # Errors
     ///
@@ -311,24 +312,21 @@ fn developer_dir() -> Option<PathBuf> {
         .find(|path| path.is_dir())
 }
 
-/// Returns what `xcrun` reads to start a tool: the developer directory and, for one inside
-/// an Xcode app, the files it checks that Xcode's license was accepted against.
+/// Returns what `xcrun` reads to start a tool: the developer directory, or for one inside an
+/// Xcode app the app's whole `Contents`, since `xcrun` runs the app's `xcodebuild` to check
+/// its first launch and license, which loads the app's frameworks, and the preferences that
+/// say the license was accepted.
 #[cfg(target_os = "macos")]
 fn developer_paths() -> Vec<PathBuf> {
     let Some(developer) = developer_dir() else {
         return Vec::new();
     };
-    let mut paths = vec![PathBuf::from(XCODE_PREFERENCES)];
-    if let Some(contents) = developer
-        .parent()
-        .filter(|parent| parent.ends_with("Contents"))
-    {
-        paths.push(contents.join("version.plist"));
-        paths.push(contents.join("Info.plist"));
-    }
-    paths.retain(|path| path.is_file());
-    paths.push(developer);
-    paths
+    let readable = match developer.parent() {
+        Some(contents) if contents.ends_with("Contents") => contents.to_path_buf(),
+        _ => developer,
+    };
+    let preferences = Some(PathBuf::from(XCODE_PREFERENCES)).filter(|path| path.is_file());
+    preferences.into_iter().chain([readable]).collect()
 }
 
 fn check_plain(path: &Path) -> Result<(), SandboxError> {
