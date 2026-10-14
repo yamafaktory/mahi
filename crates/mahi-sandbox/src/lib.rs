@@ -23,6 +23,7 @@ mod wsl;
 
 pub use inherit::inherited_pipe;
 pub use pty::{
+    MAX_PASSED,
     PtyChild,
     PtyCommand,
     PtyError,

@@ -6,9 +6,9 @@ use std::{
         OwnedFd,
         RawFd,
     },
-    sync::atomic::{
-        AtomicBool,
-        Ordering,
+    sync::{
+        Mutex,
+        PoisonError,
     },
 };
 
@@ -17,22 +17,24 @@ use rustix::{
     io::FdFlags,
 };
 
-static TAKEN: AtomicBool = AtomicBool::new(false);
+static TAKEN: Mutex<[RawFd; crate::MAX_PASSED]> = Mutex::new([-1; crate::MAX_PASSED]);
 
-/// Takes the read end of a pipe that the process which started this one left open at `fd`,
-/// as [`crate::PtyCommand::pass_fd`] does, and marks it to close on exec, so no program this
-/// one starts inherits it. It can be taken once in a process, and must be taken at startup,
-/// before this process opens anything that could get the same number.
+/// Takes an end of a pipe that the process which started this one left open at `fd`, as
+/// [`crate::PtyCommand::pass_fd`] does, and marks it to close on exec, so no program this one
+/// starts inherits it. Each number can be taken once in a process, and at most
+/// [`crate::MAX_PASSED`] of them, all at startup, before this process opens anything that
+/// could get the same number.
 ///
 /// # Errors
 ///
-/// Returns an error if `fd` is a standard stream's, if a descriptor was taken before, or if
-/// `fd` is not open or not a pipe; then it is left as it is.
+/// Returns an error if `fd` is a standard stream's, if it was taken before or the most were,
+/// or if it is not open or not a pipe; then the descriptor is left as it is, but a number
+/// refused for not being open or a pipe still counts among those taken.
 pub fn inherited_pipe(fd: RawFd) -> io::Result<File> {
     if fd <= 2 {
         return Err(io::ErrorKind::InvalidInput.into());
     }
-    if TAKEN.swap(true, Ordering::SeqCst) {
+    if !take_number(fd) {
         return Err(io::ErrorKind::AlreadyExists.into());
     }
     let pipe = is_pipe(fd)?;
@@ -42,6 +44,18 @@ pub fn inherited_pipe(fd: RawFd) -> io::Result<File> {
     let owned = own(fd);
     rustix::io::fcntl_setfd(&owned, FdFlags::CLOEXEC)?;
     Ok(File::from(owned))
+}
+
+fn take_number(fd: RawFd) -> bool {
+    let mut taken = TAKEN.lock().unwrap_or_else(PoisonError::into_inner);
+    if taken.contains(&fd) {
+        return false;
+    }
+    let Some(free) = taken.iter_mut().find(|number| **number == -1) else {
+        return false;
+    };
+    *free = fd;
+    true
 }
 
 #[expect(
@@ -65,7 +79,7 @@ fn is_pipe(fd: RawFd) -> io::Result<bool> {
 fn own(fd: RawFd) -> OwnedFd {
     // SAFETY: `fd` is open, a pipe, and above the standard streams; the caller takes it at
     // startup, before this process opens anything of its own that could share the number, and
-    // `TAKEN` lets it be taken once, so no other owner of it exists.
+    // `TAKEN` lets each number be taken once, so no other owner of it exists.
     unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
@@ -85,19 +99,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_pipe_is_taken_once_and_a_standard_stream_never() {
+    fn each_pipe_is_taken_once_two_at_most_and_a_standard_stream_never() {
         assert_eq!(
             inherited_pipe(1).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
         let file = tempfile::tempfile().unwrap().into_raw_fd();
         assert!(inherited_pipe(file).is_err());
-        TAKEN.store(false, Ordering::SeqCst);
+        *TAKEN.lock().unwrap() = [-1; crate::MAX_PASSED];
         let (closed, _writer) = rustix::pipe::pipe().unwrap();
         let number = closed.as_raw_fd();
         drop(closed);
         assert!(inherited_pipe(number).is_err());
-        TAKEN.store(false, Ordering::SeqCst);
+        *TAKEN.lock().unwrap() = [-1; crate::MAX_PASSED];
         let (reader, writer) = rustix::pipe::pipe().unwrap();
         let mut writer = File::from(writer);
         writer.write_all(b"secret").unwrap();
@@ -112,9 +126,15 @@ mod tests {
                 .unwrap()
                 .contains(FdFlags::CLOEXEC)
         );
-        let (again, _writer) = rustix::pipe::pipe().unwrap();
         assert_eq!(
-            inherited_pipe(again.into_raw_fd()).unwrap_err().kind(),
+            inherited_pipe(taken.as_raw_fd()).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let (second, _writer) = rustix::pipe::pipe().unwrap();
+        let _second = inherited_pipe(second.into_raw_fd()).unwrap();
+        let (third, _writer) = rustix::pipe::pipe().unwrap();
+        assert_eq!(
+            inherited_pipe(third.into_raw_fd()).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
     }

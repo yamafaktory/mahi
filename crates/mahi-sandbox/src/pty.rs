@@ -73,6 +73,9 @@ pub struct WindowSize {
     pub cols: u16,
 }
 
+/// The most descriptors [`PtyCommand::pass_fd`] passes to one program.
+pub const MAX_PASSED: usize = 2;
+
 /// A program to run in a new pseudo-terminal.
 ///
 /// It starts with an empty environment: only the variables set with [`PtyCommand::env`] are
@@ -86,7 +89,8 @@ pub struct PtyCommand {
     size: WindowSize,
     sandbox: Option<Sandbox>,
     hold_terminal: bool,
-    passed: Option<Arc<OwnedFd>>,
+    passed: Vec<Arc<OwnedFd>>,
+    too_many_passed: bool,
 }
 
 /// A program running in a pseudo-terminal, and the terminal's controlling side.
@@ -128,7 +132,8 @@ impl PtyCommand {
             size,
             sandbox: None,
             hold_terminal: false,
-            passed: None,
+            passed: Vec::new(),
+            too_many_passed: false,
         }
     }
 
@@ -157,10 +162,15 @@ impl PtyCommand {
 
     /// Leaves `fd` open in the program, under the same number, which the caller tells it some
     /// other way, such as in a variable; every other descriptor the caller marked to close on
-    /// exec stays closed. Only a program outside a sandbox can be given one.
+    /// exec stays closed. Only a program outside a sandbox can be given one, and at most
+    /// [`MAX_PASSED`]: [`PtyCommand::spawn`] refuses a command given more.
     #[must_use]
     pub fn pass_fd(mut self, fd: OwnedFd) -> Self {
-        self.passed = Some(Arc::new(fd));
+        if self.passed.len() < MAX_PASSED {
+            self.passed.push(Arc::new(fd));
+        } else {
+            self.too_many_passed = true;
+        }
         self
     }
 
@@ -184,7 +194,13 @@ impl PtyCommand {
     /// Returns [`PtyError::Open`] if the pseudo-terminal cannot be created, or
     /// [`PtyError::Spawn`] if the program cannot be started or the sandbox cannot be entered.
     pub fn spawn(self) -> Result<PtyChild, PtyError> {
-        if self.sandbox.is_some() && self.passed.is_some() {
+        if self.too_many_passed {
+            return Err(PtyError::Spawn(
+                self.program,
+                io::Error::other("a program can be given at most two descriptors"),
+            ));
+        }
+        if self.sandbox.is_some() && !self.passed.is_empty() {
             return Err(PtyError::Spawn(
                 self.program,
                 io::Error::other("a sandboxed program cannot be given a descriptor"),
@@ -209,11 +225,11 @@ impl PtyCommand {
         if sandbox.is_none() || cfg!(target_os = "macos") {
             command.current_dir(&self.cwd);
         }
-        set_up_child(
-            &mut command,
-            sandbox,
-            self.passed.as_ref().map(AsRawFd::as_raw_fd),
-        );
+        let mut passed = [None; MAX_PASSED];
+        for (slot, fd) in passed.iter_mut().zip(&self.passed) {
+            *slot = Some(fd.as_raw_fd());
+        }
+        set_up_child(&mut command, sandbox, passed);
         let child = command
             .spawn()
             .map_err(|error| PtyError::Spawn(self.program.clone(), error))?;
@@ -242,7 +258,8 @@ impl fmt::Debug for PtyCommand {
             .field("size", &self.size)
             .field("sandbox", &self.sandbox)
             .field("hold_terminal", &self.hold_terminal)
-            .field("passed", &self.passed.is_some())
+            .field("passed", &self.passed.len())
+            .field("too_many_passed", &self.too_many_passed)
             .finish()
     }
 }
@@ -289,7 +306,11 @@ fn prepare_sandbox(
     unsafe_code,
     reason = "the child must start a session, take the terminal and enter the sandbox between fork and exec"
 )]
-fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>, passed: Option<RawFd>) {
+fn set_up_child(
+    command: &mut Command,
+    mut sandbox: Option<ChildSetup>,
+    passed: [Option<RawFd>; MAX_PASSED],
+) {
     // SAFETY: the hook runs in the forked child before exec, where only async-signal-safe work
     // is allowed. On Linux it makes system calls through rustix and libc and allocates
     // nothing: every path and buffer the sandbox needs was prepared before the fork. On macOS
@@ -308,7 +329,7 @@ fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>, passed: 
                 sandbox.enter()
             } else {
                 rustix::process::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
-                if let Some(passed) = passed {
+                for passed in passed.into_iter().flatten() {
                     rustix::io::fcntl_setfd(BorrowedFd::borrow_raw(passed), FdFlags::empty())?;
                 }
                 Ok(())
@@ -614,6 +635,46 @@ mod tests {
         }
         child.terminate().unwrap();
         assert_eq!(exit_code(child.wait().unwrap()), 7);
+    }
+
+    #[test]
+    fn two_passed_descriptors_both_stay_open_in_the_program() {
+        let mut pipes = Vec::new();
+        for text in [&b"first"[..], b"second"] {
+            let (reader, writer) = rustix::pipe::pipe().unwrap();
+            rustix::io::fcntl_setfd(&reader, FdFlags::CLOEXEC).unwrap();
+            let mut writer = File::from(writer);
+            std::io::Write::write_all(&mut writer, text).unwrap();
+            pipes.push(reader);
+        }
+        let script = format!(
+            "cat <&{}; echo; cat <&{}",
+            pipes[0].as_raw_fd(),
+            pipes[1].as_raw_fd()
+        );
+        let mut command = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
+            .arg("-c")
+            .arg(&script);
+        for pipe in pipes {
+            command = command.pass_fd(pipe);
+        }
+        let child = command.spawn().unwrap();
+        let mut output = String::new();
+        let _ = child.reader().unwrap().read_to_string(&mut output);
+        assert!(
+            output.contains("first") && output.contains("second"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn a_program_given_more_descriptors_than_it_can_take_is_not_started() {
+        let mut command = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE);
+        for _ in 0..=MAX_PASSED {
+            let (reader, _writer) = rustix::pipe::pipe().unwrap();
+            command = command.pass_fd(reader);
+        }
+        assert!(matches!(command.spawn(), Err(PtyError::Spawn(..))));
     }
 
     #[test]
