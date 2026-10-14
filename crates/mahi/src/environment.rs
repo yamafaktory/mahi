@@ -81,6 +81,7 @@ pub(crate) struct Environment {
     pub(crate) colorterm: Option<String>,
     pub(crate) kitty: bool,
     pub(crate) vte: bool,
+    pub(crate) whole: Vec<(OsString, Zeroizing<Vec<u8>>)>,
 }
 
 /// Whether `mahi run` and `mahi resume` let teammates watch, from `MAHI_LIVE`.
@@ -214,6 +215,9 @@ impl Environment {
             colorterm: text("COLORTERM"),
             kitty: value("KITTY_WINDOW_ID").is_some(),
             vte: value("VTE_VERSION").is_some(),
+            whole: env::vars_os()
+                .map(|(name, value)| (name, Zeroizing::new(value.into_vec())))
+                .collect(),
             passed_on: PASSED_ON
                 .iter()
                 .filter_map(|&name| value(name).map(|value| (name, value)))
