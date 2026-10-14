@@ -92,7 +92,7 @@ use crate::{
 
 const ENTER_SCREEN: &[u8] =
     b"\x1b[?1049h\x1b[?2004h\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[2J";
-const LEAVE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l";
+const LEAVE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1049l";
 const REREAD: Duration = Duration::from_secs(2);
 const KEY_WAIT: Duration = Duration::from_millis(200);
 const SEQUENCE_WAIT: Duration = Duration::from_millis(30);
@@ -180,6 +180,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
             Ok(Chosen::Action(action)) => {
                 status = act(action, &mut store, environment);
                 ui::keys_make_signals(false);
+                workspace.set_screen(terminal::size(), true);
                 if let Err(error) = Screen::restore() {
                     break Err(Ended::Failed(error));
                 }
@@ -323,15 +324,10 @@ fn choose(
             terminal.autoresize()?;
             dirty = true;
         }
+        workspace.set_screen(size, false);
         workspace.resize(agents_size(size, workspace));
         if dirty {
-            let view = HomeView {
-                repository: place.repository,
-                remote: &remote,
-                identity: place.identity,
-                rows: &rows,
-                activity: &activity,
-            };
+            let view = home_view(place, &remote, &rows, &activity);
             draw(&mut terminal, home, &view, status, workspace)?;
             dirty = false;
         }
@@ -345,11 +341,15 @@ fn choose(
             Chunk::End => return Ok(Chosen::InputEnded),
             Chunk::Stopped(signal) => return Ok(Chosen::Stopped(signal)),
         };
-        dirty |= route_keys(
+        match route_keys(
             workspace,
             buffer.get(..read).unwrap_or_default(),
             &mut for_threads,
-        );
+        ) {
+            Moved::Nothing => {}
+            Moved::Shown => dirty = true,
+            Moved::New => return Ok(Chosen::Action(HomeAction::New)),
+        }
         if for_threads.is_empty() || ignore_until.is_some_and(|until| Instant::now() < until) {
             continue;
         }
@@ -361,13 +361,7 @@ fn choose(
         match chosen {
             Some(HomeAction::Quit) => return Ok(Chosen::Quit),
             Some(action) => {
-                let view = HomeView {
-                    repository: place.repository,
-                    remote: &remote,
-                    identity: place.identity,
-                    rows: &rows,
-                    activity: &activity,
-                };
+                let view = home_view(place, &remote, &rows, &activity);
                 draw(&mut terminal, home, &view, status, workspace)?;
                 return Ok(Chosen::Action(action));
             }
@@ -440,13 +434,30 @@ fn agents_size(size: WindowSize, workspace: &Workspace) -> WindowSize {
 /// Gives what was `typed` to the workspace, which keeps its own keys and the shown agent's,
 /// and leaves in `for_threads` what the thread list reads; returns whether another tab is
 /// shown.
-fn route_keys(workspace: &mut Workspace, typed: &[u8], for_threads: &mut Vec<u8>) -> bool {
+fn route_keys(workspace: &mut Workspace, typed: &[u8], for_threads: &mut Vec<u8>) -> Moved {
     for_threads.clear();
     if workspace.has_tabs() {
-        workspace.type_keys(typed, for_threads) == Moved::Shown
+        workspace.type_keys(typed, for_threads)
     } else {
-        for_threads.extend_from_slice(typed);
-        false
+        workspace.type_without_tabs(typed, for_threads);
+        Moved::Nothing
+    }
+}
+
+/// Returns what the home screen shows of `place`, its `remote`, its thread `rows` and the
+/// `activity` it caught.
+fn home_view<'a>(
+    place: &'a Place<'_>,
+    remote: &'a str,
+    rows: &'a [HomeRow],
+    activity: &'a [String],
+) -> HomeView<'a> {
+    HomeView {
+        repository: place.repository,
+        remote,
+        identity: place.identity,
+        rows,
+        activity,
     }
 }
 

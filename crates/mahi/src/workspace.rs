@@ -34,13 +34,20 @@ use mahi_term::{
     AgentScreen,
     AgentState,
     KeyScanner,
+    ListHit,
     ListPlace,
+    MouseEvent,
     PaletteKey,
     Segment,
     TabBar,
+    TabHit,
     ThreadView,
+    Typed,
     WorkspaceAgent,
     WorkspaceTab,
+    agent_mouse,
+    cut_report,
+    split_mouse,
 };
 use ratatui_core::{
     buffer::Buffer,
@@ -57,6 +64,8 @@ use crate::environment::{
 
 const READ_CHUNK: usize = 16 * 1024;
 const STOP_POLL: Duration = Duration::from_millis(20);
+const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1002l\x1b[?1006l";
 const QUEUED_WRITES: usize = 64;
 const TERMINAL_OWN: [&str; 6] = [
     "KITTY_WINDOW_ID",
@@ -290,6 +299,18 @@ pub(crate) struct Workspace {
     passed: Vec<u8>,
     applied: Option<usize>,
     pending: Vec<u8>,
+    screen: WindowSize,
+    mouse: MouseState,
+}
+
+/// What the workspace keeps of the mouse between reads.
+#[derive(Debug, Default)]
+struct MouseState {
+    on: bool,
+    dragging: bool,
+    carried: Vec<u8>,
+    joined: Vec<u8>,
+    encoded: Vec<u8>,
 }
 
 /// A thread's tab: the agents the workspace runs for it.
@@ -311,6 +332,21 @@ struct Running {
     ending: Ending,
 }
 
+impl Running {
+    /// Returns the agent as the list of a thread's agents shows it.
+    fn shown_as(&self) -> WorkspaceAgent<'_> {
+        WorkspaceAgent {
+            owner: None,
+            name: &self.name,
+            state: if self.ending == Ending::Failed {
+                AgentState::Failed
+            } else {
+                AgentState::Working
+            },
+        }
+    }
+}
+
 /// How far an agent whose command ended is from leaving its tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ending {
@@ -327,6 +363,8 @@ pub(crate) enum Moved {
     Nothing,
     /// Another tab or agent is shown, or the list was hidden or shown.
     Shown,
+    /// `+` was clicked, to open another thread.
+    New,
 }
 
 impl Workspace {
@@ -346,6 +384,8 @@ impl Workspace {
             passed: Vec::new(),
             applied: None,
             pending: Vec::new(),
+            screen: WindowSize { rows: 2, cols: 2 },
+            mouse: MouseState::default(),
         }
     }
 
@@ -536,6 +576,11 @@ impl Workspace {
     pub(crate) fn apply_shown(&mut self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.pending);
         self.pending.clear();
+        let wanted = self.has_tabs();
+        if wanted != self.mouse.on {
+            out.extend_from_slice(if wanted { MOUSE_ON } else { MOUSE_OFF });
+            self.mouse.on = wanted;
+        }
         let shown = self.shown_id();
         if shown == self.applied {
             return;
@@ -588,6 +633,16 @@ impl Workspace {
         }
     }
 
+    /// Takes note of the user's terminal being `size`, for the clicks the workspace reads, and
+    /// of the terminal's mouse reporting having been reset, as an action that left the screen
+    /// may have done.
+    pub(crate) fn set_screen(&mut self, size: WindowSize, reset: bool) {
+        self.screen = size;
+        if reset {
+            self.mouse.on = false;
+        }
+    }
+
     /// Gives every agent's terminal `size`.
     pub(crate) fn resize(&mut self, size: WindowSize) {
         if size == self.size {
@@ -604,6 +659,165 @@ impl Workspace {
     /// `threads`.
     pub(crate) fn type_keys(&mut self, typed: &[u8], threads: &mut Vec<u8>) -> Moved {
         let before = (self.selected, self.shown_id(), self.list_shown);
+        let mut joined = std::mem::take(&mut self.mouse.joined);
+        let mut new = false;
+        for piece in split_mouse(self.join_carried(typed, &mut joined)) {
+            match piece {
+                Typed::Keys(keys) => self.type_plain(keys, threads),
+                Typed::Mouse(event) => new |= self.click(event),
+            }
+        }
+        self.mouse.joined = joined;
+        if new {
+            Moved::New
+        } else if (self.selected, self.shown_id(), self.list_shown) == before {
+            Moved::Nothing
+        } else {
+            Moved::Shown
+        }
+    }
+
+    /// Takes what was typed while no tab is open: every key goes to `threads`, and a mouse
+    /// report, which the terminal may still send just after the last tab closed, is dropped.
+    pub(crate) fn type_without_tabs(&mut self, typed: &[u8], threads: &mut Vec<u8>) {
+        let mut joined = std::mem::take(&mut self.mouse.joined);
+        for piece in split_mouse(self.join_carried(typed, &mut joined)) {
+            if let Typed::Keys(keys) = piece {
+                threads.extend_from_slice(keys);
+            }
+        }
+        self.mouse.joined = joined;
+        self.mouse.dragging = false;
+    }
+
+    /// Returns `typed` after what was carried from the last read, put together in `joined`
+    /// when there is any, and keeps for the next read the start of a mouse report it ends
+    /// with.
+    fn join_carried<'t>(&mut self, typed: &'t [u8], joined: &'t mut Vec<u8>) -> &'t [u8] {
+        joined.clear();
+        let whole: &[u8] = if self.mouse.carried.is_empty() {
+            typed
+        } else {
+            joined.append(&mut self.mouse.carried);
+            joined.extend_from_slice(typed);
+            joined
+        };
+        let kept = whole.len() - cut_report(whole);
+        match whole.get(kept..) {
+            Some(tail) if tail.starts_with(b"\x1b[<") => {
+                self.mouse.carried.extend_from_slice(tail);
+                whole.get(..kept).unwrap_or_default()
+            }
+            _ => whole,
+        }
+    }
+
+    /// Acts on a mouse event: a click on the row of tabs or the list of agents is the
+    /// workspace's, and the rest of a thread's tab is the shown agent's, when it asked for the
+    /// mouse, as is all of a drag that began in its pane; returns whether `+` was clicked.
+    fn click(&mut self, event: MouseEvent) -> bool {
+        let position = Position::new(event.column, event.row);
+        let area = Rect::new(0, 0, self.screen.cols, self.screen.rows);
+        let (bar, body) = TabBar::split(area);
+        let dragged = self.mouse.dragging && (event.is_motion() || !event.pressed);
+        if !event.pressed {
+            self.mouse.dragging = false;
+        }
+        if dragged {
+            self.give_agent(event, body, position, true);
+            return false;
+        }
+        if bar.contains(position) {
+            if !event.is_left_click() {
+                return false;
+            }
+            let titles: Vec<WorkspaceTab<'_>> = self.tab_titles().collect();
+            match (TabBar {
+                tabs: &titles,
+                selected: self.selected,
+            })
+            .tab_at(event.column - bar.x)
+            {
+                TabHit::Tab(index) => self.step(Step::To(index)),
+                TabHit::New => return true,
+                TabHit::Nothing => {}
+            }
+            return false;
+        }
+        let list = self.list_place(body.width);
+        let Some(tab) = self
+            .selected
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get_mut(index))
+        else {
+            return false;
+        };
+        let agents: Vec<WorkspaceAgent<'_>> = tab.agents.iter().map(Running::shown_as).collect();
+        let hit = ThreadView {
+            agents: &agents,
+            selected: tab.selected,
+            prompts: 0,
+            list,
+            hints: &[],
+        }
+        .list_at(body, position);
+        drop(agents);
+        match hit {
+            Some(ListHit::Agent(index)) if event.is_left_click() => {
+                tab.selected = index;
+                return false;
+            }
+            Some(_) => return false,
+            None => {}
+        }
+        let reached = self.give_agent(event, body, position, !event.pressed || event.is_motion());
+        if reached && event.pressed && !event.is_motion() {
+            self.mouse.dragging = true;
+        }
+        false
+    }
+
+    /// Gives a mouse event at `position` to the shown agent, at its own cell of the pane drawn
+    /// in `body`, the nearest one when `clamp`, if the agent asked for it; returns whether it
+    /// did.
+    fn give_agent(
+        &mut self,
+        event: MouseEvent,
+        body: Rect,
+        position: Position,
+        clamp: bool,
+    ) -> bool {
+        let list = self.list_place(body.width);
+        let Some(tab) = self
+            .selected
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get_mut(index))
+        else {
+            return false;
+        };
+        let point = ThreadView {
+            agents: &[],
+            selected: 0,
+            prompts: 0,
+            list,
+            hints: &[],
+        }
+        .pane_point(body, position, clamp);
+        let (Some(point), Some(running)) = (point, tab.agents.get_mut(tab.selected)) else {
+            return false;
+        };
+        self.mouse.encoded.clear();
+        if !event.encode(
+            agent_mouse(running.child.screen()),
+            point,
+            &mut self.mouse.encoded,
+        ) {
+            return false;
+        }
+        running.child.send(&self.mouse.encoded).is_ok()
+    }
+
+    fn type_plain(&mut self, typed: &[u8], threads: &mut Vec<u8>) {
         let mut scanner =
             std::mem::replace(&mut self.scanner, KeyScanner::new(PaletteKey::default()));
         for segment in scanner.scan(typed) {
@@ -628,11 +842,6 @@ impl Workspace {
             }
         }
         self.scanner = scanner;
-        if (self.selected, self.shown_id(), self.list_shown) == before {
-            Moved::Nothing
-        } else {
-            Moved::Shown
-        }
     }
 
     fn pass(&mut self, bytes: &[u8], threads: &mut Vec<u8>) {
@@ -695,33 +904,14 @@ impl Workspace {
     /// Draws the row of tabs into `bar` and, on a thread's tab, the tab into `body`; returns
     /// where the shown agent's cursor is.
     pub(crate) fn render(&self, bar: Rect, body: Rect, buffer: &mut Buffer) -> Option<Position> {
-        let tabs: Vec<WorkspaceTab<'_>> = self
-            .tabs
-            .iter()
-            .map(|tab| WorkspaceTab {
-                title: &tab.title,
-                asks: false,
-            })
-            .collect();
+        let tabs: Vec<WorkspaceTab<'_>> = self.tab_titles().collect();
         TabBar {
             tabs: &tabs,
             selected: self.selected,
         }
         .render(bar, buffer);
         let tab = self.tabs.get(self.selected.checked_sub(1)?)?;
-        let agents: Vec<WorkspaceAgent<'_>> = tab
-            .agents
-            .iter()
-            .map(|running| WorkspaceAgent {
-                owner: None,
-                name: &running.name,
-                state: if running.ending == Ending::Failed {
-                    AgentState::Failed
-                } else {
-                    AgentState::Working
-                },
-            })
-            .collect();
+        let agents: Vec<WorkspaceAgent<'_>> = tab.agents.iter().map(Running::shown_as).collect();
         let shown = tab.agents.get(tab.selected);
         let failed = shown.is_some_and(|running| running.ending == Ending::Failed);
         ThreadView {
@@ -732,6 +922,13 @@ impl Workspace {
             hints: if failed { &FAILED_HINTS } else { &HINTS },
         }
         .render(shown.map(|running| running.child.screen()), body, buffer)
+    }
+
+    fn tab_titles(&self) -> impl Iterator<Item = WorkspaceTab<'_>> {
+        self.tabs.iter().map(|tab| WorkspaceTab {
+            title: &tab.title,
+            asks: false,
+        })
     }
 
     fn shown_id(&self) -> Option<usize> {
@@ -964,6 +1161,153 @@ mod tests {
         workspace.type_keys(b"\x00b", &mut threads);
         assert_eq!(workspace.list_place(80), ListPlace::Over);
         assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn a_click_on_a_tab_selects_it_and_one_on_plus_asks_for_a_new_thread() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        workspace.set_screen(
+            WindowSize {
+                rows: 30,
+                cols: 100,
+            },
+            false,
+        );
+        for title in ["a", "b"] {
+            let agent = running(&mut workspace, "sleep 5");
+            workspace.tabs.push(tab(title, vec![agent]));
+        }
+        let mut threads = Vec::new();
+        assert_eq!(
+            workspace.type_keys(b"\x1b[<0;14;1M", &mut threads),
+            Moved::Shown
+        );
+        assert_eq!(workspace.selected, 1);
+        assert_eq!(
+            workspace.type_keys(b"\x1b[<0;", &mut threads),
+            Moved::Nothing
+        );
+        assert_eq!(workspace.type_keys(b"2;1M", &mut threads), Moved::Shown);
+        assert_eq!(workspace.selected, 0);
+        assert_eq!(
+            workspace.type_keys(b"\x1b[<0;22;1M", &mut threads),
+            Moved::New
+        );
+        assert_eq!(
+            workspace.type_keys(b"\x1b[<0;22;1m", &mut threads),
+            Moved::Nothing
+        );
+        assert!(threads.is_empty(), "{threads:?}");
+        let mut out = Vec::new();
+        workspace.apply_shown(&mut out);
+        assert!(out.ends_with(MOUSE_ON), "{out:?}");
+    }
+
+    #[test]
+    fn a_click_in_the_pane_reaches_an_agent_that_asked_for_the_mouse_at_its_own_cell() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        workspace.set_screen(
+            WindowSize {
+                rows: 30,
+                cols: 100,
+            },
+            false,
+        );
+        let asking = running(
+            &mut workspace,
+            "stty raw -echo; printf '\\033[?1000h\\033[?1006hready'; \
+             dd bs=1 count=9 2>/dev/null | od -An -c | tr -d ' \\n'; echo; echo end",
+        );
+        let deaf = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("a", vec![asking, deaf]));
+        workspace.selected = 1;
+        let mut out = Vec::new();
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .contains("ready")
+        });
+        let mut threads = Vec::new();
+        workspace.type_keys(b"\x1b[<0;2;3M", &mut threads);
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .contains("end")
+        });
+        let shown = workspace.tabs[0].agents[0].child.screen().contents();
+        assert!(shown.contains("033[<0;1;1M"), "{shown}");
+        let deaf = workspace.tabs[0].agents[1].child.screen().contents();
+        assert!(!deaf.contains("[<"), "{deaf}");
+        workspace.type_keys(b"\x1b[<0;80;5M", &mut threads);
+        assert_eq!(workspace.tabs[0].selected, 1);
+        assert_eq!(
+            workspace.type_keys(b"\x1b[<0;2;3M", &mut threads),
+            Moved::Nothing
+        );
+        assert!(threads.is_empty(), "{threads:?}");
+        workspace.tabs.clear();
+        workspace.selected = 0;
+        out.clear();
+        workspace.mouse.on = true;
+        workspace.apply_shown(&mut out);
+        assert_eq!(out, MOUSE_OFF);
+    }
+
+    #[test]
+    fn a_drag_that_leaves_the_pane_still_ends_at_the_agent() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        workspace.set_screen(
+            WindowSize {
+                rows: 30,
+                cols: 100,
+            },
+            false,
+        );
+        let asking = running(
+            &mut workspace,
+            "stty raw -echo; printf '\\033[?1002h\\033[?1006hready'; \
+             dd bs=1 count=19 2>/dev/null | od -An -c | tr -d ' \\n'; echo; echo end",
+        );
+        workspace.tabs.push(tab("a", vec![asking]));
+        workspace.selected = 1;
+        let mut out = Vec::new();
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .contains("ready")
+        });
+        let mut threads = Vec::new();
+        workspace.type_keys(b"\x1b[<0;2;3M", &mut threads);
+        assert!(workspace.mouse.dragging);
+        workspace.type_keys(b"\x1b[<0;90;5m", &mut threads);
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .contains("end")
+        });
+        let shown = workspace.tabs[0].agents[0].child.screen().contents();
+        assert!(shown.contains("033[<0;1;1M033[<0;74;3m"), "{shown}");
+        assert!(!workspace.mouse.dragging);
+    }
+
+    #[test]
+    fn a_report_cut_when_the_last_tab_closed_never_reaches_the_thread_list() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut threads = Vec::new();
+        workspace.mouse.carried.extend_from_slice(b"\x1b[<0;10");
+        workspace.type_without_tabs(b";5mq", &mut threads);
+        assert_eq!(threads, b"q");
+        assert!(workspace.mouse.carried.is_empty());
+        workspace.type_without_tabs(b"ab\x1b[<0;1;1Mc", &mut threads);
+        assert_eq!(threads, b"qabc");
     }
 
     #[test]

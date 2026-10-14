@@ -73,7 +73,9 @@ impl MouseEvent {
         self.code & LOW_BUTTONS != LOW_BUTTONS || self.code & !(MODIFIERS | MOTION) != LOW_BUTTONS
     }
 
-    fn is_motion(self) -> bool {
+    /// Returns whether it reports motion rather than a button going down or up.
+    #[must_use]
+    pub fn is_motion(self) -> bool {
         self.code & MOTION != 0
     }
 
@@ -146,6 +148,25 @@ impl MouseEvent {
             }
         }
     }
+}
+
+/// Returns which mouse events the agent drawing `screen` asked for, and how it asked for them
+/// to be written.
+#[must_use]
+pub fn agent_mouse(screen: &vt100::Screen) -> (MouseMode, MouseEncoding) {
+    let mode = match screen.mouse_protocol_mode() {
+        vt100::MouseProtocolMode::None => MouseMode::Off,
+        vt100::MouseProtocolMode::Press => MouseMode::Press,
+        vt100::MouseProtocolMode::PressRelease => MouseMode::PressRelease,
+        vt100::MouseProtocolMode::ButtonMotion => MouseMode::ButtonMotion,
+        vt100::MouseProtocolMode::AnyMotion => MouseMode::AnyMotion,
+    };
+    let encoding = match screen.mouse_protocol_encoding() {
+        vt100::MouseProtocolEncoding::Default => MouseEncoding::X10,
+        vt100::MouseProtocolEncoding::Utf8 => MouseEncoding::Utf8,
+        vt100::MouseProtocolEncoding::Sgr => MouseEncoding::Sgr,
+    };
+    (mode, encoding)
 }
 
 /// Splits `typed` into keys and the SGR mouse reports among them, in order; a report cut off
@@ -383,6 +404,20 @@ mod tests {
         let control_click = MouseEvent { code: 16, ..extra };
         assert!(control_click.encode((MouseMode::Press, MouseEncoding::Sgr), (0, 0), &mut out));
         assert_eq!(out, b"\x1b[<0;1;1M");
+    }
+
+    #[test]
+    fn an_agents_mouse_mode_and_encoding_are_read_from_its_screen() {
+        let mut parser = vt100::Parser::new(5, 20, 0);
+        assert_eq!(
+            agent_mouse(parser.screen()),
+            (MouseMode::Off, MouseEncoding::X10)
+        );
+        parser.process(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(
+            agent_mouse(parser.screen()),
+            (MouseMode::ButtonMotion, MouseEncoding::Sgr)
+        );
     }
 
     #[test]

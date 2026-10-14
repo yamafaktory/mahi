@@ -291,6 +291,23 @@ impl ThreadView<'_> {
         Some(agent.map_or(ListHit::Elsewhere, ListHit::Agent))
     }
 
+    /// Returns the cell of the agent's screen at `position`, when the tab is drawn in `area`,
+    /// below the row of tabs; a position past the pane gives its nearest cell when `clamp`,
+    /// as a drag that leaves it does, and nothing otherwise.
+    #[must_use]
+    pub fn pane_point(&self, area: Rect, position: Position, clamp: bool) -> Option<(u16, u16)> {
+        let [body, _] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(HINT_ROWS)]).areas(area);
+        let (pane, _) = self.areas(body);
+        let inner = Block::bordered().inner(pane);
+        if inner.is_empty() || (!clamp && !inner.contains(position)) {
+            return None;
+        }
+        let column = position.x.clamp(inner.x, inner.right() - 1) - inner.x;
+        let row = position.y.clamp(inner.y, inner.bottom() - 1) - inner.y;
+        Some((column, row))
+    }
+
     fn areas(&self, body: Rect) -> (Rect, Option<Rect>) {
         match self.list {
             ListPlace::Beside => {
@@ -577,6 +594,35 @@ mod tests {
             ..view
         };
         assert_eq!(at(&hidden, 80, 3), None);
+    }
+
+    #[test]
+    fn a_position_in_the_pane_is_a_cell_of_the_agents_screen() {
+        let view = ThreadView {
+            agents: &AGENTS,
+            selected: 0,
+            prompts: 0,
+            list: ListPlace::Beside,
+            hints: &[],
+        };
+        let area = Rect::new(0, 1, 100, 12);
+        assert_eq!(
+            view.pane_point(area, Position::new(1, 2), false),
+            Some((0, 0))
+        );
+        assert_eq!(
+            view.pane_point(area, Position::new(5, 4), false),
+            Some((4, 2))
+        );
+        assert_eq!(view.pane_point(area, Position::new(0, 2), false), None);
+        assert_eq!(
+            view.pane_point(area, Position::new(90, 30), true),
+            Some((73, 8))
+        );
+        assert_eq!(
+            view.pane_point(area, Position::new(0, 0), true),
+            Some((0, 0))
+        );
     }
 
     #[test]

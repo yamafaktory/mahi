@@ -42,6 +42,7 @@ pub use mouse::{
     MouseEvent,
     MouseMode,
     Typed,
+    agent_mouse,
     cut_report,
     split_mouse,
 };
