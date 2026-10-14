@@ -196,6 +196,20 @@ mod tests {
     }
 
     #[test]
+    fn the_systems_git_runs_in_the_sandbox() {
+        let (_dir, root) = canonical_tempdir();
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let (code, output) = run(
+            system_with(&[(&work, Access::ReadWrite)]),
+            &work,
+            "TMPDIR=$PWD /usr/bin/git --version",
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("git version"), "{output}");
+    }
+
+    #[test]
     fn local_socket_pairs_still_work() {
         let (code, output) = run(
             Sandbox::system().unwrap(),

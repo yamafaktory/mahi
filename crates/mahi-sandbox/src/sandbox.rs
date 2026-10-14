@@ -24,6 +24,12 @@ const SYSTEM: &[&str] = &[
     "/usr", "/etc", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/opt",
 ];
 #[cfg(target_os = "macos")]
+const XCODE_SELECT_LINK: &str = "/private/var/db/xcode_select_link";
+#[cfg(target_os = "macos")]
+const COMMAND_LINE_TOOLS: &str = "/Library/Developer/CommandLineTools";
+#[cfg(target_os = "macos")]
+const XCODE_PREFERENCES: &str = "/Library/Preferences/com.apple.dt.Xcode.plist";
+#[cfg(target_os = "macos")]
 const SYSTEM: &[&str] = &[
     "/usr",
     "/bin",
@@ -129,7 +135,9 @@ impl Sandbox {
     /// `/sbin`, `/lib`, `/lib32`, `/lib64` and `/opt` (where distribution packages install
     /// programs, and Homebrew on Apple Silicon) as they are on the host, each either bound
     /// read-only or recreated as the same symbolic link. On macOS the data package managers
-    /// keep for their services, such as `/opt/homebrew/var`, stays unreadable.
+    /// keep for their services, such as `/opt/homebrew/var`, stays unreadable, and the
+    /// developer directory `xcode-select` chose is readable, with the files `xcrun` checks
+    /// Xcode's license against, so `/usr/bin/git` and the tools beside it start.
     ///
     /// # Errors
     ///
@@ -151,6 +159,10 @@ impl Sandbox {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(SandboxError::Inspect(path.to_path_buf(), error)),
             }
+        }
+        #[cfg(target_os = "macos")]
+        for path in developer_paths() {
+            let _ = sandbox.bind(&path, Access::ReadOnly);
         }
         Ok(sandbox)
     }
@@ -287,6 +299,36 @@ impl Sandbox {
         });
         Ok(self)
     }
+}
+
+/// Returns the developer directory `xcode-select` chose, which `/usr/bin/git` and the other
+/// tools there load through `xcrun`, or the Command Line Tools when none was chosen.
+#[cfg(target_os = "macos")]
+fn developer_dir() -> Option<PathBuf> {
+    [XCODE_SELECT_LINK, COMMAND_LINE_TOOLS]
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .find(|path| path.is_dir())
+}
+
+/// Returns what `xcrun` reads to start a tool: the developer directory and, for one inside
+/// an Xcode app, the files it checks that Xcode's license was accepted against.
+#[cfg(target_os = "macos")]
+fn developer_paths() -> Vec<PathBuf> {
+    let Some(developer) = developer_dir() else {
+        return Vec::new();
+    };
+    let mut paths = vec![PathBuf::from(XCODE_PREFERENCES)];
+    if let Some(contents) = developer
+        .parent()
+        .filter(|parent| parent.ends_with("Contents"))
+    {
+        paths.push(contents.join("version.plist"));
+        paths.push(contents.join("Info.plist"));
+    }
+    paths.retain(|path| path.is_file());
+    paths.push(developer);
+    paths
 }
 
 fn check_plain(path: &Path) -> Result<(), SandboxError> {
@@ -459,6 +501,14 @@ mod tests {
         assert!(sandbox.is_bound(Path::new("/opt/repo/.git")));
         assert!(!sandbox.is_bound(Path::new("/optional")));
         assert!(!sandbox.is_bound(Path::new("/")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_system_sandbox_reads_the_developer_directory_git_runs_from() {
+        let sandbox = Sandbox::system().unwrap();
+        let developer = developer_dir().expect("a Mac that builds mahi has a developer directory");
+        assert!(sandbox.is_bound(&developer), "{}", developer.display());
     }
 
     #[test]
