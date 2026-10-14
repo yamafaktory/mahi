@@ -118,6 +118,14 @@ fn main() {
         _ => None,
     };
     let mut environment = Environment::read(required.as_deref().unwrap_or_default(), &[]);
+    if let Some(fd) = environment.key_fd
+        && let Ok(config) = ConfigDir::resolve(
+            environment.home.as_deref(),
+            environment.xdg_config_home.as_deref(),
+        )
+    {
+        unlocked::receive(fd, &config.identity_file());
+    }
     make_config_private(&environment);
     if required.is_some() {
         let loaded = ConfigDir::resolve(

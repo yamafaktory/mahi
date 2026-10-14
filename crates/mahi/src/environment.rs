@@ -39,8 +39,9 @@ pub(crate) const MAHI_BIN: &str = "MAHI_BIN";
 pub(crate) const PROXY_VARIABLES: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 
 const LONGEST_ENV_NAME: usize = 128;
-const RESERVED: [&str; 14] = [
+const RESERVED: [&str; 15] = [
     "HOME",
+    KEY_FD,
     "MAHI_HANDOFF",
     "TMPDIR",
     HOOK_SOCKET,
@@ -55,6 +56,10 @@ const RESERVED: [&str; 14] = [
     "NO_PROXY",
     "no_proxy",
 ];
+
+/// Names the descriptor of the pipe on which the workspace gives a child mahi the user's
+/// unlocked mahi key.
+pub(crate) const KEY_FD: &str = "MAHI_KEY_FD";
 
 /// The environment variables mahi reads, read once at startup.
 #[derive(Default)]
@@ -82,6 +87,7 @@ pub(crate) struct Environment {
     pub(crate) kitty: bool,
     pub(crate) vte: bool,
     pub(crate) whole: Vec<(OsString, Zeroizing<Vec<u8>>)>,
+    pub(crate) key_fd: Option<i32>,
 }
 
 /// Whether `mahi run` and `mahi resume` let teammates watch, from `MAHI_LIVE`.
@@ -215,6 +221,9 @@ impl Environment {
             colorterm: text("COLORTERM"),
             kitty: value("KITTY_WINDOW_ID").is_some(),
             vte: value("VTE_VERSION").is_some(),
+            key_fd: text(KEY_FD)
+                .and_then(|fd| fd.parse().ok())
+                .filter(|fd| *fd > 2),
             whole: env::vars_os()
                 .map(|(name, value)| (name, Zeroizing::new(value.into_vec())))
                 .collect(),
@@ -314,6 +323,7 @@ mod tests {
             "MAHI_HOOK_SOCKET",
             "MAHI_MCP_SOCKET",
             "MAHI_BIN",
+            "MAHI_KEY_FD",
         ] {
             assert!(
                 matches!(text.parse::<EnvName>(), Err(EnvNameError::Reserved(_))),

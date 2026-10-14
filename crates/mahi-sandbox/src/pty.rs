@@ -13,8 +13,10 @@ use std::{
     os::{
         fd::{
             AsFd,
+            AsRawFd,
             BorrowedFd,
             OwnedFd,
+            RawFd,
         },
         unix::{
             ffi::OsStringExt,
@@ -34,6 +36,7 @@ use std::{
         ExitStatus,
         Stdio,
     },
+    sync::Arc,
 };
 
 use rustix::{
@@ -41,7 +44,10 @@ use rustix::{
         Mode,
         OFlags,
     },
-    io::Errno,
+    io::{
+        Errno,
+        FdFlags,
+    },
     pty::{
         OpenptFlags,
         grantpt,
@@ -80,6 +86,7 @@ pub struct PtyCommand {
     size: WindowSize,
     sandbox: Option<Sandbox>,
     hold_terminal: bool,
+    passed: Option<Arc<OwnedFd>>,
 }
 
 /// A program running in a pseudo-terminal, and the terminal's controlling side.
@@ -121,6 +128,7 @@ impl PtyCommand {
             size,
             sandbox: None,
             hold_terminal: false,
+            passed: None,
         }
     }
 
@@ -147,6 +155,15 @@ impl PtyCommand {
         self
     }
 
+    /// Leaves `fd` open in the program, under the same number, which the caller tells it some
+    /// other way, such as in a variable; every other descriptor the caller marked to close on
+    /// exec stays closed. Only a program outside a sandbox can be given one.
+    #[must_use]
+    pub fn pass_fd(mut self, fd: OwnedFd) -> Self {
+        self.passed = Some(Arc::new(fd));
+        self
+    }
+
     /// Keeps the caller's own copy of the terminal open until [`PtyChild::take_terminal`], so
     /// the program's exit never closes the last copy. macOS drops what the program wrote and
     /// no one read yet when its last copy closes; a copy closed by a live process instead waits
@@ -167,6 +184,12 @@ impl PtyCommand {
     /// Returns [`PtyError::Open`] if the pseudo-terminal cannot be created, or
     /// [`PtyError::Spawn`] if the program cannot be started or the sandbox cannot be entered.
     pub fn spawn(self) -> Result<PtyChild, PtyError> {
+        if self.sandbox.is_some() && self.passed.is_some() {
+            return Err(PtyError::Spawn(
+                self.program,
+                io::Error::other("a sandboxed program cannot be given a descriptor"),
+            ));
+        }
         let (master, slave, terminal) = open_pty(self.size).map_err(PtyError::Open)?;
         let mut sandbox = self
             .sandbox
@@ -186,7 +209,11 @@ impl PtyCommand {
         if sandbox.is_none() || cfg!(target_os = "macos") {
             command.current_dir(&self.cwd);
         }
-        set_up_child(&mut command, sandbox);
+        set_up_child(
+            &mut command,
+            sandbox,
+            self.passed.as_ref().map(AsRawFd::as_raw_fd),
+        );
         let child = command
             .spawn()
             .map_err(|error| PtyError::Spawn(self.program.clone(), error))?;
@@ -215,6 +242,7 @@ impl fmt::Debug for PtyCommand {
             .field("size", &self.size)
             .field("sandbox", &self.sandbox)
             .field("hold_terminal", &self.hold_terminal)
+            .field("passed", &self.passed.is_some())
             .finish()
     }
 }
@@ -261,7 +289,7 @@ fn prepare_sandbox(
     unsafe_code,
     reason = "the child must start a session, take the terminal and enter the sandbox between fork and exec"
 )]
-fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>) {
+fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>, passed: Option<RawFd>) {
     // SAFETY: the hook runs in the forked child before exec, where only async-signal-safe work
     // is allowed. On Linux it makes system calls through rustix and libc and allocates
     // nothing: every path and buffer the sandbox needs was prepared before the fork. On macOS
@@ -270,7 +298,8 @@ fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>) {
     // held (the same pattern as Nix's macOS builder). Only libdispatch or XPC use would be
     // unsafe here; profile compilation is not known to use them, and a crash, not a
     // deadlock, would be the symptom. Fd 0 is the pseudo-terminal's slave that
-    // `Command` installed as standard input.
+    // `Command` installed as standard input, and a passed descriptor is one the command owns
+    // until after the fork, so it is open in the child.
     unsafe {
         command.pre_exec(move || {
             crate::window::reset_in_child()?;
@@ -279,6 +308,9 @@ fn set_up_child(command: &mut Command, mut sandbox: Option<ChildSetup>) {
                 sandbox.enter()
             } else {
                 rustix::process::ioctl_tiocsctty(BorrowedFd::borrow_raw(0))?;
+                if let Some(passed) = passed {
+                    rustix::io::fcntl_setfd(BorrowedFd::borrow_raw(passed), FdFlags::empty())?;
+                }
                 Ok(())
             }
         });
@@ -546,6 +578,38 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the program closes its terminal");
         String::from_utf8_lossy(&output).into_owned()
+    }
+
+    #[test]
+    fn a_passed_descriptor_stays_open_in_the_program_and_not_in_a_sandbox() {
+        let closed_on_exec = || {
+            let (reader, writer) = rustix::pipe::pipe().unwrap();
+            for end in [&reader, &writer] {
+                rustix::io::fcntl_setfd(end, FdFlags::CLOEXEC).unwrap();
+            }
+            (reader, writer)
+        };
+        let (reader, writer) = closed_on_exec();
+        let fd = reader.as_raw_fd();
+        let mut writer = File::from(writer);
+        std::io::Write::write_all(&mut writer, b"passed-through").unwrap();
+        drop(writer);
+        let script = format!("cat <&{fd}");
+        let child = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
+            .arg("-c")
+            .arg(&script)
+            .pass_fd(reader)
+            .spawn()
+            .unwrap();
+        let mut output = String::new();
+        let _ = child.reader().unwrap().read_to_string(&mut output);
+        assert!(output.contains("passed-through"), "{output}");
+        let (other, _keep) = closed_on_exec();
+        let refused = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
+            .sandbox(Sandbox::new())
+            .pass_fd(other)
+            .spawn();
+        assert!(matches!(refused, Err(PtyError::Spawn(..))));
     }
 
     #[test]

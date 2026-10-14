@@ -13,6 +13,7 @@ compile_error!("mahi supports Linux and macOS only");
 ))]
 compile_error!("the Linux sandbox supports little-endian x86_64 and aarch64 only");
 
+mod inherit;
 mod pty;
 mod sandbox;
 mod userns;
@@ -20,6 +21,7 @@ mod window;
 #[cfg(any(target_os = "linux", test))]
 mod wsl;
 
+pub use inherit::inherited_pipe;
 pub use pty::{
     PtyChild,
     PtyCommand,

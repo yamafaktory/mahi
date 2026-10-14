@@ -5,12 +5,20 @@ use std::{
         Read,
         Write,
     },
-    os::unix::ffi::OsStrExt,
+    os::{
+        fd::{
+            AsRawFd,
+            OwnedFd,
+        },
+        unix::ffi::OsStrExt,
+    },
     path::Path,
     sync::mpsc,
     thread,
 };
 
+use age::secrecy::ExposeSecret;
+use mahi_identity::LocalIdentity;
 use mahi_sandbox::{
     PtyChild,
     PtyCommand,
@@ -20,7 +28,10 @@ use mahi_sandbox::{
 };
 use mahi_term::AgentScreen;
 
-use crate::environment::Environment;
+use crate::environment::{
+    Environment,
+    KEY_FD,
+};
 
 const READ_CHUNK: usize = 16 * 1024;
 const QUEUED_WRITES: usize = 64;
@@ -57,25 +68,38 @@ pub(crate) struct Child {
 impl Child {
     /// Returns the command that runs mahi itself with `words` in `cwd`, on a terminal of
     /// `size`, with mahi's own environment but for what describes the user's own terminal,
-    /// since the child's terminal is the workspace's screen, or nothing when mahi cannot tell
-    /// where its program is.
+    /// since the child's terminal is the workspace's screen, and with the user's unlocked mahi
+    /// `key`, if any, on a pipe only the child inherits; or nothing when mahi cannot tell where
+    /// its program is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of making the pipe the key goes through.
     pub(crate) fn mahi(
         environment: &Environment,
         words: &[&OsStr],
-        cwd: &Path,
-        size: WindowSize,
-    ) -> Option<PtyCommand> {
-        let program = environment.mahi_exe.as_deref()?;
+        (cwd, size): (&Path, WindowSize),
+        key: Option<&LocalIdentity>,
+    ) -> io::Result<Option<PtyCommand>> {
+        let Some(program) = environment.mahi_exe.as_deref() else {
+            return Ok(None);
+        };
         let mut command = PtyCommand::new(program, cwd, size).hold_terminal();
         for word in words {
             command = command.arg(word);
         }
         for (name, value) in &environment.whole {
-            if name != "TERM" && !TERMINAL_OWN.iter().any(|own| name == own) {
+            if name != "TERM" && name != KEY_FD && !TERMINAL_OWN.iter().any(|own| name == own) {
                 command = command.env(name, OsStr::from_bytes(value));
             }
         }
-        Some(command.env("TERM", CHILD_TERM))
+        if let Some(key) = key {
+            let pipe = key_pipe(key)?;
+            command = command
+                .env(KEY_FD, pipe.as_raw_fd().to_string())
+                .pass_fd(pipe);
+        }
+        Ok(Some(command.env("TERM", CHILD_TERM)))
     }
 
     /// Starts `command`, made for a terminal of `size`, as the workspace's child `id`, whose
@@ -193,6 +217,31 @@ impl Child {
     }
 }
 
+/// Returns the read end of a pipe holding `key`'s secret, its write end closed; both ends are
+/// closed on exec, so only a child given the read end keeps it.
+fn key_pipe(key: &LocalIdentity) -> io::Result<OwnedFd> {
+    let (reader, writer) = closed_on_exec_pipe()?;
+    let mut writer = std::fs::File::from(writer);
+    writer.write_all(key.to_secret().expose_secret().as_bytes())?;
+    Ok(reader)
+}
+
+#[cfg(target_os = "linux")]
+fn closed_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    Ok(rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?)
+}
+
+/// Returns a pipe whose ends close on exec; macOS has no call that makes it so at once, so
+/// the workspace starts its children from one thread only, which no other start can race.
+#[cfg(not(target_os = "linux"))]
+fn closed_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let (reader, writer) = rustix::pipe::pipe()?;
+    for end in [&reader, &writer] {
+        rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC)?;
+    }
+    Ok((reader, writer))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{
@@ -287,7 +336,9 @@ mod tests {
             OsStr::new("echo \"$MAHI_SEEN $0 tmux=$TMUX term=$TERM\""),
             OsStr::new("word"),
         ];
-        let command = Child::mahi(&environment, &words, Path::new("/"), SIZE).unwrap();
+        let command = Child::mahi(&environment, &words, (Path::new("/"), SIZE), None)
+            .unwrap()
+            .unwrap();
         let (sender, events) = mpsc::sync_channel(QUEUED_WRITES);
         let mut child = Child::start(command, SIZE, 0, &sender).unwrap();
         run_until(&mut child, &events, |child| {
@@ -296,7 +347,58 @@ mod tests {
                 .contents()
                 .contains("carried word tmux= term=xterm-256color")
         });
-        assert!(Child::mahi(&Environment::default(), &words, Path::new("/"), SIZE).is_none());
+        assert!(
+            Child::mahi(
+                &Environment::default(),
+                &words,
+                (Path::new("/"), SIZE),
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_unlocked_key_reaches_the_child_on_its_own_pipe_and_only_when_given() {
+        let environment = Environment {
+            mahi_exe: Some("/bin/sh".into()),
+            whole: vec![
+                (
+                    "PATH".into(),
+                    zeroize::Zeroizing::new(b"/usr/bin:/bin".to_vec()),
+                ),
+                (KEY_FD.into(), zeroize::Zeroizing::new(b"7".to_vec())),
+            ],
+            ..Environment::default()
+        };
+        let words = [
+            OsStr::new("-c"),
+            OsStr::new(
+                "echo \"fd=${MAHI_KEY_FD:-none}\"; [ -n \"$MAHI_KEY_FD\" ] && eval \"cat <&$MAHI_KEY_FD\"; echo; echo end",
+            ),
+        ];
+        let key = LocalIdentity::generate();
+        let (sender, events) = mpsc::sync_channel(QUEUED_WRITES);
+        let given = Child::mahi(&environment, &words, (Path::new("/"), SIZE), Some(&key))
+            .unwrap()
+            .unwrap();
+        let mut child = Child::start(given, SIZE, 0, &sender).unwrap();
+        run_until(&mut child, &events, |child| {
+            child.screen().contents().contains("end")
+        });
+        let shown = child.screen().contents().replace('\n', "");
+        assert!(shown.contains(key.to_secret().expose_secret()), "{shown}");
+        assert!(!shown.contains("fd=7"), "{shown}");
+        let (sender, events) = mpsc::sync_channel(QUEUED_WRITES);
+        let plain = Child::mahi(&environment, &words, (Path::new("/"), SIZE), None)
+            .unwrap()
+            .unwrap();
+        let mut child = Child::start(plain, SIZE, 0, &sender).unwrap();
+        run_until(&mut child, &events, |child| {
+            child.screen().contents().contains("end")
+        });
+        assert!(child.screen().contents().contains("fd=none"));
     }
 
     #[test]

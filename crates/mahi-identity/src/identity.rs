@@ -107,6 +107,26 @@ impl LocalIdentity {
         &self.0
     }
 
+    /// Returns the identity's secret as text, to hand it to another of the user's own mahi
+    /// processes; it is zeroed when dropped and never shown in `Debug` output.
+    #[must_use]
+    pub fn to_secret(&self) -> SecretString {
+        self.0.to_string()
+    }
+
+    /// Reads an identity from `secret`, as [`Self::to_secret`] wrote it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Malformed`] if `secret` is not an identity.
+    pub fn from_secret(secret: &SecretString) -> Result<Self, IdentityError> {
+        let text = secret.expose_secret();
+        if text.len() > MAX_SECRET_BYTES {
+            return Err(IdentityError::Malformed);
+        }
+        text.parse().map(Self).map_err(|_| IdentityError::Malformed)
+    }
+
     /// Encrypts the identity with `passphrase` and writes it to `path`.
     ///
     /// The file is written to a temporary name, synced, and then linked into place, so `path`
@@ -242,6 +262,27 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn a_secret_handed_over_gives_back_the_same_identity_and_nothing_else_parses() {
+        let identity = LocalIdentity::generate();
+        let again = LocalIdentity::from_secret(&identity.to_secret()).unwrap();
+        assert_eq!(
+            again.recipient().to_string(),
+            identity.recipient().to_string()
+        );
+        for bad in ["", "AGE-SECRET-KEY-1", "not a key"] {
+            assert!(matches!(
+                LocalIdentity::from_secret(&SecretString::from(bad.to_owned())),
+                Err(IdentityError::Malformed)
+            ));
+        }
+        let long = SecretString::from("A".repeat(MAX_SECRET_BYTES + 1));
+        assert!(matches!(
+            LocalIdentity::from_secret(&long),
+            Err(IdentityError::Malformed)
+        ));
     }
 
     #[test]
