@@ -95,7 +95,12 @@ impl AgentFrame<'_> {
     }
 }
 
-fn draw_screen(screen: &vt100::Screen, area: Rect, buffer: &mut Buffer, only_written: bool) {
+pub(crate) fn draw_screen(
+    screen: &vt100::Screen,
+    area: Rect,
+    buffer: &mut Buffer,
+    only_written: bool,
+) {
     let (rows, columns) = screen.size();
     for row in 0..rows.min(area.height) {
         for column in 0..columns.min(area.width) {

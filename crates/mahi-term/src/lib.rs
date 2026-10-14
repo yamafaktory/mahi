@@ -13,6 +13,7 @@ mod pane;
 mod scan;
 mod screen;
 mod view;
+mod workspace;
 
 pub use agent_screen::AgentScreen;
 pub use dialog::{
@@ -53,4 +54,12 @@ pub use view::{
     PaletteItem,
     PaletteView,
     Preview,
+};
+pub use workspace::{
+    AgentState,
+    ListPlace,
+    TabBar,
+    ThreadView,
+    WorkspaceAgent,
+    WorkspaceTab,
 };
