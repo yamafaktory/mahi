@@ -1615,6 +1615,36 @@ cat parser.rs
     }
 
     #[test]
+    fn the_home_screen_asks_the_passphrase_once_for_actions_that_follow() {
+        let fixture = fixture();
+        let (thread, claude) = worked_thread(&fixture);
+        let codex = script(&fixture, "home-unlocked", "codex", CODEX_WRITES);
+        let path = format!(
+            "{}:{}:/usr/bin:/bin:/usr",
+            claude.parent().unwrap().display(),
+            codex.parent().unwrap().display()
+        );
+        let passphrase = format!("{PASSPHRASE}\r");
+        let resumed = format!("mahi resume {thread}: done");
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                (&thread, b"r"),
+                ("Passphrase", passphrase.as_bytes()),
+                (&resumed, b"a"),
+                ("What should its worktree start from?", b"2"),
+                (
+                    &format!("mahi agent add {thread} --from tester.claude -- codex: done"),
+                    b"q",
+                ),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let first = output.find(&resumed).unwrap();
+        assert!(!output[first..].contains("Passphrase"), "{output}");
+    }
+
+    #[test]
     fn a_paste_split_after_its_escape_closes_a_question_and_does_nothing_else() {
         let fixture = fixture();
         let (_thread, _claude) = worked_thread(&fixture);

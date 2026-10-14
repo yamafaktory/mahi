@@ -38,7 +38,8 @@ const MAX_SECRET_BYTES: usize = 128;
 /// The user's own mahi key: an age X25519 identity that thread keys are wrapped to.
 ///
 /// It is stored encrypted with a passphrase, and its secret half never appears in `Debug`
-/// output.
+/// output. A copy zeroes its secret when dropped, as the original does.
+#[derive(Clone)]
 pub struct LocalIdentity(x25519::Identity);
 
 /// Saving or loading the local identity failed.

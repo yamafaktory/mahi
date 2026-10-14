@@ -146,6 +146,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
             Err(error) => break Err(Ended::Failed(error)),
         }
     };
+    crate::unlocked::forget();
     drop(captured);
     drop(showing);
     drop(screen);
@@ -255,6 +256,7 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
                 remote = summary;
                 dirty = true;
             }
+            crate::unlocked::forget_unused(Instant::now());
             read_at = Instant::now();
         }
         let now_seen = place.captured.map(Captured::generation);

@@ -42,6 +42,7 @@ mod thread_lock;
 mod threads;
 mod turns;
 mod ui;
+mod unlocked;
 
 use std::{
     error::Error,

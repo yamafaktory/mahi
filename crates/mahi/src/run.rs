@@ -62,7 +62,10 @@ use std::{
     },
 };
 
-use age::secrecy::ExposeSecret;
+use age::secrecy::{
+    ExposeSecret,
+    SecretString,
+};
 use mahi_agent::profile::ProfileCredential;
 use mahi_core::{
     AgentName,
@@ -83,7 +86,6 @@ use mahi_identity::{
     CredentialError,
     CredentialName,
     IdentityError,
-    LocalIdentity,
     NodeKey,
     PublicIdentity,
     SigningKey,
@@ -281,6 +283,7 @@ use crate::{
         Summary,
         Transcript,
     },
+    unlocked,
 };
 
 pub(crate) const THREAD_STOP_WAIT: Duration = Duration::from_secs(2);
@@ -639,12 +642,7 @@ pub(crate) fn resume(
         Ok(commits) => commits,
         Err(signal) => return Ok(Outcome::Stopped(signal)),
     };
-    let passphrase = TerminalPrompt::open()
-        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
-        .map_err(RunError::Terminal)?;
-    let identity =
-        LocalIdentity::load(&config.identity_file(), &passphrase).map_err(RunError::Unlock)?;
-    drop(passphrase);
+    let identity = unlocked::identity(&config.identity_file(), ask_passphrase, RunError::Unlock)?;
     let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
     let reopen = session::Reopen {
         thread: command.thread,
@@ -936,18 +934,20 @@ pub(crate) fn source_snapshot(
     Ok((source, store.commit_tree(source)?))
 }
 
+/// Asks for the passphrase of the user's mahi key on the terminal.
+fn ask_passphrase() -> Result<SecretString, RunError> {
+    TerminalPrompt::open()
+        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
+        .map_err(RunError::Terminal)
+}
+
 /// Asks for the passphrase of the user's mahi key and opens `meta`'s thread key with it.
 pub(crate) fn unlock_thread_key(
     meta: &VerifiedMeta,
     participant: &ParticipantName,
     config: &ConfigDir,
 ) -> Result<ThreadKey, RunError> {
-    let passphrase = TerminalPrompt::open()
-        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
-        .map_err(RunError::Terminal)?;
-    let identity =
-        LocalIdentity::load(&config.identity_file(), &passphrase).map_err(RunError::Unlock)?;
-    drop(passphrase);
+    let identity = unlocked::identity(&config.identity_file(), ask_passphrase, RunError::Unlock)?;
     meta.thread_key(participant, identity.as_age())
         .map_err(|error| ResumeError::NotParticipant(meta.thread(), Box::new(error)).into())
 }

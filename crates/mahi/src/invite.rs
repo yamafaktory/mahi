@@ -15,7 +15,6 @@ use mahi_identity::{
     ConfigDir,
     ConfigError,
     IdentityError,
-    LocalIdentity,
     NodeKey,
     SigningKey,
     SshAgent,
@@ -263,12 +262,15 @@ fn add<P: Prompt>(
     inviter: &Inviter<'_>,
     open_prompt: &mut dyn FnMut() -> io::Result<P>,
 ) -> Result<VerifiedMeta, InviteError> {
-    let passphrase = open_prompt()
-        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
-        .map_err(InviteError::Terminal)?;
-    let identity = LocalIdentity::load(&inviter.config.identity_file(), &passphrase)
-        .map_err(InviteError::Unlock)?;
-    drop(passphrase);
+    let identity = crate::unlocked::identity(
+        &inviter.config.identity_file(),
+        || {
+            open_prompt()
+                .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
+                .map_err(InviteError::Terminal)
+        },
+        InviteError::Unlock,
+    )?;
     let thread_key = current
         .thread_key(current.owner(), identity.as_age())
         .map_err(|error| InviteError::Thread(thread, Box::new(error.into())))?;
@@ -292,7 +294,10 @@ mod tests {
 
     use age::secrecy::SecretString;
     use mahi_core::ParticipantName;
-    use mahi_identity::PublicIdentity;
+    use mahi_identity::{
+        LocalIdentity,
+        PublicIdentity,
+    };
     use mahi_store::GlobalPatterns;
     use mahi_thread::Participant;
     use ssh_key::{

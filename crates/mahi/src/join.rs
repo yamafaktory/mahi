@@ -42,7 +42,6 @@ use mahi_identity::{
     ConfigDir,
     ConfigError,
     IdentityError,
-    LocalIdentity,
     NodeKey,
     SigningKey,
 };
@@ -626,12 +625,15 @@ fn unlock(
     if signing_key.is_some_and(|key| me.key() != key) {
         return Err(JoinError::KeyChanged);
     }
-    let passphrase = TerminalPrompt::open()
-        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
-        .map_err(JoinError::Terminal)?;
-    let identity =
-        LocalIdentity::load(&config.identity_file(), &passphrase).map_err(JoinError::Unlock)?;
-    drop(passphrase);
+    let identity = crate::unlocked::identity(
+        &config.identity_file(),
+        || {
+            TerminalPrompt::open()
+                .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
+                .map_err(JoinError::Terminal)
+        },
+        JoinError::Unlock,
+    )?;
     let key = meta
         .thread_key(me.name(), identity.as_age())
         .map_err(JoinError::ThreadKey)?;
@@ -961,6 +963,7 @@ fn read_keys(
 #[cfg(test)]
 mod tests {
     use mahi_core::AgentName;
+    use mahi_identity::LocalIdentity;
 
     use super::*;
 
