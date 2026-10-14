@@ -50,6 +50,7 @@ const SYSTEM: &[&str] = &[
 #[derive(Debug, Clone, Default)]
 pub struct Sandbox {
     binds: Vec<Bind>,
+    placed: Vec<Placed>,
     links: Vec<Link>,
     sockets: Vec<PathBuf>,
     loopback_port: Option<u16>,
@@ -59,6 +60,16 @@ pub struct Sandbox {
 struct Bind {
     path: PathBuf,
     access: Access,
+}
+
+#[derive(Debug, Clone)]
+struct Placed {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(dead_code, reason = "only the Linux sandbox can place a file")
+    )]
+    source: PathBuf,
+    target: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +164,7 @@ impl Sandbox {
     pub fn bind(&mut self, path: &Path, access: Access) -> Result<&mut Self, SandboxError> {
         check_plain(path)?;
         let taken = self.binds.iter().any(|bind| bind.path == path)
+            || self.is_placed_under(path)
             || self
                 .links
                 .iter()
@@ -165,6 +177,43 @@ impl Sandbox {
             access,
         });
         Ok(self)
+    }
+
+    /// Shows the host file `source`, read-only, at `target` in the sandbox, on Linux only.
+    /// `target` lies outside every bound path, so nothing done to the host's file at that path
+    /// changes what the agent sees there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either path is not plain or is reserved, or if `target` is inside a
+    /// bound path, above one, or already used.
+    #[cfg(target_os = "linux")]
+    pub fn place(&mut self, source: &Path, target: &Path) -> Result<&mut Self, SandboxError> {
+        check_plain(source)?;
+        check_plain(target)?;
+        let taken = self
+            .binds
+            .iter()
+            .any(|bind| target.starts_with(&bind.path) || bind.path.starts_with(target))
+            || self.is_placed_under(target)
+            || self
+                .links
+                .iter()
+                .any(|link| target.starts_with(&link.path) || link.path.starts_with(target));
+        if taken {
+            return Err(SandboxError::Overlaps(target.to_path_buf()));
+        }
+        self.placed.push(Placed {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+        });
+        Ok(self)
+    }
+
+    fn is_placed_under(&self, path: &Path) -> bool {
+        self.placed
+            .iter()
+            .any(|placed| placed.target.starts_with(path) || path.starts_with(&placed.target))
     }
 
     /// Lets the agent connect to the Unix socket at `path`, which must be inside a path
@@ -218,6 +267,7 @@ impl Sandbox {
             .binds
             .iter()
             .any(|bind| path.starts_with(&bind.path) || bind.path.starts_with(path))
+            || self.is_placed_under(path)
             || self
                 .links
                 .iter()
@@ -358,6 +408,40 @@ mod tests {
         assert!(matches!(
             sandbox.bind(Path::new("/work"), Access::ReadWrite),
             Err(SandboxError::Overlaps(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_is_placed_only_outside_every_bound_path() {
+        let mut sandbox = Sandbox::new();
+        sandbox
+            .bind(Path::new("/repo/.git/objects"), Access::ReadOnly)
+            .unwrap();
+        let clean = Path::new("/scratch/config");
+        sandbox
+            .place(clean, Path::new("/repo/.git/config"))
+            .unwrap();
+        for target in ["/repo/.git/objects/pack", "/repo", "/repo/.git/config"] {
+            assert!(
+                matches!(
+                    sandbox.place(clean, Path::new(target)),
+                    Err(SandboxError::Overlaps(_))
+                ),
+                "{target}"
+            );
+        }
+        assert!(matches!(
+            sandbox.bind(Path::new("/repo/.git"), Access::ReadOnly),
+            Err(SandboxError::Overlaps(_))
+        ));
+        assert!(matches!(
+            sandbox.link(Path::new("/repo/.git/config"), "x".as_ref()),
+            Err(SandboxError::Overlaps(_))
+        ));
+        assert!(matches!(
+            sandbox.place(clean, Path::new("/proc/config")),
+            Err(SandboxError::Reserved(_))
         ));
     }
 

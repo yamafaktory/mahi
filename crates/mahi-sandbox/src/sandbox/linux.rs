@@ -153,6 +153,7 @@ struct PlannedMount {
     attributes: u64,
     tree: Option<OwnedFd>,
     is_dir: bool,
+    file_only: bool,
 }
 
 #[derive(Debug)]
@@ -180,19 +181,38 @@ impl Plan {
                 full_access.push(c_path(&bind.path)?);
             }
         }
-        let mut binds = sandbox.binds.iter().collect::<Vec<_>>();
-        binds.sort_by_key(|bind| bind.path.components().count());
-        let binds = binds.into_iter().map(|bind| {
-            let read_only = match bind.access {
-                Access::ReadOnly => libc::MOUNT_ATTR_RDONLY,
-                Access::ReadWrite => 0,
-            };
-            planned_mount(
-                &bind.path,
-                &bind.path,
-                libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV | read_only,
-            )
-        });
+        let mut binds = sandbox
+            .binds
+            .iter()
+            .map(|bind| {
+                let read_only = match bind.access {
+                    Access::ReadOnly => libc::MOUNT_ATTR_RDONLY,
+                    Access::ReadWrite => 0,
+                };
+                (
+                    bind.path.as_path(),
+                    bind.path.as_path(),
+                    libc::MOUNT_ATTR_NOSUID | libc::MOUNT_ATTR_NODEV | read_only,
+                    false,
+                )
+            })
+            .chain(sandbox.placed.iter().map(|placed| {
+                (
+                    placed.source.as_path(),
+                    placed.target.as_path(),
+                    LOCKED_DOWN,
+                    true,
+                )
+            }))
+            .collect::<Vec<_>>();
+        binds.sort_by_key(|(_, target, ..)| target.components().count());
+        let binds = binds
+            .into_iter()
+            .map(|(source, target, attributes, file_only)| {
+                let mut mount = planned_mount(source, target, attributes)?;
+                mount.file_only = file_only;
+                Ok(mount)
+            });
         let (loopback, receiver) = match sandbox.loopback_port {
             Some(port) => {
                 let (sender, receiver) = rustix::net::socketpair(
@@ -313,8 +333,11 @@ impl PlannedMount {
                 | OpenTreeFlags::AT_RECURSIVE,
         )?;
         set_attributes(tree.as_fd(), self.attributes)?;
-        self.is_dir =
-            FileType::from_raw_mode(rustix::fs::fstat(&tree)?.st_mode) == FileType::Directory;
+        let file_type = FileType::from_raw_mode(rustix::fs::fstat(&tree)?.st_mode);
+        if self.file_only && file_type != FileType::RegularFile {
+            return Err(Errno::INVAL.into());
+        }
+        self.is_dir = file_type == FileType::Directory;
         self.tree = Some(tree);
         Ok(())
     }
@@ -413,6 +436,7 @@ fn planned_mount(source: &Path, target: &Path, attributes: u64) -> io::Result<Pl
         attributes,
         tree: None,
         is_dir: false,
+        file_only: false,
     })
 }
 

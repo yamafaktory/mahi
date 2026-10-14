@@ -150,6 +150,62 @@ mod tests {
     }
 
     #[test]
+    fn a_placed_file_is_shown_read_only_in_place_of_the_hosts_own() {
+        let root = tempfile::tempdir().unwrap();
+        let git = root.path().join(".git");
+        let objects = git.join("objects");
+        let scratch = root.path().join("scratch");
+        fs::create_dir_all(&objects).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(objects.join("o"), "object").unwrap();
+        fs::write(git.join("config"), "config-secret").unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main").unwrap();
+        fs::write(scratch.join("config"), "clean").unwrap();
+        let mut sandbox = system_with(&[(&objects, Access::ReadOnly)]);
+        sandbox
+            .place(&scratch.join("config"), &git.join("config"))
+            .unwrap();
+        let script = format!(
+            "cat {git}/config; echo; cat {git}/objects/o; echo; \
+             echo changed > {git}/config 2>/dev/null || echo placed-read-only; \
+             ls -A {git}",
+            git = git.display(),
+        );
+        let (code, output) = run(sandbox, Path::new("/"), &script);
+        assert_eq!(code, 0, "{output}");
+        for expected in ["clean", "object", "placed-read-only"] {
+            assert!(output.contains(expected), "{expected} missing: {output}");
+        }
+        assert!(!output.contains("config-secret"), "{output}");
+        assert!(!output.contains("scratch"), "{output}");
+        assert!(!output.contains("HEAD"), "{output}");
+        assert_eq!(fs::read_to_string(scratch.join("config")).unwrap(), "clean");
+    }
+
+    #[test]
+    fn only_a_regular_file_can_be_placed() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("directory");
+        fs::create_dir_all(&directory).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        for source in [&directory, &link] {
+            let mut sandbox = system_with(&[]);
+            sandbox
+                .place(source, &root.path().join(".git/config"))
+                .unwrap();
+            let command = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
+                .arg("-c")
+                .arg("echo started");
+            assert!(
+                command.sandbox(sandbox).spawn().is_err(),
+                "{}",
+                source.display()
+            );
+        }
+    }
+
+    #[test]
     fn a_symbolic_link_on_a_bound_path_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let real = root.path().join("real");
