@@ -106,6 +106,26 @@ impl ListPlace {
     }
 }
 
+/// What a click on the row of tabs is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabHit {
+    /// A tab: 0 for the thread list, `n` for the `n`th thread's.
+    Tab(usize),
+    /// `+`, which opens another thread.
+    New,
+    /// A separator, or the row past its tabs.
+    Nothing,
+}
+
+/// What a click on the list of a thread's agents is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListHit {
+    /// An agent's line, as its index in the thread's agents.
+    Agent(usize),
+    /// Its border, a line naming whose agents follow, or a line without an agent.
+    Elsewhere,
+}
+
 /// The workspace's row of tabs: the thread list, each open thread, and `+` to open another.
 #[derive(Debug, Clone, Copy)]
 pub struct TabBar<'a> {
@@ -126,36 +146,55 @@ impl<'a> TabBar<'a> {
 
     /// Draws the row of tabs into `area`.
     pub fn render(&self, area: Rect, buffer: &mut Buffer) {
-        let mut spans = Vec::with_capacity(self.tabs.len() * 5 + 4);
-        self.push_tab(&mut spans, 0, "⌂ threads".into(), "");
-        for (index, tab) in self.tabs.iter().enumerate() {
-            spans.push(Span::styled("│", Theme::muted()));
-            let mark = if tab.asks { " !" } else { "" };
-            self.push_tab(&mut spans, index + 1, shown(tab.title), mark);
-        }
-        spans.push(Span::styled("│", Theme::muted()));
-        spans.push(Span::styled(" + ", Theme::title()));
+        let spans: Vec<Span<'a>> = self.spans().map(|(span, _)| span).collect();
         Line::from(spans).render(area, buffer);
     }
 
-    fn push_tab(
+    /// Returns what is drawn at `column` of the row of tabs, counted from the row's left.
+    #[must_use]
+    pub fn tab_at(&self, column: u16) -> TabHit {
+        let mut right = 0_usize;
+        for (span, hit) in self.spans() {
+            right += span.width();
+            if usize::from(column) < right {
+                return hit;
+            }
+        }
+        TabHit::Nothing
+    }
+
+    fn spans(&self) -> impl Iterator<Item = (Span<'a>, TabHit)> + '_ {
+        let threads = self.tab(0, "⌂ threads".into(), "");
+        let tabs =
+            self.tabs.iter().enumerate().flat_map(move |(index, tab)| {
+                let mark = if tab.asks { " !" } else { "" };
+                std::iter::once((Span::styled("│", Theme::muted()), TabHit::Nothing))
+                    .chain(self.tab(index + 1, shown(tab.title), mark))
+            });
+        threads.into_iter().chain(tabs).chain([
+            (Span::styled("│", Theme::muted()), TabHit::Nothing),
+            (Span::styled(" + ", Theme::title()), TabHit::New),
+        ])
+    }
+
+    fn tab(
         &self,
-        spans: &mut Vec<Span<'a>>,
         index: usize,
         label: Cow<'a, str>,
         mark: &'static str,
-    ) {
+    ) -> [(Span<'a>, TabHit); 4] {
         let style = if index == self.selected {
             Theme::selected()
         } else {
             Theme::title()
         };
-        spans.extend([
-            Span::styled(" ", style),
-            Span::styled(label, style),
-            Span::styled(mark, style),
-            Span::styled(" ", style),
-        ]);
+        let hit = TabHit::Tab(index);
+        [
+            (Span::styled(" ", style), hit),
+            (Span::styled(label, style), hit),
+            (Span::styled(mark, style), hit),
+            (Span::styled(" ", style), hit),
+        ]
     }
 }
 
@@ -203,20 +242,7 @@ impl ThreadView<'_> {
     ) -> Option<Position> {
         let [body, footer] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(HINT_ROWS)]).areas(area);
-        let (pane, list) = match self.list {
-            ListPlace::Beside => {
-                let [pane, list] =
-                    Layout::horizontal([Constraint::Fill(1), Constraint::Length(LIST_COLUMNS)])
-                        .areas(body);
-                (pane, Some(list))
-            }
-            ListPlace::Over => {
-                let width = LIST_COLUMNS.min(body.width);
-                let list = Rect::new(body.right() - width, body.y, width, body.height);
-                (body, Some(list))
-            }
-            ListPlace::Hidden => (body, None),
-        };
+        let (pane, list) = self.areas(body);
         let title = self
             .agents
             .get(self.selected)
@@ -240,6 +266,62 @@ impl ThreadView<'_> {
         let cursor = Position::new(inner.x.saturating_add(column), inner.y.saturating_add(row));
         let covered = list.is_some_and(|list| list.contains(cursor));
         (!screen.hide_cursor() && inner.contains(cursor) && !covered).then_some(cursor)
+    }
+
+    /// Returns what of the list is at `position`, when the tab is drawn in `area`, below the
+    /// row of tabs: nothing when the list is not there, so the click is the agent's.
+    #[must_use]
+    pub fn list_at(&self, area: Rect, position: Position) -> Option<ListHit> {
+        let [body, _] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(HINT_ROWS)]).areas(area);
+        let (_, list) = self.areas(body);
+        let list = list?;
+        if !list.contains(position) {
+            return None;
+        }
+        let inner = Block::bordered().inner(list);
+        let agent = inner
+            .contains(position)
+            .then(|| {
+                self.lines()
+                    .nth(usize::from(position.y - inner.y))
+                    .flatten()
+            })
+            .flatten();
+        Some(agent.map_or(ListHit::Elsewhere, ListHit::Agent))
+    }
+
+    fn areas(&self, body: Rect) -> (Rect, Option<Rect>) {
+        match self.list {
+            ListPlace::Beside => {
+                let [pane, list] =
+                    Layout::horizontal([Constraint::Fill(1), Constraint::Length(LIST_COLUMNS)])
+                        .areas(body);
+                (pane, Some(list))
+            }
+            ListPlace::Over => {
+                let width = LIST_COLUMNS.min(body.width);
+                let list = Rect::new(body.right() - width, body.y, width, body.height);
+                (body, Some(list))
+            }
+            ListPlace::Hidden => (body, None),
+        }
+    }
+
+    /// Returns, for each line of the list's agents, the agent it shows, or nothing for the
+    /// line naming whose agents follow.
+    fn lines(&self) -> impl Iterator<Item = Option<usize>> + '_ {
+        self.agents.iter().enumerate().flat_map(|(index, agent)| {
+            let starts_group = index == 0
+                || self
+                    .agents
+                    .get(index - 1)
+                    .is_some_and(|before| before.owner != agent.owner);
+            starts_group
+                .then_some(None)
+                .into_iter()
+                .chain(std::iter::once(Some(index)))
+        })
     }
 
     fn render_list(&self, area: Rect, buffer: &mut Buffer) {
@@ -441,6 +523,60 @@ mod tests {
             assert_eq!(buffer[(columns + 1, bottom)].symbol(), "│", "{list:?}");
             assert_eq!(buffer[(columns, bottom + 1)].symbol(), "─", "{list:?}");
         }
+    }
+
+    #[test]
+    fn a_click_finds_the_tab_and_the_agent_drawn_under_it() {
+        let tabs = [
+            WorkspaceTab {
+                title: "7f3a",
+                asks: false,
+            },
+            WorkspaceTab {
+                title: "9a48",
+                asks: true,
+            },
+        ];
+        let bar = TabBar {
+            tabs: &tabs,
+            selected: 1,
+        };
+        assert_eq!(bar.tab_at(0), TabHit::Tab(0));
+        assert_eq!(bar.tab_at(10), TabHit::Tab(0));
+        assert_eq!(bar.tab_at(11), TabHit::Nothing);
+        assert_eq!(bar.tab_at(12), TabHit::Tab(1));
+        assert_eq!(bar.tab_at(19), TabHit::Tab(2));
+        assert_eq!(bar.tab_at(27), TabHit::Nothing);
+        assert_eq!(bar.tab_at(28), TabHit::New);
+        assert_eq!(bar.tab_at(40), TabHit::Nothing);
+        let view = ThreadView {
+            agents: &AGENTS,
+            selected: 0,
+            prompts: 0,
+            list: ListPlace::Beside,
+            hints: &[],
+        };
+        let area = Rect::new(0, 1, 100, 12);
+        let at = |view: &ThreadView<'_>, x, y| view.list_at(area, Position::new(x, y));
+        assert_eq!(at(&view, 80, 1), Some(ListHit::Elsewhere));
+        assert_eq!(at(&view, 80, 2), Some(ListHit::Elsewhere));
+        assert_eq!(at(&view, 80, 3), Some(ListHit::Agent(0)));
+        assert_eq!(at(&view, 80, 5), Some(ListHit::Agent(1)));
+        assert_eq!(at(&view, 80, 7), Some(ListHit::Agent(2)));
+        assert_eq!(at(&view, 80, 8), Some(ListHit::Elsewhere));
+        assert_eq!(at(&view, 10, 3), None);
+        let over = ThreadView {
+            list: ListPlace::Over,
+            ..view
+        };
+        assert_eq!(at(&over, 90, 3), Some(ListHit::Agent(0)));
+        assert_eq!(at(&over, 99, 3), Some(ListHit::Elsewhere));
+        assert_eq!(at(&over, 50, 3), None);
+        let hidden = ThreadView {
+            list: ListPlace::Hidden,
+            ..view
+        };
+        assert_eq!(at(&hidden, 80, 3), None);
     }
 
     #[test]

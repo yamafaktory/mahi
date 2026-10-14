@@ -7,6 +7,7 @@ mod dialog;
 mod home;
 mod input;
 mod key;
+mod mouse;
 mod notify;
 mod output;
 mod pane;
@@ -36,6 +37,14 @@ pub use key::{
     PaletteKey,
     PaletteKeyError,
 };
+pub use mouse::{
+    MouseEncoding,
+    MouseEvent,
+    MouseMode,
+    Typed,
+    cut_report,
+    split_mouse,
+};
 pub use notify::{
     Notice,
     Notifier,
@@ -57,8 +66,10 @@ pub use view::{
 };
 pub use workspace::{
     AgentState,
+    ListHit,
     ListPlace,
     TabBar,
+    TabHit,
     ThreadView,
     WorkspaceAgent,
     WorkspaceTab,
