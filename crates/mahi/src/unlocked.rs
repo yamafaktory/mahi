@@ -19,6 +19,12 @@ use mahi_identity::{
     IdentityError,
     LocalIdentity,
 };
+use rustix::process::{
+    Resource,
+    Rlimit,
+    getrlimit,
+    setrlimit,
+};
 
 use crate::ui;
 
@@ -31,12 +37,36 @@ struct Kept {
     file: PathBuf,
     identity: LocalIdentity,
     used: Instant,
+    no_cores: NoCores,
+}
+
+/// The core file size limit mahi had before it was set to 0 while a key is kept, given back
+/// when dropped.
+struct NoCores(Rlimit);
+
+impl NoCores {
+    fn start() -> Option<Self> {
+        let before = getrlimit(Resource::Core);
+        let none = Rlimit {
+            current: Some(0),
+            maximum: before.maximum,
+        };
+        setrlimit(Resource::Core, none).ok()?;
+        Some(Self(before))
+    }
+}
+
+impl Drop for NoCores {
+    fn drop(&mut self) {
+        let _ = setrlimit(Resource::Core, self.0);
+    }
 }
 
 /// Returns the user's mahi key from `file`, unlocked with the passphrase `ask` gives. While
 /// the home screen owns the terminal, the key one action unlocked is kept in memory for the
 /// next, so the passphrase is asked once until the home screen ends or the key goes unused for
-/// 15 minutes; a wrong passphrase keeps nothing.
+/// 15 minutes; a wrong passphrase keeps nothing. While a key is kept, mahi's core file size
+/// limit is 0, and a key that cannot have it is not kept.
 ///
 /// # Errors
 ///
@@ -98,10 +128,15 @@ fn take_kept(file: &Path, now: Instant) -> Option<LocalIdentity> {
 }
 
 fn keep(file: &Path, identity: &LocalIdentity, now: Instant) {
-    *kept() = Some(Kept {
+    let mut kept = kept();
+    let Some(no_cores) = kept.take().map(|old| old.no_cores).or_else(NoCores::start) else {
+        return;
+    };
+    *kept = Some(Kept {
         file: file.to_path_buf(),
         identity: identity.clone(),
         used: now,
+        no_cores,
     });
 }
 
@@ -142,6 +177,26 @@ mod tests {
         assert!(kept().is_some());
         forget_unused(start + KEEP_FOR);
         assert!(kept().is_none());
+    }
+
+    #[test]
+    fn no_core_file_is_written_while_a_key_is_kept() {
+        let hard = getrlimit(Resource::Core).maximum;
+        let soft = hard.map_or(4096, |hard| hard.min(4096));
+        assert!(soft > 0, "the hard core file size limit is 0");
+        let before = Rlimit {
+            current: Some(soft),
+            maximum: hard,
+        };
+        setrlimit(Resource::Core, before).unwrap();
+        let identity = LocalIdentity::generate();
+        let file = Path::new("/config/identity");
+        keep(file, &identity, Instant::now());
+        assert_eq!(getrlimit(Resource::Core).current, Some(0));
+        keep(file, &identity, Instant::now());
+        assert_eq!(getrlimit(Resource::Core).current, Some(0));
+        forget();
+        assert_eq!(getrlimit(Resource::Core), before);
     }
 
     #[test]
