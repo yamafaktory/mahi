@@ -155,9 +155,10 @@ impl Drop for Showing {
     }
 }
 
-/// Puts the terminal back as it was before the full-screen view, when mahi is about to die of
-/// a signal while the view owns it.
+/// Forgets the mahi key the home screen kept unlocked and puts the terminal back as it was
+/// before the full-screen view, when mahi is about to die of a signal while the view owns it.
 pub(crate) fn before_dying() {
+    crate::unlocked::forget();
     if !is_showing() {
         return;
     }

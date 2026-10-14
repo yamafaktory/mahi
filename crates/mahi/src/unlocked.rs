@@ -143,4 +143,12 @@ mod tests {
         forget_unused(start + KEEP_FOR);
         assert!(kept().is_none());
     }
+
+    #[test]
+    fn a_kept_key_is_forgotten_before_mahi_dies_of_a_signal() {
+        let identity = LocalIdentity::generate();
+        keep(Path::new("/config/identity"), &identity, Instant::now());
+        ui::before_dying();
+        assert!(kept().is_none());
+    }
 }
