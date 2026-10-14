@@ -181,6 +181,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "term-report"
+path = "fuzz_targets/term_report.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "term-mouse"
 path = "fuzz_targets/term_mouse.rs"
 test = false

@@ -11,6 +11,7 @@ mod mouse;
 mod notify;
 mod output;
 mod pane;
+mod report;
 mod scan;
 mod screen;
 mod view;
@@ -53,6 +54,10 @@ pub use notify::{
 };
 pub use output::OutputTracker;
 pub use pane::AgentFrame;
+pub use report::{
+    Report,
+    ReportReader,
+};
 pub use scan::{
     KeyScanner,
     Segment,
