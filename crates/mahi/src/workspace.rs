@@ -68,10 +68,13 @@ const TERMINAL_OWN: [&str; 6] = [
 ];
 const CHILD_TERM: &str = "xterm-256color";
 const FAILED_HINTS: [(&str, &str); 2] = [("any key", "close it"), ("palette key 0", "threads")];
-const HINTS: [(&str, &str); 3] = [
-    ("palette key ←/→", "tab"),
-    ("palette key 0-9", "tab by number"),
-    ("palette key twice", "to the agent"),
+const HINTS: [(&str, &str); 6] = [
+    ("palette key", "then:"),
+    ("←→", "tab"),
+    ("0-9", "tab"),
+    ("↑↓", "agent"),
+    ("b", "list"),
+    ("palette key", "again: to the agent"),
 ];
 
 /// What the thread reading a child's terminal tells the workspace.
@@ -282,6 +285,7 @@ pub(crate) struct Workspace {
     next_id: usize,
     scanner: KeyScanner,
     armed: bool,
+    list_shown: bool,
     size: WindowSize,
     passed: Vec<u8>,
     applied: Option<usize>,
@@ -321,8 +325,8 @@ enum Ending {
 pub(crate) enum Moved {
     /// Nothing the screen shows changed.
     Nothing,
-    /// Another tab is shown.
-    Tab,
+    /// Another tab or agent is shown, or the list was hidden or shown.
+    Shown,
 }
 
 impl Workspace {
@@ -337,6 +341,7 @@ impl Workspace {
             next_id: 0,
             scanner: KeyScanner::new(palette_key),
             armed: false,
+            list_shown: true,
             size: WindowSize { rows: 2, cols: 2 },
             passed: Vec::new(),
             applied: None,
@@ -598,8 +603,7 @@ impl Workspace {
     /// on a thread's tab the rest, for its shown agent; on the thread list the rest goes to
     /// `threads`.
     pub(crate) fn type_keys(&mut self, typed: &[u8], threads: &mut Vec<u8>) -> Moved {
-        let mut moved = Moved::Nothing;
-        let shown = self.selected;
+        let before = (self.selected, self.shown_id(), self.list_shown);
         let mut scanner =
             std::mem::replace(&mut self.scanner, KeyScanner::new(PaletteKey::default()));
         for segment in scanner.scan(typed) {
@@ -624,10 +628,11 @@ impl Workspace {
             }
         }
         self.scanner = scanner;
-        if self.selected != shown {
-            moved = Moved::Tab;
+        if (self.selected, self.shown_id(), self.list_shown) == before {
+            Moved::Nothing
+        } else {
+            Moved::Shown
         }
-        moved
     }
 
     fn pass(&mut self, bytes: &[u8], threads: &mut Vec<u8>) {
@@ -653,12 +658,38 @@ impl Workspace {
 
     fn step(&mut self, step: Step) {
         let last = self.tabs.len();
-        self.selected = match step {
-            Step::To(index) if index <= last => index,
-            Step::To(_) => self.selected,
-            Step::Next => (self.selected + 1) % (last + 1),
-            Step::Previous => (self.selected + last) % (last + 1),
-        };
+        match step {
+            Step::To(index) if index <= last => self.selected = index,
+            Step::To(_) => {}
+            Step::Next => self.selected = (self.selected + 1) % (last + 1),
+            Step::Previous => self.selected = (self.selected + last) % (last + 1),
+            Step::NextAgent | Step::PreviousAgent => {
+                if let Some(tab) = self
+                    .selected
+                    .checked_sub(1)
+                    .and_then(|index| self.tabs.get_mut(index))
+                    && !tab.agents.is_empty()
+                {
+                    let count = tab.agents.len();
+                    let forward = if step == Step::NextAgent {
+                        1
+                    } else {
+                        count - 1
+                    };
+                    tab.selected = (tab.selected + forward) % count;
+                }
+            }
+            Step::List => self.list_shown = !self.list_shown,
+        }
+    }
+
+    /// Returns where the list of a thread's agents goes on a terminal `columns` wide.
+    pub(crate) fn list_place(&self, columns: u16) -> ListPlace {
+        if self.list_shown {
+            ListPlace::shown_at(columns)
+        } else {
+            ListPlace::Hidden
+        }
     }
 
     /// Draws the row of tabs into `bar` and, on a thread's tab, the tab into `body`; returns
@@ -697,7 +728,7 @@ impl Workspace {
             agents: &agents,
             selected: tab.selected,
             prompts: 0,
-            list: ListPlace::shown_at(body.width),
+            list: self.list_place(body.width),
             hints: if failed { &FAILED_HINTS } else { &HINTS },
         }
         .render(shown.map(|running| running.child.screen()), body, buffer)
@@ -727,6 +758,9 @@ enum Step {
     To(usize),
     Next,
     Previous,
+    NextAgent,
+    PreviousAgent,
+    List,
 }
 
 /// Reads the workspace key at the start of `bytes`, typed after the palette key, and returns
@@ -737,6 +771,11 @@ fn workspace_key(bytes: &[u8]) -> (Option<Step>, &[u8]) {
         (b"\x1bOC", Step::Next),
         (b"\x1b[D", Step::Previous),
         (b"\x1bOD", Step::Previous),
+        (b"\x1b[B", Step::NextAgent),
+        (b"\x1bOB", Step::NextAgent),
+        (b"\x1b[A", Step::PreviousAgent),
+        (b"\x1bOA", Step::PreviousAgent),
+        (b"b", Step::List),
     ] {
         if let Some(rest) = bytes.strip_prefix(sequence) {
             return (Some(step), rest);
@@ -834,7 +873,10 @@ mod tests {
         assert_eq!(workspace_key(b"\x1bOD"), (Some(Step::Previous), &b""[..]));
         assert_eq!(workspace_key(b"3rest"), (Some(Step::To(3)), &b"rest"[..]));
         assert_eq!(workspace_key(b"zrest"), (None, &b"rest"[..]));
-        assert_eq!(workspace_key(b"\x1b[Arest"), (None, &b"rest"[..]));
+        assert_eq!(
+            workspace_key(b"\x1b[Arest"),
+            (Some(Step::PreviousAgent), &b"rest"[..])
+        );
         assert_eq!(workspace_key(b"\x1b[1;5Arest"), (None, &b"rest"[..]));
         assert_eq!(workspace_key("érest".as_bytes()), (None, &b"rest"[..]));
         assert_eq!(workspace_key(b""), (None, &b""[..]));
@@ -880,16 +922,48 @@ mod tests {
             workspace.tabs.push(tab(title, vec![agent]));
         }
         let mut threads = Vec::new();
-        assert_eq!(workspace.type_keys(b"\x002", &mut threads), Moved::Tab);
+        assert_eq!(workspace.type_keys(b"\x002", &mut threads), Moved::Shown);
         assert_eq!(workspace.selected, 2);
-        assert_eq!(workspace.type_keys(b"\x00\x1b[C", &mut threads), Moved::Tab);
+        assert_eq!(
+            workspace.type_keys(b"\x00\x1b[C", &mut threads),
+            Moved::Shown
+        );
         assert_eq!(workspace.selected, 0);
-        assert_eq!(workspace.type_keys(b"\x00\x1b[D", &mut threads), Moved::Tab);
+        assert_eq!(
+            workspace.type_keys(b"\x00\x1b[D", &mut threads),
+            Moved::Shown
+        );
         assert_eq!(workspace.selected, 2);
         assert_eq!(workspace.type_keys(b"\x009", &mut threads), Moved::Nothing);
         assert_eq!(workspace.selected, 2);
         workspace.type_keys(b"\x000jk", &mut threads);
         assert_eq!(threads, b"jk");
+    }
+
+    #[test]
+    fn the_arrows_up_and_down_choose_the_agent_and_b_hides_the_list() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        let first = running(&mut workspace, "sleep 5");
+        let second = running(&mut workspace, "sleep 5");
+        let (first_id, second_id) = (first.id, second.id);
+        workspace.tabs.push(tab("a", vec![first, second]));
+        workspace.selected = 1;
+        let mut threads = Vec::new();
+        assert_eq!(
+            workspace.type_keys(b"\x00\x1b[B", &mut threads),
+            Moved::Shown
+        );
+        assert_eq!(workspace.shown_id(), Some(second_id));
+        workspace.type_keys(b"\x00\x1b[B", &mut threads);
+        assert_eq!(workspace.shown_id(), Some(first_id));
+        workspace.type_keys(b"\x00\x1bOA", &mut threads);
+        assert_eq!(workspace.shown_id(), Some(second_id));
+        assert_eq!(workspace.list_place(120), ListPlace::Beside);
+        assert_eq!(workspace.type_keys(b"\x00b", &mut threads), Moved::Shown);
+        assert_eq!(workspace.list_place(120), ListPlace::Hidden);
+        workspace.type_keys(b"\x00b", &mut threads);
+        assert_eq!(workspace.list_place(80), ListPlace::Over);
+        assert!(threads.is_empty());
     }
 
     #[test]

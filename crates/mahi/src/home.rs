@@ -44,7 +44,6 @@ use mahi_term::{
     HomeAction,
     HomeRow,
     HomeView,
-    ListPlace,
     PaletteInput,
     PaletteKeys,
     TabBar,
@@ -324,7 +323,7 @@ fn choose(
             terminal.autoresize()?;
             dirty = true;
         }
-        workspace.resize(agents_size(size));
+        workspace.resize(agents_size(size, workspace));
         if dirty {
             let view = HomeView {
                 repository: place.repository,
@@ -430,9 +429,11 @@ fn key_wait(workspace: &Workspace) -> Duration {
     }
 }
 
-/// Returns the size of an agent's terminal in a thread's tab on a terminal of `size`.
-fn agents_size(size: WindowSize) -> WindowSize {
-    let (rows, cols) = ThreadView::agent_size(size.rows, size.cols, ListPlace::shown_at(size.cols));
+/// Returns the size of an agent's terminal in a thread's tab on a terminal of `size`, with
+/// the list where the workspace has it.
+fn agents_size(size: WindowSize, workspace: &Workspace) -> WindowSize {
+    let (rows, cols) =
+        ThreadView::agent_size(size.rows, size.cols, workspace.list_place(size.cols));
     WindowSize { rows, cols }
 }
 
@@ -442,7 +443,7 @@ fn agents_size(size: WindowSize) -> WindowSize {
 fn route_keys(workspace: &mut Workspace, typed: &[u8], for_threads: &mut Vec<u8>) -> bool {
     for_threads.clear();
     if workspace.has_tabs() {
-        workspace.type_keys(typed, for_threads) == Moved::Tab
+        workspace.type_keys(typed, for_threads) == Moved::Shown
     } else {
         for_threads.extend_from_slice(typed);
         false

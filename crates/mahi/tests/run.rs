@@ -1364,7 +1364,7 @@ cat parser.rs
         );
         assert!(rows[3].contains("claude ● working"), "{rows:#?}");
         assert!(rows[22].starts_with("╰──"), "{rows:#?}");
-        assert!(rows[23].contains("tab by number"), "{rows:#?}");
+        assert!(rows[23].contains("0-9 tab"), "{rows:#?}");
         assert_eq!(screen.cursor_position().1, 1);
     }
 
@@ -1383,7 +1383,7 @@ cat parser.rs
                 ("Menu", b"q"),
                 ("stop it and quit?", b"n"),
                 ("the agents keep running", b"\x001"),
-                ("tab by number", b"hello\r"),
+                ("0-9 tab", b"hello\r"),
                 ("mahi run claude: done", b"q"),
             ],
         );
