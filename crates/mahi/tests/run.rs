@@ -1381,13 +1381,53 @@ cat parser.rs
                 ("Which agent should start the thread?", b"1"),
                 ("agent-ready", b"\x000"),
                 ("Menu", b"q"),
-                ("end them before quitting", b"\x001"),
+                ("stop it and quit?", b"n"),
+                ("the agents keep running", b"\x001"),
                 ("tab by number", b"hello\r"),
                 ("mahi run claude: done", b"q"),
             ],
         );
         assert_eq!(code, 0, "{output}");
         assert!(output.contains("got=hello"), "{output}");
+    }
+
+    #[test]
+    fn quitting_while_an_agent_runs_stops_it_after_a_confirmation() {
+        let fixture = fixture();
+        let agent =
+            "#!/bin/sh\necho late > late.txt\necho agent-ready\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "stopping-agents", "claude", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let started = Instant::now();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("agent-ready", b"\x000"),
+                ("Menu", b"q"),
+                ("1 agent is running: stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(started.elapsed() < Duration::from_secs(25), "{output}");
+        assert!(output.contains("stopping 1 agent(s)"), "{output}");
+        assert!(!output.contains("were killed"), "{output}");
+        let store = Store::open(&fixture.repo).unwrap();
+        let (_, last) = store
+            .thread_refs()
+            .unwrap()
+            .into_iter()
+            .find(|(thread_ref, _)| matches!(thread_ref.kind(), RefKind::Snapshots(_)))
+            .unwrap();
+        assert!(
+            store
+                .commit_blobs(last)
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path == "late.txt"),
+            "{output}"
+        );
     }
 
     #[test]

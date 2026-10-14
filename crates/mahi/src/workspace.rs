@@ -15,6 +15,10 @@ use std::{
     path::Path,
     sync::mpsc,
     thread,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use age::secrecy::ExposeSecret;
@@ -52,6 +56,7 @@ use crate::environment::{
 };
 
 const READ_CHUNK: usize = 16 * 1024;
+const STOP_POLL: Duration = Duration::from_millis(20);
 const QUEUED_WRITES: usize = 64;
 const TERMINAL_OWN: [&str; 6] = [
     "KITTY_WINDOW_ID",
@@ -223,6 +228,11 @@ impl Child {
         self.pty.resize(size)?;
         self.screen.set_size(size.rows, size.cols);
         Ok(())
+    }
+
+    /// Asks the child to end, as a stop signal does.
+    pub(crate) fn stop(&mut self) {
+        let _ = self.pty.terminate();
     }
 
     /// Writes into `out` what applies the child's key modes to the user's terminal, once it
@@ -538,6 +548,41 @@ impl Workspace {
         self.applied = shown;
     }
 
+    /// Returns how many agents run in the workspace's tabs.
+    pub(crate) fn running_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.agents.iter())
+            .filter(|running| running.ending == Ending::Running)
+            .count()
+    }
+
+    /// Asks every agent's command to end, as a stop signal does, and waits for them
+    /// for at most `within`, reading what they write meanwhile so none waits on its terminal;
+    /// returns how many still run, which dropping the workspace then kills.
+    pub(crate) fn stop_all(&mut self, within: Duration) -> usize {
+        for running in self.tabs.iter_mut().flat_map(|tab| tab.agents.iter_mut()) {
+            running.child.stop();
+        }
+        let deadline = Instant::now() + within;
+        let mut out = Vec::new();
+        loop {
+            self.take_output(&mut out);
+            out.clear();
+            let left = self
+                .tabs
+                .iter_mut()
+                .flat_map(|tab| tab.agents.iter_mut())
+                .map(|running| matches!(running.child.exited(), Ok(None)))
+                .filter(|&runs| runs)
+                .count();
+            if left == 0 || Instant::now() >= deadline {
+                return left;
+            }
+            thread::sleep(STOP_POLL);
+        }
+    }
+
     /// Gives every agent's terminal `size`.
     pub(crate) fn resize(&mut self, size: WindowSize) {
         if size == self.size {
@@ -753,11 +798,6 @@ fn closed_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{
-        Duration,
-        Instant,
-    };
-
     use super::*;
 
     const SIZE: WindowSize = WindowSize { rows: 6, cols: 40 };

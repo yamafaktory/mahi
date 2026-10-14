@@ -454,6 +454,24 @@ impl PtyChild {
         Ok(self.child.try_wait()?)
     }
 
+    /// Asks the program to end: sends `SIGTERM` to its process group, if it still runs. Unlike
+    /// `SIGHUP`, which a program started under `nohup` inherits ignored, it is rarely ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PtyError::Io`] if whether it runs cannot be told.
+    pub fn terminate(&mut self) -> Result<(), PtyError> {
+        if self.child.try_wait()?.is_none() {
+            let group = i32::try_from(self.child.id())
+                .ok()
+                .and_then(rustix::process::Pid::from_raw);
+            if let Some(group) = group {
+                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::TERM);
+            }
+        }
+        Ok(())
+    }
+
     /// Kills the program and every process in its process group, including what it started in
     /// the background. A process that left the group, by starting its own session or group, is
     /// not reached here. In a Linux sandbox the group is the program's watchers, and killing
@@ -578,6 +596,24 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the program closes its terminal");
         String::from_utf8_lossy(&output).into_owned()
+    }
+
+    #[test]
+    fn a_terminated_program_ends_as_a_stop_signal_ends_it() {
+        let mut child = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
+            .arg("-c")
+            .arg("trap 'exit 7' TERM; echo ready; while :; do sleep 0.05; done")
+            .spawn()
+            .unwrap();
+        let mut reader = child.reader().unwrap();
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("ready") {
+            let mut chunk = [0_u8; 256];
+            let read = reader.read(&mut chunk).unwrap();
+            seen.extend_from_slice(&chunk[..read]);
+        }
+        child.terminate().unwrap();
+        assert_eq!(exit_code(child.wait().unwrap()), 7);
     }
 
     #[test]

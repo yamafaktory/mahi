@@ -101,6 +101,7 @@ const ESC: u8 = 0x1b;
 const MAX_READ: usize = 1024;
 const AFTER_ESCAPE: Duration = Duration::from_millis(500);
 const CHILD_WAIT: Duration = Duration::from_millis(15);
+const STOP_WITHIN: Duration = Duration::from_secs(30);
 
 /// Opens the home screen in the repository around the current directory and runs the actions
 /// chosen there until the user quits; returns the exit code. Everything happens on its
@@ -160,9 +161,8 @@ pub(crate) fn home(environment: &Environment) -> i32 {
             captured: captured.as_ref(),
         };
         match choose(&place, &mut home, &mut status, &mut workspace) {
-            Ok(Chosen::Quit) if workspace.is_running() => {
-                "agents are running in their tabs: end them before quitting"
-                    .clone_into(&mut status);
+            Ok(Chosen::Quit) if workspace.is_running() && !stop_to_quit(&workspace) => {
+                "the agents keep running".clone_into(&mut status);
             }
             Ok(Chosen::Quit | Chosen::InputEnded) => break Ok(()),
             Ok(Chosen::Stopped(signal)) => break Err(Ended::Stopped(signal)),
@@ -192,6 +192,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
     drop(captured);
     drop(showing);
     drop(screen);
+    stop_agents(&mut workspace);
     match outcome {
         Ok(()) => 0,
         Err(Ended::Stopped(signal)) => {
@@ -539,6 +540,47 @@ fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> Stri
     match command_words(action, store, environment) {
         Ok(words) => run_words(&words, environment),
         Err(told) => told,
+    }
+}
+
+/// Asks whether to stop the agents the workspace runs in order to quit; returns whether the
+/// user says so.
+fn stop_to_quit(workspace: &Workspace) -> bool {
+    let count = workspace.running_count();
+    let (running, them) = if count == 1 {
+        ("1 agent is", "it")
+    } else {
+        ("agents are", "them")
+    };
+    let running = if count == 1 {
+        running.to_owned()
+    } else {
+        format!("{count} {running}")
+    };
+    let confirmed = DialogPrompt::default().ask(Dialog::confirm(
+        "Quit",
+        vec![format!(
+            "{running} running: stop {them} and quit? Each ends as a stop signal ends it, with \
+             its last snapshot unless it was already taking it."
+        )],
+    ));
+    matches!(confirmed, Ok(Answer::Confirmed(true)))
+}
+
+/// Stops the agents the workspace still runs, once mahi has left its screen, saying so, and
+/// says how many had to be killed without their last snapshot.
+fn stop_agents(workspace: &mut Workspace) {
+    let count = workspace.running_count();
+    if count == 0 {
+        return;
+    }
+    eprintln!("mahi: stopping {count} agent(s), each with its last snapshot");
+    let left = workspace.stop_all(STOP_WITHIN);
+    if left > 0 {
+        eprintln!(
+            "mahi: {left} agent(s) did not stop within {} s and were killed without their last snapshot",
+            STOP_WITHIN.as_secs()
+        );
     }
 }
 
