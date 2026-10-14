@@ -1373,6 +1373,7 @@ cat parser.rs
         let fixture = fixture();
         let agent = "#!/bin/sh\necho agent-ready\nread line\necho got=$line\n";
         let claude = script(&fixture, "tab-agents", "claude", agent);
+        script(&fixture, "tab-agents", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
@@ -1397,6 +1398,7 @@ cat parser.rs
         let agent =
             "#!/bin/sh\necho late > late.txt\necho agent-ready\nwhile :; do sleep 1; done\n";
         let claude = script(&fixture, "stopping-agents", "claude", agent);
+        script(&fixture, "stopping-agents", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
         let started = Instant::now();
         let (code, output) = in_terminal_typing(
@@ -1435,6 +1437,7 @@ cat parser.rs
         let fixture = fixture();
         let agent = "#!/bin/sh\necho broken-agent\nexit 3\n";
         let claude = script(&fixture, "failing-agents", "claude", agent);
+        script(&fixture, "failing-agents", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
