@@ -77,6 +77,7 @@ pub(crate) const MAX_TREE_BYTES: u64 = 1024 * 1024;
 const DISABLE_REFLOG: &str = "core.logAllRefUpdates=false";
 const REF_LOCK_TIMEOUT: &str = "core.filesRefLockTimeout=5000";
 const CONFIG_FILE: &str = "config";
+const MAX_CONFIG_BYTES: u64 = 1 << 20;
 const CONFIG_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const ALLOC_LIMIT: &str = "gitoxide.objects.allocLimit=536870912";
 
@@ -491,6 +492,35 @@ impl Store {
             .map_err(|error| std::io::Error::other(error.error))?;
         self.repo = gix::open_opts(self.repo.path(), open_options())?;
         Ok(())
+    }
+
+    /// Returns the settings of the repository's own configuration file that git needs to read
+    /// the repository, written as a configuration of their own, for an agent that must not see
+    /// the rest (remotes and their URLs, credentials, includes, programs): the `core` settings
+    /// that describe its files and its `extensions`, each only when its value is a plain word.
+    /// A repository without a configuration file gives an empty one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::UnreadableConfig`] if the file is over 1 MiB or cannot be parsed,
+    /// or [`StoreError::Io`] if it cannot be read.
+    pub fn agent_config(&self) -> Result<String, StoreError> {
+        let file = match std::fs::File::open(self.repo.common_dir().join(CONFIG_FILE)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(String::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(file, MAX_CONFIG_BYTES + 1),
+            &mut bytes,
+        )?;
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(StoreError::UnreadableConfig);
+        }
+        crate::agent_config::agent_config(bytes)
     }
 
     /// Returns the repository's common git directory, shared by all its worktrees.

@@ -3,6 +3,7 @@
 #[cfg(not(unix))]
 compile_error!("mahi supports Linux and macOS only");
 
+mod agent_config;
 mod changes;
 mod diff;
 mod fetch;

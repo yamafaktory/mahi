@@ -306,6 +306,21 @@ const MAX_DRAFT_BYTES: u64 = 256 * 1024;
 const HANDOFF_ENV: &str = "MAHI_HANDOFF";
 const HOOK_QUEUE: usize = 16;
 const HOME: &str = "home";
+const GIT_SHARED: [&str; 6] = [
+    "objects",
+    "refs",
+    "packed-refs",
+    "info",
+    "shallow",
+    "reftable",
+];
+const WORKTREE_CONFIG: &str = "config.worktree";
+#[cfg(target_os = "linux")]
+const GIT_CONFIG_NAME: &str = "git-config";
+#[cfg(not(target_os = "linux"))]
+const GIT_STAND_IN: &str = "git";
+const GIT_COMMON_DIR: &str = "GIT_COMMON_DIR";
+const MAX_GIT_LINK_BYTES: u64 = 4096;
 const TMP: &str = "tmp";
 const PRIVATE_IN_HOME: [&str; 9] = [
     ".ssh",
@@ -347,6 +362,12 @@ pub(crate) enum RunError {
     NoHome,
     #[error("refusing to give the agent {}, which holds private files", .0.display())]
     PrivateDirectory(PathBuf),
+    #[error("{} is not a worktree of this repository, so its git directory cannot be given to the agent", .0.display())]
+    NotLinkedWorktree(PathBuf),
+    #[error("refusing to give the agent the worktree's own git settings in {}", .0.display())]
+    WorktreeConfig(PathBuf),
+    #[error("refusing to run the agent, which would see all of {}, under a system directory it reads", .0.display())]
+    GitDirectoryShown(PathBuf),
     #[error("cannot find {0:?} on PATH")]
     AgentNotFound(OsString),
     #[error("cannot find the agent {}", .0.display())]
@@ -1372,6 +1393,7 @@ impl Prepared {
         let mcp = UnixListener::bind(&mcp_socket).map_err(RunError::Scratch)?;
         let sandbox = Sandbox::system()?;
         let network = Network::prepare(hosts)?;
+        write_git_config(&scratch, &store.agent_config()?, &git_dir).map_err(RunError::Scratch)?;
         Ok(Self {
             host,
             store,
@@ -2416,6 +2438,38 @@ impl Launch<'_> {
         Ok(Some(state_path))
     }
 
+    /// Shows the agent the repository's configuration cleaned of what it must not read, which
+    /// [`write_git_config`] wrote in the scratch directory, in place of the repository's own.
+    #[cfg(target_os = "linux")]
+    fn place_git_config(&self, sandbox: &mut Sandbox) -> Result<Option<PathBuf>, RunError> {
+        sandbox.place(
+            &self.scratch.join(GIT_CONFIG_NAME),
+            &self.git_dir.join("config"),
+        )?;
+        Ok(None)
+    }
+
+    /// Returns the git directory that [`write_git_config`] wrote in the scratch directory, for
+    /// `GIT_COMMON_DIR`, since the agent cannot read the repository's own configuration.
+    #[cfg(not(target_os = "linux"))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the Linux version can fail, and both share one signature"
+    )]
+    fn place_git_config(&self, _sandbox: &mut Sandbox) -> Result<Option<PathBuf>, RunError> {
+        Ok(Some(self.scratch.join(GIT_STAND_IN)))
+    }
+
+    /// Gives the agent the repository's cleaned configuration, as [`Self::place_git_config`]
+    /// does, after checking that no system directory the sandbox shows already holds the whole
+    /// git directory.
+    fn give_git_config(&self, sandbox: &mut Sandbox) -> Result<Option<PathBuf>, RunError> {
+        if sandbox.is_bound(self.git_dir) {
+            return Err(RunError::GitDirectoryShown(self.git_dir.to_path_buf()));
+        }
+        self.place_git_config(sandbox)
+    }
+
     fn spawn(
         &self,
         mut sandbox: Sandbox,
@@ -2431,7 +2485,7 @@ impl Launch<'_> {
             self.host,
         )? {
             let program_directory =
-                access == Access::ReadOnly && path != git_file && path != self.git_dir;
+                access == Access::ReadOnly && path != git_file && !path.starts_with(self.git_dir);
             match sandbox.bind(&path, access) {
                 Ok(_) => {}
                 Err(SandboxError::Overlaps(_)) if program_directory => {}
@@ -2446,6 +2500,7 @@ impl Launch<'_> {
         }
         sandbox.allow_connect(self.hook_socket)?;
         sandbox.allow_connect(self.mcp_socket)?;
+        let git_common_dir = self.give_git_config(&mut sandbox)?;
         let state = self.prepare_state()?;
         if let Some(state) = &state {
             self.restore_session(state);
@@ -2465,6 +2520,9 @@ impl Launch<'_> {
             .env("TMPDIR", self.scratch.join(TMP))
             .env(HOOK_SOCKET, self.hook_socket)
             .env(MCP_SOCKET, self.mcp_socket);
+        if let Some(common) = &git_common_dir {
+            pty = pty.env(GIT_COMMON_DIR, common);
+        }
         if let Some(mahi) = &self.environment.mahi_exe {
             pty = pty.env(MAHI_BIN, mahi);
         }
@@ -3129,14 +3187,7 @@ fn binds(
             binds.push((path.to_path_buf(), access));
         }
     }
-    let git = cwd.join(".git");
-    if git
-        .symlink_metadata()
-        .is_ok_and(|metadata| !metadata.is_symlink())
-    {
-        binds.push((git, Access::ReadOnly));
-    }
-    binds.push((git_dir.to_path_buf(), Access::ReadOnly));
+    binds.extend(git_binds(cwd, git_dir)?);
     let program_directories = [&agent.program, &agent.canonical]
         .into_iter()
         .filter_map(|path| path.parent().map(Path::to_path_buf));
@@ -3144,16 +3195,71 @@ fn binds(
         let Ok(directory) = fs::canonicalize(directory) else {
             continue;
         };
-        if !covered(&binds, &directory) && !host.is_private(&directory) {
+        if !covered(&binds, &directory)
+            && !host.is_private(&directory)
+            && !git_dir.starts_with(&directory)
+            && !directory.starts_with(git_dir)
+        {
             binds.push((directory, Access::ReadOnly));
         }
     }
     for program in [&agent.program, &agent.canonical] {
-        if !covered(&binds, program) {
+        if !covered(&binds, program) && !program.starts_with(git_dir) {
             binds.push((program.clone(), Access::ReadOnly));
         }
     }
     Ok(binds)
+}
+
+/// The parts of the repository's git directory `git_dir` that git needs in the worktree `cwd`,
+/// read-only: the worktree's `.git` file, its own record in `worktrees/`, and the objects and
+/// refs. The configuration, the remotes, the other worktrees and mahi's own files are left out.
+fn git_binds(cwd: &Path, git_dir: &Path) -> Result<Vec<(PathBuf, Access)>, RunError> {
+    let link = cwd.join(".git");
+    let metadata = match link.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(RunError::GitDirectory(error)),
+    };
+    if !metadata.is_file() {
+        return Err(RunError::NotLinkedWorktree(cwd.to_path_buf()));
+    }
+    let admin = linked_admin(&link, git_dir)
+        .ok_or_else(|| RunError::NotLinkedWorktree(cwd.to_path_buf()))?;
+    if admin.join(WORKTREE_CONFIG).symlink_metadata().is_ok() {
+        return Err(RunError::WorktreeConfig(admin.join(WORKTREE_CONFIG)));
+    }
+    let mut binds = vec![(link, Access::ReadOnly), (admin, Access::ReadOnly)];
+    for name in GIT_SHARED {
+        let path = git_dir.join(name);
+        if path
+            .symlink_metadata()
+            .is_ok_and(|metadata| !metadata.is_symlink())
+        {
+            binds.push((path, Access::ReadOnly));
+        }
+    }
+    Ok(binds)
+}
+
+/// Returns the record in `git_dir`'s `worktrees/` that the `.git` file `link` points to, when
+/// it points to one.
+fn linked_admin(link: &Path, git_dir: &Path) -> Option<PathBuf> {
+    let mut text = Vec::new();
+    File::open(link)
+        .ok()?
+        .take(MAX_GIT_LINK_BYTES)
+        .read_to_end(&mut text)
+        .ok()?;
+    let target = text.strip_prefix(b"gitdir: ")?;
+    let target = target.strip_suffix(b"\n").unwrap_or(target);
+    let target = Path::new(OsStr::from_bytes(
+        target.strip_suffix(b"\r").unwrap_or(target),
+    ));
+    let admin = fs::canonicalize(link.parent()?.join(target)).ok()?;
+    let name = admin.file_name()?;
+    (admin.parent()? == git_dir.join("worktrees") && !name.as_bytes().starts_with(b"."))
+        .then_some(admin)
 }
 
 fn notice(environment: &Environment) -> Notice {
@@ -3304,6 +3410,30 @@ impl DraftWriter {
 
 fn draft_prompt(notes: &str) -> String {
     format!("Read the notes at {notes} and rewrite the pull request description they point to.")
+}
+
+/// Writes in the fresh `scratch` directory the repository's configuration `config`, cleaned of
+/// what the agent must not read, where the agent's git reads it: a file shown in place of the
+/// repository's own on Linux, and on macOS a git directory of its own with links to the parts
+/// of `git_dir` the agent may read.
+#[cfg(target_os = "linux")]
+fn write_git_config(scratch: &Path, config: &str, _git_dir: &Path) -> io::Result<()> {
+    write_private(&scratch.join(GIT_CONFIG_NAME), config.as_bytes())
+}
+
+/// Writes in the fresh `scratch` directory the repository's configuration `config`, cleaned of
+/// what the agent must not read, where the agent's git reads it: a file shown in place of the
+/// repository's own on Linux, and on macOS a git directory of its own with links to the parts
+/// of `git_dir` the agent may read.
+#[cfg(not(target_os = "linux"))]
+fn write_git_config(scratch: &Path, config: &str, git_dir: &Path) -> io::Result<()> {
+    let common = scratch.join(GIT_STAND_IN);
+    fs::create_dir(&common)?;
+    write_private(&common.join("config"), config.as_bytes())?;
+    for name in GIT_SHARED {
+        std::os::unix::fs::symlink(git_dir.join(name), common.join(name))?;
+    }
+    Ok(())
 }
 
 fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -3599,7 +3729,6 @@ mod tests {
             [
                 (project.clone(), Access::ReadWrite),
                 (root.join("scratch"), Access::ReadWrite),
-                (PathBuf::from("/repo/.git"), Access::ReadOnly),
                 (tools, Access::ReadOnly),
             ]
         );
@@ -3647,23 +3776,137 @@ mod tests {
         assert!(!binds.iter().any(|(path, _)| path == &home));
     }
 
-    #[test]
-    fn the_git_directory_of_the_working_directory_is_read_only() {
-        let (_dir, root) = canonical_tempdir();
-        let home = root.join("home");
-        let project = home.join("project");
-        fs::create_dir_all(project.join(".git")).unwrap();
-        let agent = agent_at(Path::new("/usr/bin/true"));
-        let binds = binds(
-            (&project, Access::ReadWrite),
-            Path::new("/repo/.git"),
-            &agent,
-            Path::new("/scratch"),
-            None,
-            &host_with_home(&home),
+    fn linked_worktree(root: &Path) -> (PathBuf, PathBuf) {
+        let git = root.join("repo/.git");
+        let worktree = git.join("mahi/worktrees/a");
+        let admin = git.join("worktrees/a");
+        for directory in [
+            &worktree,
+            &admin,
+            &git.join("objects"),
+            &git.join("refs"),
+            &git.join("mahi/worktrees/b"),
+            &git.join("modules"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(
+            git.join("config"),
+            "[remote \"origin\"]\n\turl = https://u:t@h/r\n",
         )
         .unwrap();
-        assert!(binds.contains(&(project.join(".git"), Access::ReadOnly)));
+        fs::write(git.join("packed-refs"), "").unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        (git, worktree)
+    }
+
+    #[test]
+    fn only_the_parts_of_the_git_directory_git_needs_are_bound() {
+        let (_dir, root) = canonical_tempdir();
+        let (git, worktree) = linked_worktree(&root);
+        let search = env::join_paths([root.join("repo"), root.join("repo/.git/hooks")]).unwrap();
+        fs::create_dir_all(git.join("hooks")).unwrap();
+        let agent = agent_at(Path::new("/usr/bin/true"));
+        let binds = binds(
+            (&worktree, Access::ReadWrite),
+            &git,
+            &agent,
+            &root.join("scratch"),
+            Some(&search),
+            &host_with_home(&root.join("home")),
+        )
+        .unwrap();
+        let bound: Vec<&Path> = binds.iter().map(|(path, _)| path.as_path()).collect();
+        for expected in [
+            worktree.join(".git"),
+            git.join("worktrees/a"),
+            git.join("objects"),
+            git.join("refs"),
+            git.join("packed-refs"),
+        ] {
+            assert!(
+                binds.contains(&(expected.clone(), Access::ReadOnly)),
+                "{} missing: {bound:?}",
+                expected.display()
+            );
+        }
+        for above in [&git, &root.join("repo")] {
+            assert!(
+                !bound.iter().any(|path| above.starts_with(path)),
+                "{} is reachable: {bound:?}",
+                above.display()
+            );
+        }
+        for hidden in [
+            git.join("config"),
+            git.join("mahi/worktrees/b"),
+            git.join("modules"),
+            git.join("hooks"),
+        ] {
+            assert!(
+                !bound
+                    .iter()
+                    .any(|path| hidden.starts_with(path) || path.starts_with(&hidden)),
+                "{} is reachable: {bound:?}",
+                hidden.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_working_directory_that_is_not_a_linked_worktree_is_refused() {
+        let (_dir, root) = canonical_tempdir();
+        let (git, worktree) = linked_worktree(&root);
+        let agent = agent_at(Path::new("/usr/bin/true"));
+        let host = host_with_home(&root.join("home"));
+        let attempt = |cwd: &Path| {
+            binds(
+                (cwd, Access::ReadWrite),
+                &git,
+                &agent,
+                Path::new("/scratch"),
+                None,
+                &host,
+            )
+        };
+        let checkout = root.join("checkout");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        assert!(matches!(
+            attempt(&checkout),
+            Err(RunError::NotLinkedWorktree(_))
+        ));
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git.display()),
+        )
+        .unwrap();
+        assert!(matches!(
+            attempt(&worktree),
+            Err(RunError::NotLinkedWorktree(_))
+        ));
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git.join("worktrees/a").display()),
+        )
+        .unwrap();
+        assert!(attempt(&worktree).is_ok());
+        fs::write(worktree.join(".git"), "gitdir: ../../../worktrees/a\r\n").unwrap();
+        assert!(attempt(&worktree).is_ok());
+        fs::write(worktree.join(".git"), "gitdir: ../../../worktrees/b").unwrap();
+        assert!(matches!(
+            attempt(&worktree),
+            Err(RunError::NotLinkedWorktree(_))
+        ));
+        fs::write(worktree.join(".git"), "gitdir: ../../../worktrees/a\n").unwrap();
+        fs::write(git.join("worktrees/a/config.worktree"), "").unwrap();
+        assert!(matches!(
+            attempt(&worktree),
+            Err(RunError::WorktreeConfig(_))
+        ));
     }
 
     #[test]

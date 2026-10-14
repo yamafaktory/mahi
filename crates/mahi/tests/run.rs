@@ -3798,6 +3798,45 @@ echo stray > "$CODEX_HOME/history.jsonl"
         );
     }
 
+    const LEAKED_TOKEN: &str = "hunter2-token";
+
+    fn with_secrets_in_the_git_directory(fixture: &Fixture) -> PathBuf {
+        let git = fixture.repo.join(".git");
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(git.join("config"))
+            .unwrap();
+        write!(
+            config,
+            "[remote \"upstream\"]\n\turl = https://user:{LEAKED_TOKEN}@example.com/r.git\n\
+             [http]\n\textraHeader = Authorization: Bearer {LEAKED_TOKEN}\n"
+        )
+        .unwrap();
+        let other = git.join("mahi/worktrees/other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(".env"), format!("TOKEN={LEAKED_TOKEN}\n")).unwrap();
+        git
+    }
+
+    #[test]
+    fn the_agent_cannot_read_the_repositorys_config_or_other_worktrees() {
+        let fixture = fixture();
+        let git = with_secrets_in_the_git_directory(&fixture);
+        let script = format!(
+            "cat {git}/config; echo config=$?; \
+             ls {git}/mahi/worktrees; echo listed=$?; \
+             cat {git}/mahi/worktrees/other/.env; echo other=$?; \
+             admin=$(sed 's/^gitdir: //' .git); cat \"$admin/../../config\"; echo through-admin=$?",
+            git = git.display(),
+        );
+        let output = fixture.mahi(&["run", "sh", "-c", &script]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(0), "{stdout}");
+        assert!(!stdout.contains(LEAKED_TOKEN), "{stdout}");
+        assert!(!stdout.contains("other=0"), "{stdout}");
+        assert!(stdout.contains("through-admin="), "{stdout}");
+    }
+
     #[test]
     fn a_file_that_is_not_a_program_is_refused_before_a_thread_starts() {
         let fixture = fixture();
@@ -5164,6 +5203,23 @@ ln -s "$ELSEWHERE" "$TMPDIR"
 printf 'half a draft' > "$TMPDIR/PR.md"
 exit 3
 "#;
+
+        #[test]
+        fn git_works_for_the_agent_without_showing_the_repositorys_secrets() {
+            let fixture = fixture();
+            with_secrets_in_the_git_directory(&fixture);
+            let script = "echo changed >> README; git status --short; echo status=$?; \
+                          git log --oneline -1 >/dev/null; echo log=$?; \
+                          git remote -v; git config --list --show-origin; echo listed=$?";
+            let output = fixture.mahi(&["run", "sh", "-c", script]);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(output.status.code(), Some(0), "{stdout}");
+            for expected in [" M README", "status=0", "log=0", "listed=0"] {
+                assert!(stdout.contains(expected), "{expected} missing: {stdout}");
+            }
+            assert!(!stdout.contains(LEAKED_TOKEN), "{stdout}");
+            assert!(!stdout.contains("upstream"), "{stdout}");
+        }
 
         fn land_with(
             fixture: &Fixture,

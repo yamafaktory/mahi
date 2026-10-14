@@ -216,6 +216,12 @@ impl Sandbox {
             .any(|placed| placed.target.starts_with(path) || path.starts_with(&placed.target))
     }
 
+    /// Returns whether the agent sees `path` through a bound path: it is one, or inside one.
+    #[must_use]
+    pub fn is_bound(&self, path: &Path) -> bool {
+        self.binds.iter().any(|bind| path.starts_with(&bind.path))
+    }
+
     /// Lets the agent connect to the Unix socket at `path`, which must be inside a path
     /// bound before.
     ///
@@ -443,6 +449,16 @@ mod tests {
             sandbox.place(clean, Path::new("/proc/config")),
             Err(SandboxError::Reserved(_))
         ));
+    }
+
+    #[test]
+    fn a_path_is_bound_when_it_is_or_lies_inside_a_bound_one() {
+        let mut sandbox = Sandbox::new();
+        sandbox.bind(Path::new("/opt"), Access::ReadOnly).unwrap();
+        assert!(sandbox.is_bound(Path::new("/opt")));
+        assert!(sandbox.is_bound(Path::new("/opt/repo/.git")));
+        assert!(!sandbox.is_bound(Path::new("/optional")));
+        assert!(!sandbox.is_bound(Path::new("/")));
     }
 
     #[test]
