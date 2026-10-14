@@ -36,6 +36,7 @@ use mahi_sandbox::{
 };
 use mahi_store::Store;
 use mahi_term::{
+    AnsiBackend,
     Answer,
     Dialog,
     Home,
@@ -277,10 +278,7 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
                 rows: &rows,
                 activity: &activity,
             };
-            let drawn = terminal.draw(|frame| {
-                home.render(&view, status, frame.area(), frame.buffer_mut());
-            })?;
-            ui::keep_backdrop(drawn.buffer);
+            draw(&mut terminal, home, &view, status)?;
             dirty = false;
         }
         match wait(&signals, KEY_WAIT)? {
@@ -312,10 +310,34 @@ fn choose(place: &Place<'_>, home: &mut Home, status: &str) -> io::Result<Chosen
         dirty = true;
         match chosen {
             Some(HomeAction::Quit) => return Ok(Chosen::Quit),
-            Some(action) => return Ok(Chosen::Action(action)),
+            Some(action) => {
+                let view = HomeView {
+                    repository: place.repository,
+                    remote: &remote,
+                    identity: place.identity,
+                    rows: &rows,
+                    activity: &activity,
+                };
+                draw(&mut terminal, home, &view, status)?;
+                return Ok(Chosen::Action(action));
+            }
             None => {}
         }
     }
+}
+
+/// Draws the home screen and keeps the frame as the backdrop of the dialogs that follow.
+fn draw(
+    terminal: &mut Terminal<AnsiBackend<io::Stdout>>,
+    home: &Home,
+    view: &HomeView<'_>,
+    status: &str,
+) -> io::Result<()> {
+    let drawn = terminal.draw(|frame| {
+        home.render(view, status, frame.area(), frame.buffer_mut());
+    })?;
+    ui::keep_backdrop(drawn.buffer);
+    Ok(())
 }
 
 /// What reading the keys gave.

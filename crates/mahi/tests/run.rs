@@ -1591,6 +1591,30 @@ cat parser.rs
     }
 
     #[test]
+    fn a_question_after_a_choice_in_the_thread_menu_shows_the_home_screen_without_the_menu() {
+        let fixture = fixture();
+        let (thread, claude) = worked_thread(&fixture);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let passphrase = format!("{PASSPHRASE}\r");
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                (&thread, b"\r"),
+                ("Resume: start", b"1"),
+                ("Passphrase", passphrase.as_bytes()),
+                (&format!("mahi resume {thread}: done"), b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let asked = output.find("Passphrase").unwrap();
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        parser.process(&output.as_bytes()[..asked]);
+        let screen = parser.screen().contents();
+        assert!(screen.contains("Threads"), "{screen}");
+        assert!(!screen.contains("Add an agent"), "{screen}");
+    }
+
+    #[test]
     fn a_paste_split_after_its_escape_closes_a_question_and_does_nothing_else() {
         let fixture = fixture();
         let (_thread, _claude) = worked_thread(&fixture);
