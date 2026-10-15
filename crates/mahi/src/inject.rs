@@ -17,7 +17,10 @@ use std::{
     },
 };
 
-use mahi_agent::hook::HookKind;
+use mahi_agent::{
+    hook::HookKind,
+    payload::asks_user,
+};
 use mahi_core::is_invisible;
 use mahi_term::Report;
 
@@ -60,6 +63,7 @@ impl Default for Pace {
 #[derive(Debug)]
 pub(crate) struct Activity {
     turn_open: AtomicBool,
+    asking: AtomicBool,
     line_empty: AtomicBool,
     last: Mutex<Instant>,
 }
@@ -68,6 +72,7 @@ impl Default for Activity {
     fn default() -> Self {
         Self {
             turn_open: AtomicBool::new(false),
+            asking: AtomicBool::new(false),
             line_empty: AtomicBool::new(true),
             last: Mutex::new(Instant::now()),
         }
@@ -85,7 +90,7 @@ impl Activity {
     /// Notes `bytes` the user typed, or the terminal answered, that went to the agent: text
     /// leaves the line unfinished, Enter, Ctrl-C, Ctrl-U or Escape alone empties it, and Ctrl-C
     /// or Escape interrupts a turn; other sequences, such as arrows or the terminal's answers,
-    /// change neither.
+    /// change neither. Text or Enter answers the agent's question, if it asked one.
     pub(crate) fn keys(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -93,25 +98,42 @@ impl Activity {
         self.touched();
         let effect = line_effect(bytes);
         if effect.interrupts {
-            self.turn_open.store(false, Ordering::SeqCst);
+            self.asking.store(false, Ordering::SeqCst);
+            if self.turn_open.swap(false, Ordering::SeqCst) {
+                crate::report::send(Report::Done);
+            }
         }
         if let Some(empty) = effect.line_empty {
             self.line_empty.store(empty, Ordering::SeqCst);
+            if !effect.interrupts && self.asking.swap(false, Ordering::SeqCst) {
+                crate::report::send(Report::Working);
+            }
         }
     }
 
-    /// Notes what the agent's hook reported.
-    pub(crate) fn saw(&self, kind: HookKind) {
+    /// Notes what the agent's hook reported, with the `payload` it read.
+    pub(crate) fn saw(&self, kind: HookKind, payload: &[u8]) {
         match kind {
             HookKind::Prompt => {
                 self.turn_open.store(true, Ordering::SeqCst);
+                self.asking.store(false, Ordering::SeqCst);
                 crate::report::send(Report::Working);
             }
             HookKind::TurnEnd => {
                 self.turn_open.store(false, Ordering::SeqCst);
+                self.asking.store(false, Ordering::SeqCst);
                 crate::report::send(Report::Done);
             }
-            HookKind::Tool => {}
+            HookKind::Tool => {
+                if self.asking.swap(false, Ordering::SeqCst) {
+                    crate::report::send(Report::Working);
+                }
+            }
+            HookKind::Asks => {
+                if asks_user(payload) && !self.asking.swap(true, Ordering::SeqCst) {
+                    crate::report::send(Report::Asks);
+                }
+            }
         }
         self.touched();
     }
@@ -125,6 +147,9 @@ impl Activity {
         let Ok(quiet_for) = self.last.lock().map(|last| last.elapsed()) else {
             return false;
         };
+        if self.asking.load(Ordering::SeqCst) {
+            return false;
+        }
         let turn_over = !self.turn_open.load(Ordering::SeqCst) || quiet_for >= pace.stale_turn;
         turn_over && self.line_empty.load(Ordering::SeqCst) && quiet_for >= pace.quiet
     }
@@ -373,17 +398,77 @@ mod tests {
         assert!(!activity.is_idle(&pace));
         thread::sleep(pace.quiet);
         assert!(activity.is_idle(&pace));
-        activity.saw(HookKind::Prompt);
+        activity.saw(HookKind::Prompt, b"");
         thread::sleep(pace.quiet);
         assert!(!activity.is_idle(&pace));
-        activity.saw(HookKind::TurnEnd);
+        activity.saw(HookKind::TurnEnd, b"");
         thread::sleep(pace.quiet);
         assert!(activity.is_idle(&pace));
-        activity.saw(HookKind::Prompt);
+        activity.saw(HookKind::Prompt, b"");
         activity.keys(b"\x1b");
         thread::sleep(pace.quiet);
         assert!(activity.is_idle(&pace));
-        activity.saw(HookKind::Prompt);
+        activity.saw(HookKind::Prompt, b"");
+        thread::sleep(pace.stale_turn);
+        assert!(activity.is_idle(&pace));
+    }
+
+    #[test]
+    fn the_workspace_hears_of_turns_questions_and_interrupts_once_each() {
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        crate::report::connect(std::os::fd::IntoRawFd::into_raw_fd(writer));
+        let permission = br#"{"notification_type":"permission_prompt"}"#;
+        let activity = Activity::default();
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(HookKind::Asks, br#"{"notification_type":"idle_prompt"}"#);
+        activity.saw(HookKind::Asks, permission);
+        activity.saw(HookKind::Asks, permission);
+        activity.saw(HookKind::Tool, b"");
+        activity.saw(HookKind::Tool, b"");
+        activity.saw(HookKind::Asks, permission);
+        activity.keys(b"\x1b[A");
+        activity.keys(b"\r");
+        activity.keys(b"\r");
+        activity.saw(HookKind::Asks, permission);
+        activity.keys(b"\x1b");
+        activity.keys(b"\x1b");
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(HookKind::TurnEnd, b"");
+        let mut read = [0_u8; 256];
+        let length = rustix::io::read(&reader, &mut read).unwrap();
+        let mut reports = Vec::new();
+        mahi_term::ReportReader::default().feed(&read[..length], |report| reports.push(report));
+        assert_eq!(
+            reports,
+            [
+                Report::Working,
+                Report::Asks,
+                Report::Working,
+                Report::Asks,
+                Report::Working,
+                Report::Asks,
+                Report::Done,
+                Report::Working,
+                Report::Done,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_question_keeps_prompts_out_however_long_it_waits_until_the_user_answers() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(
+            HookKind::Asks,
+            br#"{"notification_type":"permission_prompt"}"#,
+        );
+        thread::sleep(pace.stale_turn);
+        assert!(!activity.is_idle(&pace));
+        activity.keys(b"\x1b[B");
+        thread::sleep(pace.stale_turn);
+        assert!(!activity.is_idle(&pace));
+        activity.keys(b"\r");
         thread::sleep(pace.stale_turn);
         assert!(activity.is_idle(&pace));
     }
@@ -403,7 +488,7 @@ mod tests {
         thread::sleep(pace.quiet);
         assert!(activity.is_idle(&pace));
         activity.keys(b"typed during the turn");
-        activity.saw(HookKind::TurnEnd);
+        activity.saw(HookKind::TurnEnd, b"");
         thread::sleep(pace.quiet);
         assert!(!activity.is_idle(&pace));
         activity.keys(b"\x1b[117;5u");

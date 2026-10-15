@@ -721,6 +721,12 @@ const CLAUDE_CODE_SETTINGS: &str = r#"{
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook turn-end" }] }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|elicitation_dialog",
+        "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook asks" }]
+      }
     ]
   }
 }
@@ -1191,7 +1197,7 @@ content = "first\n"
     }
 
     #[test]
-    fn claude_code_hooks_report_prompts_tools_and_turn_ends_to_mahi() {
+    fn claude_code_hooks_report_prompts_tools_turn_ends_and_questions_to_mahi() {
         let dir = tempfile::tempdir().unwrap();
         claude_code_profile()
             .install(&open_dir(dir.path()), Path::new(""), Path::new(""), None)
@@ -1201,6 +1207,7 @@ content = "first\n"
             ("UserPromptSubmit", "prompt"),
             ("PostToolUse", "tool"),
             ("Stop", "turn-end"),
+            ("Notification", "asks"),
         ] {
             assert!(settings.contains(event), "{settings}");
             assert!(

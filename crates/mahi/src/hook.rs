@@ -160,7 +160,10 @@ fn serve_connections(
             dropped += 1;
             continue;
         };
-        activity.saw(message.kind);
+        activity.saw(message.kind, &message.payload);
+        if message.kind == HookKind::Asks {
+            continue;
+        }
         match messages.try_send(Delivery::Message(message)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => dropped += 1,
@@ -263,6 +266,19 @@ mod tests {
             next(&server),
             message(HookKind::Tool, b"{\"tool\":\"edit\"}")
         );
+        assert_eq!(next(&server), message(HookKind::TurnEnd, b""));
+    }
+
+    #[test]
+    fn a_question_is_noted_but_never_reaches_the_transcript() {
+        let server = server();
+        send(
+            &server.socket,
+            HookKind::Asks,
+            &br#"{"notification_type":"permission_prompt"}"#[..],
+        )
+        .unwrap();
+        send(&server.socket, HookKind::TurnEnd, io::empty()).unwrap();
         assert_eq!(next(&server), message(HookKind::TurnEnd, b""));
     }
 

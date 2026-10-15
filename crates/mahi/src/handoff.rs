@@ -85,7 +85,7 @@ impl Gathered {
             HookKind::Tool if self.tools.len() < RECENT_TOOLS => {
                 self.tools.push_front(tool_text(payload));
             }
-            HookKind::Tool | HookKind::TurnEnd => {}
+            HookKind::Tool | HookKind::TurnEnd | HookKind::Asks => {}
         }
     }
 

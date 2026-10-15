@@ -21,6 +21,8 @@ pub enum HookKind {
     Tool,
     /// The agent finished its turn.
     TurnEnd,
+    /// The agent waits on a question of its own, such as a permission request.
+    Asks,
 }
 
 /// One event an agent's hook reported, with the payload it read from its standard input.
@@ -40,13 +42,14 @@ impl HookKind {
             Self::Prompt => "prompt",
             Self::Tool => "tool",
             Self::TurnEnd => "turn-end",
+            Self::Asks => "asks",
         }
     }
 
     /// Returns every event, in the order `mahi hook` lists them.
     #[must_use]
-    pub fn all() -> [Self; 3] {
-        [Self::Prompt, Self::Tool, Self::TurnEnd]
+    pub fn all() -> [Self; 4] {
+        [Self::Prompt, Self::Tool, Self::TurnEnd, Self::Asks]
     }
 
     /// Says what the event means, for `mahi hook --help`.
@@ -56,6 +59,7 @@ impl HookKind {
             Self::Prompt => "The user sent the agent a prompt",
             Self::Tool => "The agent used a tool, which may have changed the worktree",
             Self::TurnEnd => "The agent finished its turn",
+            Self::Asks => "The agent waits on a question of its own, such as a permission request",
         }
     }
 
@@ -112,7 +116,7 @@ mod tests {
 
     #[test]
     fn messages_decode_to_what_was_encoded_and_nothing_else_decodes() {
-        for kind in [HookKind::Prompt, HookKind::Tool, HookKind::TurnEnd] {
+        for kind in HookKind::all() {
             let message = encode(kind, b"payload").unwrap();
             assert_eq!(
                 decode(&message),
