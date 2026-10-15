@@ -258,6 +258,7 @@ pub(crate) mod tests {
     pub(crate) struct Setup {
         _repo: TempDir,
         _dirs: TempDir,
+        _runtime: TempDir,
         pub(crate) store: Store,
         pub(crate) config: ConfigDir,
         pub(crate) environment: Environment,
@@ -298,16 +299,19 @@ pub(crate) mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        let runtime = dirs.path().join("run");
-        std::fs::create_dir(&runtime).unwrap();
+        let runtime = tempfile::Builder::new()
+            .prefix("m")
+            .tempdir_in("/tmp")
+            .unwrap();
         let environment = Environment {
             live: LiveMode::Local,
-            xdg_runtime_dir: Some(runtime),
+            xdg_runtime_dir: Some(runtime.path().to_path_buf()),
             ..Environment::default()
         };
         Setup {
             _repo: repo,
             _dirs: dirs,
+            _runtime: runtime,
             store,
             config,
             environment,
