@@ -406,7 +406,7 @@ impl ThreadTools {
         let mut looker = RunningLock::looker(&self.config);
         let running = |agent: &AgentName| looker.runs(self.thread, agent).unwrap_or(false);
         push_agents(&mut text, listed, &agents, (&self.me, running));
-        push_claims(&mut text, &self.claims.all(&self.me));
+        push_claims(&mut text, &self.claims.all(Some(&self.me)));
         Ok(cleaned(&text))
     }
 
@@ -441,7 +441,7 @@ impl ThreadTools {
 
     fn list_claims(&self) -> String {
         let mut text = String::new();
-        push_claims(&mut text, &self.claims.all(&self.me));
+        push_claims(&mut text, &self.claims.all(Some(&self.me)));
         if text.is_empty() {
             text.push_str("Nobody claims anything.\n");
         }

@@ -311,9 +311,9 @@ fn serve_guest(mut stream: UnixStream, handle: &HostHandle) -> Result<(), LocalE
         Some(offers) => {
             let (mut writer, done) = (stream.try_clone()?, Arc::clone(&done));
             let (claims, me) = handle.claims();
-            let (claims, me) = (Arc::clone(claims), me.clone());
+            let (claims, me) = (Arc::clone(claims), me.cloned());
             Some(thread::spawn(move || {
-                forward_offers(&offers, &mut writer, &done, (&claims, &me));
+                forward_offers(&offers, &mut writer, &done, (&claims, me.as_ref()));
                 offers
             }))
         }
@@ -341,7 +341,7 @@ fn forward_offers(
     offers: &Receiver<Offer>,
     writer: &mut UnixStream,
     done: &AtomicBool,
-    (claims, me): (&Claims, &AgentSlot),
+    (claims, me): (&Claims, Option<&AgentSlot>),
 ) {
     let mut told = None;
     while !done.load(Ordering::SeqCst) {
@@ -703,7 +703,9 @@ impl Joining {
         ) {
             Ok(host) => {
                 claims.host_lost();
-                tap.attach(host.tap());
+                if let Some(host_tap) = host.tap() {
+                    tap.attach(host_tap);
+                }
                 let hub = Hub::start(self.socket.clone(), host.handle()).ok();
                 Ok(Role::Host(Box::new(host), hub))
             }
@@ -972,26 +974,26 @@ mod tests {
         let guest_claims = Arc::new(Claims::default());
         let link = GuestLink::connect(&path, &codex, &tap, (&prompts, &guest_claims)).unwrap();
         let (host_claims, host) = handle.claims();
-        let (host_claims, host) = (Arc::clone(host_claims), host.clone());
+        let (host_claims, host) = (Arc::clone(host_claims), host.cloned().unwrap());
         guest_claims
             .claim(&codex, "docs", Some("rewriting"))
             .unwrap();
         eventually("the guest's claim at the host", || {
             host_claims
-                .all(&host)
+                .all(Some(&host))
                 .iter()
                 .any(|claim| claim.slot == codex && claim.what == "docs")
         });
         host_claims.claim(&host, "src/parser.rs", None).unwrap();
         eventually("the host's claim at the guest", || {
             guest_claims
-                .all(&codex)
+                .all(Some(&codex))
                 .iter()
                 .any(|claim| claim.slot == host && claim.what == "src/parser.rs")
         });
         assert_eq!(
             guest_claims
-                .all(&codex)
+                .all(Some(&codex))
                 .iter()
                 .filter(|claim| claim.what == "docs")
                 .count(),
@@ -1000,7 +1002,7 @@ mod tests {
         link.close();
         eventually("the guest's claims forgotten", || {
             !host_claims
-                .all(&host)
+                .all(Some(&host))
                 .iter()
                 .any(|claim| claim.slot == codex)
         });

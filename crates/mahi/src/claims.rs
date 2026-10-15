@@ -88,7 +88,7 @@ impl Board {
         }
     }
 
-    fn others(&self, me: &AgentSlot) -> impl Iterator<Item = (&ClaimEntry, Duration)> {
+    fn others(&self, me: Option<&AgentSlot>) -> impl Iterator<Item = (&ClaimEntry, Duration)> {
         let fresh = |heard: &Instant| heard.elapsed() <= THEIRS_KEPT;
         let guests = self
             .guests
@@ -107,7 +107,7 @@ impl Board {
         guests
             .chain(theirs)
             .chain(from_host)
-            .filter(move |(entry, _)| &entry.slot != me)
+            .filter(move |(entry, _)| Some(&entry.slot) != me)
     }
 }
 
@@ -130,7 +130,7 @@ impl Claims {
             return Err(ClaimError::Unavailable);
         };
         let mut others: Vec<AgentSlot> = board
-            .others(me)
+            .others(Some(me))
             .filter(|(entry, _)| entry.what == what)
             .map(|(entry, _)| entry.slot.clone())
             .collect();
@@ -220,12 +220,15 @@ impl Claims {
         }
     }
 
-    /// Returns every claim known, those of `me`, this mahi's agent, first.
-    pub(crate) fn all(&self, me: &AgentSlot) -> Vec<Claim> {
+    /// Returns every claim known, those of `me`, this mahi's agent if it runs one, first.
+    pub(crate) fn all(&self, me: Option<&AgentSlot>) -> Vec<Claim> {
         let Ok(board) = self.state.lock() else {
             return Vec::new();
         };
-        let mut all: Vec<Claim> = board.held.iter().map(|held| held.claim(me)).collect();
+        let mut all: Vec<Claim> = me
+            .into_iter()
+            .flat_map(|me| board.held.iter().map(|held| held.claim(me)))
+            .collect();
         all.extend(board.others(me).map(|(entry, since)| Claim {
             slot: entry.slot.clone(),
             what: entry.what.clone(),
@@ -235,23 +238,22 @@ impl Claims {
         all
     }
 
-    /// Returns what this mahi broadcasts as host: the claims of its agent `me` and of the
-    /// agents it hosts for the user's other mahis, at most as many as a frame carries.
-    pub(crate) fn hosted(&self, me: &AgentSlot) -> Vec<ClaimEntry> {
+    /// Returns what this mahi broadcasts as host: the claims of its agent `me`, if it runs
+    /// one, and of the agents it hosts for the user's other mahis, at most as many as a frame
+    /// carries.
+    pub(crate) fn hosted(&self, me: Option<&AgentSlot>) -> Vec<ClaimEntry> {
         let Ok(board) = self.state.lock() else {
             return Vec::new();
         };
-        board
-            .held
-            .iter()
-            .map(|held| held.entry(me))
+        me.into_iter()
+            .flat_map(|me| board.held.iter().map(|held| held.entry(me)))
             .chain(board.guests.values().flatten().cloned())
             .take(MAX_FRAME_CLAIMS)
             .collect()
     }
 
     /// Returns every claim known, as the host sends them to the user's other mahis.
-    pub(crate) fn known(&self, me: &AgentSlot) -> Vec<ClaimEntry> {
+    pub(crate) fn known(&self, me: Option<&AgentSlot>) -> Vec<ClaimEntry> {
         self.all(me)
             .into_iter()
             .take(MAX_LOCAL_CLAIMS)
@@ -347,13 +349,13 @@ mod tests {
             .claim(&claude, "src/parser.rs", Some("adding tests"))
             .unwrap();
         assert_ne!(claims.held_version(), version);
-        let all = claims.all(&claude);
+        let all = claims.all(Some(&claude));
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].note.as_deref(), Some("adding tests"));
         assert_eq!(claims.held(&claude)[0].slot, claude);
         assert!(claims.release("src/parser.rs"));
         assert!(!claims.release("src/parser.rs"));
-        assert!(claims.all(&claude).is_empty());
+        assert!(claims.all(Some(&claude)).is_empty());
     }
 
     #[test]
@@ -400,7 +402,7 @@ mod tests {
             vec![entry("alice.codex", "docs"), entry("bob.x", "forged")],
         );
         assert!(claims.take_hosted_changed());
-        let hosted = claims.hosted(&claude);
+        let hosted = claims.hosted(Some(&claude));
         assert_eq!(hosted.len(), 2);
         assert!(hosted.iter().all(|entry| entry.slot != slot("bob.x")));
         let node =
@@ -410,9 +412,16 @@ mod tests {
             claims.claim(&claude, "src/parser.rs", None),
             Ok(vec![slot("bob.codex")])
         );
-        assert_eq!(claims.all(&claude).len(), 3);
+        assert_eq!(claims.all(Some(&claude)).len(), 3);
         claims.forget_guest(&codex);
-        assert_eq!(claims.hosted(&claude).len(), 1);
+        assert_eq!(claims.hosted(Some(&claude)).len(), 1);
+
+        let host = Claims::default();
+        host.hear_guest(&codex, vec![entry("alice.codex", "docs")]);
+        host.hear(node, vec![entry("bob.codex", "tests")]);
+        assert_eq!(host.hosted(None), [entry("alice.codex", "docs")]);
+        assert_eq!(host.all(None).len(), 2);
+        assert_eq!(host.known(None).len(), 2);
 
         let guest = Claims::default();
         guest.claim(&codex, "docs", None).unwrap();
@@ -420,9 +429,9 @@ mod tests {
             entry("alice.codex", "docs"),
             entry("alice.claude", "x"),
         ]);
-        let known = guest.all(&codex);
+        let known = guest.all(Some(&codex));
         assert_eq!(known.len(), 2);
-        assert_eq!(guest.known(&codex).len(), 2);
+        assert_eq!(guest.known(Some(&codex)).len(), 2);
     }
 
     #[test]
@@ -435,20 +444,20 @@ mod tests {
         let node =
             NodeId::from_bytes(mahi_identity::NodeKey::generate().unwrap().public()).unwrap();
         claims.hear_at(node, vec![entry("bob.codex", "old")], long_ago);
-        assert!(claims.all(&me).is_empty());
+        assert!(claims.all(Some(&me)).is_empty());
         claims.hear(node, vec![entry("bob.codex", "new")]);
-        assert_eq!(claims.all(&me).len(), 1);
+        assert_eq!(claims.all(Some(&me)).len(), 1);
         claims.hear_host(vec![entry("alice.codex", "docs")]);
-        assert_eq!(claims.all(&me).len(), 2);
+        assert_eq!(claims.all(Some(&me)).len(), 2);
         if let Ok(mut board) = claims.state.lock()
             && let Some((heard, _)) = board.from_host.as_mut()
         {
             *heard = long_ago;
         }
-        assert_eq!(claims.all(&me).len(), 2);
+        assert_eq!(claims.all(Some(&me)).len(), 2);
         let version = claims.version();
         claims.host_lost();
         assert_ne!(claims.version(), version);
-        assert_eq!(claims.all(&me).len(), 1);
+        assert_eq!(claims.all(Some(&me)).len(), 1);
     }
 }

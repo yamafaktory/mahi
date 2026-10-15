@@ -121,6 +121,8 @@ pub(crate) enum HostError {
     Hub(#[source] io::Error),
     #[error("cannot take the live layer's lock")]
     Lock(#[from] LockError),
+    #[error("this node is not a participant of the thread")]
+    NotParticipant,
 }
 
 /// How many chunks of output wait for the broadcaster before newer ones are dropped.
@@ -489,7 +491,7 @@ impl Drop for Guest {
 pub(crate) struct LiveHost {
     _hosting: LiveLock,
     shared: SharedNode,
-    tap: HostTap,
+    tap: Option<HostTap>,
     stop: Arc<AtomicBool>,
     stop_broadcast: Arc<AtomicBool>,
     listener: JoinHandle<()>,
@@ -498,12 +500,22 @@ pub(crate) struct LiveHost {
     config: ConfigDir,
     thread: ThreadId,
     owner: ParticipantName,
-    prompts: Arc<Prompts>,
+    prompts: Option<Arc<Prompts>>,
     claims: Arc<Claims>,
-    me: AgentSlot,
+    me: Option<AgentSlot>,
     registry: Arc<Mutex<Registry>>,
     queue: SyncSender<Tapped>,
     dropped: Arc<AtomicBool>,
+}
+
+/// The agent a host runs itself: its slot, its terminal's size and what it drew, and the
+/// prompts teammates send it.
+#[derive(Debug)]
+pub(crate) struct OwnAgent<'a> {
+    pub(crate) slot: AgentSlot,
+    pub(crate) size: WindowSize,
+    pub(crate) drawn: &'a [u8],
+    pub(crate) prompts: Arc<Prompts>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -528,51 +540,60 @@ impl LiveHost {
         let hosting =
             LiveLock::try_acquire(&setup.config, keys.thread())?.ok_or(HostError::AnotherHost)?;
         let shared = SharedNode::bind(&setup.node_key, setup.relays)?;
+        let own = OwnAgent {
+            slot,
+            size,
+            drawn,
+            prompts,
+        };
         Self::start_on(
             (&shared, hosting),
             setup,
-            git_dir,
-            (slot, keys),
-            (size, drawn),
-            (prompts, claims),
+            (git_dir, keys),
+            Some(own),
+            claims,
         )
     }
 
     /// Opens the live layer as [`LiveHost::start`] does, on the node `shared`, which may host
-    /// other threads too, under the live-layer lock `hosting` already taken for the thread.
+    /// other threads too, under the live-layer lock `hosting` already taken for the thread,
+    /// for the agent `own` this mahi runs, if it runs one, and the agents the user's other
+    /// mahis hand it.
     pub(crate) fn start_on(
         (shared, hosting): (&SharedNode, LiveLock),
         setup: &LiveSetup,
-        git_dir: &Path,
-        (slot, keys): (AgentSlot, &LiveKeys),
-        (size, drawn): (WindowSize, &[u8]),
-        (prompts, claims): (Arc<Prompts>, Arc<Claims>),
+        (git_dir, keys): (&Path, &LiveKeys),
+        own: Option<OwnAgent<'_>>,
+        claims: Arc<Claims>,
     ) -> Result<Self, HostError> {
         let thread = keys.thread();
-        withdraw_address(&setup.config, thread);
         let peers = Arc::new(HostPeers::new(
             git_dir.to_path_buf(),
             thread,
             setup.owner.clone(),
             REREAD_EVERY,
         )?);
+        let participants = peers.participants();
+        let owner = host_owner(own.as_ref(), &setup.node_key, &participants)?;
+        withdraw_address(&setup.config, thread);
         let shared = shared.clone();
         let node = Arc::clone(&shared.node);
         let topic = Arc::new(node.join(keys.topic(), &setup.bootstrap, None)?);
         let sender = FrameSender::new(keys.clone(), setup.node_key.secret())?;
-        let mut receiver = FrameReceiver::new(keys.clone(), peers.participants());
-        let owner = slot.participant().clone();
-        let me = slot.clone();
+        let mut receiver = FrameReceiver::new(keys.clone(), participants);
         receiver.take_prompts_for(&sender, owner.clone());
         let registry = Arc::new(Mutex::new(Registry::default()));
-        let (agent, screen) = registry
-            .lock()
-            .ok()
-            .and_then(|mut registry| registry.add(slot, size, Inbox::Local(Arc::clone(&prompts))))
-            .ok_or(HostError::SlotTaken)?;
-        if let Ok(mut copy) = screen.lock() {
-            copy.parser.process(drawn);
-        }
+        let (me, prompts, own_tap) = match own {
+            Some(own) => {
+                let (slot, prompts) = (own.slot.clone(), Arc::clone(&own.prompts));
+                (
+                    Some(slot),
+                    Some(prompts),
+                    Some(register_own(&registry, own)?),
+                )
+            }
+            None => (None, None, None),
+        };
         if !shared.threads.add(thread, Arc::clone(&peers)) {
             return Err(HostError::AnotherHost);
         }
@@ -608,12 +629,12 @@ impl LiveHost {
         Ok(Self {
             _hosting: hosting,
             shared,
-            tap: HostTap {
+            tap: own_tap.map(|(agent, screen)| HostTap {
                 agent,
                 screen,
                 queue: queue.clone(),
                 dropped: Arc::clone(&dropped),
-            },
+            }),
             stop,
             stop_broadcast,
             broadcaster: thread::spawn(move || broadcaster.run()),
@@ -631,8 +652,8 @@ impl LiveHost {
         })
     }
 
-    /// Returns where the agent's terminal is copied.
-    pub(crate) fn tap(&self) -> HostTap {
+    /// Returns where the agent this mahi runs copies its terminal, if it runs one.
+    pub(crate) fn tap(&self) -> Option<HostTap> {
         self.tap.clone()
     }
 
@@ -648,13 +669,15 @@ impl LiveHost {
         }
     }
 
-    /// Stops the live layer once the agent is gone: output still queued is dropped, and so
-    /// are the prompts waiting, whose senders are told.
+    /// Stops the live layer once the agent it runs, if it runs one, is gone: output still
+    /// queued is dropped, and so are that agent's prompts waiting, whose senders are told.
     pub(crate) fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.listener.join();
         let _ = self.publisher.join();
-        self.prompts.close();
+        if let Some(prompts) = &self.prompts {
+            prompts.close();
+        }
         self.stop_broadcast.store(true, Ordering::SeqCst);
         let _ = self.broadcaster.join();
         withdraw_address(&self.config, self.thread);
@@ -663,6 +686,40 @@ impl LiveHost {
             let _ = node.close();
         }
     }
+}
+
+/// Returns the participant a host serves the agents of: the one whose agent `own` it runs, or
+/// else the participant of `participants` whose node `node_key` is.
+fn host_owner(
+    own: Option<&OwnAgent<'_>>,
+    node_key: &NodeKey,
+    participants: &[(NodeId, ParticipantName)],
+) -> Result<ParticipantName, HostError> {
+    if let Some(own) = own {
+        return Ok(own.slot.participant().clone());
+    }
+    let node = NodeId::from_bytes(node_key.public()).map_err(|_| HostError::NotParticipant)?;
+    participants
+        .iter()
+        .find(|(participant, _)| *participant == node)
+        .map(|(_, name)| name.clone())
+        .ok_or(HostError::NotParticipant)
+}
+
+/// Adds the agent `own` a host runs to `registry`, with what it drew so far.
+fn register_own(
+    registry: &Mutex<Registry>,
+    own: OwnAgent<'_>,
+) -> Result<(AgentId, Arc<Mutex<Screen>>), HostError> {
+    let (agent, screen) = registry
+        .lock()
+        .ok()
+        .and_then(|mut registry| registry.add(own.slot, own.size, Inbox::Local(own.prompts)))
+        .ok_or(HostError::SlotTaken)?;
+    if let Ok(mut copy) = screen.lock() {
+        copy.parser.process(own.drawn);
+    }
+    Ok((agent, screen))
 }
 
 /// A live node and the threads it hosts, shared by the hosts of one process, so the user's
@@ -735,7 +792,7 @@ pub(crate) struct HostHandle {
     queue: SyncSender<Tapped>,
     dropped: Arc<AtomicBool>,
     claims: Arc<Claims>,
-    me: AgentSlot,
+    me: Option<AgentSlot>,
 }
 
 impl std::fmt::Debug for HostHandle {
@@ -752,7 +809,10 @@ impl HostHandle {
         let (queue, tapped) = mpsc::sync_channel(TAP_QUEUE);
         (
             Self {
-                me: AgentSlot::new(owner.clone(), mahi_core::AgentName::new("host").unwrap()),
+                me: Some(AgentSlot::new(
+                    owner.clone(),
+                    mahi_core::AgentName::new("host").unwrap(),
+                )),
                 owner,
                 registry: Arc::new(Mutex::new(Registry::default())),
                 queue,
@@ -822,9 +882,10 @@ impl HostHandle {
             .unwrap_or_default()
     }
 
-    /// Returns the claims this host keeps, and its own agent, whose claims they are first.
-    pub(crate) fn claims(&self) -> (&Arc<Claims>, &AgentSlot) {
-        (&self.claims, &self.me)
+    /// Returns the claims this host keeps, and its own agent, if it runs one, whose claims
+    /// they are first.
+    pub(crate) fn claims(&self) -> (&Arc<Claims>, Option<&AgentSlot>) {
+        (&self.claims, self.me.as_ref())
     }
 
     /// Starts serving `slot`'s agent, which another mahi of the user runs, with its terminal at
@@ -920,7 +981,7 @@ struct Broadcaster {
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
     sent_at: Instant,
-    claims: (Arc<Claims>, AgentSlot, Option<Instant>),
+    claims: (Arc<Claims>, Option<AgentSlot>, Option<Instant>),
 }
 
 impl Broadcaster {
@@ -976,7 +1037,7 @@ impl Broadcaster {
             return;
         }
         let body = Body::Claims {
-            claims: claims.hosted(me),
+            claims: claims.hosted(me.as_ref()),
         };
         if self.send(&body) {
             self.claims.2 = Some(Instant::now());
@@ -1358,6 +1419,7 @@ mod tests {
 
     struct Hosted {
         _repo: TempDir,
+        node_keys: TempDir,
         store: Store,
         owner_key: PrivateKey,
         owner: ParticipantKey,
@@ -1370,7 +1432,10 @@ mod tests {
         let (repo, store) = repository_on_main();
         let identity = LocalIdentity::generate();
         let owner_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        let owner_node = NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap();
+        let node_key = NodeKey::generate().unwrap();
+        let owner_node = NodeId::from_bytes(node_key.public()).unwrap();
+        let node_keys = TempDir::new().unwrap();
+        node_key.save(&node_keys.path().join("node.key")).unwrap();
         let worktrees = TempDir::new().unwrap();
         let started = session::start(
             &store,
@@ -1390,6 +1455,7 @@ mod tests {
         let owner = ParticipantKey::from_public_key(owner_key.public_key()).unwrap();
         Hosted {
             _repo: repo,
+            node_keys,
             store,
             owner_key,
             owner,
@@ -1484,16 +1550,21 @@ mod tests {
                 ParticipantName::new("alice").unwrap(),
                 AgentName::new("claude").unwrap(),
             );
+            let own = OwnAgent {
+                slot,
+                size: WindowSize { rows: 24, cols: 80 },
+                drawn: b"",
+                prompts: Arc::new(Prompts::default()),
+            };
             LiveHost::start_on(
                 (&shared, lock),
                 &setup,
-                hosted.store.common_dir(),
                 (
-                    slot,
+                    hosted.store.common_dir(),
                     &LiveKeys::derive(&hosted.thread_key, hosted.thread).unwrap(),
                 ),
-                (WindowSize { rows: 24, cols: 80 }, b""),
-                (Arc::new(Prompts::default()), Arc::new(Claims::default())),
+                Some(own),
+                Arc::new(Claims::default()),
             )
             .unwrap()
         };
@@ -1515,6 +1586,63 @@ mod tests {
         again.stop();
         two.stop();
         assert!(!shared.threads.admits(&second.owner_node));
+    }
+
+    #[test]
+    fn a_host_with_no_agent_of_its_own_serves_the_users_other_mahis_only_in_its_threads() {
+        let hosted = hosted();
+        let dir = TempDir::new().unwrap();
+        let config = ConfigDir::resolve(Some(dir.path()), Some(dir.path())).unwrap();
+        let shared = SharedNode::bind(&NodeKey::generate().unwrap(), Relays::Disabled).unwrap();
+        let keys = LiveKeys::derive(&hosted.thread_key, hosted.thread).unwrap();
+        let start = |node_key: NodeKey| {
+            let setup = LiveSetup {
+                config: config.clone(),
+                runtime: dir.path().to_path_buf(),
+                node_key,
+                owner: hosted.owner.clone(),
+                relays: Relays::Disabled,
+                bootstrap: Vec::new(),
+            };
+            let lock = LiveLock::try_acquire(&config, hosted.thread)
+                .unwrap()
+                .unwrap();
+            LiveHost::start_on(
+                (&shared, lock),
+                &setup,
+                (hosted.store.common_dir(), &keys),
+                None,
+                Arc::new(Claims::default()),
+            )
+        };
+        assert!(matches!(
+            start(NodeKey::generate().unwrap()),
+            Err(HostError::NotParticipant)
+        ));
+        let host =
+            start(NodeKey::load(&hosted.node_keys.path().join("node.key")).unwrap()).unwrap();
+        assert!(host.tap().is_none());
+        let handle = host.handle();
+        assert!(handle.claims().1.is_none());
+        let size = WindowSize { rows: 24, cols: 80 };
+        let own = AgentSlot::new(
+            ParticipantName::new("alice").unwrap(),
+            AgentName::new("codex").unwrap(),
+        );
+        let guest = handle.serve(own.clone(), size).unwrap();
+        assert_eq!(handle.served(), 1);
+        assert!(matches!(handle.serve(own, size), Err(HostError::SlotTaken)));
+        let bobs = AgentSlot::new(
+            ParticipantName::new("bob").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+        assert!(matches!(
+            handle.serve(bobs, size),
+            Err(HostError::NotOwnSlot)
+        ));
+        drop(guest);
+        host.stop();
+        assert!(!shared.threads.admits(&hosted.owner_node));
     }
 
     #[test]
