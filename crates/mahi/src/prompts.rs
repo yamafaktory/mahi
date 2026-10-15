@@ -13,6 +13,7 @@ use mahi_live::{
     PromptOutcome,
     PromptText,
 };
+use mahi_term::Report;
 
 use crate::merge::MergeRequest;
 
@@ -39,6 +40,7 @@ struct State {
     answers: VecDeque<Answer>,
     arrivals: VecDeque<Arrival>,
     closed: bool,
+    reported: usize,
 }
 
 /// A prompt that just came, for the host user to be told of.
@@ -127,6 +129,7 @@ impl Prompts {
                 at: Instant::now(),
                 merge: None,
             });
+            state.report_waiting();
             PromptOutcome::Queued
         };
         state.answer(id, outcome);
@@ -173,6 +176,7 @@ impl Prompts {
             at: Instant::now(),
             merge: Some(request),
         });
+        state.report_waiting();
         PromptOutcome::Queued
     }
 
@@ -211,6 +215,7 @@ impl Prompts {
                 outcome
             }
         };
+        state.report_waiting();
         state.answer(id, outcome);
         true
     }
@@ -250,6 +255,7 @@ impl Prompts {
         while let Some(waiting) = state.waiting.pop_front() {
             state.answer(waiting.id, PromptOutcome::Dropped);
         }
+        state.report_waiting();
         while let Some(accepted) = state.accepted.pop_front() {
             state.answer(accepted.id, PromptOutcome::Dropped);
         }
@@ -288,6 +294,14 @@ impl State {
         PromptOutcome::Accepted
     }
 
+    fn report_waiting(&mut self) {
+        let count = self.waiting.len();
+        if count != self.reported {
+            self.reported = count;
+            crate::report::send(Report::Prompts(u16::try_from(count).unwrap_or(u16::MAX)));
+        }
+    }
+
     fn answer(&mut self, id: [u8; PROMPT_ID_BYTES], outcome: PromptOutcome) {
         if self.answers.len() == MAX_ANSWERS {
             self.answers.pop_front();
@@ -318,6 +332,36 @@ mod tests {
         let mut answers = Vec::new();
         prompts.take_answers(&mut answers);
         answers
+    }
+
+    #[test]
+    fn the_workspace_hears_how_many_prompts_wait_each_time_it_changes() {
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        crate::report::connect(std::os::fd::IntoRawFd::into_raw_fd(writer));
+        let prompts = Prompts::default();
+        for id in 1..=3 {
+            prompts.offer(name("bob"), [id; 16], text());
+        }
+        prompts.offer(name("carol"), [4; 16], text());
+        prompts.offer_merge(name("alice"), [5; 16], (text(), request()));
+        prompts.offer_merge(name("alice"), [6; 16], (text(), request()));
+        prompts.decide([9; 16], Decision::Reject);
+        prompts.decide([1; 16], Decision::AlwaysAccept);
+        prompts.offer(name("bob"), [7; 16], text());
+        prompts.decide([5; 16], Decision::Accept);
+        prompts.close();
+        let mut read = [0_u8; 256];
+        let length = rustix::io::read(&reader, &mut read).unwrap();
+        let mut reports = Vec::new();
+        mahi_term::ReportReader::default().feed(&read[..length], |report| reports.push(report));
+        let counts: Vec<u16> = reports
+            .into_iter()
+            .map(|report| match report {
+                Report::Prompts(count) => count,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(counts, [1, 2, 3, 4, 5, 2, 1, 0]);
     }
 
     #[test]
