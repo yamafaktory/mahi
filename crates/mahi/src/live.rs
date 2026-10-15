@@ -16,6 +16,8 @@ use std::{
     sync::{
         Arc,
         Mutex,
+        MutexGuard,
+        PoisonError,
         atomic::{
             AtomicBool,
             Ordering,
@@ -486,7 +488,7 @@ impl Drop for Guest {
 #[derive(Debug)]
 pub(crate) struct LiveHost {
     _hosting: LiveLock,
-    node: Arc<LiveNode>,
+    shared: SharedNode,
     tap: HostTap,
     stop: Arc<AtomicBool>,
     stop_broadcast: Arc<AtomicBool>,
@@ -523,9 +525,30 @@ impl LiveHost {
         (size, drawn): (WindowSize, &[u8]),
         (prompts, claims): (Arc<Prompts>, Arc<Claims>),
     ) -> Result<Self, HostError> {
-        let thread = keys.thread();
         let hosting =
-            LiveLock::try_acquire(&setup.config, thread)?.ok_or(HostError::AnotherHost)?;
+            LiveLock::try_acquire(&setup.config, keys.thread())?.ok_or(HostError::AnotherHost)?;
+        let shared = SharedNode::bind(&setup.node_key, setup.relays)?;
+        Self::start_on(
+            (&shared, hosting),
+            setup,
+            git_dir,
+            (slot, keys),
+            (size, drawn),
+            (prompts, claims),
+        )
+    }
+
+    /// Opens the live layer as [`LiveHost::start`] does, on the node `shared`, which may host
+    /// other threads too, under the live-layer lock `hosting` already taken for the thread.
+    pub(crate) fn start_on(
+        (shared, hosting): (&SharedNode, LiveLock),
+        setup: &LiveSetup,
+        git_dir: &Path,
+        (slot, keys): (AgentSlot, &LiveKeys),
+        (size, drawn): (WindowSize, &[u8]),
+        (prompts, claims): (Arc<Prompts>, Arc<Claims>),
+    ) -> Result<Self, HostError> {
+        let thread = keys.thread();
         withdraw_address(&setup.config, thread);
         let peers = Arc::new(HostPeers::new(
             git_dir.to_path_buf(),
@@ -533,11 +556,8 @@ impl LiveHost {
             setup.owner.clone(),
             REREAD_EVERY,
         )?);
-        let node = Arc::new(LiveNode::bind_live(
-            setup.node_key.secret(),
-            setup.relays,
-            Arc::clone(&peers) as Arc<dyn Peers>,
-        )?);
+        let shared = shared.clone();
+        let node = Arc::clone(&shared.node);
         let topic = Arc::new(node.join(keys.topic(), &setup.bootstrap, None)?);
         let sender = FrameSender::new(keys.clone(), setup.node_key.secret())?;
         let mut receiver = FrameReceiver::new(keys.clone(), peers.participants());
@@ -552,6 +572,9 @@ impl LiveHost {
             .ok_or(HostError::SlotTaken)?;
         if let Ok(mut copy) = screen.lock() {
             copy.parser.process(drawn);
+        }
+        if !shared.threads.add(thread, Arc::clone(&peers)) {
+            return Err(HostError::AnotherHost);
         }
         let (queue, tapped) = mpsc::sync_channel(TAP_QUEUE);
         let dropped = Arc::new(AtomicBool::new(false));
@@ -584,7 +607,7 @@ impl LiveHost {
         };
         Ok(Self {
             _hosting: hosting,
-            node,
+            shared,
             tap: HostTap {
                 agent,
                 screen,
@@ -635,9 +658,72 @@ impl LiveHost {
         self.stop_broadcast.store(true, Ordering::SeqCst);
         let _ = self.broadcaster.join();
         withdraw_address(&self.config, self.thread);
-        if let Ok(node) = Arc::try_unwrap(self.node) {
+        self.shared.threads.remove(self.thread);
+        if let Ok(node) = Arc::try_unwrap(self.shared.node) {
             let _ = node.close();
         }
+    }
+}
+
+/// A live node and the threads it hosts, shared by the hosts of one process, so the user's
+/// node key is bound by one endpoint however many threads it hosts.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedNode {
+    node: Arc<LiveNode>,
+    threads: Arc<HostedThreads>,
+}
+
+impl SharedNode {
+    /// Binds a node with `node_key`, reaching relays as `relays` says, that hosts no thread yet.
+    pub(crate) fn bind(node_key: &NodeKey, relays: Relays) -> Result<Self, HostError> {
+        let threads = Arc::new(HostedThreads::default());
+        let node = Arc::new(LiveNode::bind_live(
+            node_key.secret(),
+            relays,
+            Arc::clone(&threads) as Arc<dyn Peers>,
+        )?);
+        Ok(Self { node, threads })
+    }
+}
+
+/// The participants and `meta` of each thread a node hosts: the node admits a participant of
+/// any of them, since each topic's frames are still checked against its own thread's `meta`,
+/// and serves each thread's `meta` only to that thread's participants.
+#[derive(Debug, Default)]
+pub(crate) struct HostedThreads {
+    threads: Mutex<HashMap<ThreadId, Arc<HostPeers>>>,
+}
+
+impl HostedThreads {
+    fn threads(&self) -> MutexGuard<'_, HashMap<ThreadId, Arc<HostPeers>>> {
+        self.threads.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn add(&self, thread: ThreadId, peers: Arc<HostPeers>) -> bool {
+        let mut threads = self.threads();
+        if threads.contains_key(&thread) {
+            return false;
+        }
+        threads.insert(thread, peers);
+        true
+    }
+
+    fn remove(&self, thread: ThreadId) {
+        self.threads().remove(&thread);
+    }
+
+    fn of(&self, thread: ThreadId) -> Option<Arc<HostPeers>> {
+        self.threads().get(&thread).cloned()
+    }
+}
+
+impl Peers for HostedThreads {
+    fn admits(&self, node: &NodeId) -> bool {
+        self.threads().values().any(|peers| peers.admits(node))
+    }
+
+    fn meta_for(&self, thread: ThreadId, node: &NodeId) -> Option<Vec<u8>> {
+        self.of(thread)?.meta_for(thread, node)
     }
 }
 
@@ -1354,6 +1440,81 @@ mod tests {
             peers.participants(),
             [(hosted.owner_node, ParticipantName::new("alice").unwrap())]
         );
+    }
+
+    #[test]
+    fn one_node_admits_every_hosted_threads_participants_and_serves_each_only_its_own_meta() {
+        let (first, second) = (hosted(), hosted());
+        let threads = HostedThreads::default();
+        assert!(threads.add(first.thread, Arc::new(peers(&first, REREAD_EVERY))));
+        assert!(!threads.add(first.thread, Arc::new(peers(&first, REREAD_EVERY))));
+        assert!(threads.add(second.thread, Arc::new(peers(&second, REREAD_EVERY))));
+        assert!(threads.admits(&first.owner_node));
+        assert!(threads.admits(&second.owner_node));
+        assert!(!threads.admits(bob().node()));
+        let document = threads.meta_for(first.thread, &first.owner_node).unwrap();
+        VerifiedMeta::decode(&document, first.thread, &first.owner).unwrap();
+        assert!(threads.meta_for(first.thread, &second.owner_node).is_none());
+        assert!(threads.meta_for(second.thread, &first.owner_node).is_none());
+        threads.remove(first.thread);
+        assert!(!threads.admits(&first.owner_node));
+        assert!(threads.meta_for(first.thread, &first.owner_node).is_none());
+        assert!(threads.admits(&second.owner_node));
+    }
+
+    #[test]
+    fn hosts_of_two_threads_share_one_node_and_one_stops_without_the_other() {
+        let (first, second) = (hosted(), hosted());
+        let dir = TempDir::new().unwrap();
+        let config = ConfigDir::resolve(Some(dir.path()), Some(dir.path())).unwrap();
+        let shared = SharedNode::bind(&NodeKey::generate().unwrap(), Relays::Disabled).unwrap();
+        let start = |hosted: &Hosted| {
+            let setup = LiveSetup {
+                config: config.clone(),
+                runtime: dir.path().to_path_buf(),
+                node_key: NodeKey::generate().unwrap(),
+                owner: hosted.owner.clone(),
+                relays: Relays::Disabled,
+                bootstrap: Vec::new(),
+            };
+            let lock = LiveLock::try_acquire(&config, hosted.thread)
+                .unwrap()
+                .unwrap();
+            let slot = AgentSlot::new(
+                ParticipantName::new("alice").unwrap(),
+                AgentName::new("claude").unwrap(),
+            );
+            LiveHost::start_on(
+                (&shared, lock),
+                &setup,
+                hosted.store.common_dir(),
+                (
+                    slot,
+                    &LiveKeys::derive(&hosted.thread_key, hosted.thread).unwrap(),
+                ),
+                (WindowSize { rows: 24, cols: 80 }, b""),
+                (Arc::new(Prompts::default()), Arc::new(Claims::default())),
+            )
+            .unwrap()
+        };
+        let one = start(&first);
+        let two = start(&second);
+        assert!(shared.threads.admits(&first.owner_node));
+        assert!(shared.threads.admits(&second.owner_node));
+        one.stop();
+        assert!(!shared.threads.admits(&first.owner_node));
+        assert!(
+            shared
+                .threads
+                .meta_for(second.thread, &second.owner_node)
+                .is_some()
+        );
+        assert!(shared.node.node().is_ok());
+        let again = start(&first);
+        assert!(shared.threads.admits(&first.owner_node));
+        again.stop();
+        two.stop();
+        assert!(!shared.threads.admits(&second.owner_node));
     }
 
     #[test]
