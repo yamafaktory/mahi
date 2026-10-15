@@ -606,9 +606,7 @@ pub(crate) fn resume(
     let owner = session::thread_owner(&store, command.thread, own.clone())
         .map_err(|error| RunError::ThreadOwner(command.thread, error))?;
     let owns_meta = owner == own;
-    let bootstrap: Vec<HostAddress> = live::remembered_host(&store, command.thread)
-        .into_iter()
-        .collect();
+    let bootstrap: Vec<HostAddress> = live::bootstrap(&store, command.thread);
     let _whole_thread = command
         .take_remote
         .then(|| ThreadLock::acquire(&config, command.thread))
@@ -779,7 +777,7 @@ fn start_new_agent(
     let store = Store::discover(&cwd)?;
     let owner = session::thread_owner(&store, thread, own.clone())
         .map_err(|error| RunError::ThreadOwner(thread, error))?;
-    let bootstrap: Vec<HostAddress> = live::remembered_host(&store, thread).into_iter().collect();
+    let bootstrap: Vec<HostAddress> = live::bootstrap(&store, thread);
     let agent_name = session::agent_from(Path::new(program));
     let _lock = AgentLock::acquire(&config, thread, &agent_name)?;
     let slot = AgentSlot::new(participant.clone(), agent_name.clone());

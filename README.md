@@ -229,8 +229,10 @@ the same time also connect to each other directly. [DESIGN.md](DESIGN.md) specif
   relay's URL, never an IP address, so teammates still find it when the address they hold is
   stale. Anyone who knows a node id (a thread's `meta` lists them) can see which relay it uses
   and, by asking again over time, when it was hosting, since the record is republished every
-  5 minutes; `MAHI_LIVE=off` or `MAHI_LIVE=local` publishes nothing. Remembering the last
-  address of every participant of a thread comes next.
+  5 minutes; `MAHI_LIVE=off` or `MAHI_LIVE=local` publishes nothing. While it hosts a thread,
+  mahi also remembers, in the repository's git directory, the last address at which it reached
+  each participant, and joins the thread through those of the participants `meta` still
+  lists, alongside the pkarr lookup.
 - **Agents.** A profile tells mahi how to launch an agent, which hosts it may reach and where
   its state lives. Its hooks report each prompt, tool call and turn end to `mahi hook`, and
   `mahi mcp` serves it the thread's tools over the

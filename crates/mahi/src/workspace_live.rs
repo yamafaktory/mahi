@@ -172,7 +172,7 @@ impl WorkspaceLive {
             node_key,
             owner,
             relays: self.relays,
-            bootstrap: live::remembered_host(&store, thread).into_iter().collect(),
+            bootstrap: live::bootstrap(&store, thread),
         };
         let host = LiveHost::start_on(
             (&shared, lock),

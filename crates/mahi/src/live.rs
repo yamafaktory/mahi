@@ -3,7 +3,10 @@ use std::{
         HashMap,
         VecDeque,
     },
-    fs::File,
+    fs::{
+        self,
+        File,
+    },
     io::{
         self,
         Read,
@@ -35,6 +38,7 @@ use std::{
     time::{
         Duration,
         Instant,
+        SystemTime,
     },
 };
 
@@ -145,6 +149,12 @@ const MAX_SOCKET_PATH: usize = 103;
 #[cfg(not(target_os = "macos"))]
 const MAX_SOCKET_PATH: usize = 107;
 const HOSTS: &str = "hosts";
+const PEERS: &str = "peers";
+/// The most participants' nodes remembered for one thread.
+const MAX_REMEMBERED_PEERS: usize = 32;
+const NODE_NAME_BYTES: usize = 64;
+/// The most entries of a thread's peers directory read, whatever they are.
+const MAX_SCANNED_ENTRIES: usize = 256;
 const MAX_PUBLISHED_BYTES: u64 = 4096;
 const PUBLISH_EVERY: Duration = Duration::from_secs(2);
 /// How long a host that stops keeps telling senders their prompts were dropped.
@@ -193,23 +203,127 @@ pub(crate) fn publish_address(
 /// Returns where the running host of `thread` said it can be reached, if it did.
 pub(crate) fn published_address(config: &ConfigDir, thread: ThreadId) -> Option<HostAddress> {
     let directory = published_dir(config).ok()?;
-    read_address(&directory, thread)
+    read_address(&directory, &thread.to_string())
 }
 
-fn hosts_dir(store: &Store) -> io::Result<OwnedFd> {
-    let parent = store.common_dir().join("mahi");
+fn mahi_dir(git_dir: &Path) -> io::Result<OwnedFd> {
+    let parent = git_dir.join("mahi");
     profile::create_private_dir(&parent)?;
-    let parent = rustix::fs::open(
+    Ok(rustix::fs::open(
         &parent,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
-    profile::open_private_dir(&parent, HOSTS)?.ok_or_else(|| {
+    )?)
+}
+
+fn private_dir(parent: &OwnedFd, name: &str) -> io::Result<OwnedFd> {
+    profile::open_private_dir(parent, name)?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "the hosts directory is not a private directory",
+            "mahi's directory of remembered addresses is not a private directory",
         )
     })
+}
+
+fn hosts_dir(store: &Store) -> io::Result<OwnedFd> {
+    private_dir(&mahi_dir(store.common_dir())?, HOSTS)
+}
+
+fn peers_dir(git_dir: &Path, thread: ThreadId) -> io::Result<OwnedFd> {
+    let peers = private_dir(&mahi_dir(git_dir)?, PEERS)?;
+    private_dir(&peers, &thread.to_string())
+}
+
+/// Keeps, in the git directory `git_dir`, where a participant's node was last reached in
+/// `thread`, so the thread's topic is rejoined through it later; at most
+/// [`MAX_REMEMBERED_PEERS`] are kept for a thread, the one remembered longest ago going first.
+pub(crate) fn remember_peer(
+    git_dir: &Path,
+    thread: ThreadId,
+    address: &HostAddress,
+) -> io::Result<()> {
+    let bytes = address
+        .to_bytes()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let directory = peers_dir(git_dir, thread)?;
+    let name = address.node().to_string();
+    let path = git_dir.join("mahi").join(PEERS).join(thread.to_string());
+    let mut known = remembered_names(&path);
+    if !known.iter().any(|(known, _)| *known == name) {
+        known.sort_by_key(|(_, at)| *at);
+        let over = (known.len() + 1).saturating_sub(MAX_REMEMBERED_PEERS);
+        for (oldest, _) in known.iter().take(over) {
+            rustix::fs::unlinkat(&directory, oldest.as_str(), rustix::fs::AtFlags::empty())?;
+        }
+    }
+    profile::replace(&directory, &name, &bytes)
+}
+
+/// Returns where the participants' nodes were last reached in `thread`, as the git directory
+/// `git_dir` remembers them.
+pub(crate) fn remembered_peers(git_dir: &Path, thread: ThreadId) -> Vec<HostAddress> {
+    let path = git_dir.join("mahi").join(PEERS).join(thread.to_string());
+    if !path.is_dir() {
+        return Vec::new();
+    }
+    let Ok(directory) = peers_dir(git_dir, thread) else {
+        return Vec::new();
+    };
+    remembered_names(&path)
+        .iter()
+        .filter_map(|(name, _)| {
+            read_address(&directory, name).filter(|address| address.node().to_string() == *name)
+        })
+        .take(MAX_REMEMBERED_PEERS)
+        .collect()
+}
+
+/// Returns the peers to join `thread`'s topic through: the host of the ticket it was joined
+/// with, then every participant's node remembered, each once.
+pub(crate) fn bootstrap(store: &Store, thread: ThreadId) -> Vec<HostAddress> {
+    let mut found: Vec<HostAddress> = remembered_host(store, thread).into_iter().collect();
+    for peer in remembered_peers(store.common_dir(), thread) {
+        if !found.iter().any(|known| known.node() == peer.node()) {
+            found.push(peer);
+        }
+    }
+    found
+}
+
+/// Forgets every address remembered for `thread`, as purging it does.
+pub(crate) fn forget_addresses(store: &Store, thread: ThreadId) {
+    if let Ok(hosts) = hosts_dir(store) {
+        let _ = rustix::fs::unlinkat(
+            &hosts,
+            thread.to_string().as_str(),
+            rustix::fs::AtFlags::empty(),
+        );
+    }
+    let path = store
+        .common_dir()
+        .join("mahi")
+        .join(PEERS)
+        .join(thread.to_string());
+    let _ = fs::remove_dir_all(path);
+}
+
+fn remembered_names(path: &Path) -> Vec<(String, SystemTime)> {
+    let Ok(entries) = fs::read_dir(path) else {
+        return Vec::new();
+    };
+    entries
+        .take(MAX_SCANNED_ENTRIES)
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let metadata = entry.metadata().ok()?;
+            (name.len() == NODE_NAME_BYTES
+                && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && metadata.is_file())
+            .then(|| Some((name, metadata.modified().ok()?)))
+            .flatten()
+        })
+        .collect()
 }
 
 /// Keeps, in the repository's git directory, where the host of a joined thread was last
@@ -224,13 +338,13 @@ pub(crate) fn remember_host(store: &Store, thread: ThreadId, host: &HostAddress)
 /// Returns where the host of a joined thread was last reached, if it was joined here.
 pub(crate) fn remembered_host(store: &Store, thread: ThreadId) -> Option<HostAddress> {
     let directory = hosts_dir(store).ok()?;
-    read_address(&directory, thread)
+    read_address(&directory, &thread.to_string())
 }
 
-fn read_address(directory: &OwnedFd, thread: ThreadId) -> Option<HostAddress> {
+fn read_address(directory: &OwnedFd, name: &str) -> Option<HostAddress> {
     let file = rustix::fs::openat(
         directory,
-        thread.to_string().as_str(),
+        name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -578,7 +692,13 @@ impl LiveHost {
         withdraw_address(&setup.config, thread);
         let shared = shared.clone();
         let node = Arc::clone(&shared.node);
-        let topic = Arc::new(node.join(keys.topic(), &setup.bootstrap, None)?);
+        let listed: Vec<HostAddress> = setup
+            .bootstrap
+            .iter()
+            .filter(|peer| participants.iter().any(|(node, _)| node == peer.node()))
+            .cloned()
+            .collect();
+        let topic = Arc::new(node.join(keys.topic(), &listed, None)?);
         let sender = FrameSender::new(keys.clone(), setup.node_key.secret())?;
         let mut receiver = FrameReceiver::new(keys.clone(), participants);
         receiver.take_prompts_for(&sender, owner.clone());
@@ -617,14 +737,15 @@ impl LiveHost {
             topic,
             receiver,
             registry: Arc::clone(&registry),
-            peers,
+            peers: Arc::clone(&peers),
             wanted,
             stop: Arc::clone(&stop),
             claims: Arc::clone(&claims),
         };
         let publisher = {
             let (node, stop, config) = (Arc::clone(&node), Arc::clone(&stop), setup.config.clone());
-            thread::spawn(move || publish(&node, &stop, &config, thread))
+            let (git_dir, peers) = (git_dir.to_path_buf(), Arc::clone(&peers));
+            thread::spawn(move || publish(&node, &stop, (&config, &git_dir), (thread, &peers)))
         };
         Ok(Self {
             _hosting: hosting,
@@ -953,15 +1074,30 @@ pub(crate) fn private_socket(runtime: &Path, name: &str) -> io::Result<PathBuf> 
     Ok(socket)
 }
 
-/// Keeps the host's published address current: the relay it reaches, and its direct addresses.
-fn publish(node: &LiveNode, stop: &AtomicBool, config: &ConfigDir, thread: ThreadId) {
+/// Keeps the host's published address current, the relay it reaches and its direct
+/// addresses, and remembers where each of the thread's participants is reached.
+fn publish(
+    node: &LiveNode,
+    stop: &AtomicBool,
+    (config, git_dir): (&ConfigDir, &Path),
+    (thread, peers): (ThreadId, &HostPeers),
+) {
     let mut published: Option<HostAddress> = None;
+    let mut remembered: HashMap<NodeId, HostAddress> = HashMap::new();
     while !stop.load(Ordering::SeqCst) {
         if let Ok(address) = node.address(Duration::ZERO)
             && published.as_ref() != Some(&address)
             && publish_address(config, thread, &address).is_ok()
         {
             published = Some(address);
+        }
+        for (participant, _) in peers.participants() {
+            if let Some(address) = node.reached(&participant)
+                && remembered.get(&participant) != Some(&address)
+                && remember_peer(git_dir, thread, &address).is_ok()
+            {
+                remembered.insert(participant, address);
+            }
         }
         let deadline = Instant::now() + PUBLISH_EVERY;
         while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
@@ -1643,6 +1779,76 @@ mod tests {
         drop(guest);
         host.stop();
         assert!(!shared.threads.admits(&hosted.owner_node));
+    }
+
+    fn peer_addresses(count: usize) -> Vec<HostAddress> {
+        (0..count)
+            .map(|_| {
+                let node = NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap();
+                HostAddress::new(
+                    node,
+                    Some("https://relay.example/".parse().unwrap()),
+                    Vec::new(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_peers_of_a_thread_are_remembered_at_most_32_the_oldest_going_first() {
+        let hosted = hosted();
+        let git_dir = hosted.store.common_dir();
+        let addresses = peer_addresses(33);
+        remember_peer(git_dir, hosted.thread, &addresses[0]).unwrap();
+        let first = git_dir
+            .join("mahi")
+            .join(PEERS)
+            .join(hosted.thread.to_string())
+            .join(addresses[0].node().to_string());
+        File::options()
+            .write(true)
+            .open(first)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        for address in &addresses[1..] {
+            remember_peer(git_dir, hosted.thread, address).unwrap();
+        }
+        let peers = remembered_peers(git_dir, hosted.thread);
+        assert_eq!(peers.len(), MAX_REMEMBERED_PEERS);
+        assert!(!peers.contains(&addresses[0]));
+        assert!(peers.contains(&addresses[32]));
+        assert!(remembered_peers(git_dir, ThreadId::random().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_remembered_peer_is_read_only_under_its_own_node_and_purging_forgets_it() {
+        let hosted = hosted();
+        let git_dir = hosted.store.common_dir();
+        let addresses = peer_addresses(3);
+        let (host, peer, other) = (&addresses[0], &addresses[1], &addresses[2]);
+        remember_host(&hosted.store, hosted.thread, host).unwrap();
+        remember_peer(git_dir, hosted.thread, host).unwrap();
+        remember_peer(git_dir, hosted.thread, peer).unwrap();
+        let directory = git_dir
+            .join("mahi")
+            .join(PEERS)
+            .join(hosted.thread.to_string());
+        fs::copy(
+            directory.join(peer.node().to_string()),
+            directory.join(other.node().to_string()),
+        )
+        .unwrap();
+        fs::write(directory.join("notes"), b"x").unwrap();
+        assert_eq!(remembered_peers(git_dir, hosted.thread).len(), 2);
+        assert_eq!(
+            bootstrap(&hosted.store, hosted.thread),
+            [host.clone(), peer.clone()]
+        );
+        forget_addresses(&hosted.store, hosted.thread);
+        assert!(bootstrap(&hosted.store, hosted.thread).is_empty());
+        assert!(!directory.exists());
     }
 
     #[test]

@@ -441,6 +441,7 @@ fn remove_local(
             Err(error) => return Err(error.into()),
         }
     }
+    crate::live::forget_addresses(store, thread);
     match fs::remove_dir_all(session::state_root(store, thread)) {
         Ok(()) => report.push_str("removed the agents' state\n"),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}

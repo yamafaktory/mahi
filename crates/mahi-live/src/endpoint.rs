@@ -12,8 +12,10 @@ use std::{
 
 use iroh::{
     Endpoint,
+    PublicKey,
     RelayMode,
     SecretKey,
+    TransportAddr,
     address_lookup::memory::MemoryLookup,
     endpoint::{
         BindError,
@@ -21,6 +23,7 @@ use iroh::{
         Builder,
         ConnectError,
         InvalidSocketAddr,
+        TransportAddrUsage,
     },
     protocol::Router,
 };
@@ -60,6 +63,7 @@ use crate::{
         META_ALPN,
         MetaHandler,
     },
+    ticket::is_plain_relay,
 };
 
 const WORKER_THREADS: usize = 2;
@@ -67,6 +71,7 @@ const FIRST_STABLE_PORT: u16 = 49_152;
 const STABLE_PORTS: u16 = 16_384;
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 const FETCH_WAIT: Duration = Duration::from_secs(20);
+const REACHED_WAIT: Duration = Duration::from_secs(1);
 
 /// Which relays an endpoint uses to reach peers it cannot reach directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +388,30 @@ impl LiveNode {
         Ok(())
     }
 
+    /// Returns where `node` is reached now, when this node uses an address of it: its relay
+    /// and its direct addresses that a ticket could hold, so it can be remembered for later.
+    #[must_use]
+    pub fn reached(&self, node: &NodeId) -> Option<HostAddress> {
+        outside_runtime().ok()?;
+        let id = PublicKey::from_bytes(node.as_bytes()).ok()?;
+        let info = self
+            .runtime()
+            .ok()?
+            .block_on(async {
+                tokio::time::timeout(REACHED_WAIT, self.endpoint.remote_info(id)).await
+            })
+            .ok()??;
+        reached_at(
+            *node,
+            info.addrs().map(|address| {
+                (
+                    address.addr(),
+                    matches!(address.usage(), TransportAddrUsage::Active),
+                )
+            }),
+        )
+    }
+
     fn runtime(&self) -> Result<&Runtime, LiveError> {
         self.runtime.as_ref().ok_or(LiveError::Closed)
     }
@@ -415,6 +444,36 @@ impl Drop for LiveNode {
     fn drop(&mut self) {
         self.shut_down();
     }
+}
+
+/// Returns `node`'s address made of `addresses` when one of them is in active use: its relay,
+/// and its direct addresses in active use, which a ticket could hold, since a direct address
+/// iroh only heard of, from a peer that names it, is not one the node was reached at.
+fn reached_at<'a>(
+    node: NodeId,
+    addresses: impl Iterator<Item = (&'a TransportAddr, bool)>,
+) -> Option<HostAddress> {
+    let mut relay = None;
+    let mut direct = Vec::with_capacity(MAX_DIRECT_ADDRESSES);
+    let mut used = false;
+    for (address, active) in addresses {
+        used |= active;
+        match address {
+            TransportAddr::Relay(url) if relay.is_none() && is_plain_relay(url) => {
+                relay = Some(url.clone());
+            }
+            TransportAddr::Ip(ip)
+                if active && direct.len() < MAX_DIRECT_ADDRESSES && is_reachable(ip) =>
+            {
+                direct.push(*ip);
+            }
+            _ => {}
+        }
+    }
+    let usable = relay.is_some() || !direct.is_empty();
+    (used && usable)
+        .then(|| HostAddress::new(node, relay, direct).ok())
+        .flatten()
 }
 
 /// Returns the UDP port a node listens on when it is free: one of the 16384 dynamic ports,
@@ -484,6 +543,41 @@ fn outside_runtime() -> Result<(), LiveError> {
 mod tests {
     use super::*;
     use crate::testing::random_secret;
+
+    #[test]
+    fn a_reached_peer_is_remembered_only_while_in_use_and_only_as_a_ticket_could_hold_it() {
+        let node = NodeId::from_bytes(*SecretKey::from_bytes(&random_secret()).public().as_bytes())
+            .unwrap();
+        let relay = TransportAddr::Relay("https://relay.example/".parse().unwrap());
+        let local = TransportAddr::Relay("https://localhost/".parse().unwrap());
+        let ip = |text: &str| TransportAddr::Ip(text.parse().unwrap());
+        let lan = ip("192.168.1.5:4000");
+        let unspecified = ip("0.0.0.0:4000");
+        let used = reached_at(
+            node,
+            [
+                (&local, false),
+                (&relay, true),
+                (&unspecified, false),
+                (&lan, false),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            used.relay().map(ToString::to_string).as_deref(),
+            Some("https://relay.example/")
+        );
+        assert!(used.direct().is_empty());
+        assert!(reached_at(node, [(&relay, false), (&lan, false)].into_iter()).is_none());
+        assert!(reached_at(node, [(&local, true), (&unspecified, true)].into_iter()).is_none());
+        let many: Vec<TransportAddr> = (0..12)
+            .map(|port| ip(&format!("192.168.1.5:{}", 4000 + port)))
+            .collect();
+        let capped = reached_at(node, many.iter().map(|address| (address, true))).unwrap();
+        assert_eq!(capped.direct().len(), MAX_DIRECT_ADDRESSES);
+        assert!(capped.relay().is_none());
+    }
 
     #[test]
     fn a_node_speaks_as_its_key_and_is_reachable_directly_without_relays() {
