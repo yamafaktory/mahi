@@ -224,12 +224,13 @@ the same time also connect to each other directly. [DESIGN.md](DESIGN.md) specif
   with a key derived from the thread key so only its participants can read them. TLS is
   [rustls](https://github.com/rustls/rustls) with mahi's own pure-Rust crypto provider, built
   on [RustCrypto](https://github.com/RustCrypto). An invite ticket carries the host's address
-  and the key a joiner must trust. Coming with the workspace: to reach a teammate without a
-  ticket, mahi will try the addresses it remembers for the thread, then look up the relay their
-  mahi uses in a record it publishes while it hosts an agent, signed with its node key, through
-  n0's DNS service. The record will hold only the relay's URL, never an IP address, but anyone
-  who knows a node id (a thread's `meta` lists them) will be able to see whether that node is
-  hosting and which relay it uses. `MAHI_LIVE=off` or `MAHI_LIVE=local` will publish nothing.
+  and the key a joiner must trust. While a mahi hosts an agent with the public relays, it also
+  publishes a record, signed with its node key, through n0's pkarr server, holding only the
+  relay's URL, never an IP address, so teammates still find it when the address they hold is
+  stale. Anyone who knows a node id (a thread's `meta` lists them) can see which relay it uses
+  and, by asking again over time, when it was hosting, since the record is republished every
+  5 minutes; `MAHI_LIVE=off` or `MAHI_LIVE=local` publishes nothing. Remembering the last
+  address of every participant of a thread comes next.
 - **Agents.** A profile tells mahi how to launch an agent, which hosts it may reach and where
   its state lives. Its hooks report each prompt, tool call and turn end to `mahi hook`, and
   `mahi mcp` serves it the thread's tools over the

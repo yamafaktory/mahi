@@ -7,6 +7,7 @@ mod frame;
 pub mod fuzzing;
 mod gossip;
 mod local;
+mod lookup;
 mod meta;
 mod pair;
 #[cfg(test)]

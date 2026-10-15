@@ -734,7 +734,7 @@ impl SharedNode {
     /// Binds a node with `node_key`, reaching relays as `relays` says, that hosts no thread yet.
     pub(crate) fn bind(node_key: &NodeKey, relays: Relays) -> Result<Self, HostError> {
         let threads = Arc::new(HostedThreads::default());
-        let node = Arc::new(LiveNode::bind_live(
+        let node = Arc::new(LiveNode::bind_host(
             node_key.secret(),
             relays,
             Arc::clone(&threads) as Arc<dyn Peers>,

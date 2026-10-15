@@ -51,6 +51,10 @@ use crate::{
         MAX_GOSSIP_MESSAGE_BYTES,
     },
     is_reachable,
+    lookup::{
+        Lookup,
+        with_lookups,
+    },
     meta::{
         self,
         META_ALPN,
@@ -168,11 +172,13 @@ impl LiveNode {
     /// [`LiveError::Runtime`] if the runtime cannot start, or [`LiveError::Bind`] if the
     /// endpoint cannot bind its sockets.
     pub fn bind(secret: &[u8; 32], relays: Relays) -> Result<Self, LiveError> {
-        Self::bind_with(secret, relays, None)
+        Self::bind_with(secret, relays, (None, Lookup::None))
     }
 
     /// Binds an endpoint like [`LiveNode::bind`] that can join live topics, admitting the
-    /// nodes `peers` admits, and serves `meta` from `peers` to the nodes it accepts.
+    /// nodes `peers` admits, and serves `meta` from `peers` to the nodes it accepts. With the
+    /// public relays, it also finds a peer it has no address for at the relay the peer's host
+    /// published, through n0's pkarr server.
     ///
     /// # Errors
     ///
@@ -182,13 +188,28 @@ impl LiveNode {
         relays: Relays,
         source: Arc<dyn Peers>,
     ) -> Result<Self, LiveError> {
-        Self::bind_with(secret, relays, Some(source))
+        Self::bind_with(secret, relays, (Some(source), Lookup::Resolve))
+    }
+
+    /// Binds an endpoint like [`LiveNode::bind_live`] for a host, which, with the public
+    /// relays, also publishes, signed with its node key, a record holding only its relay's
+    /// URL, so its participants find it without a ticket.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`LiveNode::bind`].
+    pub fn bind_host(
+        secret: &[u8; 32],
+        relays: Relays,
+        source: Arc<dyn Peers>,
+    ) -> Result<Self, LiveError> {
+        Self::bind_with(secret, relays, (Some(source), Lookup::Publish))
     }
 
     fn bind_with(
         secret: &[u8; 32],
         relays: Relays,
-        source: Option<Arc<dyn Peers>>,
+        (source, lookup): (Option<Arc<dyn Peers>>, Lookup),
     ) -> Result<Self, LiveError> {
         outside_runtime()?;
         let runtime = runtime::Builder::new_multi_thread()
@@ -205,10 +226,17 @@ impl LiveNode {
             .map_or(0, |node| stable_port(&node));
         let addresses = MemoryLookup::new();
         let stable = builder(&secret_key, relay_mode.clone(), port, &addresses)?;
-        let endpoint = match runtime.block_on(stable.bind()) {
+        let endpoint = match runtime.block_on(with_lookups(stable, relays, lookup).bind()) {
             Ok(endpoint) => endpoint,
             Err(_) => runtime
-                .block_on(builder(&secret_key, relay_mode, 0, &addresses)?.bind())
+                .block_on(
+                    with_lookups(
+                        builder(&secret_key, relay_mode, 0, &addresses)?,
+                        relays,
+                        lookup,
+                    )
+                    .bind(),
+                )
                 .map_err(|error| LiveError::Bind(Box::new(error)))?,
         };
         let (router, gossip) = match source {

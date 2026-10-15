@@ -357,7 +357,7 @@ pub fn is_reachable(address: &SocketAddr) -> bool {
     ip_usable && address.port() != 0
 }
 
-fn is_plain_relay(relay: &RelayUrl) -> bool {
+pub(crate) fn is_plain_relay(relay: &RelayUrl) -> bool {
     let Some(domain) = relay.domain() else {
         return false;
     };

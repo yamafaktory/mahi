@@ -200,10 +200,14 @@ impl WorkspaceLive {
         self.hosted.contains_key(&thread)
     }
 
-    /// Stops hosting `thread`, once none of its tabs is open.
+    /// Stops hosting `thread`, once none of its tabs is open, and closes the node once it
+    /// hosts no thread, so it no longer publishes where it is.
     pub(crate) fn release(&mut self, thread: ThreadId) {
         if let Some((host, hub)) = self.hosted.remove(&thread) {
             stop(host, hub);
+        }
+        if self.hosted.is_empty() {
+            self.shared = None;
         }
     }
 }
@@ -330,6 +334,7 @@ pub(crate) mod tests {
         assert!(socket.exists());
         live.release(setup.thread);
         assert!(live.hosted.is_empty());
+        assert!(live.shared.is_none());
         assert!(
             LiveLock::try_acquire(&setup.config, setup.thread)
                 .unwrap()
