@@ -26,9 +26,14 @@ pub(crate) fn connect(fd: i32) {
     }
 }
 
+/// Returns whether a workspace started this mahi and reads its reports.
+pub(crate) fn connected() -> bool {
+    PIPE.get().is_some()
+}
+
 /// Tells the workspace that started this mahi `report`, if one did; a report the pipe has no
 /// room for is dropped.
-pub(crate) fn send(report: Report) {
+pub(crate) fn send(report: &Report) {
     let Some(mut pipe) = PIPE.get() else {
         return;
     };
@@ -52,8 +57,8 @@ mod tests {
     fn reports_reach_the_pipe_and_none_waits_once_it_is_full() {
         let (reader, writer) = rustix::pipe::pipe().unwrap();
         connect(writer.into_raw_fd());
-        send(Report::Working);
-        send(Report::Done);
+        send(&Report::Working);
+        send(&Report::Done);
         let mut reader = File::from(reader);
         let mut read = [0_u8; 64];
         let length = reader.read(&mut read).unwrap();
@@ -62,7 +67,7 @@ mod tests {
         assert_eq!(reports, [Report::Working, Report::Done]);
         let started = std::time::Instant::now();
         for _ in 0..100_000 {
-            send(Report::Working);
+            send(&Report::Working);
         }
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }

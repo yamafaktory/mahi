@@ -298,7 +298,7 @@ impl State {
         let count = self.waiting.len();
         if count != self.reported {
             self.reported = count;
-            crate::report::send(Report::Prompts(u16::try_from(count).unwrap_or(u16::MAX)));
+            crate::report::send(&Report::Prompts(u16::try_from(count).unwrap_or(u16::MAX)));
         }
     }
 

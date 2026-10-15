@@ -2,11 +2,12 @@ use std::io::Write as _;
 
 use mahi_core::ThreadId;
 
-const MAX_LINE_BYTES: usize = 64;
+const MAX_LINE_BYTES: usize = 511;
+const NOTIFY: &str = "notify ";
 
 /// What a mahi the workspace started tells it about its agent, on a pipe of their own: one
 /// line each, which the agent cannot write, unlike its terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Report {
     /// The agent's thread.
     Thread(ThreadId),
@@ -18,12 +19,31 @@ pub enum Report {
     Asks,
     /// How many of the teammates' prompts wait for the user.
     Prompts(u16),
+    /// A notification for the user, such as a teammate's prompt that came.
+    Notify(String),
 }
 
 impl Report {
-    /// Writes the report into `out` as its line.
-    pub fn write(self, out: &mut Vec<u8>) {
+    /// Writes the report into `out` as its line; a notification's control characters become
+    /// spaces, and its text is cut to what a line holds.
+    pub fn write(&self, out: &mut Vec<u8>) {
         let _ = match self {
+            Self::Notify(text) => {
+                out.extend_from_slice(NOTIFY.as_bytes());
+                let room = MAX_LINE_BYTES - NOTIFY.len();
+                let mut used = 0;
+                let mut buffer = [0_u8; 4];
+                for c in text.chars() {
+                    let c = if c.is_control() { ' ' } else { c };
+                    let encoded = c.encode_utf8(&mut buffer);
+                    used += encoded.len();
+                    if used > room {
+                        break;
+                    }
+                    out.extend_from_slice(encoded.as_bytes());
+                }
+                writeln!(out)
+            }
             Self::Thread(id) => writeln!(out, "thread {id}"),
             Self::Working => writeln!(out, "working"),
             Self::Done => writeln!(out, "done"),
@@ -38,6 +58,10 @@ impl Report {
             b"done" => return Some(Self::Done),
             b"asks" => return Some(Self::Asks),
             _ => {}
+        }
+        if let Some(text) = line.strip_prefix(NOTIFY.as_bytes()) {
+            let text = std::str::from_utf8(text).ok()?;
+            return (!text.chars().any(char::is_control)).then(|| Self::Notify(text.to_owned()));
         }
         if let Some(id) = line.strip_prefix(b"thread ") {
             return std::str::from_utf8(id).ok()?.parse().ok().map(Self::Thread);
@@ -59,8 +83,8 @@ impl Report {
     }
 }
 
-/// Reads the reports a mahi writes, from the pieces its pipe gives: a line longer than 64
-/// bytes is skipped to its end, and one that is no report is ignored.
+/// Reads the reports a mahi writes, from the pieces its pipe gives: a line longer than 511
+/// bytes before its newline is skipped to its end, and one that is no report is ignored.
 #[derive(Debug)]
 pub struct ReportReader {
     line: [u8; MAX_LINE_BYTES],
@@ -129,9 +153,11 @@ mod tests {
             Report::Prompts(0),
             Report::Done,
             Report::Asks,
+            Report::Notify("bob sent a prompt: fix the parser".to_owned()),
+            Report::Notify(String::new()),
         ];
         let mut out = Vec::new();
-        for report in written {
+        for report in &written {
             report.write(&mut out);
         }
         assert_eq!(read(&[&out]), written);
@@ -140,18 +166,16 @@ mod tests {
     }
 
     #[test]
-    fn a_line_of_up_to_64_bytes_is_read_and_a_longer_one_skipped_to_its_end() {
-        let mut fits = b"prompts 1".to_vec();
-        fits.resize(64, b' ');
-        fits.push(b'\n');
-        assert_eq!(read(&[&fits]), []);
-        let mut exact = vec![b'0'; 56];
-        exact.splice(0..0, b"prompts ".iter().copied());
-        assert_eq!(exact.len(), 64);
+    fn a_line_of_up_to_511_bytes_and_its_newline_is_read_and_a_longer_one_skipped_to_its_end() {
+        let mut exact = b"notify ".to_vec();
+        exact.resize(511, b'x');
         exact.push(b'\n');
-        assert_eq!(read(&[&exact, b"done\n"]), [Report::Done]);
-        let mut long = b"done".to_vec();
-        long.resize(65, b'x');
+        assert_eq!(
+            read(&[&exact, b"done\n"]),
+            [Report::Notify("x".repeat(504)), Report::Done]
+        );
+        let mut long = b"notify ".to_vec();
+        long.resize(512, b'x');
         long.extend_from_slice(b"\ndone\n");
         assert_eq!(read(&[&long]), [Report::Done]);
     }
@@ -168,9 +192,29 @@ mod tests {
             b"prompts 99999\n",
             b"done\r\n",
             b"sleeping\n",
+            b"notify a\tb\n",
+            b"notify \xff\n",
+            b"notify\n",
             b"done",
         ] {
             assert_eq!(read(&[line]), [], "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_notification_is_written_on_one_line_cut_to_fit_and_read_back() {
+        let mut out = Vec::new();
+        Report::Notify("two\nlines\r\x1b]9;x\x07".to_owned()).write(&mut out);
+        assert_eq!(out, b"notify two lines  ]9;x \n");
+        for (long, kept) in [("é".repeat(400), 252), ("x".repeat(600), 504)] {
+            let mut out = Vec::new();
+            Report::Notify(long).write(&mut out);
+            assert!(out.len() <= 512, "{}", out.len());
+            let reports = read(&[&out]);
+            let [Report::Notify(text)] = reports.as_slice() else {
+                panic!("{reports:?}");
+            };
+            assert_eq!(text.chars().count(), kept);
         }
     }
 }

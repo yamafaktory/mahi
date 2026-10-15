@@ -100,13 +100,13 @@ impl Activity {
         if effect.interrupts {
             self.asking.store(false, Ordering::SeqCst);
             if self.turn_open.swap(false, Ordering::SeqCst) {
-                crate::report::send(Report::Done);
+                crate::report::send(&Report::Done);
             }
         }
         if let Some(empty) = effect.line_empty {
             self.line_empty.store(empty, Ordering::SeqCst);
             if !effect.interrupts && self.asking.swap(false, Ordering::SeqCst) {
-                crate::report::send(Report::Working);
+                crate::report::send(&Report::Working);
             }
         }
     }
@@ -117,21 +117,21 @@ impl Activity {
             HookKind::Prompt => {
                 self.turn_open.store(true, Ordering::SeqCst);
                 self.asking.store(false, Ordering::SeqCst);
-                crate::report::send(Report::Working);
+                crate::report::send(&Report::Working);
             }
             HookKind::TurnEnd => {
                 self.turn_open.store(false, Ordering::SeqCst);
                 self.asking.store(false, Ordering::SeqCst);
-                crate::report::send(Report::Done);
+                crate::report::send(&Report::Done);
             }
             HookKind::Tool => {
                 if self.asking.swap(false, Ordering::SeqCst) {
-                    crate::report::send(Report::Working);
+                    crate::report::send(&Report::Working);
                 }
             }
             HookKind::Asks => {
                 if asks_user(payload) && !self.asking.swap(true, Ordering::SeqCst) {
-                    crate::report::send(Report::Asks);
+                    crate::report::send(&Report::Asks);
                 }
             }
         }

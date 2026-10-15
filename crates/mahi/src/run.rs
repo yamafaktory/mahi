@@ -1443,7 +1443,7 @@ impl Prepared {
     }
 
     fn announce(&self, started: &Started) {
-        crate::report::send(mahi_term::Report::Thread(started.thread));
+        crate::report::send(&mahi_term::Report::Thread(started.thread));
         eprintln!(
             "mahi: thread {} in {}",
             started.thread,
@@ -2648,27 +2648,11 @@ fn relay(
         forward_input(&input_writer, input, &input_activity, &input_quitting);
     });
     let running = Arc::new(AtomicBool::new(palette.is_some()));
-    let (tick_screen, ticking) = (Arc::clone(&screen), Arc::clone(&running));
-    let told = prompts.clone().zip(palette);
-    thread::spawn(move || {
-        let mut arrivals = Vec::new();
-        let mut notice = Vec::new();
-        let mut text = String::new();
-        while ticking.load(Ordering::SeqCst) {
-            thread::sleep(PALETTE_TICK);
-            let _ = tick_screen.tick();
-            if let Some((prompts, (key, notifier))) = &told {
-                prompts.take_arrivals(&mut arrivals);
-                for arrival in arrivals.drain(..) {
-                    notice.clear();
-                    text.clear();
-                    arrival_text(&arrival, *key, &mut text);
-                    notifier.write("mahi", &text, &mut notice);
-                    let _ = tick_screen.notify(&notice);
-                }
-            }
-        }
-    });
+    spawn_ticker(
+        Arc::clone(&screen),
+        Arc::clone(&running),
+        prompts.clone().zip(palette),
+    );
     let merge_server = spawn_merges(
         merging,
         (
@@ -2759,6 +2743,39 @@ fn follow_resizes(
             }
         }
     })
+}
+
+/// Ticks the palette's `screen` each second while `ticking` holds, and tells the user of each
+/// teammate's prompt that came to `told`'s prompts: through the workspace that started this
+/// mahi, if one did, otherwise with `told`'s notice on the terminal.
+fn spawn_ticker(
+    screen: Arc<UserScreen>,
+    ticking: Arc<AtomicBool>,
+    told: Option<(Arc<Prompts>, (PaletteKey, Notice))>,
+) {
+    thread::spawn(move || {
+        let mut arrivals = Vec::new();
+        let mut notice = Vec::new();
+        let mut text = String::new();
+        while ticking.load(Ordering::SeqCst) {
+            thread::sleep(PALETTE_TICK);
+            let _ = screen.tick();
+            if let Some((prompts, (key, notifier))) = &told {
+                prompts.take_arrivals(&mut arrivals);
+                for arrival in arrivals.drain(..) {
+                    notice.clear();
+                    text.clear();
+                    arrival_text(&arrival, *key, &mut text);
+                    if crate::report::connected() {
+                        crate::report::send(&mahi_term::Report::Notify(std::mem::take(&mut text)));
+                        continue;
+                    }
+                    notifier.write("mahi", &text, &mut notice);
+                    let _ = screen.notify(&notice);
+                }
+            }
+        }
+    });
 }
 
 fn arrival_text(arrival: &Arrival, key: PaletteKey, out: &mut String) {
@@ -3263,7 +3280,8 @@ fn linked_admin(link: &Path, git_dir: &Path) -> Option<PathBuf> {
         .then_some(admin)
 }
 
-fn notice(environment: &Environment) -> Notice {
+/// Chooses how the user's terminal, as `environment` describes it, raises a notification.
+pub(crate) fn notice(environment: &Environment) -> Notice {
     Notice::for_terminal(TerminalHints {
         term: environment.term.as_deref(),
         term_program: environment.term_program.as_deref(),

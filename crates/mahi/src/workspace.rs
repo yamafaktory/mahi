@@ -37,6 +37,7 @@ use mahi_term::{
     ListHit,
     ListPlace,
     MouseEvent,
+    Notice,
     PaletteKey,
     Report,
     ReportReader,
@@ -337,6 +338,7 @@ pub(crate) struct Workspace {
     pending: Vec<u8>,
     screen: WindowSize,
     mouse: MouseState,
+    notice: Notice,
 }
 
 /// What the workspace keeps of the mouse between reads.
@@ -406,8 +408,9 @@ pub(crate) enum Moved {
 }
 
 impl Workspace {
-    /// Starts a workspace with no thread open, whose keys follow `palette_key`.
-    pub(crate) fn new(palette_key: PaletteKey) -> Self {
+    /// Starts a workspace with no thread open, whose keys follow `palette_key`, and which
+    /// raises its agents' notifications as `notice` says the user's terminal does.
+    pub(crate) fn new(palette_key: PaletteKey, notice: Notice) -> Self {
         let (sender, events) = mpsc::sync_channel(QUEUED_WRITES);
         Self {
             tabs: Vec::new(),
@@ -424,6 +427,7 @@ impl Workspace {
             pending: Vec::new(),
             screen: WindowSize { rows: 2, cols: 2 },
             mouse: MouseState::default(),
+            notice,
         }
     }
 
@@ -503,8 +507,8 @@ impl Workspace {
     }
 
     /// Draws what the children wrote since the last call into their screens, and writes to
-    /// `out` what the shown agent asks of the user's terminal itself; returns whether the
-    /// shown agent's screen changed.
+    /// `out` what the shown agent asks of the user's terminal itself and the notifications
+    /// any child reported; returns whether the shown agent's screen changed.
     pub(crate) fn take_output(&mut self, out: &mut Vec<u8>) -> bool {
         let shown = self.shown_id().filter(|&id| self.applied == Some(id));
         let mut changed = false;
@@ -523,8 +527,9 @@ impl Workspace {
                     }
                     self.passed = passed;
                 }
+                ChildEvent::Report(id, Report::Notify(text)) => self.notify(id, &text, out),
                 ChildEvent::Report(id, report) => {
-                    changed |= self.take_report(id, report);
+                    changed |= self.take_report(id, &report);
                 }
                 ChildEvent::Closed(id) => {
                     if let Some(running) = self.running_mut(id) {
@@ -983,9 +988,21 @@ impl Workspace {
         })
     }
 
+    /// Writes to `out` the notification `text` that the child `id` reported, titled with its
+    /// tab.
+    fn notify(&self, id: usize, text: &str, out: &mut Vec<u8>) {
+        let tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.agents.iter().any(|running| running.id == id))
+            .map_or("", |tab| tab.title.as_str());
+        let title = format!("mahi {tab}");
+        self.notice.write(title.trim_end(), text, out);
+    }
+
     /// Takes what the child `id` reported about its agent; returns whether what the screen
     /// shows changed.
-    fn take_report(&mut self, id: usize, report: Report) -> bool {
+    fn take_report(&mut self, id: usize, report: &Report) -> bool {
         let Some(tab) = self
             .tabs
             .iter_mut()
@@ -1009,8 +1026,8 @@ impl Workspace {
             Report::Working => running.state = AgentState::Working,
             Report::Done => running.state = AgentState::Done,
             Report::Asks => running.state = AgentState::AsksYou,
-            Report::Prompts(count) => running.prompts = count,
-            Report::Thread(_) => {}
+            Report::Prompts(count) => running.prompts = *count,
+            Report::Thread(_) | Report::Notify(_) => {}
         }
         true
     }
@@ -1157,6 +1174,8 @@ fn closed_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 
 #[cfg(test)]
 mod tests {
+    use mahi_term::TerminalHints;
+
     use super::*;
 
     const SIZE: WindowSize = WindowSize { rows: 6, cols: 40 };
@@ -1238,7 +1257,10 @@ mod tests {
 
     #[test]
     fn moving_between_tabs_wraps_and_a_tab_that_is_not_there_is_ignored() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         for title in ["a", "b"] {
             let agent = running(&mut workspace, "sleep 5");
             workspace.tabs.push(tab(title, vec![agent]));
@@ -1264,7 +1286,10 @@ mod tests {
 
     #[test]
     fn the_arrows_up_and_down_choose_the_agent_and_b_hides_the_list() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         let first = running(&mut workspace, "sleep 5");
         let second = running(&mut workspace, "sleep 5");
         let (first_id, second_id) = (first.id, second.id);
@@ -1290,7 +1315,10 @@ mod tests {
 
     #[test]
     fn a_click_on_a_tab_selects_it_and_one_on_plus_asks_for_a_new_thread() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         workspace.set_screen(
             WindowSize {
                 rows: 30,
@@ -1330,7 +1358,10 @@ mod tests {
 
     #[test]
     fn a_click_in_the_pane_reaches_an_agent_that_asked_for_the_mouse_at_its_own_cell() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         workspace.set_screen(
             WindowSize {
                 rows: 30,
@@ -1384,7 +1415,10 @@ mod tests {
 
     #[test]
     fn a_drag_that_leaves_the_pane_still_ends_at_the_agent() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         workspace.set_screen(
             WindowSize {
                 rows: 30,
@@ -1425,7 +1459,10 @@ mod tests {
 
     #[test]
     fn a_report_cut_when_the_last_tab_closed_never_reaches_the_thread_list() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         let mut threads = Vec::new();
         workspace.mouse.carried.extend_from_slice(b"\x1b[<0;10");
         workspace.type_without_tabs(b";5mq", &mut threads);
@@ -1437,26 +1474,55 @@ mod tests {
 
     #[test]
     fn reports_set_an_agents_state_and_name_a_new_threads_tab() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         let agent = running(&mut workspace, "sleep 5");
         let id = agent.id;
         workspace.tabs.push(tab(NEW_TAB, vec![agent]));
         let thread: mahi_core::ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
-        assert!(workspace.take_report(id, Report::Thread(thread)));
+        assert!(workspace.take_report(id, &Report::Thread(thread)));
         assert_eq!(workspace.tabs[0].title, "01234567");
-        assert!(!workspace.take_report(id, Report::Thread(thread)));
-        assert!(workspace.take_report(id, Report::Asks));
+        assert!(!workspace.take_report(id, &Report::Thread(thread)));
+        assert!(workspace.take_report(id, &Report::Asks));
         assert!(workspace.tab_titles().next().unwrap().asks);
-        workspace.take_report(id, Report::Prompts(2));
+        workspace.take_report(id, &Report::Prompts(2));
         assert_eq!(workspace.tabs[0].agents[0].prompts, 2);
-        workspace.take_report(id, Report::Done);
+        workspace.take_report(id, &Report::Done);
         assert_eq!(workspace.tabs[0].agents[0].state, AgentState::Done);
-        assert!(!workspace.take_report(99, Report::Done));
+        assert!(!workspace.take_report(99, &Report::Done));
+    }
+
+    #[test]
+    fn a_notification_a_hidden_child_reports_reaches_the_terminal_titled_with_its_tab() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let agent = running(&mut workspace, "sleep 5");
+        let id = agent.id;
+        workspace.tabs.push(tab("3e5c8646", vec![agent]));
+        workspace.selected = 0;
+        let text = "bob sent a prompt: fix it".to_owned();
+        workspace
+            .sender
+            .send(ChildEvent::Report(id, Report::Notify(text)))
+            .unwrap();
+        let mut out = Vec::new();
+        workspace.take_output(&mut out);
+        assert_eq!(
+            out,
+            b"\x1b]9;mahi 3e5c8646: bob sent a prompt: fix it\x07\x07"
+        );
     }
 
     #[test]
     fn space_after_the_palette_key_shows_the_next_agent_that_waits_in_any_tab() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         let mut agents = Vec::new();
         for _ in 0..3 {
             agents.push(running(&mut workspace, "sleep 5"));
@@ -1466,9 +1532,9 @@ mod tests {
         workspace.tabs.push(tab("a", agents));
         workspace.tabs.push(tab("b", vec![third]));
         workspace.selected = 1;
-        workspace.take_report(ids[0], Report::Working);
-        workspace.take_report(ids[1], Report::Done);
-        workspace.take_report(ids[2], Report::Asks);
+        workspace.take_report(ids[0], &Report::Working);
+        workspace.take_report(ids[1], &Report::Done);
+        workspace.take_report(ids[2], &Report::Asks);
         let mut threads = Vec::new();
         workspace.type_keys(b"\x00 ", &mut threads);
         assert_eq!(workspace.shown_id(), Some(ids[1]));
@@ -1481,7 +1547,10 @@ mod tests {
 
     #[test]
     fn a_hidden_agents_key_modes_reach_the_terminal_only_while_it_is_shown() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         let agent = running(&mut workspace, "printf '\\033[?1hready'; sleep 5");
         workspace.tabs.push(tab("a", vec![agent]));
         let mut out = Vec::new();
@@ -1513,7 +1582,10 @@ mod tests {
 
     #[test]
     fn an_agent_that_ends_leaves_the_selection_on_the_one_that_was_selected() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         let first = running(&mut workspace, "exit 0");
         let second = running(&mut workspace, "sleep 5");
         let kept = second.id;
@@ -1530,7 +1602,10 @@ mod tests {
 
     #[test]
     fn closing_a_failed_agent_changes_the_screen_and_ends_the_workspaces_own_keys() {
-        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
         let agent = running(&mut workspace, "exit 3");
         workspace.tabs.push(tab("a", vec![agent]));
         workspace.selected = 1;

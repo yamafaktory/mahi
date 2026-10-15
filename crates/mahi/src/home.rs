@@ -150,7 +150,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
         .and_then(|config| Settings::load(config).ok())
         .map(|settings| settings.palette_key)
         .unwrap_or_default();
-    let mut workspace = Workspace::new(palette_key);
+    let mut workspace = Workspace::new(palette_key, crate::run::notice(environment));
     let outcome = loop {
         let own = threads::own_key(environment);
         let place = Place {
