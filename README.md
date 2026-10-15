@@ -20,8 +20,11 @@ mahi is a single Rust binary for Linux and macOS, and for Windows through WSL 2.
 ## Status
 
 mahi is a preview. Every part [DESIGN.md](DESIGN.md) specifies is built and tested, on Linux,
-macOS and WSL 2, and with the real Claude Code and Codex, but it has had few users so far:
-expect rough edges, and changes that need you to start threads again. DESIGN.md is the
+macOS and WSL 2, and with the real Claude Code and Codex, except the workspace (milestone 8),
+which is being built: agents started from the home screen already run in its tabs, while
+watching teammates' agents, the actions in its palette, the no-approval mode and prompts
+from agents come next. mahi has had few users so far: expect rough
+edges, and changes that need you to start threads again. DESIGN.md is the
 specification and lists what is still open. Please report what breaks in the
 [issues](https://github.com/yamafaktory/mahi/issues).
 
@@ -76,7 +79,7 @@ sandbox cannot start Windows programs. CI runs mahi's tests inside WSL 2.
 
 ```sh
 cd my-project                 # any git repository
-mahi                          # the home screen: your threads, and keys to start, resume, land, end or purge them
+mahi                          # the home screen: your threads, and keys to start, resume, land, end or purge them; agents run in tabs
 mahi run claude               # run an agent in a sandbox, in a new thread
 mahi threads                  # list this repository's threads
 mahi resume <thread>          # pick a thread up again, with the same agent
@@ -97,6 +100,12 @@ chose. Cards and tickets still work without it: `mahi id` prints the card a thre
 needs, `mahi invite <thread> <card>` turns it into a ticket, and `mahi join <ticket>` uses it.
 `mahi handoff`, `mahi agent` and `mahi merge`
 move work between agents.
+
+On the home screen, an agent you start, resume or add runs in its thread's tab, beside the list
+of the thread's agents and their state (working, done, asks you). The palette key
+(`Ctrl-Space`) followed by `0` to `9` or the arrows moves between tabs and agents, followed by
+`Space` jumps to the next agent waiting for you. Pressed twice, the palette key is sent to
+the agent.
 
 ## Agents
 
@@ -215,7 +224,12 @@ the same time also connect to each other directly. [DESIGN.md](DESIGN.md) specif
   with a key derived from the thread key so only its participants can read them. TLS is
   [rustls](https://github.com/rustls/rustls) with mahi's own pure-Rust crypto provider, built
   on [RustCrypto](https://github.com/RustCrypto). An invite ticket carries the host's address
-  and the key a joiner must trust.
+  and the key a joiner must trust. Coming with the workspace: to reach a teammate without a
+  ticket, mahi will try the addresses it remembers for the thread, then look up the relay their
+  mahi uses in a record it publishes while it hosts an agent, signed with its node key, through
+  n0's DNS service. The record will hold only the relay's URL, never an IP address, but anyone
+  who knows a node id (a thread's `meta` lists them) will be able to see whether that node is
+  hosting and which relay it uses. `MAHI_LIVE=off` or `MAHI_LIVE=local` will publish nothing.
 - **Agents.** A profile tells mahi how to launch an agent, which hosts it may reach and where
   its state lives. Its hooks report each prompt, tool call and turn end to `mahi hook`, and
   `mahi mcp` serves it the thread's tools over the
