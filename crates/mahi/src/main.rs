@@ -32,6 +32,7 @@ mod prompts;
 mod purge;
 mod recorder;
 mod remote;
+mod report;
 mod run;
 mod session;
 mod session_sync;
@@ -118,6 +119,9 @@ fn main() {
         )
     {
         unlocked::receive(fd, &config.identity_file());
+    }
+    if let Some(fd) = environment.report_fd {
+        report::connect(fd);
     }
     make_config_private(&environment);
     if required.is_some() {

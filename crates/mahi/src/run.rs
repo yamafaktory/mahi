@@ -1443,6 +1443,7 @@ impl Prepared {
     }
 
     fn announce(&self, started: &Started) {
+        crate::report::send(mahi_term::Report::Thread(started.thread));
         eprintln!(
             "mahi: thread {} in {}",
             started.thread,

@@ -86,6 +86,7 @@ use crate::{
     unlocked,
     workspace::{
         Moved,
+        NEW_TAB,
         Workspace,
     },
 };
@@ -617,7 +618,7 @@ fn open_agent(
     let (title, resumes) = match &action {
         HomeAction::Resume(thread) => (short(thread), true),
         HomeAction::AddAgent(thread) | HomeAction::Handoff(thread) => (short(thread), false),
-        _ => ("new".to_owned(), false),
+        _ => (NEW_TAB.to_owned(), false),
     };
     let needs_key = !matches!(action, HomeAction::New);
     let words = command_words(action, store, environment)?;
@@ -643,7 +644,7 @@ fn open_agent(
     workspace.open(
         environment,
         (&title, &name, &shown),
-        (&words, title == "new"),
+        (&words, title == NEW_TAB),
         key.as_ref(),
     )
 }

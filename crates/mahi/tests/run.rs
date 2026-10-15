@@ -1355,7 +1355,10 @@ cat parser.rs
         parser.process(&output.as_bytes()[..end]);
         let screen = parser.screen();
         let rows: Vec<String> = screen.rows(0, 200).collect();
-        assert!(rows[0].starts_with(" ⌂ threads │ new │ + "), "{rows:#?}");
+        assert!(
+            rows[0].starts_with(" ⌂ threads │ ") && rows[0].contains(" │ + "),
+            "{rows:#?}"
+        );
         assert!(rows[1].starts_with("╭ claude "), "{rows:#?}");
         assert!(
             rows.iter()
@@ -1430,6 +1433,38 @@ cat parser.rs
                 .any(|(path, _)| path == "late.txt"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn a_workspace_tab_takes_its_threads_id_and_shows_an_agent_whose_turn_ended_as_done() {
+        let fixture = fixture();
+        let agent = format!(
+            "{}\necho agent-ready\nwhile :; do sleep 1; done\n",
+            WORKING_CLAUDE.trim_end()
+        );
+        let claude = script(&fixture, "reporting-agents", "claude", &agent);
+        script(&fixture, "reporting-agents", "codex", &agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("✓ done", b"\x000"),
+                ("Menu", b"q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let store = Store::open(&fixture.repo).unwrap();
+        let (thread_ref, _) = store
+            .thread_refs()
+            .unwrap()
+            .into_iter()
+            .find(|(thread_ref, _)| matches!(thread_ref.kind(), RefKind::Snapshots(_)))
+            .unwrap();
+        let short: String = thread_ref.thread().to_string().chars().take(8).collect();
+        assert!(output.contains(&format!(" {short} ")), "{output}");
     }
 
     #[test]

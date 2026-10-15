@@ -38,6 +38,8 @@ use mahi_term::{
     ListPlace,
     MouseEvent,
     PaletteKey,
+    Report,
+    ReportReader,
     Segment,
     TabBar,
     TabHit,
@@ -60,6 +62,7 @@ use ratatui_core::{
 use crate::environment::{
     Environment,
     KEY_FD,
+    REPORT_FD,
 };
 
 const READ_CHUNK: usize = 16 * 1024;
@@ -76,13 +79,16 @@ const TERMINAL_OWN: [&str; 6] = [
     "COLUMNS",
 ];
 const CHILD_TERM: &str = "xterm-256color";
+pub(crate) const NEW_TAB: &str = "new";
+const SHORT_THREAD: usize = 8;
 const FAILED_HINTS: [(&str, &str); 2] = [("any key", "close it"), ("palette key 0", "threads")];
-const HINTS: [(&str, &str); 6] = [
+const HINTS: [(&str, &str); 7] = [
     ("palette key", "then:"),
     ("←→", "tab"),
     ("0-9", "tab"),
     ("↑↓", "agent"),
     ("b", "list"),
+    ("␣", "waiting"),
     ("palette key", "again: to the agent"),
 ];
 
@@ -93,6 +99,31 @@ pub(crate) enum ChildEvent {
     Output(usize, Vec<u8>),
     /// The child `0`'s terminal has nothing more to read.
     Closed(usize),
+    /// The child `0` reported this about its agent.
+    Report(usize, Report),
+}
+
+/// Reads on a thread of its own the reports the workspace's child `id` writes on the pipe
+/// `reports`, and sends each to `events`.
+fn read_reports(reports: OwnedFd, id: usize, events: &mpsc::SyncSender<ChildEvent>) {
+    let events = events.clone();
+    thread::spawn(move || {
+        let mut pipe = std::fs::File::from(reports);
+        let mut reader = ReportReader::default();
+        let mut chunk = [0_u8; 512];
+        while let Ok(read) = pipe.read(&mut chunk) {
+            let Some(bytes) = chunk.get(..read).filter(|bytes| !bytes.is_empty()) else {
+                break;
+            };
+            let mut gone = false;
+            reader.feed(bytes, |report| {
+                gone |= events.send(ChildEvent::Report(id, report)).is_err();
+            });
+            if gone {
+                break;
+            }
+        }
+    });
 }
 
 /// A mahi command the workspace runs on a pseudo-terminal of its own, and the screen its output
@@ -116,13 +147,13 @@ impl Child {
     ///
     /// # Errors
     ///
-    /// Returns the error of making the pipe the key goes through.
+    /// Returns the error of making the pipes the key and the reports go through.
     pub(crate) fn mahi(
         environment: &Environment,
         words: &[&OsStr],
         (cwd, size): (&Path, WindowSize),
         key: Option<&LocalIdentity>,
-    ) -> io::Result<Option<PtyCommand>> {
+    ) -> io::Result<Option<(PtyCommand, OwnedFd)>> {
         let Some(program) = environment.mahi_exe.as_deref() else {
             return Ok(None);
         };
@@ -131,7 +162,8 @@ impl Child {
             command = command.arg(word);
         }
         for (name, value) in &environment.whole {
-            if name != "TERM" && name != KEY_FD && !TERMINAL_OWN.iter().any(|own| name == own) {
+            let ours = [KEY_FD, REPORT_FD].iter().any(|own| name == own);
+            if name != "TERM" && !ours && !TERMINAL_OWN.iter().any(|own| name == own) {
                 command = command.env(name, OsStr::from_bytes(value));
             }
         }
@@ -141,7 +173,11 @@ impl Child {
                 .env(KEY_FD, pipe.as_raw_fd().to_string())
                 .pass_fd(pipe);
         }
-        Ok(Some(command.env("TERM", CHILD_TERM)))
+        let (reports, report_end) = closed_on_exec_pipe()?;
+        command = command
+            .env(REPORT_FD, report_end.as_raw_fd().to_string())
+            .pass_fd(report_end);
+        Ok(Some((command.env("TERM", CHILD_TERM), reports)))
     }
 
     /// Starts `command`, made for a terminal of `size`, as the workspace's child `id`, whose
@@ -330,6 +366,8 @@ struct Running {
     child: Child,
     closed: bool,
     ending: Ending,
+    state: AgentState,
+    prompts: u16,
 }
 
 impl Running {
@@ -341,7 +379,7 @@ impl Running {
             state: if self.ending == Ending::Failed {
                 AgentState::Failed
             } else {
-                AgentState::Working
+                self.state
             },
         }
     }
@@ -425,12 +463,13 @@ impl Workspace {
         let failed = |error: &dyn std::fmt::Display| format!("{shown} cannot start: {error}");
         let cwd = std::env::current_dir().map_err(|error| failed(&error))?;
         let words: Vec<&OsStr> = words.iter().map(OsStr::new).collect();
-        let command = Child::mahi(environment, &words, (&cwd, self.size), key)
+        let (command, reports) = Child::mahi(environment, &words, (&cwd, self.size), key)
             .map_err(|error| failed(&error))?
             .ok_or_else(|| failed(&"mahi cannot find its own program"))?;
         let id = self.next_id;
         let child =
             Child::start(command, self.size, id, &self.sender).map_err(|error| failed(&error))?;
+        read_reports(reports, id, &self.sender);
         self.next_id += 1;
         let running = Running {
             id,
@@ -439,6 +478,8 @@ impl Workspace {
             child,
             closed: false,
             ending: Ending::Running,
+            state: AgentState::Working,
+            prompts: 0,
         };
         let open = (!new)
             .then(|| self.tabs.iter().position(|tab| tab.title == title))
@@ -481,6 +522,9 @@ impl Workspace {
                         changed = true;
                     }
                     self.passed = passed;
+                }
+                ChildEvent::Report(id, report) => {
+                    changed |= self.take_report(id, report);
                 }
                 ChildEvent::Closed(id) => {
                     if let Some(running) = self.running_mut(id) {
@@ -889,6 +933,7 @@ impl Workspace {
                 }
             }
             Step::List => self.list_shown = !self.list_shown,
+            Step::Waiting => self.show_next_waiting(),
         }
     }
 
@@ -917,7 +962,11 @@ impl Workspace {
         ThreadView {
             agents: &agents,
             selected: tab.selected,
-            prompts: 0,
+            prompts: tab
+                .agents
+                .iter()
+                .map(|running| usize::from(running.prompts))
+                .sum(),
             list: self.list_place(body.width),
             hints: if failed { &FAILED_HINTS } else { &HINTS },
         }
@@ -927,8 +976,80 @@ impl Workspace {
     fn tab_titles(&self) -> impl Iterator<Item = WorkspaceTab<'_>> {
         self.tabs.iter().map(|tab| WorkspaceTab {
             title: &tab.title,
-            asks: false,
+            asks: tab
+                .agents
+                .iter()
+                .any(|running| running.state == AgentState::AsksYou),
         })
+    }
+
+    /// Takes what the child `id` reported about its agent; returns whether what the screen
+    /// shows changed.
+    fn take_report(&mut self, id: usize, report: Report) -> bool {
+        let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.agents.iter().any(|running| running.id == id))
+        else {
+            return false;
+        };
+        if let Report::Thread(thread) = report {
+            if tab.title == NEW_TAB {
+                let mut title = thread.to_string();
+                title.truncate(SHORT_THREAD);
+                tab.title = title;
+                return true;
+            }
+            return false;
+        }
+        let Some(running) = tab.agents.iter_mut().find(|running| running.id == id) else {
+            return false;
+        };
+        match report {
+            Report::Working => running.state = AgentState::Working,
+            Report::Done => running.state = AgentState::Done,
+            Report::Asks => running.state = AgentState::AsksYou,
+            Report::Prompts(count) => running.prompts = count,
+            Report::Thread(_) => {}
+        }
+        true
+    }
+
+    /// Shows the next agent after the one shown, in any tab, that asks the user, is done or
+    /// failed, if there is one.
+    fn show_next_waiting(&mut self) {
+        let flat: Vec<(usize, usize, bool)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(tab, agents)| {
+                agents
+                    .agents
+                    .iter()
+                    .enumerate()
+                    .map(move |(agent, running)| {
+                        let waiting = running.ending == Ending::Failed
+                            || matches!(running.state, AgentState::Done | AgentState::AsksYou);
+                        (tab, agent, waiting)
+                    })
+            })
+            .collect();
+        let current = self.selected.checked_sub(1).and_then(|tab| {
+            let agent = self.tabs.get(tab)?.selected;
+            flat.iter()
+                .position(|&(at_tab, at_agent, _)| at_tab == tab && at_agent == agent)
+        });
+        let start = current.map_or(0, |at| at + 1);
+        let next = (0..flat.len())
+            .map(|offset| (start + offset) % flat.len())
+            .filter_map(|index| flat.get(index))
+            .find(|&&(_, _, waiting)| waiting);
+        if let Some(&(tab, agent, _)) = next {
+            self.selected = tab + 1;
+            if let Some(tab) = self.tabs.get_mut(tab) {
+                tab.selected = agent;
+            }
+        }
     }
 
     fn shown_id(&self) -> Option<usize> {
@@ -952,6 +1073,7 @@ impl Workspace {
 /// A move the workspace's keys make between tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
+    Waiting,
     To(usize),
     Next,
     Previous,
@@ -973,6 +1095,7 @@ fn workspace_key(bytes: &[u8]) -> (Option<Step>, &[u8]) {
         (b"\x1b[A", Step::PreviousAgent),
         (b"\x1bOA", Step::PreviousAgent),
         (b"b", Step::List),
+        (b" ", Step::Waiting),
     ] {
         if let Some(rest) = bytes.strip_prefix(sequence) {
             return (Some(step), rest);
@@ -1089,6 +1212,8 @@ mod tests {
             child: Child::start(shell(script), SIZE, id, &workspace.sender).unwrap(),
             closed: false,
             ending: Ending::Running,
+            state: AgentState::Working,
+            prompts: 0,
         }
     }
 
@@ -1311,6 +1436,49 @@ mod tests {
     }
 
     #[test]
+    fn reports_set_an_agents_state_and_name_a_new_threads_tab() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        let agent = running(&mut workspace, "sleep 5");
+        let id = agent.id;
+        workspace.tabs.push(tab(NEW_TAB, vec![agent]));
+        let thread: mahi_core::ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        assert!(workspace.take_report(id, Report::Thread(thread)));
+        assert_eq!(workspace.tabs[0].title, "01234567");
+        assert!(!workspace.take_report(id, Report::Thread(thread)));
+        assert!(workspace.take_report(id, Report::Asks));
+        assert!(workspace.tab_titles().next().unwrap().asks);
+        workspace.take_report(id, Report::Prompts(2));
+        assert_eq!(workspace.tabs[0].agents[0].prompts, 2);
+        workspace.take_report(id, Report::Done);
+        assert_eq!(workspace.tabs[0].agents[0].state, AgentState::Done);
+        assert!(!workspace.take_report(99, Report::Done));
+    }
+
+    #[test]
+    fn space_after_the_palette_key_shows_the_next_agent_that_waits_in_any_tab() {
+        let mut workspace = Workspace::new(PaletteKey::default());
+        let mut agents = Vec::new();
+        for _ in 0..3 {
+            agents.push(running(&mut workspace, "sleep 5"));
+        }
+        let ids: Vec<usize> = agents.iter().map(|agent| agent.id).collect();
+        let third = agents.pop().unwrap();
+        workspace.tabs.push(tab("a", agents));
+        workspace.tabs.push(tab("b", vec![third]));
+        workspace.selected = 1;
+        workspace.take_report(ids[1], Report::Done);
+        workspace.take_report(ids[2], Report::Asks);
+        let mut threads = Vec::new();
+        workspace.type_keys(b"\x00 ", &mut threads);
+        assert_eq!(workspace.shown_id(), Some(ids[1]));
+        workspace.type_keys(b"\x00 ", &mut threads);
+        assert_eq!(workspace.shown_id(), Some(ids[2]));
+        workspace.type_keys(b"\x00 ", &mut threads);
+        assert_eq!(workspace.shown_id(), Some(ids[1]));
+        assert!(threads.is_empty());
+    }
+
+    #[test]
     fn a_hidden_agents_key_modes_reach_the_terminal_only_while_it_is_shown() {
         let mut workspace = Workspace::new(PaletteKey::default());
         let agent = running(&mut workspace, "printf '\\033[?1hready'; sleep 5");
@@ -1440,7 +1608,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let (sender, events) = mpsc::sync_channel(QUEUED_WRITES);
-        let mut child = Child::start(command, SIZE, 0, &sender).unwrap();
+        let mut child = Child::start(command.0, SIZE, 0, &sender).unwrap();
         run_until(&mut child, &events, |child| {
             child
                 .screen()
@@ -1483,7 +1651,7 @@ mod tests {
         let given = Child::mahi(&environment, &words, (Path::new("/"), SIZE), Some(&key))
             .unwrap()
             .unwrap();
-        let mut child = Child::start(given, SIZE, 0, &sender).unwrap();
+        let mut child = Child::start(given.0, SIZE, 0, &sender).unwrap();
         run_until(&mut child, &events, |child| {
             child.screen().contents().contains("end")
         });
@@ -1494,7 +1662,7 @@ mod tests {
         let plain = Child::mahi(&environment, &words, (Path::new("/"), SIZE), None)
             .unwrap()
             .unwrap();
-        let mut child = Child::start(plain, SIZE, 0, &sender).unwrap();
+        let mut child = Child::start(plain.0, SIZE, 0, &sender).unwrap();
         run_until(&mut child, &events, |child| {
             child.screen().contents().contains("end")
         });
@@ -1514,7 +1682,7 @@ mod tests {
             match events.recv_timeout(Duration::from_millis(50)) {
                 Ok(ChildEvent::Output(_, bytes)) => child.feed(&bytes, Some(&mut passed)),
                 Ok(ChildEvent::Closed(0)) => break,
-                Ok(ChildEvent::Closed(_)) | Err(_) => {}
+                Ok(ChildEvent::Closed(_) | ChildEvent::Report(..)) | Err(_) => {}
             }
         }
         assert!(child.screen().contents().contains("done"));

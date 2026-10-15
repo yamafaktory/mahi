@@ -19,6 +19,7 @@ use std::{
 
 use mahi_agent::hook::HookKind;
 use mahi_core::is_invisible;
+use mahi_term::Report;
 
 use crate::{
     merge::MergeRequest,
@@ -102,8 +103,14 @@ impl Activity {
     /// Notes what the agent's hook reported.
     pub(crate) fn saw(&self, kind: HookKind) {
         match kind {
-            HookKind::Prompt => self.turn_open.store(true, Ordering::SeqCst),
-            HookKind::TurnEnd => self.turn_open.store(false, Ordering::SeqCst),
+            HookKind::Prompt => {
+                self.turn_open.store(true, Ordering::SeqCst);
+                crate::report::send(Report::Working);
+            }
+            HookKind::TurnEnd => {
+                self.turn_open.store(false, Ordering::SeqCst);
+                crate::report::send(Report::Done);
+            }
             HookKind::Tool => {}
         }
         self.touched();
