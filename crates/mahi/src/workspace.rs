@@ -478,7 +478,7 @@ impl Workspace {
             child,
             closed: false,
             ending: Ending::Running,
-            state: AgentState::Working,
+            state: AgentState::Done,
             prompts: 0,
         };
         let open = (!new)
@@ -1212,7 +1212,7 @@ mod tests {
             child: Child::start(shell(script), SIZE, id, &workspace.sender).unwrap(),
             closed: false,
             ending: Ending::Running,
-            state: AgentState::Working,
+            state: AgentState::Done,
             prompts: 0,
         }
     }
@@ -1466,6 +1466,7 @@ mod tests {
         workspace.tabs.push(tab("a", agents));
         workspace.tabs.push(tab("b", vec![third]));
         workspace.selected = 1;
+        workspace.take_report(ids[0], Report::Working);
         workspace.take_report(ids[1], Report::Done);
         workspace.take_report(ids[2], Report::Asks);
         let mut threads = Vec::new();

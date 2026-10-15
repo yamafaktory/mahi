@@ -1365,7 +1365,7 @@ cat parser.rs
                 .any(|row| row.starts_with("│agent-ready 20 174")),
             "{rows:#?}"
         );
-        assert!(rows[3].contains("claude ● working"), "{rows:#?}");
+        assert!(rows[3].contains("claude ✓ done"), "{rows:#?}");
         assert!(rows[22].starts_with("╰──"), "{rows:#?}");
         assert!(rows[23].contains("0-9 tab"), "{rows:#?}");
         assert_eq!(screen.cursor_position().1, 1);
@@ -1436,21 +1436,19 @@ cat parser.rs
     }
 
     #[test]
-    fn a_workspace_tab_takes_its_threads_id_and_shows_an_agent_whose_turn_ended_as_done() {
+    fn a_workspace_tab_takes_its_threads_id_and_shows_its_agent_working_once_a_prompt_opens_a_turn()
+    {
         let fixture = fixture();
-        let agent = format!(
-            "{}\necho agent-ready\nwhile :; do sleep 1; done\n",
-            WORKING_CLAUDE.trim_end()
-        );
-        let claude = script(&fixture, "reporting-agents", "claude", &agent);
-        script(&fixture, "reporting-agents", "codex", &agent);
+        let agent = "#!/bin/sh\nprintf '{\"prompt\":\"build\"}' | \"$MAHI_BIN\" hook prompt\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "reporting-agents", "claude", agent);
+        script(&fixture, "reporting-agents", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
-                ("✓ done", b"\x000"),
+                ("● working", b"\x000"),
                 ("Menu", b"q"),
                 ("stop it and quit?", b"y"),
             ],
@@ -1464,7 +1462,14 @@ cat parser.rs
             .find(|(thread_ref, _)| matches!(thread_ref.kind(), RefKind::Snapshots(_)))
             .unwrap();
         let short: String = thread_ref.thread().to_string().chars().take(8).collect();
-        assert!(output.contains(&format!(" {short} ")), "{output}");
+        let end = output.rfind("\x1b[?1049l").unwrap();
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        parser.process(&output.as_bytes()[..end]);
+        let rows: Vec<String> = parser.screen().rows(0, 200).collect();
+        assert!(
+            rows[0].starts_with(&format!(" ⌂ threads │ {short} │ + ")),
+            "{rows:#?}"
+        );
     }
 
     #[test]
