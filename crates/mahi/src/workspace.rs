@@ -1687,7 +1687,14 @@ mod tests {
             }
         }
         assert!(child.screen().contents().contains("done"));
-        assert_eq!(child.exited().unwrap(), Some(0));
+        let code = loop {
+            if let Some(code) = child.exited().unwrap() {
+                break code;
+            }
+            assert!(Instant::now() < deadline, "the child never exited");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(code, 0);
         assert!(
             String::from_utf8_lossy(&passed).contains("a title"),
             "{passed:?}"
