@@ -57,7 +57,10 @@ use crate::{
         Cli,
         Command,
     },
-    environment::Environment,
+    environment::{
+        Environment,
+        LiveMode,
+    },
     profile::Profile,
     prompt::{
         Prompt,
@@ -89,6 +92,7 @@ use crate::{
         NEW_TAB,
         Workspace,
     },
+    workspace_live::WorkspaceLive,
 };
 
 const ENTER_SCREEN: &[u8] =
@@ -151,6 +155,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
         .map(|settings| settings.palette_key)
         .unwrap_or_default();
     let mut workspace = Workspace::new(palette_key, crate::run::notice(environment));
+    workspace.host_with(workspace_live(environment, config.as_ref(), &store));
     let outcome = loop {
         let own = threads::own_key(environment);
         let place = Place {
@@ -194,6 +199,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
     drop(showing);
     drop(screen);
     stop_agents(&mut workspace);
+    workspace.host_with(None);
     match outcome {
         Ok(()) => 0,
         Err(Ended::Stopped(signal)) => {
@@ -605,6 +611,16 @@ fn runs_agent(action: &HomeAction) -> bool {
     )
 }
 
+/// Returns the live layer the workspace hosts its threads' agents on, unless it is off or
+/// mahi is not set up in `config`.
+fn workspace_live(
+    environment: &Environment,
+    config: Option<&ConfigDir>,
+    store: &Store,
+) -> Option<WorkspaceLive> {
+    WorkspaceLive::new(environment, config?, store.common_dir())
+}
+
 /// Starts the agent `action` runs in its thread's tab of the workspace, with the user's mahi
 /// key unlocked first when the agent needs it, from the `identity_file`; returns what to tell
 /// the user when it does not start.
@@ -620,7 +636,7 @@ fn open_agent(
         HomeAction::AddAgent(thread) | HomeAction::Handoff(thread) => (short(thread), false),
         _ => (NEW_TAB.to_owned(), false),
     };
-    let needs_key = !matches!(action, HomeAction::New);
+    let needs_key = !matches!(action, HomeAction::New) || environment.live != LiveMode::Off;
     let words = command_words(action, store, environment)?;
     let name = if resumes {
         "agent".to_owned()

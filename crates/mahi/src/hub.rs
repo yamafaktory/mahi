@@ -211,15 +211,25 @@ fn drawn_from(mirror: &vt100::Parser) -> (WindowSize, Vec<u8>) {
 
 /// Serves the agents of the user's other mahis in the thread over a Unix socket in mahi's
 /// private live directory, while this mahi hosts the live layer.
-struct Hub {
+pub(crate) struct Hub {
     path: PathBuf,
     stop: Arc<AtomicBool>,
     connections: Arc<Mutex<HashMap<u64, UnixStream>>>,
     acceptor: JoinHandle<()>,
 }
 
+impl std::fmt::Debug for Hub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hub")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Hub {
-    fn start(path: PathBuf, handle: HostHandle) -> io::Result<Self> {
+    /// Serves on the socket at `path` the agents `handle`'s host takes from the user's other
+    /// mahis.
+    pub(crate) fn start(path: PathBuf, handle: HostHandle) -> io::Result<Self> {
         match std::fs::remove_file(&path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
             _ => {}
@@ -240,7 +250,8 @@ impl Hub {
         })
     }
 
-    fn stop(self) {
+    /// Stops serving, closing the socket and the connections to the user's other mahis.
+    pub(crate) fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.acceptor.join();
         let _ = std::fs::remove_file(&self.path);
@@ -589,6 +600,7 @@ impl Link {
                 "mahi: teammates watch {} through your other mahi in this thread",
                 joining.slot.agent()
             ),
+            Role::Alone if crate::report::connected() => {}
             Role::Alone => eprintln!(
                 "mahi: teammates cannot watch {} yet: your other mahi in this thread does not answer",
                 joining.slot.agent()
@@ -687,12 +699,17 @@ impl Joining {
     }
 
     /// Hosts the live layer, or else connects to the mahi that does; a failure to reach that
-    /// one leaves this mahi alone, to try again, and any other failure is returned.
+    /// one leaves this mahi alone, to try again, and any other failure is returned. A mahi a
+    /// workspace started never hosts: the workspace hosts its threads, so the user's node key
+    /// is bound once.
     fn settle(
         &self,
         tap: &OutputTap,
         (prompts, claims): (&Arc<Prompts>, &Arc<Claims>),
     ) -> Result<Role, HostError> {
+        if crate::report::connected() {
+            return Ok(self.connect(tap, (prompts, claims)));
+        }
         let (size, drawn) = tap.drawn();
         match LiveHost::start(
             &self.setup,
@@ -709,14 +726,13 @@ impl Joining {
                 let hub = Hub::start(self.socket.clone(), host.handle()).ok();
                 Ok(Role::Host(Box::new(host), hub))
             }
-            Err(HostError::AnotherHost) => {
-                Ok(
-                    GuestLink::connect(&self.socket, &self.slot, tap, (prompts, claims))
-                        .map_or(Role::Alone, Role::Guest),
-                )
-            }
+            Err(HostError::AnotherHost) => Ok(self.connect(tap, (prompts, claims))),
             Err(error) => Err(error),
         }
+    }
+
+    fn connect(&self, tap: &OutputTap, shared: (&Arc<Prompts>, &Arc<Claims>)) -> Role {
+        GuestLink::connect(&self.socket, &self.slot, tap, shared).map_or(Role::Alone, Role::Guest)
     }
 }
 
@@ -731,6 +747,11 @@ mod tests {
     use mahi_live::{
         PromptOutcome,
         PromptText,
+    };
+    use ssh_key::{
+        Algorithm,
+        PrivateKey,
+        rand_core::OsRng,
     };
 
     use super::*;
@@ -1007,5 +1028,50 @@ mod tests {
                 .any(|claim| claim.slot == codex)
         });
         hub.stop();
+    }
+
+    #[test]
+    fn a_mahi_a_workspace_started_never_hosts_and_joins_the_workspaces_hub() {
+        let (reports, report_end) = rustix::pipe::pipe().unwrap();
+        crate::report::connect(std::os::fd::IntoRawFd::into_raw_fd(report_end));
+        let dir = tempfile::tempdir().unwrap();
+        let config = mahi_identity::ConfigDir::resolve(Some(dir.path()), Some(dir.path())).unwrap();
+        let thread = mahi_core::ThreadId::random().unwrap();
+        let owner = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let joining = Joining {
+            setup: LiveSetup {
+                config: config.clone(),
+                runtime: dir.path().to_path_buf(),
+                node_key: mahi_identity::NodeKey::generate().unwrap(),
+                owner: mahi_thread::ParticipantKey::from_public_key(owner.public_key()).unwrap(),
+                relays: mahi_live::Relays::Disabled,
+                bootstrap: Vec::new(),
+            },
+            git_dir: dir.path().to_path_buf(),
+            slot: slot("alice", "claude"),
+            keys: mahi_live::LiveKeys::derive(&mahi_crypto::ThreadKey::generate(), thread).unwrap(),
+            socket: dir.path().join("thread.sock"),
+        };
+        let tap = OutputTap::new(WindowSize { rows: 24, cols: 80 });
+        let shared = (&Arc::new(Prompts::default()), &Arc::new(Claims::default()));
+        let role = joining.settle(&tap, shared).unwrap();
+        assert!(matches!(role, Role::Alone));
+        assert!(
+            crate::thread_lock::LiveLock::try_acquire(&config, thread)
+                .unwrap()
+                .is_some()
+        );
+        let (handle, _tapped) = HostHandle::for_tests(ParticipantName::new("alice").unwrap());
+        let hub = Hub::start(joining.socket.clone(), handle.clone()).unwrap();
+        let role = joining.settle(&tap, shared).unwrap();
+        assert!(matches!(role, Role::Guest(_)));
+        eventually("the guest served by the workspace's hub", || {
+            handle.served() == 1
+        });
+        if let Role::Guest(link) = role {
+            link.close();
+        }
+        hub.stop();
+        drop(reports);
     }
 }

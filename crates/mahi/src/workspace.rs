@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     io::{
         self,
@@ -22,6 +23,7 @@ use std::{
 };
 
 use age::secrecy::ExposeSecret;
+use mahi_core::ThreadId;
 use mahi_identity::LocalIdentity;
 use mahi_sandbox::{
     PtyChild,
@@ -60,10 +62,13 @@ use ratatui_core::{
     },
 };
 
-use crate::environment::{
-    Environment,
-    KEY_FD,
-    REPORT_FD,
+use crate::{
+    environment::{
+        Environment,
+        KEY_FD,
+        REPORT_FD,
+    },
+    workspace_live::WorkspaceLive,
 };
 
 const READ_CHUNK: usize = 16 * 1024;
@@ -80,6 +85,7 @@ const TERMINAL_OWN: [&str; 6] = [
     "COLUMNS",
 ];
 const CHILD_TERM: &str = "xterm-256color";
+const HOST_AGAIN: Duration = Duration::from_secs(2);
 pub(crate) const NEW_TAB: &str = "new";
 const SHORT_THREAD: usize = 8;
 const FAILED_HINTS: [(&str, &str); 2] = [("any key", "close it"), ("palette key 0", "threads")];
@@ -339,6 +345,10 @@ pub(crate) struct Workspace {
     screen: WindowSize,
     mouse: MouseState,
     notice: Notice,
+    live: Option<WorkspaceLive>,
+    live_told: Option<String>,
+    live_failed: HashSet<ThreadId>,
+    live_tried: Instant,
 }
 
 /// What the workspace keeps of the mouse between reads.
@@ -355,6 +365,7 @@ struct MouseState {
 #[derive(Debug)]
 struct Tab {
     title: String,
+    thread: Option<ThreadId>,
     agents: Vec<Running>,
     selected: usize,
 }
@@ -428,7 +439,17 @@ impl Workspace {
             screen: WindowSize { rows: 2, cols: 2 },
             mouse: MouseState::default(),
             notice,
+            live: None,
+            live_told: None,
+            live_failed: HashSet::new(),
+            live_tried: Instant::now(),
         }
+    }
+
+    /// Lets the workspace host the live layer of the threads its tabs show with `live`, so
+    /// its children never bind the user's node key themselves.
+    pub(crate) fn host_with(&mut self, live: Option<WorkspaceLive>) {
+        self.live = live;
     }
 
     /// Returns whether a thread's tab is open.
@@ -492,6 +513,7 @@ impl Workspace {
             index
         } else {
             self.tabs.push(Tab {
+                thread: None,
                 title: title.to_owned(),
                 agents: Vec::new(),
                 selected: 0,
@@ -546,6 +568,7 @@ impl Workspace {
     /// returns what to tell the user about the last one to end, and whether what the screen
     /// shows changed.
     pub(crate) fn take_ended(&mut self) -> (Option<String>, bool) {
+        self.host_again();
         let mut told = None;
         let mut changed = false;
         for tab in &mut self.tabs {
@@ -611,13 +634,25 @@ impl Workspace {
                         .filter(|tab| !tab.agents.is_empty())
                         .count()
                 });
+            for tab in self.tabs.iter().filter(|tab| tab.agents.is_empty()) {
+                let still_open = |thread| {
+                    self.tabs
+                        .iter()
+                        .any(|other| !other.agents.is_empty() && other.thread == Some(thread))
+                };
+                if let (Some(thread), Some(live)) = (tab.thread, self.live.as_mut())
+                    && !still_open(thread)
+                {
+                    live.release(thread);
+                }
+            }
             self.tabs.retain(|tab| !tab.agents.is_empty());
             self.selected = selected;
             if self.tabs.is_empty() {
                 self.armed = false;
             }
         }
-        (told, changed)
+        (told.or_else(|| self.live_told.take()), changed)
     }
 
     /// Writes into `out` what puts the user's terminal in the key modes of the agent shown
@@ -660,6 +695,7 @@ impl Workspace {
     /// for at most `within`, reading what they write meanwhile so none waits on its terminal;
     /// returns how many still run, which dropping the workspace then kills.
     pub(crate) fn stop_all(&mut self, within: Duration) -> usize {
+        let live = self.live.take();
         for running in self.tabs.iter_mut().flat_map(|tab| tab.agents.iter_mut()) {
             running.child.stop();
         }
@@ -676,6 +712,7 @@ impl Workspace {
                 .filter(|&runs| runs)
                 .count();
             if left == 0 || Instant::now() >= deadline {
+                drop(live);
                 return left;
             }
             thread::sleep(STOP_POLL);
@@ -1011,13 +1048,18 @@ impl Workspace {
             return false;
         };
         if let Report::Thread(thread) = report {
-            if tab.title == NEW_TAB {
+            let thread = *thread;
+            let renamed = tab.title == NEW_TAB;
+            if renamed {
                 let mut title = thread.to_string();
                 title.truncate(SHORT_THREAD);
                 tab.title = title;
-                return true;
             }
-            return false;
+            if tab.thread.is_none() {
+                tab.thread = Some(thread);
+                self.host(thread);
+            }
+            return renamed;
         }
         let Some(running) = tab.agents.iter_mut().find(|running| running.id == id) else {
             return false;
@@ -1030,6 +1072,41 @@ impl Workspace {
             Report::Thread(_) | Report::Notify(_) => {}
         }
         true
+    }
+
+    fn host(&mut self, thread: ThreadId) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        match live.host(thread) {
+            Ok(()) => {
+                self.live_failed.remove(&thread);
+            }
+            Err(error) => {
+                if self.live_failed.insert(thread) {
+                    self.live_told =
+                        Some(format!("teammates cannot watch thread {thread}: {error}"));
+                }
+            }
+        }
+    }
+
+    /// Tries again, at most every [`HOST_AGAIN`], to host the open threads the workspace does
+    /// not host: one whose hosting failed, or that another of the user's mahis hosted and left.
+    fn host_again(&mut self) {
+        if self.live.is_none() || self.live_tried.elapsed() < HOST_AGAIN {
+            return;
+        }
+        self.live_tried = Instant::now();
+        let unhosted: Vec<ThreadId> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.thread)
+            .filter(|&thread| self.live.as_ref().is_some_and(|live| !live.hosts(thread)))
+            .collect();
+        for thread in unhosted {
+            self.host(thread);
+        }
     }
 
     /// Shows the next agent after the one shown, in any tab, that asks the user, is done or
@@ -1239,6 +1316,7 @@ mod tests {
     fn tab(title: &str, agents: Vec<Running>) -> Tab {
         Tab {
             title: title.to_owned(),
+            thread: None,
             agents,
             selected: 0,
         }
@@ -1515,6 +1593,32 @@ mod tests {
             out,
             b"\x1b]9;mahi 3e5c8646: bob sent a prompt: fix it\x07\x07"
         );
+    }
+
+    #[test]
+    fn a_thread_the_workspace_cannot_host_is_told_once_and_tried_again() {
+        let setup = crate::workspace_live::tests::setup();
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        workspace.host_with(WorkspaceLive::new(
+            &setup.environment,
+            &setup.config,
+            setup.store.common_dir(),
+        ));
+        let agent = running(&mut workspace, "sleep 5");
+        let id = agent.id;
+        workspace.tabs.push(tab(NEW_TAB, vec![agent]));
+        workspace.take_report(id, &Report::Thread(setup.thread));
+        assert_eq!(workspace.tabs[0].thread, Some(setup.thread));
+        let (told, _) = workspace.take_ended();
+        let told = told.unwrap();
+        assert!(told.contains("your mahi key is not unlocked"), "{told}");
+        workspace.live_tried = Instant::now().checked_sub(HOST_AGAIN).unwrap();
+        let (told, _) = workspace.take_ended();
+        assert!(told.is_none());
+        assert!(workspace.live_failed.contains(&setup.thread));
     }
 
     #[test]

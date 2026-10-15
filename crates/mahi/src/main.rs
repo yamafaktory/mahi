@@ -45,6 +45,7 @@ mod turns;
 mod ui;
 mod unlocked;
 mod workspace;
+mod workspace_live;
 
 use std::{
     error::Error,
