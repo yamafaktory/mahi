@@ -23,7 +23,10 @@ use std::{
 };
 
 use age::secrecy::ExposeSecret;
-use mahi_core::ThreadId;
+use mahi_core::{
+    AgentSlot,
+    ThreadId,
+};
 use mahi_identity::LocalIdentity;
 use mahi_sandbox::{
     PtyChild,
@@ -68,6 +71,7 @@ use crate::{
         KEY_FD,
         REPORT_FD,
     },
+    teammates::Teammates,
     workspace_live::WorkspaceLive,
 };
 
@@ -368,6 +372,69 @@ struct Tab {
     thread: Option<ThreadId>,
     agents: Vec<Running>,
     selected: usize,
+    watching: Option<AgentSlot>,
+}
+
+impl Tab {
+    /// Returns the agents the list shows: the user's own, then the teammates' the workspace
+    /// watches, from `teammates`.
+    fn listed<'a>(&'a self, teammates: Option<&'a Teammates>) -> Vec<WorkspaceAgent<'a>> {
+        let watched = teammates.into_iter().flat_map(Teammates::agents);
+        let count = teammates.map_or(0, |teammates| teammates.agents().len());
+        let mut listed = Vec::with_capacity(self.agents.len() + count);
+        listed.extend(self.agents.iter().map(Running::shown_as));
+        listed.extend(watched.map(|(slot, online)| WorkspaceAgent {
+            owner: Some(slot.participant().as_str()),
+            name: slot.agent().as_str(),
+            state: if online {
+                AgentState::Live
+            } else {
+                AgentState::Offline
+            },
+        }));
+        listed
+    }
+
+    /// Returns the screen of the selected agent: the user's own child's, or the teammate's of
+    /// `teammates`, once one of it arrived.
+    fn screen<'a>(&'a self, teammates: Option<&'a Teammates>) -> Option<&'a vt100::Screen> {
+        match (self.agents.get(self.selected), &self.watching) {
+            (Some(running), _) => Some(running.child.screen()),
+            (None, Some(slot)) => teammates?.screen(slot),
+            (None, None) => None,
+        }
+    }
+
+    /// Selects the agent at `index` of the list, the user's own or, past them, the teammate's
+    /// of `teammates` at that place, which stays selected when the list changes.
+    fn select(&mut self, index: usize, teammates: Option<&Teammates>) {
+        self.selected = index;
+        self.watching = index
+            .checked_sub(self.agents.len())
+            .and_then(|at| teammates?.agents().nth(at))
+            .map(|(slot, _)| slot.clone());
+    }
+
+    /// Selects again the teammate's agent selected before the list of `teammates` changed,
+    /// or the user's last agent when it is no longer listed.
+    fn reselect(&mut self, teammates: Option<&Teammates>) {
+        let Some(slot) = &self.watching else {
+            return;
+        };
+        let place = teammates
+            .and_then(|teammates| teammates.agents().position(|(watched, _)| watched == slot));
+        if let Some(place) = place {
+            self.selected = self.agents.len() + place;
+        } else {
+            self.watching = None;
+            self.selected = self.agents.len().saturating_sub(1);
+        }
+    }
+}
+
+/// Returns the teammates `live` watches in `thread`, when the workspace hosts it.
+fn teammates_of(live: Option<&WorkspaceLive>, thread: Option<ThreadId>) -> Option<&Teammates> {
+    live?.teammates(thread?)
 }
 
 /// An agent the workspace runs, as the mahi command that runs it.
@@ -517,12 +584,13 @@ impl Workspace {
                 title: title.to_owned(),
                 agents: Vec::new(),
                 selected: 0,
+                watching: None,
             });
             self.tabs.len() - 1
         };
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.agents.push(running);
-            tab.selected = tab.agents.len() - 1;
+            tab.select(tab.agents.len() - 1, None);
         }
         self.selected = index + 1;
         Ok(())
@@ -559,6 +627,25 @@ impl Workspace {
                     }
                 }
             }
+        }
+        changed | self.watch_teammates()
+    }
+
+    /// Takes what the teammates' hosts sent, keeping each tab's selected teammate selected;
+    /// returns whether the list or a teammate's screen changed in the thread whose tab is
+    /// shown.
+    fn watch_teammates(&mut self) -> bool {
+        let shown = self
+            .selected
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| tab.thread);
+        let Some(live) = self.live.as_mut() else {
+            return false;
+        };
+        let changed = live.watch(Instant::now(), shown);
+        for tab in &mut self.tabs {
+            tab.reselect(teammates_of(self.live.as_ref(), tab.thread));
         }
         changed
     }
@@ -615,6 +702,7 @@ impl Workspace {
                 tab.selected = selected
                     .and_then(|id| tab.agents.iter().position(|running| running.id == id))
                     .unwrap_or_else(|| tab.selected.min(tab.agents.len().saturating_sub(1)));
+                tab.reselect(teammates_of(self.live.as_ref(), tab.thread));
             }
         }
         if self.tabs.iter().any(|tab| tab.agents.is_empty()) {
@@ -744,7 +832,7 @@ impl Workspace {
     /// on a thread's tab the rest, for its shown agent; on the thread list the rest goes to
     /// `threads`.
     pub(crate) fn type_keys(&mut self, typed: &[u8], threads: &mut Vec<u8>) -> Moved {
-        let before = (self.selected, self.shown_id(), self.list_shown);
+        let before = (self.shown_place(), self.shown_id(), self.list_shown);
         let mut joined = std::mem::take(&mut self.mouse.joined);
         let mut new = false;
         for piece in split_mouse(self.join_carried(typed, &mut joined)) {
@@ -756,7 +844,7 @@ impl Workspace {
         self.mouse.joined = joined;
         if new {
             Moved::New
-        } else if (self.selected, self.shown_id(), self.list_shown) == before {
+        } else if (self.shown_place(), self.shown_id(), self.list_shown) == before {
             Moved::Nothing
         } else {
             Moved::Shown
@@ -838,7 +926,8 @@ impl Workspace {
         else {
             return false;
         };
-        let agents: Vec<WorkspaceAgent<'_>> = tab.agents.iter().map(Running::shown_as).collect();
+        let teammates = teammates_of(self.live.as_ref(), tab.thread);
+        let agents = tab.listed(teammates);
         let hit = ThreadView {
             agents: &agents,
             selected: tab.selected,
@@ -850,7 +939,7 @@ impl Workspace {
         drop(agents);
         match hit {
             Some(ListHit::Agent(index)) if event.is_left_click() => {
-                tab.selected = index;
+                tab.select(index, teammates);
                 return false;
             }
             Some(_) => return false,
@@ -963,15 +1052,18 @@ impl Workspace {
                     .selected
                     .checked_sub(1)
                     .and_then(|index| self.tabs.get_mut(index))
-                    && !tab.agents.is_empty()
                 {
-                    let count = tab.agents.len();
-                    let forward = if step == Step::NextAgent {
-                        1
-                    } else {
-                        count - 1
-                    };
-                    tab.selected = (tab.selected + forward) % count;
+                    let teammates = teammates_of(self.live.as_ref(), tab.thread);
+                    let count =
+                        tab.agents.len() + teammates.map_or(0, |watched| watched.agents().len());
+                    if count > 0 {
+                        let forward = if step == Step::NextAgent {
+                            1
+                        } else {
+                            count - 1
+                        };
+                        tab.select((tab.selected + forward) % count, teammates);
+                    }
                 }
             }
             Step::List => self.list_shown = !self.list_shown,
@@ -998,10 +1090,12 @@ impl Workspace {
         }
         .render(bar, buffer);
         let tab = self.tabs.get(self.selected.checked_sub(1)?)?;
-        let agents: Vec<WorkspaceAgent<'_>> = tab.agents.iter().map(Running::shown_as).collect();
+        let teammates = teammates_of(self.live.as_ref(), tab.thread);
+        let agents = tab.listed(teammates);
         let shown = tab.agents.get(tab.selected);
         let failed = shown.is_some_and(|running| running.ending == Ending::Failed);
-        ThreadView {
+        let screen = tab.screen(teammates);
+        let cursor = ThreadView {
             agents: &agents,
             selected: tab.selected,
             prompts: tab
@@ -1012,7 +1106,8 @@ impl Workspace {
             list: self.list_place(body.width),
             hints: if failed { &FAILED_HINTS } else { &HINTS },
         }
-        .render(shown.map(|running| running.child.screen()), body, buffer)
+        .render(screen, body, buffer);
+        cursor.filter(|_| shown.is_some())
     }
 
     fn tab_titles(&self) -> impl Iterator<Item = WorkspaceTab<'_>> {
@@ -1128,12 +1223,14 @@ impl Workspace {
                     })
             })
             .collect();
-        let current = self.selected.checked_sub(1).and_then(|tab| {
-            let agent = self.tabs.get(tab)?.selected;
+        let start = self.selected.checked_sub(1).map_or(0, |tab| {
+            let agent = self.tabs.get(tab).map_or(0, |shown| shown.selected);
             flat.iter()
-                .position(|&(at_tab, at_agent, _)| at_tab == tab && at_agent == agent)
+                .position(|&(at_tab, at_agent, _)| {
+                    at_tab > tab || (at_tab == tab && at_agent > agent)
+                })
+                .unwrap_or(0)
         });
-        let start = current.map_or(0, |at| at + 1);
         let next = (0..flat.len())
             .map(|offset| (start + offset) % flat.len())
             .filter_map(|index| flat.get(index))
@@ -1141,9 +1238,20 @@ impl Workspace {
         if let Some(&(tab, agent, _)) = next {
             self.selected = tab + 1;
             if let Some(tab) = self.tabs.get_mut(tab) {
-                tab.selected = agent;
+                tab.select(agent, None);
             }
         }
+    }
+
+    /// Returns the tab shown and, on a thread's tab, the place of its shown agent in its
+    /// list, the user's own or a teammate's.
+    fn shown_place(&self) -> (usize, Option<usize>) {
+        let agent = self
+            .selected
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.selected);
+        (self.selected, agent)
     }
 
     fn shown_id(&self) -> Option<usize> {
@@ -1319,6 +1427,7 @@ mod tests {
             thread: None,
             agents,
             selected: 0,
+            watching: None,
         }
     }
 
@@ -1388,6 +1497,123 @@ mod tests {
         assert_eq!(workspace.list_place(120), ListPlace::Hidden);
         workspace.type_keys(b"\x00b", &mut threads);
         assert_eq!(workspace.list_place(80), ListPlace::Over);
+        assert!(threads.is_empty());
+    }
+
+    fn heard(teammates: &mut Teammates, slot: &str) {
+        let slot: AgentSlot = slot.parse().unwrap();
+        let participant = slot.participant().clone();
+        teammates.apply(
+            &participant,
+            mahi_live::Body::Heartbeat { slot },
+            Instant::now(),
+        );
+    }
+
+    #[test]
+    fn a_tab_lists_the_users_agents_then_the_teammates_and_keeps_a_teammate_selected() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let own = running(&mut workspace, "sleep 5");
+        let mut tab = tab("a", vec![own]);
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        heard(&mut teammates, "bob.claude");
+        let listed: Vec<(Option<&str>, &str, AgentState)> = tab
+            .listed(Some(&teammates))
+            .iter()
+            .map(|agent| (agent.owner, agent.name, agent.state))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (None, "agent", AgentState::Done),
+                (Some("bob"), "claude", AgentState::Live),
+            ]
+        );
+        tab.select(1, Some(&teammates));
+        assert_eq!(tab.watching, Some("bob.claude".parse().unwrap()));
+        assert!(tab.screen(Some(&teammates)).is_none());
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let screen = mahi_live::Body::Screen {
+            slot: bob.clone(),
+            rows: 2,
+            columns: 20,
+            challenge: [1; 16],
+            part: 0,
+            parts: 1,
+            bytes: b"bob's screen".to_vec(),
+        };
+        teammates.apply(bob.participant(), screen, Instant::now());
+        assert_eq!(
+            tab.screen(Some(&teammates)).map(vt100::Screen::contents),
+            Some("bob's screen".to_owned())
+        );
+        heard(&mut teammates, "bob.aider");
+        tab.reselect(Some(&teammates));
+        assert_eq!(tab.selected, 2);
+        tab.select(0, Some(&teammates));
+        assert!(tab.watching.is_none());
+        tab.select(2, Some(&teammates));
+        tab.reselect(None);
+        assert_eq!((tab.selected, tab.watching.is_none()), (0, true));
+    }
+
+    #[test]
+    fn a_move_between_teammates_agents_is_shown_and_space_from_one_goes_to_the_next_tab() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        heard(&mut teammates, "bob.claude");
+        heard(&mut teammates, "bob.codex");
+        let first = running(&mut workspace, "sleep 5");
+        let second = running(&mut workspace, "sleep 5");
+        let second_id = second.id;
+        let mut watching = tab("a", vec![first]);
+        watching.select(1, Some(&teammates));
+        workspace.tabs.push(watching);
+        workspace.tabs.push(tab("b", vec![second]));
+        workspace.selected = 1;
+        let on_first = workspace.shown_place();
+        workspace.tabs[0].select(2, Some(&teammates));
+        assert_ne!(workspace.shown_place(), on_first);
+        workspace.step(Step::Waiting);
+        assert_eq!(workspace.shown_id(), Some(second_id));
+    }
+
+    #[test]
+    fn no_key_reaches_an_agent_while_a_teammates_agent_is_shown() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let own = running(&mut workspace, "read line; echo \"got $line\"; sleep 5");
+        let mut tab = tab("a", vec![own]);
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        heard(&mut teammates, "bob.claude");
+        tab.select(1, Some(&teammates));
+        workspace.tabs.push(tab);
+        workspace.selected = 1;
+        let (mut threads, mut out) = (Vec::new(), Vec::new());
+        assert_eq!(workspace.shown_id(), None);
+        workspace.type_keys(b"abc\r", &mut threads);
+        if let Some(tab) = workspace.tabs.first_mut() {
+            tab.select(0, None);
+        }
+        workspace.type_keys(b"xyz\r", &mut threads);
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .contains("got")
+        });
+        let contents = workspace.tabs[0].agents[0].child.screen().contents();
+        assert!(contents.contains("got xyz"), "{contents}");
+        assert!(!contents.contains("abc"), "{contents}");
         assert!(threads.is_empty());
     }
 

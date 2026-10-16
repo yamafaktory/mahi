@@ -44,6 +44,8 @@ pub enum AgentState {
     Done,
     /// It waits on a question of its own for the user.
     AsksYou,
+    /// A teammate's agent whose host is connected; its frames say nothing of its turns.
+    Live,
     /// A teammate's agent whose host is not connected.
     Offline,
     /// The command that ran it failed; its last screen stays until the user closes it.
@@ -56,6 +58,7 @@ impl AgentState {
             Self::Working => Span::styled("● working", Style::new().fg(Theme::ACCENT)),
             Self::Done => Span::styled("✓ done", Style::new().fg(Theme::OK)),
             Self::AsksYou => Span::styled("! asks you", Theme::code()),
+            Self::Live => Span::styled("◉ live", Style::new().fg(Theme::ACCENT)),
             Self::Offline => Span::styled("○ offline", Theme::muted()),
             Self::Failed => Span::styled("✗ failed", Style::new().fg(Theme::ERROR)),
         }

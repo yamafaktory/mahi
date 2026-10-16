@@ -222,26 +222,18 @@ impl WorkspaceLive {
 
     /// Takes at `now` what the teammates' hosts sent in every thread the workspace hosts, and
     /// asks them for their agents' screens when they are wanted; returns whether what the
-    /// teammates' agents show changed.
-    #[expect(
-        dead_code,
-        reason = "the workspace's tabs list and draw teammates' agents next"
-    )]
-    pub(crate) fn watch(&mut self, now: Instant) -> bool {
+    /// teammates' agents show in `shown`, the thread whose tab is shown, changed.
+    pub(crate) fn watch(&mut self, now: Instant, shown: Option<ThreadId>) -> bool {
         let mut changed = false;
-        for hosted in self.hosted.values_mut() {
+        for (thread, hosted) in &mut self.hosted {
             if let Some(watch) = hosted.host.watch() {
-                changed |= watch.update(&mut hosted.teammates, now);
+                changed |= watch.update(&mut hosted.teammates, now) && Some(*thread) == shown;
             }
         }
         changed
     }
 
     /// Returns the teammates' agents the workspace watches in `thread`, while it hosts it.
-    #[expect(
-        dead_code,
-        reason = "the workspace's tabs list and draw teammates' agents next"
-    )]
     pub(crate) fn teammates(&self, thread: ThreadId) -> Option<&Teammates> {
         self.hosted.get(&thread).map(|hosted| &hosted.teammates)
     }

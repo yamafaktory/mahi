@@ -213,7 +213,7 @@ impl Teammates {
     }
 
     /// Returns the agents watched, in slot order, and whether each is online.
-    pub(crate) fn agents(&self) -> impl Iterator<Item = (&AgentSlot, bool)> {
+    pub(crate) fn agents(&self) -> impl ExactSizeIterator<Item = (&AgentSlot, bool)> {
         self.agents
             .iter()
             .map(|teammate| (&teammate.slot, teammate.online))
