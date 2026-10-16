@@ -1,5 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{
+        BTreeSet,
+        HashMap,
+    },
     io,
     path::{
         Path,
@@ -10,7 +13,11 @@ use std::{
     time::Instant,
 };
 
-use mahi_core::ThreadId;
+use mahi_core::{
+    AgentSlot,
+    RefKind,
+    ThreadId,
+};
 use mahi_identity::{
     ConfigDir,
     IdentityError,
@@ -33,6 +40,7 @@ use mahi_thread::{
     OwnerError,
     ParticipantKey,
     ThreadError,
+    VerifiedMeta,
     load_meta,
 };
 use thiserror::Error;
@@ -58,6 +66,7 @@ use crate::{
         LiveLock,
         LockError,
     },
+    threads,
     unlocked,
 };
 
@@ -197,7 +206,8 @@ impl WorkspaceLive {
             .and_then(|socket| Hub::start(socket, host.handle()));
         match hub {
             Ok(hub) => {
-                let teammates = Teammates::new(participant);
+                let mut teammates = Teammates::new(participant);
+                teammates.add_offline(&known_agents(&store, &meta));
                 self.hosted.insert(
                     thread,
                     Hosted {
@@ -263,6 +273,29 @@ impl Drop for WorkspaceLive {
     }
 }
 
+/// Returns the agents of the participants `meta` lists that the thread's refs name here, its
+/// own and those fetched, which anyone who can push to the remote chooses; none when the refs
+/// cannot be read, since each agent is listed anyway once its host is heard from.
+fn known_agents(store: &Store, meta: &VerifiedMeta) -> BTreeSet<AgentSlot> {
+    let thread = meta.thread();
+    let fetched = store.fetched_refs(thread).unwrap_or_default();
+    let own = threads::thread_agents(store, thread).unwrap_or_default();
+    fetched
+        .iter()
+        .filter_map(|(thread_ref, _)| match thread_ref.kind() {
+            RefKind::Snapshots(slot) | RefKind::Transcript(slot) | RefKind::Session(slot) => {
+                Some(slot.clone())
+            }
+            RefKind::Meta | RefKind::State => None,
+        })
+        .chain(own)
+        .filter(|slot| {
+            meta.participants()
+                .any(|participant| participant.name() == slot.participant())
+        })
+        .collect()
+}
+
 fn stop(hosted: Hosted) {
     hosted.hub.stop();
     hosted.host.stop();
@@ -278,6 +311,10 @@ pub(crate) mod tests {
     use mahi_core::ParticipantName;
     use mahi_identity::PublicIdentity;
     use mahi_store::GlobalPatterns;
+    use mahi_thread::{
+        Participant,
+        add_participant,
+    };
     use ssh_key::{
         Algorithm,
         PrivateKey,
@@ -301,6 +338,7 @@ pub(crate) mod tests {
         pub(crate) config: ConfigDir,
         pub(crate) environment: Environment,
         identity: LocalIdentity,
+        owner_key: PrivateKey,
         pub(crate) thread: ThreadId,
     }
 
@@ -354,6 +392,7 @@ pub(crate) mod tests {
             config,
             environment,
             identity,
+            owner_key,
             thread: started.thread,
         }
     }
@@ -382,6 +421,53 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_hosted_threads_teammates_agents_from_its_refs_are_listed_offline() {
+        let setup = setup();
+        let tree = setup.store.write_tree(&[]).unwrap();
+        let bob = Participant::new(
+            "bob".parse().unwrap(),
+            ParticipantKey::from_public_key(
+                PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+                    .unwrap()
+                    .public_key(),
+            )
+            .unwrap(),
+            age::x25519::Identity::generate().to_public(),
+            NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
+        )
+        .unwrap();
+        let owner = ParticipantKey::from_public_key(setup.owner_key.public_key()).unwrap();
+        let thread_key = load_meta(&setup.store, setup.thread, &owner, 0)
+            .unwrap()
+            .thread_key(&"alice".parse().unwrap(), setup.identity.as_age())
+            .unwrap();
+        add_participant(
+            &setup.store,
+            setup.thread,
+            &thread_key,
+            &setup.owner_key,
+            bob,
+        )
+        .unwrap();
+        for slot in ["bob.codex", "mallory.claude"] {
+            let slot: AgentSlot = slot.parse().unwrap();
+            let agent = mahi_core::ThreadRef::new(setup.thread, RefKind::Transcript(slot));
+            setup.store.append(&agent, None, tree, "test").unwrap();
+        }
+        let mut live =
+            WorkspaceLive::new(&setup.environment, &setup.config, setup.store.common_dir())
+                .unwrap();
+        live.host_unlocked(setup.thread, &setup.identity).unwrap();
+        let listed: Vec<(String, bool)> = live
+            .teammates(setup.thread)
+            .unwrap()
+            .agents()
+            .map(|(slot, online)| (slot.to_string(), online))
+            .collect();
+        assert_eq!(listed, [("bob.codex".to_owned(), false)]);
     }
 
     #[test]

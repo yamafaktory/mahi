@@ -36,8 +36,7 @@ pub(crate) struct Teammates {
 #[derive(Debug)]
 struct Teammate {
     slot: AgentSlot,
-    heard: Instant,
-    online: bool,
+    presence: Presence,
     screen: Watched,
     rebuilding: Option<Rebuilding>,
 }
@@ -50,6 +49,21 @@ impl Teammate {
         let was = matches!(self.screen, Watched::TooLarge);
         self.screen = Watched::TooLarge;
         !was
+    }
+}
+
+/// Whether a teammate's agent's host is heard from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presence {
+    /// Heard from last at this time, within [`HOST_SILENCE`].
+    Online(Instant),
+    /// Not heard from for [`HOST_SILENCE`], since this time, or never.
+    Offline(Option<Instant>),
+}
+
+impl Presence {
+    fn is_online(self) -> bool {
+        matches!(self, Self::Online(_))
     }
 }
 
@@ -184,7 +198,7 @@ impl Teammates {
         }
         let wanted = self.lost
             || self.agents.iter().any(|teammate| {
-                teammate.online
+                teammate.presence.is_online()
                     && match &teammate.rebuilding {
                         Some(rebuilding) => rebuilding.waited_longer_than(STUCK_SCREEN, now),
                         None => matches!(teammate.screen, Watched::Waiting),
@@ -202,8 +216,10 @@ impl Teammates {
     pub(crate) fn expire(&mut self, now: Instant) -> bool {
         let mut changed = false;
         for teammate in &mut self.agents {
-            if teammate.online && now.saturating_duration_since(teammate.heard) > HOST_SILENCE {
-                teammate.online = false;
+            if let Presence::Online(heard) = teammate.presence
+                && now.saturating_duration_since(heard) > HOST_SILENCE
+            {
+                teammate.presence = Presence::Offline(Some(heard));
                 teammate.screen = Watched::Waiting;
                 teammate.rebuilding = None;
                 changed = true;
@@ -212,11 +228,45 @@ impl Teammates {
         changed
     }
 
+    /// Lists as offline the agents of `slots` that are not the user's and not listed yet,
+    /// while the list has room: those the thread's refs name, whose hosts were not heard from;
+    /// returns whether one was listed.
+    pub(crate) fn add_offline<'a>(
+        &mut self,
+        slots: impl IntoIterator<Item = &'a AgentSlot>,
+    ) -> bool {
+        let mut added = false;
+        for slot in slots {
+            if self.agents.len() >= MOST_WATCHED {
+                break;
+            }
+            if slot.participant() == &self.own {
+                continue;
+            }
+            if let Err(index) = self
+                .agents
+                .binary_search_by(|teammate| teammate.slot.cmp(slot))
+            {
+                self.agents.insert(
+                    index,
+                    Teammate {
+                        slot: slot.clone(),
+                        presence: Presence::Offline(None),
+                        screen: Watched::Waiting,
+                        rebuilding: None,
+                    },
+                );
+                added = true;
+            }
+        }
+        added
+    }
+
     /// Returns the agents watched, in slot order, and whether each is online.
     pub(crate) fn agents(&self) -> impl ExactSizeIterator<Item = (&AgentSlot, bool)> {
         self.agents
             .iter()
-            .map(|teammate| (&teammate.slot, teammate.online))
+            .map(|teammate| (&teammate.slot, teammate.presence.is_online()))
     }
 
     /// Returns the screen of `slot`'s agent, once one arrived and while it is online.
@@ -238,9 +288,8 @@ impl Teammates {
         {
             Ok(index) => {
                 let teammate = self.agents.get_mut(index)?;
-                teammate.heard = now;
-                let back = !teammate.online;
-                teammate.online = true;
+                let back = !teammate.presence.is_online();
+                teammate.presence = Presence::Online(now);
                 return Some((teammate, back));
             }
             Err(index) if self.agents.len() < MOST_WATCHED => index,
@@ -249,8 +298,11 @@ impl Teammates {
                     .agents
                     .iter()
                     .enumerate()
-                    .filter(|(_, teammate)| !teammate.online)
-                    .min_by_key(|(_, teammate)| teammate.heard)
+                    .filter_map(|(index, teammate)| match teammate.presence {
+                        Presence::Offline(heard) => Some((index, heard)),
+                        Presence::Online(_) => None,
+                    })
+                    .min_by_key(|&(_, heard)| heard)
                     .map(|(index, _)| index)?;
                 self.agents.remove(silent);
                 self.agents
@@ -262,8 +314,7 @@ impl Teammates {
             index,
             Teammate {
                 slot: slot.clone(),
-                heard: now,
-                online: true,
+                presence: Presence::Online(now),
                 screen: Watched::Waiting,
                 rebuilding: None,
             },
@@ -521,6 +572,59 @@ mod tests {
         assert!(teammates.apply(&bob(), resize, now));
         teammates.apply(&bob(), part(1), now);
         assert!(teammates.screen(&slot("bob.claude")).is_none());
+    }
+
+    #[test]
+    fn agents_of_the_threads_refs_are_listed_offline_until_heard_and_go_first_when_full() {
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let known = [
+            slot("alice.claude"),
+            slot("bob.codex"),
+            slot("carol.claude"),
+        ];
+        assert!(teammates.add_offline(&known));
+        assert!(!teammates.add_offline(&known));
+        let listed: Vec<(String, bool)> = teammates
+            .agents()
+            .map(|(slot, online)| (slot.to_string(), online))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("bob.codex".to_owned(), false),
+                ("carol.claude".to_owned(), false)
+            ]
+        );
+        let mut clock = Clock::new();
+        assert!(!clock.asks(&mut teammates));
+        let now = Instant::now();
+        assert!(teammates.apply(
+            &bob(),
+            Body::Heartbeat {
+                slot: slot("bob.codex")
+            },
+            now
+        ));
+        for agent in 0..MOST_WATCHED - 2 {
+            let heartbeat = Body::Heartbeat {
+                slot: slot(&format!("bob.agent{agent:02}")),
+            };
+            teammates.apply(&bob(), heartbeat, now);
+        }
+        assert!(teammates.apply(
+            &bob(),
+            Body::Heartbeat {
+                slot: slot("bob.new")
+            },
+            now
+        ));
+        let listed: Vec<String> = teammates
+            .agents()
+            .map(|(slot, _)| slot.to_string())
+            .collect();
+        assert!(!listed.contains(&"carol.claude".to_owned()));
+        assert!(listed.contains(&"bob.codex".to_owned()));
+        assert!(!teammates.add_offline(&known));
     }
 
     #[test]
