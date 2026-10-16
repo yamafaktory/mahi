@@ -104,6 +104,10 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
+    rebuilding::{
+        Part,
+        Rebuilding,
+    },
     run::{
         self,
         Joined,
@@ -132,7 +136,7 @@ use crate::{
 const META_WAIT: Duration = Duration::from_secs(30);
 const RETRY_PAUSE: Duration = Duration::from_secs(1);
 const JOIN_WAIT: Duration = Duration::from_secs(15);
-const ASK_EVERY: Duration = Duration::from_secs(1);
+pub(crate) const ASK_EVERY: Duration = Duration::from_secs(1);
 const MOST_AGENTS: usize = 32;
 const SWITCH_WAIT: Duration = Duration::from_secs(10);
 const RECEIVE_PAUSE: Duration = Duration::from_millis(100);
@@ -141,9 +145,9 @@ const MAIN_SCREEN: &[u8] = b"\x1b[?1049l";
 const CLEAR: &[u8] = b"\x1b[H\x1b[2J";
 const RESET: &[u8] =
     b"\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>";
-const STUCK_SCREEN: Duration = Duration::from_secs(3);
+pub(crate) const STUCK_SCREEN: Duration = Duration::from_secs(3);
 const DRAIN: usize = 256;
-const HOST_SILENCE: Duration = Duration::from_secs(30);
+pub(crate) const HOST_SILENCE: Duration = Duration::from_secs(30);
 const KEY_QUEUE: usize = 64;
 const TYPING_PAUSE: Duration = Duration::from_millis(10);
 
@@ -221,16 +225,7 @@ pub(crate) struct View {
     screen: Option<vt100::Parser>,
     shown: Option<vt100::Screen>,
     changed: bool,
-    pending: Option<Pending>,
-}
-
-struct Pending {
-    slot: AgentSlot,
-    challenge: [u8; 16],
-    rows: u16,
-    columns: u16,
-    parts: Vec<Option<Vec<u8>>>,
-    since: Instant,
+    pending: Option<Rebuilding>,
 }
 
 impl View {
@@ -257,7 +252,7 @@ impl View {
     pub(crate) fn is_stuck(&self, wait: Duration) -> bool {
         self.pending
             .as_ref()
-            .is_some_and(|pending| pending.since.elapsed() > wait)
+            .is_some_and(|pending| pending.waited_longer_than(wait, Instant::now()))
     }
 
     /// Applies what `participant` sent to the viewer's screen.
@@ -291,7 +286,15 @@ impl View {
                     .map(|(wanted, _)| wanted)
                     .or(self.slot.as_ref());
                 if followed.is_none_or(|followed| followed == &slot) {
-                    self.take_part(slot, challenge, (rows, columns), (part, parts), bytes);
+                    self.take_part(Part {
+                        slot,
+                        challenge,
+                        rows,
+                        columns,
+                        index: part,
+                        parts,
+                        bytes,
+                    });
                 }
             }
             Body::Output { slot, bytes } => {
@@ -413,48 +416,11 @@ impl View {
         self.screen.as_mut()
     }
 
-    fn take_part(
-        &mut self,
-        slot: AgentSlot,
-        challenge: [u8; 16],
-        (rows, columns): (u16, u16),
-        (part, parts): (u16, u16),
-        bytes: Vec<u8>,
-    ) {
-        let same = self.pending.as_ref().is_some_and(|pending| {
-            pending.slot == slot
-                && pending.challenge == challenge
-                && (pending.rows, pending.columns) == (rows, columns)
-                && pending.parts.len() == usize::from(parts)
-        });
-        if !same {
-            self.pending = Some(Pending {
-                slot,
-                challenge,
-                rows,
-                columns,
-                parts: vec![None; usize::from(parts)],
-                since: Instant::now(),
-            });
-        }
-        let Some(pending) = self.pending.as_mut() else {
+    fn take_part(&mut self, part: Part) {
+        let Some((slot, screen)) = Rebuilding::add(&mut self.pending, part, Instant::now()) else {
             return;
         };
-        let Some(place) = pending.parts.get_mut(usize::from(part)) else {
-            return;
-        };
-        *place = Some(bytes);
-        if pending.parts.iter().any(Option::is_none) {
-            return;
-        }
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        let mut screen = vt100::Parser::new(pending.rows, pending.columns, 0);
-        for bytes in pending.parts.into_iter().flatten() {
-            screen.process(&bytes);
-        }
-        self.slot = Some(pending.slot);
+        self.slot = Some(slot);
         self.wanted = None;
         self.screen = Some(screen);
         self.shown = None;

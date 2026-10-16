@@ -30,6 +30,7 @@ mod profile;
 mod prompt;
 mod prompts;
 mod purge;
+mod rebuilding;
 mod recorder;
 mod remote;
 mod report;
@@ -38,6 +39,14 @@ mod session;
 mod session_sync;
 mod settings;
 mod sync;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the workspace watches teammates' agents with this in its next piece"
+    )
+)]
+mod teammates;
 mod terminal;
 mod thread_lock;
 mod threads;
