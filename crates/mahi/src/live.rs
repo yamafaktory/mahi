@@ -23,6 +23,7 @@ use std::{
         PoisonError,
         atomic::{
             AtomicBool,
+            AtomicUsize,
             Ordering,
         },
         mpsc::{
@@ -67,6 +68,7 @@ use mahi_live::{
     Peers,
     PromptOutcome,
     PromptText,
+    Received,
     Relays,
 };
 use mahi_sandbox::WindowSize;
@@ -94,6 +96,7 @@ use crate::{
         Answer,
         Prompts,
     },
+    teammates::Teammates,
     thread_lock::{
         LiveLock,
         LockError,
@@ -161,6 +164,12 @@ const PUBLISH_EVERY: Duration = Duration::from_secs(2);
 const LAST_ANSWERS_WAIT: Duration = Duration::from_secs(2);
 /// The most answers a host keeps to send again after the network failed it.
 const MAX_UNSENT_ANSWERS: usize = 256;
+/// The most frames of teammates' agents the workspace's host keeps until the workspace reads
+/// them.
+const WATCH_QUEUE: usize = 1024;
+/// The most bytes of teammates' agents' terminals the workspace's host keeps until the
+/// workspace reads them.
+const WATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// What a host needs to open the live layer, gathered before the agent starts.
 #[derive(Debug)]
@@ -620,6 +629,145 @@ pub(crate) struct LiveHost {
     registry: Arc<Mutex<Registry>>,
     queue: SyncSender<Tapped>,
     dropped: Arc<AtomicBool>,
+    watch: Option<Watch>,
+}
+
+/// What a host serves besides the agents the user's other mahis hand it.
+#[derive(Debug)]
+pub(crate) enum HostRole<'a> {
+    /// The agent this mahi runs itself.
+    Agent(OwnAgent<'a>),
+    /// No agent of its own: the workspace's host, which passes on what the teammates' hosts
+    /// send, so the workspace watches their agents.
+    Workspace,
+}
+
+impl<'a> HostRole<'a> {
+    fn into_own(self) -> Option<OwnAgent<'a>> {
+        match self {
+            Self::Agent(own) => Some(own),
+            Self::Workspace => None,
+        }
+    }
+}
+
+/// What the workspace's host passes on of the frames the teammates' hosts send, and how the
+/// workspace asks them for their agents' screens.
+#[derive(Debug)]
+pub(crate) struct Watch {
+    frames: Receiver<Received>,
+    lost: Arc<AtomicBool>,
+    ask: Arc<AtomicBool>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Watch {
+    /// Opens a watch, and the listener's half of it, which hands its screen requests to the
+    /// broadcaster through `request`.
+    fn open(request: &Arc<Mutex<Option<Body>>>) -> (Self, Watching) {
+        let (passed, frames) = mpsc::sync_channel(WATCH_QUEUE);
+        let (lost, ask) = (Arc::<AtomicBool>::default(), Arc::<AtomicBool>::default());
+        let queued = Arc::<AtomicUsize>::default();
+        let watching = Watching {
+            frames: passed,
+            lost: Arc::clone(&lost),
+            ask: Arc::clone(&ask),
+            request: Arc::clone(request),
+            queued: Arc::clone(&queued),
+        };
+        let watch = Self {
+            frames,
+            lost,
+            ask,
+            queued,
+        };
+        (watch, watching)
+    }
+
+    /// Applies to `teammates` at `now` what their hosts sent since the last call, and asks
+    /// for their agents' screens when `teammates` wants them; returns whether what
+    /// `teammates` shows changed.
+    pub(crate) fn update(&self, teammates: &mut Teammates, now: Instant) -> bool {
+        let mut changed = teammates.expire(now);
+        for received in self.frames.try_iter().take(WATCH_QUEUE) {
+            self.queued
+                .fetch_sub(drawn_bytes(&received.body), Ordering::SeqCst);
+            changed |= teammates.apply(&received.participant, received.body, now);
+        }
+        if self.lost.swap(false, Ordering::SeqCst) {
+            teammates.lose();
+        }
+        if teammates.take_wants_screen(now) {
+            self.ask.store(true, Ordering::SeqCst);
+        }
+        changed
+    }
+}
+
+/// Returns how many bytes of an agent's terminal `body` carries.
+fn drawn_bytes(body: &Body) -> usize {
+    match body {
+        Body::Output { bytes, .. } | Body::Screen { bytes, .. } => bytes.len(),
+        _ => 0,
+    }
+}
+
+/// The listener's half of a [`Watch`]: where it passes the teammates' frames on, and the
+/// screen request it hands the broadcaster when the workspace asks for one.
+#[derive(Debug)]
+struct Watching {
+    frames: SyncSender<Received>,
+    lost: Arc<AtomicBool>,
+    ask: Arc<AtomicBool>,
+    request: Arc<Mutex<Option<Body>>>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Watching {
+    /// Takes `received` when it draws an agent, passing it on when the agent is a
+    /// participant's other than `owner`, and noting that frames were lost when there is no
+    /// room for it; returns any other frame.
+    fn pass(&self, received: Received, owner: &ParticipantName) -> Option<Received> {
+        if !matches!(
+            received.body,
+            Body::Screen { .. }
+                | Body::Output { .. }
+                | Body::Resize { .. }
+                | Body::Heartbeat { .. }
+        ) {
+            return Some(received);
+        }
+        if &received.participant == owner {
+            return None;
+        }
+        let bytes = drawn_bytes(&received.body);
+        let held = self.queued.fetch_add(bytes, Ordering::SeqCst) + bytes;
+        if held > WATCH_BYTES || self.frames.try_send(received).is_err() {
+            self.queued.fetch_sub(bytes, Ordering::SeqCst);
+            self.lost.store(true, Ordering::SeqCst);
+        }
+        None
+    }
+
+    /// Notes that frames were lost when the topic's count of frames it dropped, `dropped`,
+    /// grew past `seen`.
+    fn note_dropped(&self, dropped: u64, seen: &mut u64) {
+        if dropped != *seen {
+            *seen = dropped;
+            self.lost.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Hands the broadcaster a request for the agents' screens, made by `receiver` so that it
+    /// anchors the runs that answer, when the workspace asked for one.
+    fn ask_if_wanted(&self, receiver: &mut FrameReceiver) {
+        if !self.ask.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let (Ok(request), Ok(mut slot)) = (receiver.request_screen(), self.request.lock()) {
+            *slot = Some(request);
+        }
+    }
 }
 
 /// The agent a host runs itself: its slot, its terminal's size and what it drew, and the
@@ -664,22 +812,23 @@ impl LiveHost {
             (&shared, hosting),
             setup,
             (git_dir, keys),
-            Some(own),
+            HostRole::Agent(own),
             claims,
         )
     }
 
     /// Opens the live layer as [`LiveHost::start`] does, on the node `shared`, which may host
     /// other threads too, under the live-layer lock `hosting` already taken for the thread,
-    /// for the agent `own` this mahi runs, if it runs one, and the agents the user's other
-    /// mahis hand it.
+    /// for what `role` says, and the agents the user's other mahis hand it.
     pub(crate) fn start_on(
         (shared, hosting): (&SharedNode, LiveLock),
         setup: &LiveSetup,
         (git_dir, keys): (&Path, &LiveKeys),
-        own: Option<OwnAgent<'_>>,
+        role: HostRole<'_>,
         claims: Arc<Claims>,
     ) -> Result<Self, HostError> {
+        let watches = matches!(role, HostRole::Workspace);
+        let own = role.into_own();
         let thread = keys.thread();
         let peers = Arc::new(HostPeers::new(
             git_dir.to_path_buf(),
@@ -722,6 +871,8 @@ impl LiveHost {
         let wanted = Arc::new(Mutex::new(VecDeque::with_capacity(PENDING_SCREENS)));
         let stop = Arc::new(AtomicBool::new(false));
         let stop_broadcast = Arc::new(AtomicBool::new(false));
+        let request = Arc::new(Mutex::new(None));
+        let (watch, watching) = watches.then(|| Watch::open(&request)).unzip();
         let broadcaster = Broadcaster {
             topic: Arc::clone(&topic),
             sender,
@@ -732,10 +883,13 @@ impl LiveHost {
             stop: Arc::clone(&stop_broadcast),
             sent_at: Instant::now(),
             claims: (Arc::clone(&claims), me.clone(), None),
+            request,
         };
         let listener = Listener {
             topic,
             receiver,
+            owner: owner.clone(),
+            watching,
             registry: Arc::clone(&registry),
             peers: Arc::clone(&peers),
             wanted,
@@ -770,7 +924,13 @@ impl LiveHost {
             registry,
             queue,
             dropped,
+            watch,
         })
+    }
+
+    /// Returns what passes on the teammates' frames, on the workspace's host.
+    pub(crate) fn watch(&self) -> Option<&Watch> {
+        self.watch.as_ref()
     }
 
     /// Returns where the agent this mahi runs copies its terminal, if it runs one.
@@ -1118,12 +1278,14 @@ struct Broadcaster {
     stop: Arc<AtomicBool>,
     sent_at: Instant,
     claims: (Arc<Claims>, Option<AgentSlot>, Option<Instant>),
+    request: Arc<Mutex<Option<Body>>>,
 }
 
 impl Broadcaster {
     fn run(mut self) {
         while !self.stopping() {
             self.send_screens_if_needed();
+            self.send_request_if_any();
             self.send_answers(None);
             self.send_claims_if_needed();
             if self.sent_at.elapsed() >= HEARTBEAT_EVERY {
@@ -1177,6 +1339,18 @@ impl Broadcaster {
         };
         if self.send(&body) {
             self.claims.2 = Some(Instant::now());
+        }
+    }
+
+    /// Sends the screen request the workspace asked for, if any.
+    fn send_request_if_any(&mut self) {
+        let request = self
+            .request
+            .lock()
+            .ok()
+            .and_then(|mut request| request.take());
+        if let Some(request) = request {
+            self.send(&request);
         }
     }
 
@@ -1307,6 +1481,8 @@ impl Broadcaster {
 struct Listener {
     topic: Arc<LiveTopic>,
     receiver: FrameReceiver,
+    owner: ParticipantName,
+    watching: Option<Watching>,
     registry: Arc<Mutex<Registry>>,
     peers: Arc<HostPeers>,
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
@@ -1318,16 +1494,35 @@ impl Listener {
     fn run(mut self) {
         let mut answered: HashMap<NodeId, Instant> = HashMap::new();
         let mut participants_at = Instant::now();
+        let mut dropped = self.topic.dropped();
         while !self.stop.load(Ordering::SeqCst) {
             if participants_at.elapsed() >= REREAD_EVERY {
                 self.receiver.set_participants(self.peers.participants());
                 participants_at = Instant::now();
             }
+            if let Some(watching) = &self.watching {
+                watching.note_dropped(self.topic.dropped(), &mut dropped);
+                watching.ask_if_wanted(&mut self.receiver);
+            }
             let Ok(Some(frame)) = self.topic.receive(LISTEN_PAUSE) else {
                 continue;
             };
-            let Ok(received) = self.receiver.open(&frame) else {
-                continue;
+            let received = match self.receiver.open(&frame) {
+                Ok(received) => received,
+                Err(FrameError::Unanchored) => {
+                    if let Some(watching) = &self.watching {
+                        watching.lost.store(true, Ordering::SeqCst);
+                    }
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let received = match &self.watching {
+                Some(watching) => match watching.pass(received, &self.owner) {
+                    Some(received) => received,
+                    None => continue,
+                },
+                None => received,
             };
             let challenge = match received.body {
                 Body::ScreenRequest { challenge } => challenge,
@@ -1699,7 +1894,7 @@ mod tests {
                     hosted.store.common_dir(),
                     &LiveKeys::derive(&hosted.thread_key, hosted.thread).unwrap(),
                 ),
-                Some(own),
+                HostRole::Agent(own),
                 Arc::new(Claims::default()),
             )
             .unwrap()
@@ -1747,7 +1942,7 @@ mod tests {
                 (&shared, lock),
                 &setup,
                 (hosted.store.common_dir(), &keys),
-                None,
+                HostRole::Workspace,
                 Arc::new(Claims::default()),
             )
         };
@@ -1779,6 +1974,199 @@ mod tests {
         drop(guest);
         host.stop();
         assert!(!shared.threads.admits(&hosted.owner_node));
+    }
+
+    fn host_on(
+        hosted: &Hosted,
+        dir: &TempDir,
+        node_key: &Path,
+        (bootstrap, role): (Vec<HostAddress>, HostRole<'_>),
+    ) -> (SharedNode, LiveHost) {
+        let config = ConfigDir::resolve(Some(dir.path()), Some(dir.path())).unwrap();
+        let shared = SharedNode::bind(&NodeKey::load(node_key).unwrap(), Relays::Disabled).unwrap();
+        let setup = LiveSetup {
+            config: config.clone(),
+            runtime: dir.path().to_path_buf(),
+            node_key: NodeKey::load(node_key).unwrap(),
+            owner: hosted.owner.clone(),
+            relays: Relays::Disabled,
+            bootstrap,
+        };
+        let lock = LiveLock::try_acquire(&config, hosted.thread)
+            .unwrap()
+            .unwrap();
+        let keys = LiveKeys::derive(&hosted.thread_key, hosted.thread).unwrap();
+        let host = LiveHost::start_on(
+            (&shared, lock),
+            &setup,
+            (hosted.store.common_dir(), &keys),
+            role,
+            Arc::new(Claims::default()),
+        )
+        .unwrap();
+        (shared, host)
+    }
+
+    fn watched_until(
+        watch: &Watch,
+        teammates: &mut Teammates,
+        slot: &AgentSlot,
+        text: &str,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            watch.update(teammates, Instant::now());
+            let contents = teammates
+                .screen(slot)
+                .map(vt100::Screen::contents)
+                .unwrap_or_default();
+            if contents.contains(text) || Instant::now() >= deadline {
+                return contents;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn the_workspaces_host_watches_a_teammates_agent_from_its_screen_and_output() {
+        let hosted = hosted();
+        let bob_node = NodeKey::generate().unwrap();
+        let bob_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let bob = Participant::new(
+            ParticipantName::new("bob").unwrap(),
+            ParticipantKey::from_public_key(bob_key.public_key()).unwrap(),
+            age::x25519::Identity::generate().to_public(),
+            NodeId::from_bytes(bob_node.public()).unwrap(),
+        )
+        .unwrap();
+        add_participant(
+            &hosted.store,
+            hosted.thread,
+            &hosted.thread_key,
+            &hosted.owner_key,
+            bob,
+        )
+        .unwrap();
+        let alice_node = hosted.node_keys.path().join("node.key");
+        let (alice_dir, bob_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let bob_key_file = bob_dir.path().join("node.key");
+        bob_node.save(&bob_key_file).unwrap();
+        let (alice_shared, alice) = host_on(
+            &hosted,
+            &alice_dir,
+            &alice_node,
+            (Vec::new(), HostRole::Workspace),
+        );
+        assert!(alice.tap().is_none());
+        let address = alice_shared.node.address(Duration::from_secs(1)).unwrap();
+        let slot = AgentSlot::new(
+            ParticipantName::new("bob").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+        let own = OwnAgent {
+            slot: slot.clone(),
+            size: WindowSize { rows: 4, cols: 40 },
+            drawn: b"bob's agent",
+            prompts: Arc::new(Prompts::default()),
+        };
+        let (_bob_shared, bob) = host_on(
+            &hosted,
+            &bob_dir,
+            &bob_key_file,
+            (vec![address], HostRole::Agent(own)),
+        );
+        assert!(bob.watch().is_none());
+        let watch = alice.watch().unwrap();
+        let mut teammates = Teammates::new(ParticipantName::new("alice").unwrap());
+        let shown = watched_until(watch, &mut teammates, &slot, "bob's agent");
+        assert!(shown.contains("bob's agent"), "{shown:?}");
+        bob.tap().unwrap().output(b" works");
+        let shown = watched_until(watch, &mut teammates, &slot, "bob's agent works");
+        assert!(shown.contains("bob's agent works"), "{shown:?}");
+        bob.stop();
+        alice.stop();
+    }
+
+    fn watching(queue: usize) -> (Watching, Receiver<Received>) {
+        let (passed, frames) = mpsc::sync_channel(queue);
+        let watching = Watching {
+            frames: passed,
+            lost: Arc::default(),
+            ask: Arc::default(),
+            request: Arc::default(),
+            queued: Arc::default(),
+        };
+        (watching, frames)
+    }
+
+    fn received(participant: &str, body: Body) -> Received {
+        Received {
+            sender: NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
+            participant: ParticipantName::new(participant).unwrap(),
+            body,
+        }
+    }
+
+    fn output(participant: &str, bytes: usize) -> Body {
+        Body::Output {
+            slot: AgentSlot::new(
+                ParticipantName::new(participant).unwrap(),
+                AgentName::new("claude").unwrap(),
+            ),
+            bytes: vec![b'x'; bytes],
+        }
+    }
+
+    #[test]
+    fn the_workspaces_host_passes_on_only_teammates_drawing_frames() {
+        let (watching, frames) = watching(8);
+        let alice = ParticipantName::new("alice").unwrap();
+        assert!(
+            watching
+                .pass(received("alice", output("alice", 10)), &alice)
+                .is_none()
+        );
+        assert!(frames.try_recv().is_err());
+        let request = Body::ScreenRequest { challenge: [1; 16] };
+        let returned = watching.pass(received("bob", request.clone()), &alice);
+        assert_eq!(returned.map(|received| received.body), Some(request));
+        assert!(
+            watching
+                .pass(received("bob", output("bob", 10)), &alice)
+                .is_none()
+        );
+        assert_eq!(frames.try_recv().unwrap().participant.as_str(), "bob");
+        assert!(!watching.lost.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn frames_past_the_queues_bytes_are_dropped_and_noted_as_lost() {
+        let (watching, frames) = watching(WATCH_QUEUE);
+        let alice = ParticipantName::new("alice").unwrap();
+        for _ in 0..=WATCH_BYTES / MAX_CHUNK_BYTES {
+            watching.pass(received("bob", output("bob", MAX_CHUNK_BYTES)), &alice);
+        }
+        assert!(watching.lost.load(Ordering::SeqCst));
+        let held: usize = frames
+            .try_iter()
+            .map(|received| match received.body {
+                Body::Output { bytes, .. } => bytes.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(held <= WATCH_BYTES);
+    }
+
+    #[test]
+    fn frames_the_topic_dropped_are_noted_as_lost_once() {
+        let (watching, _frames) = watching(8);
+        let mut seen = 0;
+        watching.note_dropped(0, &mut seen);
+        assert!(!watching.lost.load(Ordering::SeqCst));
+        watching.note_dropped(3, &mut seen);
+        assert!(watching.lost.swap(false, Ordering::SeqCst));
+        watching.note_dropped(3, &mut seen);
+        assert!(!watching.lost.load(Ordering::SeqCst));
     }
 
     fn peer_addresses(count: usize) -> Vec<HostAddress> {

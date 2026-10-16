@@ -7,6 +7,7 @@ use std::{
     },
     sync::Arc,
     thread,
+    time::Instant,
 };
 
 use mahi_core::ThreadId;
@@ -46,11 +47,13 @@ use crate::{
     live::{
         self,
         HostError,
+        HostRole,
         LiveHost,
         LiveSetup,
         SharedNode,
     },
     session,
+    teammates::Teammates,
     thread_lock::{
         LiveLock,
         LockError,
@@ -95,7 +98,16 @@ pub(crate) struct WorkspaceLive {
     relays: Relays,
     git_dir: PathBuf,
     shared: Option<SharedNode>,
-    hosted: HashMap<ThreadId, (LiveHost, Hub)>,
+    hosted: HashMap<ThreadId, Hosted>,
+}
+
+/// A thread the workspace hosts: its host, the socket its agents reach it on, and the
+/// teammates' agents it watches.
+#[derive(Debug)]
+struct Hosted {
+    host: LiveHost,
+    hub: Hub,
+    teammates: Teammates,
 }
 
 impl WorkspaceLive {
@@ -178,14 +190,22 @@ impl WorkspaceLive {
             (&shared, lock),
             &setup,
             (store.common_dir(), &keys),
-            None,
+            HostRole::Workspace,
             Arc::new(Claims::default()),
         )?;
         let hub = live::hub_socket(&self.runtime, thread)
             .and_then(|socket| Hub::start(socket, host.handle()));
         match hub {
             Ok(hub) => {
-                self.hosted.insert(thread, (host, hub));
+                let teammates = Teammates::new(participant);
+                self.hosted.insert(
+                    thread,
+                    Hosted {
+                        host,
+                        hub,
+                        teammates,
+                    },
+                );
                 Ok(())
             }
             Err(error) => {
@@ -200,11 +220,37 @@ impl WorkspaceLive {
         self.hosted.contains_key(&thread)
     }
 
+    /// Takes at `now` what the teammates' hosts sent in every thread the workspace hosts, and
+    /// asks them for their agents' screens when they are wanted; returns whether what the
+    /// teammates' agents show changed.
+    #[expect(
+        dead_code,
+        reason = "the workspace's tabs list and draw teammates' agents next"
+    )]
+    pub(crate) fn watch(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        for hosted in self.hosted.values_mut() {
+            if let Some(watch) = hosted.host.watch() {
+                changed |= watch.update(&mut hosted.teammates, now);
+            }
+        }
+        changed
+    }
+
+    /// Returns the teammates' agents the workspace watches in `thread`, while it hosts it.
+    #[expect(
+        dead_code,
+        reason = "the workspace's tabs list and draw teammates' agents next"
+    )]
+    pub(crate) fn teammates(&self, thread: ThreadId) -> Option<&Teammates> {
+        self.hosted.get(&thread).map(|hosted| &hosted.teammates)
+    }
+
     /// Stops hosting `thread`, once none of its tabs is open, and closes the node once it
     /// hosts no thread, so it no longer publishes where it is.
     pub(crate) fn release(&mut self, thread: ThreadId) {
-        if let Some((host, hub)) = self.hosted.remove(&thread) {
-            stop(host, hub);
+        if let Some(hosted) = self.hosted.remove(&thread) {
+            stop(hosted);
         }
         if self.hosted.is_empty() {
             self.shared = None;
@@ -217,7 +263,7 @@ impl Drop for WorkspaceLive {
         let stopping: Vec<_> = self
             .hosted
             .drain()
-            .map(|(_, (host, hub))| thread::spawn(move || stop(host, hub)))
+            .map(|(_, hosted)| thread::spawn(move || stop(hosted)))
             .collect();
         for stopped in stopping {
             let _ = stopped.join();
@@ -225,9 +271,9 @@ impl Drop for WorkspaceLive {
     }
 }
 
-fn stop(host: LiveHost, hub: Hub) {
-    hub.stop();
-    host.stop();
+fn stop(hosted: Hosted) {
+    hosted.hub.stop();
+    hosted.host.stop();
 }
 
 #[cfg(test)]
