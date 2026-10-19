@@ -786,7 +786,7 @@ fn run_words(words: &[String], environment: &Environment) -> String {
     };
     match code {
         0 => format!("{shown}: done"),
-        code => format!("{shown} failed with exit code {code}; see the activity"),
+        code => format!("{shown} failed with exit code {code}"),
     }
 }
 
@@ -1201,7 +1201,7 @@ fn choose_remote(store: &mut Store) -> String {
         }
         Err(error) => {
             crate::report_with("cannot choose the remote", &error);
-            "the remote was not changed; see the activity".to_owned()
+            "the remote was not changed".to_owned()
         }
     }
 }

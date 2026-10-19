@@ -1,7 +1,10 @@
 use std::borrow::Cow;
 
 use ratatui_core::{
-    buffer::Buffer,
+    buffer::{
+        Buffer,
+        CellWidth as _,
+    },
     layout::{
         Constraint,
         Layout,
@@ -61,6 +64,7 @@ const MENU: [(&str, &str); 8] = [
 const SIDEBAR_WIDTH: u16 = 24;
 const DETAILS_HEIGHT: u16 = 5;
 const ACTIVITY_HEIGHT: u16 = 8;
+const ACTIVITY_LEAST: u16 = 3;
 
 /// One thread as the home screen lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -484,13 +488,12 @@ impl Home {
         }
     }
 
-    /// Draws the home screen into `area`, with `status`, the outcome of the last action, above
-    /// the keys.
+    /// Draws the home screen into `area`, with `status`, the outcome of the last action, on the
+    /// Activity panel's last rows.
     pub fn render(&self, view: &HomeView<'_>, status: &str, area: Rect, buffer: &mut Buffer) {
-        let [header, body, message, footer] = Layout::vertical([
+        let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
-            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -499,19 +502,20 @@ impl Home {
             Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
                 .areas(body);
         self.render_menu(sidebar, buffer);
+        let activity_rows = ACTIVITY_HEIGHT
+            .min(main.height.saturating_sub(DETAILS_HEIGHT + 3))
+            .max(ACTIVITY_LEAST)
+            .min(main.height);
+        let details_rows = DETAILS_HEIGHT.min(main.height - activity_rows);
         let [threads, details, activity] = Layout::vertical([
             Constraint::Fill(1),
-            Constraint::Length(DETAILS_HEIGHT),
-            Constraint::Length(ACTIVITY_HEIGHT),
+            Constraint::Length(details_rows),
+            Constraint::Length(activity_rows),
         ])
         .areas(main);
         self.render_threads(view.rows, threads, buffer);
         self.render_details(view.rows, details, buffer);
-        Self::render_activity(view.activity, activity, buffer);
-        let line = self.note.unwrap_or(status);
-        Line::from(shown(line).into_owned())
-            .style(Style::new().fg(Theme::WARN))
-            .render(message, buffer);
+        Self::render_activity(view.activity, self.note.unwrap_or(status), activity, buffer);
         Line::from(self.footer_hints()).render(footer, buffer);
         if let Some((dialog, _)) = &self.dialog {
             dialog.render(area, buffer);
@@ -636,11 +640,27 @@ impl Home {
         .render(inner, buffer);
     }
 
-    fn render_activity(activity: &[String], area: Rect, buffer: &mut Buffer) {
+    /// Draws what mahi's commands printed, oldest first, with `status`, the outcome of the last
+    /// action, on the last row below them.
+    fn render_activity(activity: &[String], status: &str, area: Rect, buffer: &mut Buffer) {
         let block = panel("Activity", false);
         let inner = block.inner(area);
         block.render(area, buffer);
-        let shown_lines = usize::from(inner.height);
+        let status = format!(" {}", shown(status));
+        let mut lines = if status.trim().is_empty() {
+            Vec::new()
+        } else {
+            status_lines(&status, usize::from(inner.width))
+        };
+        let kept = lines.len().min(usize::from(inner.height));
+        lines.drain(..lines.len() - kept);
+        let told = u16::try_from(kept).unwrap_or(u16::MAX);
+        let [printed, last] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(told)]).areas(inner);
+        for (line, row) in lines.into_iter().zip(last.rows()) {
+            Line::styled(line, Style::new().fg(Theme::WARN)).render(row, buffer);
+        }
+        let shown_lines = usize::from(printed.height);
         let start = activity.len().saturating_sub(shown_lines);
         let lines: Vec<Line<'_>> = activity
             .get(start..)
@@ -655,12 +675,12 @@ impl Home {
                 Line::styled(format!(" {}", shown(line)), style)
             })
             .collect();
-        if lines.is_empty() {
-            Line::styled(" what mahi does shows here", Theme::muted()).render(inner, buffer);
+        if lines.is_empty() && told == 0 {
+            Line::styled(" what mahi does shows here", Theme::muted()).render(printed, buffer);
         } else {
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
-                .render(inner, buffer);
+                .render(printed, buffer);
         }
     }
 
@@ -687,6 +707,38 @@ impl Home {
             ]),
         }
     }
+}
+
+/// Cuts `text` into lines at most `width` columns wide as the screen draws them, breaking at
+/// the last space that fits, which is left out, or, in a word longer than a line, before the
+/// character that does not fit.
+fn status_lines(text: &str, width: usize) -> Vec<&str> {
+    let columns =
+        |from: usize, to: usize| usize::from(text.get(from..to).unwrap_or_default().cell_width());
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut space = None;
+    for (at, c) in text.char_indices() {
+        let end = at + c.len_utf8();
+        while at > start && columns(start, end) > width {
+            if let Some(gap) = space.filter(|&gap| gap > start && c != ' ') {
+                lines.push(text.get(start..gap).unwrap_or_default());
+                start = gap + 1;
+                space = None;
+                continue;
+            }
+            lines.push(text.get(start..at).unwrap_or_default());
+            start = if c == ' ' { end } else { at };
+            space = None;
+        }
+        if c == ' ' && start <= at {
+            space = Some(at);
+        }
+    }
+    if start < text.len() || lines.is_empty() {
+        lines.push(text.get(start..).unwrap_or_default());
+    }
+    lines
 }
 
 fn panel<'a>(title: &str, focused: bool) -> Block<'a> {
@@ -716,6 +768,8 @@ fn row(row: &HomeRow) -> Row<'_> {
 
 #[cfg(test)]
 mod tests {
+    use unicode_width::UnicodeWidthStr as _;
+
     use super::*;
 
     fn rows() -> Vec<HomeRow> {
@@ -996,6 +1050,79 @@ mod tests {
             assert_eq!(home.key(PaletteInput::Pasted(c), &rows), None);
         }
         assert!(!home.has_dialog());
+    }
+
+    #[test]
+    fn the_last_actions_outcome_is_the_newest_line_of_the_activity_panel() {
+        let rows = rows();
+        let drawn = screen(&Home::default(), &rows, "mahi join failed with exit code 1");
+        let lines: Vec<&str> = drawn.lines().collect();
+        let told = lines
+            .iter()
+            .position(|line| line.contains("mahi join failed with exit code 1"))
+            .unwrap();
+        let printed = lines
+            .iter()
+            .position(|line| line.contains("mahi: cannot reach the remote"))
+            .unwrap();
+        assert!(printed < told, "{drawn}");
+        assert!(lines[told].trim_end().ends_with('│'), "{drawn}");
+        assert!(lines[told + 1].contains('╰'), "{drawn}");
+        assert!(lines[told + 2].contains("tab menu"), "{drawn}");
+    }
+
+    #[test]
+    fn a_long_outcome_wraps_in_the_activity_panel_and_a_short_screen_still_shows_it() {
+        let rows = rows();
+        let outcome =
+            "mahi invite 0123456789abcdef0123456789abcdef failed with exit code 1".to_owned();
+        let drawn = screen_in(&Home::default(), &rows, &outcome, Rect::new(0, 0, 80, 24));
+        let joined: String = drawn
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .skip(usize::from(SIDEBAR_WIDTH) + 1)
+                    .collect::<String>()
+                    .trim_end()
+                    .trim_end_matches('│')
+                    .trim()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("failed with exit code 1"), "{drawn}");
+        assert!(
+            joined.contains("0123456789abcdef0123456789abcdef"),
+            "{drawn}"
+        );
+        let short = screen_in(
+            &Home::default(),
+            &rows,
+            "resumed t1",
+            Rect::new(0, 0, 80, 6),
+        );
+        assert!(short.contains("resumed t1"), "{short}");
+        let cramped = screen_in(&Home::default(), &rows, &outcome, Rect::new(0, 0, 80, 6));
+        assert!(cramped.contains("with exit code 1"), "{cramped}");
+    }
+
+    #[test]
+    fn the_status_wraps_into_rows_no_wider_than_the_panel_breaking_at_spaces() {
+        let status = format!(" {} {}", "a".repeat(20), "b".repeat(33));
+        assert_eq!(status.width(), 55);
+        let aaaa = format!(" {}", "a".repeat(20));
+        let bbbb = "b".repeat(33);
+        assert_eq!(status_lines(&status, 54), [aaaa.as_str(), bbbb.as_str()]);
+        let wide = " \u{65e5}\u{65e5}\u{e9}\u{e9}\u{65e5}";
+        let lines = status_lines(wide, 4);
+        assert!(lines.iter().all(|line| line.cell_width() <= 4), "{lines:?}");
+        assert_eq!(lines.concat(), wide);
+        assert_eq!(status_lines(&"c".repeat(9), 4), ["cccc", "cccc", "c"]);
+        let marked = status_lines("ab\u{263a}\u{fe0f}\u{ff76}\u{ff9e}", 3);
+        assert!(
+            marked.iter().all(|line| line.cell_width() <= 3),
+            "{marked:?}"
+        );
     }
 
     #[test]
