@@ -655,18 +655,7 @@ impl Workspace {
         let open = (!new)
             .then(|| self.tabs.iter().position(|tab| tab.title == title))
             .flatten();
-        let index = if let Some(index) = open {
-            index
-        } else {
-            self.tabs.push(Tab {
-                thread: None,
-                title: title.to_owned(),
-                agents: Vec::new(),
-                selected: 0,
-                watching: None,
-            });
-            self.tabs.len() - 1
-        };
+        let index = open.unwrap_or_else(|| self.add_tab(title));
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.agents.push(running);
             tab.select(tab.agents.len() - 1, None);
@@ -674,6 +663,22 @@ impl Workspace {
         self.selected = index + 1;
         self.palette = None;
         Ok(())
+    }
+
+    /// Adds a tab titled `title` and returns its index; the first tab starts with the list
+    /// hidden on a terminal too narrow to show it beside the pane.
+    fn add_tab(&mut self, title: &str) -> usize {
+        if self.tabs.is_empty() {
+            self.list_shown = ListPlace::shown_at(self.screen.cols) == ListPlace::Beside;
+        }
+        self.tabs.push(Tab {
+            thread: None,
+            title: title.to_owned(),
+            agents: Vec::new(),
+            selected: 0,
+            watching: None,
+        });
+        self.tabs.len() - 1
     }
 
     /// Draws what the children wrote since the last call into their screens, and writes to
@@ -2405,6 +2410,32 @@ mod tests {
             out,
             b"\x1b]9;mahi 3e5c8646: bob sent a prompt: fix it\x07\x07"
         );
+    }
+
+    #[test]
+    fn the_list_starts_hidden_on_a_terminal_narrower_than_100_columns() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        workspace.set_screen(WindowSize { rows: 24, cols: 99 }, false);
+        assert_eq!(workspace.add_tab("a"), 0);
+        assert_eq!(workspace.list_place(99), ListPlace::Hidden);
+        workspace.step(Step::List);
+        assert_eq!(workspace.list_place(99), ListPlace::Over);
+        assert_eq!(workspace.add_tab("b"), 1);
+        assert_eq!(workspace.list_place(99), ListPlace::Over);
+        workspace.tabs.clear();
+        workspace.set_screen(
+            WindowSize {
+                rows: 24,
+                cols: 100,
+            },
+            false,
+        );
+        workspace.step(Step::List);
+        workspace.add_tab("c");
+        assert_eq!(workspace.list_place(100), ListPlace::Beside);
     }
 
     #[test]
