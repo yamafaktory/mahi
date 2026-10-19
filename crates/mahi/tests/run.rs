@@ -1365,7 +1365,7 @@ cat parser.rs
                 .any(|row| row.starts_with("│agent-ready 20 174")),
             "{rows:#?}"
         );
-        assert!(rows[3].contains("claude ✓ done"), "{rows:#?}");
+        assert!(rows[3].contains("✓ claude"), "{rows:#?}");
         assert!(rows[22].starts_with("╰──"), "{rows:#?}");
         assert!(rows[23].contains("Ctrl-Space palette"), "{rows:#?}");
         assert_eq!(screen.cursor_position().1, 1);
@@ -1578,7 +1578,7 @@ cat parser.rs
             &[
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
-                ("● working", b"\x000"),
+                ("● claude", b"\x000"),
                 ("Menu", b"q"),
                 ("stop it and quit?", b"y"),
             ],
@@ -1619,11 +1619,18 @@ cat parser.rs
             ],
         );
         assert_eq!(code, 0, "{output}");
-        assert!(
-            pane_at(&output, "✗ failed").contains("broken-agent"),
-            "{output}"
-        );
-        assert!(output.contains("✗ failed"), "{output}");
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        let screen = output
+            .as_bytes()
+            .chunks(16)
+            .find_map(|chunk| {
+                parser.process(chunk);
+                let screen = parser.screen().contents();
+                screen.contains("close it").then_some(screen)
+            })
+            .unwrap();
+        assert!(screen.contains("broken-agent"), "{screen}");
+        assert!(screen.contains("│ ✗ claude"), "{screen}");
     }
 
     #[test]
@@ -1905,8 +1912,13 @@ cat parser.rs
                 screen.contains("agent-ready").then_some(screen)
             })
             .unwrap();
-        assert!(screen.contains("│ claude"), "{screen}");
-        assert!(!screen.contains("│ agent"), "{screen}");
+        let listed = |name: &str| {
+            ["●", "✓", "!", "◉", "○", "✗"]
+                .iter()
+                .any(|mark| screen.contains(&format!("│ {mark} {name}")))
+        };
+        assert!(listed("claude"), "{screen}");
+        assert!(!listed("agent"), "{screen}");
     }
 
     #[test]

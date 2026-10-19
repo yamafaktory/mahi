@@ -74,7 +74,18 @@ impl AgentState {
             Self::Offline => Theme::muted(),
             Self::Failed => Style::new().fg(Theme::ERROR),
         };
-        Span::styled(self.as_str(), style)
+        Span::styled(self.symbol(), style)
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Working => "●",
+            Self::Done => "✓",
+            Self::AsksYou => "!",
+            Self::Live => "◉",
+            Self::Offline => "○",
+            Self::Failed => "✗",
+        }
     }
 }
 
@@ -230,7 +241,7 @@ pub struct ThreadView<'a> {
     pub hints: &'a [(&'a str, &'a str)],
 }
 
-impl ThreadView<'_> {
+impl<'a> ThreadView<'a> {
     /// Returns the rows and columns of an agent's terminal in a thread's tab on a terminal of
     /// `rows` and `columns`, at least two of each, with the list `list`.
     #[must_use]
@@ -298,12 +309,12 @@ impl ThreadView<'_> {
         let inner = Block::bordered().inner(list);
         let agent = inner
             .contains(position)
-            .then(|| {
-                self.lines()
-                    .nth(usize::from(position.y - inner.y))
-                    .flatten()
-            })
-            .flatten();
+            .then(|| self.lines().nth(usize::from(position.y - inner.y)))
+            .flatten()
+            .and_then(|row| match row {
+                ListRow::Agent(index) => Some(index),
+                ListRow::Blank | ListRow::Group(_) => None,
+            });
         Some(agent.map_or(ListHit::Elsewhere, ListHit::Agent))
     }
 
@@ -341,20 +352,39 @@ impl ThreadView<'_> {
         }
     }
 
-    /// Returns, for each line of the list's agents, the agent it shows, or nothing for the
-    /// line naming whose agents follow.
-    fn lines(&self) -> impl Iterator<Item = Option<usize>> + '_ {
+    /// Returns the rows of the list's agents: each group's heading, after a blank row but for
+    /// the first, then its agents.
+    fn lines(&self) -> impl Iterator<Item = ListRow<'a>> + '_ {
         self.agents.iter().enumerate().flat_map(|(index, agent)| {
             let starts_group = index == 0
                 || self
                     .agents
                     .get(index - 1)
                     .is_some_and(|before| before.owner != agent.owner);
-            starts_group
-                .then_some(None)
+            let blank = (starts_group && index > 0).then_some(ListRow::Blank);
+            let group = starts_group.then_some(ListRow::Group(agent.owner));
+            blank
                 .into_iter()
-                .chain(std::iter::once(Some(index)))
+                .chain(group)
+                .chain(std::iter::once(ListRow::Agent(index)))
         })
+    }
+
+    fn agent_line(&self, index: usize) -> Line<'a> {
+        let Some(agent) = self.agents.get(index) else {
+            return Line::default();
+        };
+        let line = Line::from(vec![
+            Span::raw(" "),
+            agent.state.mark(),
+            Span::raw(" "),
+            Span::raw(shown(agent.name)),
+        ]);
+        if index == self.selected {
+            line.style(Theme::selected())
+        } else {
+            line
+        }
     }
 
     fn render_list(&self, area: Rect, buffer: &mut Buffer) {
@@ -364,25 +394,17 @@ impl ThreadView<'_> {
             .title(Span::styled(" Agents ", Theme::title()));
         let inner = block.inner(area);
         block.render(area, buffer);
-        let mut lines = Vec::with_capacity(self.agents.len() * 2 + 2);
-        let mut group = None;
-        for (index, agent) in self.agents.iter().enumerate() {
-            if index == 0 || agent.owner != group {
-                group = agent.owner;
-                lines.push(Line::from(Span::styled(
-                    agent.owner.map_or("yours".into(), shown),
-                    Theme::muted(),
-                )));
-            }
-            let style = if index == self.selected {
-                Theme::selected()
-            } else {
-                Style::new()
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", shown(agent.name)), style),
-                agent.state.mark(),
-            ]));
+        let mut lines = Vec::with_capacity(self.agents.len() * 3 + 2);
+        for row in self.lines() {
+            lines.push(match row {
+                ListRow::Blank => Line::default(),
+                ListRow::Group(None) => Line::from(Span::styled("Yours", Theme::muted())),
+                ListRow::Group(Some(owner)) => Line::from(vec![
+                    Span::styled(shown(owner), Theme::muted()),
+                    Span::styled("'s", Theme::muted()),
+                ]),
+                ListRow::Agent(index) => self.agent_line(index),
+            });
         }
         if self.prompts > 0 {
             lines.push(Line::default());
@@ -396,6 +418,14 @@ impl ThreadView<'_> {
             line.render(row, buffer);
         }
     }
+}
+
+/// A row of the agents' list.
+#[derive(Debug, Clone, Copy)]
+enum ListRow<'a> {
+    Blank,
+    Group(Option<&'a str>),
+    Agent(usize),
 }
 
 impl WorkspaceAgent<'_> {
@@ -486,7 +516,7 @@ mod tests {
     fn a_thread_shows_its_agents_grouped_by_owner_beside_the_selected_one() {
         let mut parser = vt100::Parser::new(5, 20, 0);
         parser.process(b"hello from claude");
-        let area = Rect::new(0, 0, 100, 12);
+        let area = Rect::new(0, 0, 100, 14);
         let mut buffer = Buffer::empty(area);
         let cursor = ThreadView {
             agents: &AGENTS,
@@ -503,19 +533,76 @@ mod tests {
             .map(|row| row.chars().skip(76).collect())
             .collect();
         let shown = list.join("\n");
-        for expected in [
-            "yours",
-            " claude ● working",
-            "alice",
-            " claude ✓ done",
-            "bob",
-            " codex ○ offline",
-            "✉ 2 prompts waiting",
-        ] {
-            assert!(shown.contains(expected), "{expected} missing:\n{shown}");
-        }
-        assert!(rows[11].contains("ctrl-space workspace"), "{rows:#?}");
+        let in_list: Vec<String> = list
+            .iter()
+            .skip(1)
+            .take(10)
+            .map(|row| {
+                row.trim_start_matches('│')
+                    .trim_end_matches([' ', '│'])
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            in_list,
+            [
+                "Yours",
+                " ● claude",
+                "",
+                "alice's",
+                " ✓ claude",
+                "",
+                "bob's",
+                " ○ codex",
+                "",
+                "✉ 2 prompts waiting",
+            ],
+            "{shown}"
+        );
+        let selected = Theme::selected().bg;
+        let claude_row = 2;
+        assert!(
+            (77..99).all(|x| buffer[(x, claude_row)].style().bg == selected),
+            "{shown}"
+        );
+        assert_ne!(buffer[(78, 5)].style().bg, selected);
+        assert!(rows[13].contains("ctrl-space workspace"), "{rows:#?}");
         assert_eq!(cursor, Some(Position::new(18, 1)));
+    }
+
+    #[test]
+    fn a_list_of_teammates_agents_only_starts_with_the_first_owners_group() {
+        let agents = [AGENTS[1], AGENTS[2]];
+        let view = ThreadView {
+            agents: &agents,
+            selected: 1,
+            prompts: 0,
+            list: ListPlace::Beside,
+            hints: &[],
+        };
+        let area = Rect::new(0, 0, 100, 10);
+        let mut buffer = Buffer::empty(area);
+        view.render(None, area, &mut buffer);
+        let in_list: Vec<String> = rows(&buffer)
+            .iter()
+            .skip(1)
+            .take(5)
+            .map(|row| {
+                row.chars()
+                    .skip(76)
+                    .collect::<String>()
+                    .trim_start_matches('│')
+                    .trim_end_matches([' ', '│'])
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(in_list, ["alice's", " ✓ claude", "", "bob's", " ○ codex"]);
+        let at = |y| view.list_at(area, Position::new(80, y));
+        assert_eq!(at(1), Some(ListHit::Elsewhere));
+        assert_eq!(at(2), Some(ListHit::Agent(0)));
+        assert_eq!(at(3), Some(ListHit::Elsewhere));
+        assert_eq!(at(4), Some(ListHit::Elsewhere));
+        assert_eq!(at(5), Some(ListHit::Agent(1)));
     }
 
     #[test]
@@ -632,9 +719,11 @@ mod tests {
         assert_eq!(at(&view, 80, 1), Some(ListHit::Elsewhere));
         assert_eq!(at(&view, 80, 2), Some(ListHit::Elsewhere));
         assert_eq!(at(&view, 80, 3), Some(ListHit::Agent(0)));
-        assert_eq!(at(&view, 80, 5), Some(ListHit::Agent(1)));
-        assert_eq!(at(&view, 80, 7), Some(ListHit::Agent(2)));
-        assert_eq!(at(&view, 80, 8), Some(ListHit::Elsewhere));
+        assert_eq!(at(&view, 80, 4), Some(ListHit::Elsewhere));
+        assert_eq!(at(&view, 80, 5), Some(ListHit::Elsewhere));
+        assert_eq!(at(&view, 80, 6), Some(ListHit::Agent(1)));
+        assert_eq!(at(&view, 80, 9), Some(ListHit::Agent(2)));
+        assert_eq!(at(&view, 80, 10), Some(ListHit::Elsewhere));
         assert_eq!(at(&view, 10, 3), None);
         let over = ThreadView {
             list: ListPlace::Over,
