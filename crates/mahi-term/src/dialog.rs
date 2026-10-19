@@ -431,7 +431,7 @@ impl Dialog {
                 .max(),
             Kind::Menu { items, .. } => {
                 let (action, key) = menu_widths(items);
-                Some(action + key + 7)
+                Some(action + key + 8)
             }
             Kind::Table { header, rows, .. } => {
                 let [first, second, third] = column_widths(header, rows);
@@ -507,7 +507,9 @@ impl Dialog {
                 StatefulWidget::render(list, rest, buffer, &mut state);
             }
             Kind::Menu { items, selected } => {
-                let (action_width, _) = menu_widths(items);
+                let (widest, key_width) = menu_widths(items);
+                let action_width =
+                    widest.min(usize::from(area.width).saturating_sub(key_width + 4));
                 let list = List::new(
                     items
                         .iter()
@@ -592,11 +594,30 @@ fn menu_widths(items: &[(String, String)]) -> (usize, usize) {
 
 fn menu_line(item: &str, key: &str, action_width: usize) -> Line<'static> {
     let item = shown(item);
+    let item = cut_to(&item, action_width);
     let pad = action_width.saturating_sub(Span::raw(item.as_ref()).width());
     Line::from(vec![
         Span::raw(format!(" {item}{}", " ".repeat(pad + 2))),
         Span::styled(format!("{} ", shown(key)), Theme::title()),
     ])
+}
+
+fn cut_to(text: &str, width: usize) -> Cow<'_, str> {
+    if Span::raw(text).width() <= width {
+        return Cow::Borrowed(text);
+    }
+    let mut cut = String::with_capacity(text.len());
+    for c in text.chars() {
+        cut.push(c);
+        if Span::raw(cut.as_str()).width() >= width {
+            cut.pop();
+            break;
+        }
+    }
+    if width > 0 {
+        cut.push('…');
+    }
+    Cow::Owned(cut)
 }
 
 fn choice(index: usize, item: &str) -> Line<'static> {
@@ -724,6 +745,83 @@ mod tests {
         assert_eq!(menu.key(PaletteInput::Text('k')), None);
         assert_eq!(menu.key(PaletteInput::Enter), Some(Answer::Choice(0)));
         assert_eq!(menu.key(PaletteInput::Escape), Some(Answer::Cancelled));
+    }
+
+    #[test]
+    fn a_menu_too_wide_for_the_screen_cuts_its_long_actions_and_keeps_every_key() {
+        let long = format!("Show {}'s agent {}", "a".repeat(32), "日本".repeat(16));
+        let menu = Dialog::menu(
+            "4799a3af",
+            vec![
+                (long.clone(), String::new()),
+                (
+                    "Pass Ctrl-Space through to the agent".to_owned(),
+                    "Ctrl-Space".to_owned(),
+                ),
+                ("Quit mahi".to_owned(), "q".to_owned()),
+            ],
+        );
+        let shown = drawn(&menu);
+        let row_of = |item: &str| {
+            shown
+                .lines()
+                .find(|row| row.contains(item))
+                .unwrap_or_else(|| panic!("{item} missing:\n{shown}"))
+                .trim_end_matches([' ', '│'])
+        };
+        assert!(row_of("Quit mahi").ends_with(" q"), "{shown}");
+        assert_eq!(
+            row_of("Pass Ctrl-Space through")
+                .matches("Ctrl-Space")
+                .count(),
+            2,
+            "{shown}"
+        );
+        let cut = row_of("Show aaaa");
+        assert!(cut.ends_with('…'), "{shown}");
+    }
+
+    #[test]
+    fn a_menu_wider_than_its_least_width_that_fits_keeps_its_widest_action_whole() {
+        let widest = format!("Act {}", "x".repeat(80));
+        let menu = Dialog::menu(
+            "4799a3af",
+            vec![
+                (widest.clone(), "k".to_owned()),
+                ("Quit".to_owned(), "q".to_owned()),
+            ],
+        );
+        let area = Rect::new(0, 0, 140, 20);
+        let mut buffer = Buffer::empty(area);
+        menu.render(area, &mut buffer);
+        let shown: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(shown.contains(&format!(" {widest}  k ")), "{shown}");
+        assert!(!shown.contains('…'), "{shown}");
+    }
+
+    #[test]
+    fn a_cut_action_ends_in_an_ellipsis_within_its_width_even_with_wide_characters() {
+        assert_eq!(cut_to("Quit", 4), "Quit");
+        assert_eq!(cut_to("Quit mahi", 4), "Qui…");
+        assert_eq!(cut_to("日本日本", 4), "日…");
+        assert_eq!(cut_to("日本日本", 5), "日本…");
+        assert_eq!(cut_to("Quit", 0), "");
+        assert_eq!(cut_to("Quit", 1), "…");
+        let joined = "ab❤\u{FE0F}cdefgh";
+        for width in 0..=10 {
+            let cut = cut_to(joined, width);
+            assert!(
+                unicode_width::UnicodeWidthStr::width(cut.as_ref()) <= width,
+                "{cut:?} is wider than {width}"
+            );
+        }
     }
 
     #[test]
