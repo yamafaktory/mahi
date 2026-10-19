@@ -92,16 +92,6 @@ const CHILD_TERM: &str = "xterm-256color";
 const HOST_AGAIN: Duration = Duration::from_secs(2);
 pub(crate) const NEW_TAB: &str = "new";
 const SHORT_THREAD: usize = 8;
-const FAILED_HINTS: [(&str, &str); 2] = [("any key", "close it"), ("palette key 0", "threads")];
-const HINTS: [(&str, &str); 7] = [
-    ("palette key", "then:"),
-    ("←→", "tab"),
-    ("0-9", "tab"),
-    ("↑↓", "agent"),
-    ("b", "list"),
-    ("␣", "waiting"),
-    ("palette key", "again: to the agent"),
-];
 
 /// What the thread reading a child's terminal tells the workspace.
 #[derive(Debug)]
@@ -342,6 +332,8 @@ pub(crate) struct Workspace {
     scanner: KeyScanner,
     armed: bool,
     list_shown: bool,
+    palette: String,
+    palette_then_zero: String,
     size: WindowSize,
     passed: Vec<u8>,
     applied: Option<usize>,
@@ -499,6 +491,8 @@ impl Workspace {
             scanner: KeyScanner::new(palette_key),
             armed: false,
             list_shown: true,
+            palette: palette_key.to_string(),
+            palette_then_zero: format!("{palette_key} 0"),
             size: WindowSize { rows: 2, cols: 2 },
             passed: Vec::new(),
             applied: None,
@@ -1103,6 +1097,19 @@ impl Workspace {
         let shown = tab.agents.get(tab.selected);
         let failed = shown.is_some_and(|running| running.ending == Ending::Failed);
         let screen = tab.screen(teammates);
+        let failed_hints = [
+            ("any key", "close it"),
+            (self.palette_then_zero.as_str(), "threads"),
+        ];
+        let hints = [
+            (self.palette.as_str(), "then:"),
+            ("←→", "tab"),
+            ("0-9", "tab"),
+            ("↑↓", "agent"),
+            ("b", "list"),
+            ("␣", "waiting"),
+            (self.palette.as_str(), "again: to the agent"),
+        ];
         let cursor = ThreadView {
             agents: &agents,
             selected: tab.selected,
@@ -1112,7 +1119,7 @@ impl Workspace {
                 .map(|running| usize::from(running.prompts))
                 .sum(),
             list: self.list_place(body.width),
-            hints: if failed { &FAILED_HINTS } else { &HINTS },
+            hints: if failed { &failed_hints } else { &hints },
         }
         .render(screen, body, buffer);
         cursor.filter(|_| shown.is_some())
@@ -1448,6 +1455,35 @@ mod tests {
             workspace.apply_shown(out);
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn the_hints_name_the_palette_key_the_user_chose() {
+        let mut workspace = Workspace::new(
+            "f5".parse().unwrap(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let agent = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("a", vec![agent]));
+        workspace.selected = 1;
+        let footer = |workspace: &Workspace| {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 12));
+            workspace.render(
+                Rect::new(0, 0, 120, 1),
+                Rect::new(0, 1, 120, 11),
+                &mut buffer,
+            );
+            (0..120)
+                .filter_map(|x| buffer.cell((x, 11)).map(|cell| cell.symbol().to_owned()))
+                .collect::<String>()
+        };
+        let shown = footer(&workspace);
+        assert!(shown.starts_with("F5 then:"), "{shown}");
+        assert!(shown.contains("F5 again: to the agent"), "{shown}");
+        assert!(!shown.contains("palette key"), "{shown}");
+        workspace.tabs[0].agents[0].ending = Ending::Failed;
+        let shown = footer(&workspace);
+        assert!(shown.contains("F5 0 threads"), "{shown}");
     }
 
     #[test]
