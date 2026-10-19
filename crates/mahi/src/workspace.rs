@@ -99,6 +99,7 @@ const REDRAW_WAIT: Duration = Duration::from_millis(250);
 const REDRAW_QUIET: Duration = Duration::from_millis(15);
 pub(crate) const NEW_TAB: &str = "new";
 const SHORT_THREAD: usize = 8;
+const ASKS_TOLD_EVERY: Duration = Duration::from_secs(30);
 
 /// What the thread reading a child's terminal tells the workspace.
 #[derive(Debug)]
@@ -465,6 +466,7 @@ struct Running {
     ending: Ending,
     state: AgentState,
     prompts: u16,
+    told_asks: Option<Instant>,
 }
 
 impl Running {
@@ -648,6 +650,7 @@ impl Workspace {
             ending: Ending::Running,
             state: AgentState::Done,
             prompts: 0,
+            told_asks: None,
         };
         let open = (!new)
             .then(|| self.tabs.iter().position(|tab| tab.title == title))
@@ -698,7 +701,7 @@ impl Workspace {
                 }
                 ChildEvent::Report(id, Report::Notify(text)) => self.notify(id, &text, out),
                 ChildEvent::Report(id, report) => {
-                    changed |= self.take_report(id, &report);
+                    changed |= self.take_report(id, &report, out);
                 }
                 ChildEvent::Closed(id) => {
                     if let Some(running) = self.running_mut(id) {
@@ -1430,14 +1433,19 @@ impl Workspace {
         self.notice.write(title.trim_end(), text, out);
     }
 
-    /// Takes what the child `id` reported about its agent; returns whether what the screen
+    /// Takes what the child `id` reported about its agent, writing to `out` the bell and a
+    /// notification when it starts to ask in a tab not shown; returns whether what the screen
     /// shows changed.
-    fn take_report(&mut self, id: usize, report: &Report) -> bool {
-        let Some(tab) = self
+    fn take_report(&mut self, id: usize, report: &Report, out: &mut Vec<u8>) -> bool {
+        let Some(place) = self
             .tabs
-            .iter_mut()
-            .find(|tab| tab.agents.iter().any(|running| running.id == id))
+            .iter()
+            .position(|tab| tab.agents.iter().any(|running| running.id == id))
         else {
+            return false;
+        };
+        let hidden = self.selected != place + 1;
+        let Some(tab) = self.tabs.get_mut(place) else {
             return false;
         };
         if let Report::Thread(thread) = report {
@@ -1460,7 +1468,18 @@ impl Workspace {
         match report {
             Report::Working => running.state = AgentState::Working,
             Report::Done => running.state = AgentState::Done,
-            Report::Asks => running.state = AgentState::AsksYou,
+            Report::Asks => {
+                let quiet = running
+                    .told_asks
+                    .is_none_or(|told| told.elapsed() >= ASKS_TOLD_EVERY);
+                if hidden && running.state != AgentState::AsksYou && quiet {
+                    let title = format!("mahi {}", tab.title);
+                    let text = format!("{} asks you", running.name);
+                    self.notice.write(&title, &text, out);
+                    running.told_asks = Some(Instant::now());
+                }
+                running.state = AgentState::AsksYou;
+            }
             Report::Prompts(count) => running.prompts = *count,
             Report::Thread(_) | Report::Notify(_) => {}
         }
@@ -1655,6 +1674,7 @@ mod tests {
             ending: Ending::Running,
             state: AgentState::Done,
             prompts: 0,
+            told_asks: None,
         }
     }
 
@@ -2352,16 +2372,16 @@ mod tests {
         let id = agent.id;
         workspace.tabs.push(tab(NEW_TAB, vec![agent]));
         let thread: mahi_core::ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
-        assert!(workspace.take_report(id, &Report::Thread(thread)));
+        assert!(workspace.take_report(id, &Report::Thread(thread), &mut Vec::new()));
         assert_eq!(workspace.tabs[0].title, "01234567");
-        assert!(!workspace.take_report(id, &Report::Thread(thread)));
-        assert!(workspace.take_report(id, &Report::Asks));
+        assert!(!workspace.take_report(id, &Report::Thread(thread), &mut Vec::new()));
+        assert!(workspace.take_report(id, &Report::Asks, &mut Vec::new()));
         assert!(workspace.tab_titles().next().unwrap().asks);
-        workspace.take_report(id, &Report::Prompts(2));
+        workspace.take_report(id, &Report::Prompts(2), &mut Vec::new());
         assert_eq!(workspace.tabs[0].agents[0].prompts, 2);
-        workspace.take_report(id, &Report::Done);
+        workspace.take_report(id, &Report::Done, &mut Vec::new());
         assert_eq!(workspace.tabs[0].agents[0].state, AgentState::Done);
-        assert!(!workspace.take_report(99, &Report::Done));
+        assert!(!workspace.take_report(99, &Report::Done, &mut Vec::new()));
     }
 
     #[test]
@@ -2388,6 +2408,50 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_that_asks_in_a_hidden_tab_rings_the_bell_and_raises_a_notification_once() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let hidden = running(&mut workspace, "sleep 5");
+        let shown = running(&mut workspace, "sleep 5");
+        let beside = running(&mut workspace, "sleep 5");
+        let (hidden_id, shown_id, beside_id) = (hidden.id, shown.id, beside.id);
+        workspace.tabs.push(tab("3e5c8646", vec![hidden]));
+        workspace.tabs.push(tab("9a48f2c1", vec![shown, beside]));
+        workspace.selected = 2;
+        let mut out = Vec::new();
+        let mut asks = |workspace: &mut Workspace, id, report| {
+            out.clear();
+            workspace
+                .sender
+                .send(ChildEvent::Report(id, report))
+                .unwrap();
+            workspace.take_output(&mut out);
+            out.clone()
+        };
+        let told = b"\x1b]9;mahi 3e5c8646: agent asks you\x07\x07";
+        assert_eq!(asks(&mut workspace, hidden_id, Report::Asks), told);
+        assert!(asks(&mut workspace, hidden_id, Report::Asks).is_empty());
+        assert!(asks(&mut workspace, hidden_id, Report::Working).is_empty());
+        assert!(asks(&mut workspace, hidden_id, Report::Asks).is_empty());
+        asks(&mut workspace, hidden_id, Report::Working);
+        workspace.tabs[0].agents[0].told_asks = Instant::now().checked_sub(ASKS_TOLD_EVERY);
+        assert_eq!(asks(&mut workspace, hidden_id, Report::Asks), told);
+        assert!(asks(&mut workspace, shown_id, Report::Asks).is_empty());
+        assert!(asks(&mut workspace, beside_id, Report::Asks).is_empty());
+        workspace.selected = 0;
+        assert_eq!(
+            asks(&mut workspace, shown_id, Report::Working),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            asks(&mut workspace, shown_id, Report::Asks),
+            b"\x1b]9;mahi 9a48f2c1: agent asks you\x07\x07"
+        );
+    }
+
+    #[test]
     fn a_thread_the_workspace_cannot_host_is_told_once_and_tried_again() {
         let setup = crate::workspace_live::tests::setup();
         let mut workspace = Workspace::new(
@@ -2402,7 +2466,7 @@ mod tests {
         let agent = running(&mut workspace, "sleep 5");
         let id = agent.id;
         workspace.tabs.push(tab(NEW_TAB, vec![agent]));
-        workspace.take_report(id, &Report::Thread(setup.thread));
+        workspace.take_report(id, &Report::Thread(setup.thread), &mut Vec::new());
         assert_eq!(workspace.tabs[0].thread, Some(setup.thread));
         let (told, _) = workspace.take_ended();
         let told = told.unwrap();
@@ -2428,9 +2492,9 @@ mod tests {
         workspace.tabs.push(tab("a", agents));
         workspace.tabs.push(tab("b", vec![third]));
         workspace.selected = 1;
-        workspace.take_report(ids[0], &Report::Working);
-        workspace.take_report(ids[1], &Report::Done);
-        workspace.take_report(ids[2], &Report::Asks);
+        workspace.take_report(ids[0], &Report::Working, &mut Vec::new());
+        workspace.take_report(ids[1], &Report::Done, &mut Vec::new());
+        workspace.take_report(ids[2], &Report::Asks, &mut Vec::new());
         let mut threads = Vec::new();
         workspace.type_keys(b"\x00 ", &mut threads);
         assert_eq!(workspace.shown_id(), Some(ids[1]));
