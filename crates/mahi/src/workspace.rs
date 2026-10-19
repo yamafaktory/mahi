@@ -1148,7 +1148,7 @@ impl Workspace {
     }
 
     /// Opens the palette, which the palette key `key` opened, with the entries for what is
-    /// shown: the thread list and the tabs, the shown tab's agents, the next agent waiting,
+    /// shown: the thread list and the tabs, the shown tab's other agents, the next agent waiting,
     /// the list, the palette key itself for the shown agent, and quitting.
     fn open_palette(&mut self, key: &[u8]) {
         let mut items = Vec::new();
@@ -1190,9 +1190,14 @@ impl Workspace {
             let entries = (0..tab.agents.len())
                 .map(Entry::Agent)
                 .chain(slots.map(|(slot, _)| Entry::Teammate(slot.clone())));
-            for (agent, entry) in tab.listed(teammates).iter().zip(entries) {
-                let item = agent.palette_label();
-                add(item, String::new(), entry);
+            let others = tab
+                .listed(teammates)
+                .into_iter()
+                .zip(entries)
+                .enumerate()
+                .filter(|(index, _)| *index != tab.selected);
+            for (_, (agent, entry)) in others {
+                add(agent.palette_label(), String::new(), entry);
             }
         }
         add(
@@ -1826,7 +1831,6 @@ mod tests {
             [
                 Entry::Step(Step::To(0)),
                 Entry::Step(Step::To(1)),
-                Entry::Agent(0),
                 Entry::Agent(1),
                 Entry::Step(Step::Waiting),
                 Entry::Step(Step::List),
@@ -1853,7 +1857,7 @@ mod tests {
             assert!(drawn.contains(item), "{item}: {drawn}");
         }
         assert_eq!(
-            workspace.type_keys(b"\x1b[B\x1b[B\x1b[B", &mut threads),
+            workspace.type_keys(b"\x1b[B\x1b[B", &mut threads),
             Moved::Shown
         );
         assert_eq!(workspace.type_keys(b"\r", &mut threads), Moved::Shown);
@@ -2049,7 +2053,7 @@ mod tests {
         let mut threads = Vec::new();
         workspace.type_keys(b"\x00\x00x", &mut threads);
         assert!(!workspace.palette_open());
-        workspace.type_keys(b"\x00\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r", &mut threads);
+        workspace.type_keys(b"\x00\x1b[B\x1b[B\x1b[B\x1b[B\r", &mut threads);
         workspace.type_keys(b"\x00\x1b[32;5u\x1b[32;5u", &mut threads);
         let mut out = Vec::new();
         settle(&mut workspace, &mut out, |workspace| {
