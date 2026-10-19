@@ -3,6 +3,7 @@ use std::{
         BTreeSet,
         HashMap,
     },
+    fmt::Write as _,
     io,
     path::{
         Path,
@@ -18,6 +19,7 @@ use mahi_core::{
     RefKind,
     ThreadId,
 };
+use mahi_crypto::ThreadKey;
 use mahi_identity::{
     ConfigDir,
     IdentityError,
@@ -31,6 +33,7 @@ use mahi_live::{
     Relays,
 };
 use mahi_store::{
+    ObjectId,
     Store,
     StoreError,
 };
@@ -60,6 +63,7 @@ use crate::{
         LiveSetup,
         SharedNode,
     },
+    mcp,
     session,
     teammates::Teammates,
     thread_lock::{
@@ -117,6 +121,8 @@ struct Hosted {
     host: LiveHost,
     hub: Hub,
     teammates: Teammates,
+    key: ThreadKey,
+    base: ObjectId,
 }
 
 impl WorkspaceLive {
@@ -179,7 +185,8 @@ impl WorkspaceLive {
             .find(|participant| *participant.node() == node)
             .map(|participant| participant.name().clone())
             .ok_or(WorkspaceLiveError::NotParticipant)?;
-        let keys = LiveKeys::derive(&meta.thread_key(&participant, identity.as_age())?, thread)?;
+        let key = meta.thread_key(&participant, identity.as_age())?;
+        let keys = LiveKeys::derive(&key, thread)?;
         let shared = if let Some(shared) = &self.shared {
             shared.clone()
         } else {
@@ -214,6 +221,8 @@ impl WorkspaceLive {
                         host,
                         hub,
                         teammates,
+                        key,
+                        base: meta.base(),
                     },
                 );
                 Ok(())
@@ -248,6 +257,34 @@ impl WorkspaceLive {
         self.hosted.get(&thread).map(|hosted| &hosted.teammates)
     }
 
+    /// Shows the record of the work of `slot`'s agent in `thread`, its latest turns and the
+    /// files it changed, as `read_transcript` and `read_diff` read them, on a screen of `size`,
+    /// when the agent is offline and none is shown yet; returns whether it shows one now.
+    pub(crate) fn show_record(
+        &mut self,
+        thread: ThreadId,
+        slot: &AgentSlot,
+        size: (u16, u16),
+    ) -> bool {
+        let Some(hosted) = self.hosted.get_mut(&thread) else {
+            return false;
+        };
+        if !hosted.teammates.wants_record(slot) {
+            return false;
+        }
+        let record = record(&self.git_dir, (thread, &hosted.key, hosted.base), slot);
+        hosted.teammates.set_record(slot, &record, size);
+        true
+    }
+
+    /// Forgets the records shown of offline agents' work, so they are read again at another
+    /// size.
+    pub(crate) fn forget_records(&mut self) {
+        for hosted in self.hosted.values_mut() {
+            hosted.teammates.forget_records();
+        }
+    }
+
     /// Stops hosting `thread`, once none of its tabs is open, and closes the node once it
     /// hosts no thread, so it no longer publishes where it is.
     pub(crate) fn release(&mut self, thread: ThreadId) {
@@ -271,6 +308,32 @@ impl Drop for WorkspaceLive {
             let _ = stopped.join();
         }
     }
+}
+
+/// Returns the record of the work of `slot`'s agent in the thread of the repository at
+/// `git_dir`, whose records `key` opens and whose base is `base`: its latest turns, then the
+/// files it changed, or why each cannot be read.
+fn record(
+    git_dir: &Path,
+    (thread, key, base): (ThreadId, &ThreadKey, ObjectId),
+    slot: &AgentSlot,
+) -> String {
+    let store = match Store::open(git_dir) {
+        Ok(store) => store,
+        Err(error) => {
+            return format!("the repository cannot be read: {}", crate::describe(&error));
+        }
+    };
+    let mut record = mcp::transcript_text(&store, key, thread, slot, mcp::DEFAULT_TURNS)
+        .unwrap_or_else(|error| format!("{slot}'s turns cannot be read: {error}"));
+    record.push_str("\n\n");
+    match mcp::changes_text(&store, thread, base, slot) {
+        Ok(changes) => record.push_str(&changes),
+        Err(error) => {
+            let _ = write!(record, "{slot}'s changes cannot be read: {error}");
+        }
+    }
+    record
 }
 
 /// Returns the agents of the participants `meta` lists that the thread's refs name here, its
@@ -423,10 +486,7 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn a_hosted_threads_teammates_agents_from_its_refs_are_listed_offline() {
-        let setup = setup();
-        let tree = setup.store.write_tree(&[]).unwrap();
+    fn add_bob(setup: &Setup) {
         let bob = Participant::new(
             "bob".parse().unwrap(),
             ParticipantKey::from_public_key(
@@ -452,6 +512,52 @@ pub(crate) mod tests {
             bob,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn an_offline_teammates_agent_shows_its_turns_and_changes_as_the_tools_read_them() {
+        let setup = setup();
+        add_bob(&setup);
+        let bob: AgentSlot = "bob.codex".parse().unwrap();
+        let snapshots = mahi_core::ThreadRef::new(setup.thread, RefKind::Snapshots(bob.clone()));
+        let tree = setup.store.write_tree(&[]).unwrap();
+        setup.store.append(&snapshots, None, tree, "test").unwrap();
+        let mut live =
+            WorkspaceLive::new(&setup.environment, &setup.config, setup.store.common_dir())
+                .unwrap();
+        live.host_unlocked(setup.thread, &setup.identity).unwrap();
+        assert!(live.show_record(setup.thread, &bob, (20, 80)));
+        assert!(!live.show_record(setup.thread, &bob, (20, 80)));
+        let shown = live
+            .teammates(setup.thread)
+            .unwrap()
+            .screen(&bob)
+            .unwrap()
+            .contents();
+        assert!(
+            shown.contains("bob.codex has no recorded turns here"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("Files bob.codex's latest snapshot changed from the thread's base:"),
+            "{shown}"
+        );
+        live.forget_records();
+        assert!(live.show_record(setup.thread, &bob, (10, 40)));
+        let size = live
+            .teammates(setup.thread)
+            .unwrap()
+            .screen(&bob)
+            .unwrap()
+            .size();
+        assert_eq!(size, (10, 40));
+    }
+
+    #[test]
+    fn a_hosted_threads_teammates_agents_from_its_refs_are_listed_offline() {
+        let setup = setup();
+        let tree = setup.store.write_tree(&[]).unwrap();
+        add_bob(&setup);
         for slot in ["bob.codex", "mallory.claude"] {
             let slot: AgentSlot = slot.parse().unwrap();
             let agent = mahi_core::ThreadRef::new(setup.thread, RefKind::Transcript(slot));

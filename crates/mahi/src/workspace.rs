@@ -638,12 +638,17 @@ impl Workspace {
         let shown = self
             .selected
             .checked_sub(1)
-            .and_then(|index| self.tabs.get(index))
-            .and_then(|tab| tab.thread);
+            .and_then(|index| self.tabs.get(index));
+        let watching = shown.and_then(|tab| Some((tab.thread?, tab.watching.clone()?)));
+        let thread = shown.and_then(|tab| tab.thread);
+        let size = (self.size.rows, self.size.cols);
         let Some(live) = self.live.as_mut() else {
             return false;
         };
-        let changed = live.watch(Instant::now(), shown);
+        let mut changed = live.watch(Instant::now(), thread);
+        if let Some((thread, slot)) = watching {
+            changed |= live.show_record(thread, &slot, size);
+        }
         for tab in &mut self.tabs {
             tab.reselect(teammates_of(self.live.as_ref(), tab.thread));
         }
@@ -825,6 +830,9 @@ impl Workspace {
         self.size = size;
         for running in self.tabs.iter_mut().flat_map(|tab| tab.agents.iter_mut()) {
             let _ = running.child.resize(size);
+        }
+        if let Some(live) = self.live.as_mut() {
+            live.forget_records();
         }
     }
 

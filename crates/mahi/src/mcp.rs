@@ -105,7 +105,7 @@ const META_REREAD: Duration = Duration::from_secs(5);
 const MAX_SLOT_CHARS: usize = 65;
 const MAX_PATH_CHARS: usize = 4096;
 const MAX_LISTED_CHANGES: usize = 500;
-const DEFAULT_TURNS: usize = 10;
+pub(crate) const DEFAULT_TURNS: usize = 10;
 const MAX_TURNS: usize = 30;
 const TURNS_BUDGET: usize = MAX_TOOL_TEXT - 512;
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
@@ -453,37 +453,12 @@ impl ThreadTools {
         let view = self.meta(&store)?;
         let slot = listed_agent(arguments, &view)?;
         let path = mcp::text_argument(arguments, "path", MAX_PATH_CHARS)?;
-        let snapshot = store
-            .head(&ThreadRef::new(
-                self.thread,
-                RefKind::Snapshots(slot.clone()),
-            ))
-            .map_err(|error| failed(&error))?
-            .ok_or_else(|| ToolError::Failed(format!("{slot} has no snapshot here")))?;
+        let Some(path) = path else {
+            return changes_text(&store, self.thread, view.base, &slot).map_err(ToolError::Failed);
+        };
+        let snapshot = latest_snapshot(&store, self.thread, &slot).map_err(ToolError::Failed)?;
         let tree = |commit| store.commit_tree(commit).map_err(|error| failed(&error));
         let (base, latest) = (tree(view.base)?, tree(snapshot)?);
-        let Some(path) = path else {
-            let changes = store
-                .changed_paths(base, latest, MAX_LISTED_CHANGES)
-                .map_err(|error| failed(&error))?;
-            let mut text =
-                format!("Files {slot}'s latest snapshot changed from the thread's base:\n");
-            for (path, change) in &changes.paths {
-                let what = match change {
-                    Change::Added => "added",
-                    Change::Deleted => "deleted",
-                    Change::Modified => "modified",
-                };
-                let _ = writeln!(text, "{what} {path:?}");
-            }
-            if changes.paths.is_empty() {
-                text.push_str("none\n");
-            }
-            if changes.truncated {
-                text.push_str("(more changed than are listed)\n");
-            }
-            return Ok(cleaned(&text));
-        };
         let diffed = store
             .file_diff(base, latest, path)
             .map_err(|error| failed(&error))?;
@@ -581,29 +556,84 @@ impl ThreadTools {
                 .filter(|last| (1..=MAX_TURNS).contains(last))
                 .ok_or(ToolError::Arguments)?,
         };
-        let mut read = TurnsRead::default();
-        let walked = walk_turns(&store, key, self.thread, &slot, last, |turn| {
-            read.take(
-                turn.turn(),
-                turn.events().iter().map(mahi_thread::Event::payload),
-            );
-        });
-        if read.kept.is_empty() {
-            walked.map_err(|error| failed(&error))?;
-            return Ok(format!("{slot} has no recorded turns here"));
-        }
-        let mut text = format!("The latest turns of {slot}, oldest first:\n");
-        if walked.is_err() {
-            text.push_str("(older turns could not be read)\n");
-        }
-        if read.left_out > 0 {
-            let _ = writeln!(text, "({} older turns left out for size)", read.left_out);
-        }
-        for range in read.kept.iter().rev() {
-            text.push_str(read.text.get(range.clone()).unwrap_or_default());
-        }
-        Ok(cleaned(&text))
+        transcript_text(&store, key, self.thread, &slot, last).map_err(ToolError::Failed)
     }
+}
+
+/// Returns the latest snapshot of `slot` in `thread`, or why there is none.
+fn latest_snapshot(store: &Store, thread: ThreadId, slot: &AgentSlot) -> Result<ObjectId, String> {
+    store
+        .head(&ThreadRef::new(thread, RefKind::Snapshots(slot.clone())))
+        .map_err(|error| crate::describe(&error))?
+        .ok_or_else(|| format!("{slot} has no snapshot here"))
+}
+
+/// Returns what `read_diff` shows without a path: the files the latest snapshot of `slot` in
+/// `thread` changed from the thread's `base`; or why it cannot be read.
+pub(crate) fn changes_text(
+    store: &Store,
+    thread: ThreadId,
+    base: ObjectId,
+    slot: &AgentSlot,
+) -> Result<String, String> {
+    let snapshot = latest_snapshot(store, thread, slot)?;
+    let tree = |commit| {
+        store
+            .commit_tree(commit)
+            .map_err(|error| crate::describe(&error))
+    };
+    let changes = store
+        .changed_paths(tree(base)?, tree(snapshot)?, MAX_LISTED_CHANGES)
+        .map_err(|error| crate::describe(&error))?;
+    let mut text = format!("Files {slot}'s latest snapshot changed from the thread's base:\n");
+    for (path, change) in &changes.paths {
+        let what = match change {
+            Change::Added => "added",
+            Change::Deleted => "deleted",
+            Change::Modified => "modified",
+        };
+        let _ = writeln!(text, "{what} {path:?}");
+    }
+    if changes.paths.is_empty() {
+        text.push_str("none\n");
+    }
+    if changes.truncated {
+        text.push_str("(more changed than are listed)\n");
+    }
+    Ok(cleaned(&text))
+}
+
+/// Returns what `read_transcript` shows of the latest `last` turns of `slot` in `thread`,
+/// opened with `key`; or why they cannot be read.
+pub(crate) fn transcript_text(
+    store: &Store,
+    key: &ThreadKey,
+    thread: ThreadId,
+    slot: &AgentSlot,
+    last: usize,
+) -> Result<String, String> {
+    let mut read = TurnsRead::default();
+    let walked = walk_turns(store, key, thread, slot, last, |turn| {
+        read.take(
+            turn.turn(),
+            turn.events().iter().map(mahi_thread::Event::payload),
+        );
+    });
+    if read.kept.is_empty() {
+        walked.map_err(|error| crate::describe(&error))?;
+        return Ok(format!("{slot} has no recorded turns here"));
+    }
+    let mut text = format!("The latest turns of {slot}, oldest first:\n");
+    if walked.is_err() {
+        text.push_str("(older turns could not be read)\n");
+    }
+    if read.left_out > 0 {
+        let _ = writeln!(text, "({} older turns left out for size)", read.left_out);
+    }
+    for range in read.kept.iter().rev() {
+        text.push_str(read.text.get(range.clone()).unwrap_or_default());
+    }
+    Ok(cleaned(&text))
 }
 
 /// The turns `read_transcript` keeps, newest first, written into one buffer within

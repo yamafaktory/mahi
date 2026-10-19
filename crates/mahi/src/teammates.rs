@@ -5,6 +5,7 @@ use mahi_core::{
     ParticipantName,
 };
 use mahi_live::Body;
+use unicode_width::UnicodeWidthChar;
 
 use crate::{
     join::{
@@ -20,6 +21,7 @@ use crate::{
 
 const MOST_WATCHED: usize = 16;
 const MOST_CELLS: u32 = 100_000;
+const TAB_STOP: usize = 8;
 
 /// The agents of a thread's other participants, as the workspace watches them: a screen for
 /// each agent whose frames it accepted, rebuilt as a viewer rebuilds one, from which only
@@ -72,6 +74,7 @@ enum Watched {
     Waiting,
     Drawn(Box<vt100::Parser>),
     TooLarge,
+    Record(Box<vt100::Parser>),
 }
 
 impl std::fmt::Debug for Watched {
@@ -80,6 +83,7 @@ impl std::fmt::Debug for Watched {
             Self::Waiting => "Waiting",
             Self::Drawn(_) => "Drawn",
             Self::TooLarge => "TooLarge",
+            Self::Record(_) => "Record",
         })
     }
 }
@@ -117,7 +121,7 @@ impl Teammates {
                         screen.process(&bytes);
                         true
                     }
-                    Watched::Waiting | Watched::TooLarge => new,
+                    Watched::Waiting | Watched::TooLarge | Watched::Record(_) => new,
                 }
             }
             Body::Resize {
@@ -140,7 +144,7 @@ impl Teammates {
                         teammate.screen = Watched::Waiting;
                         true
                     }
-                    Watched::Waiting => new,
+                    Watched::Waiting | Watched::Record(_) => new,
                 }
             }
             Body::Screen {
@@ -273,8 +277,42 @@ impl Teammates {
     pub(crate) fn screen(&self, slot: &AgentSlot) -> Option<&vt100::Screen> {
         let teammate = self.agents.iter().find(|teammate| &teammate.slot == slot)?;
         match &teammate.screen {
-            Watched::Drawn(screen) => Some(screen.screen()),
+            Watched::Drawn(screen) | Watched::Record(screen) => Some(screen.screen()),
             Watched::Waiting | Watched::TooLarge => None,
+        }
+    }
+
+    /// Says whether `slot`'s agent is offline and shows no record of its work yet.
+    pub(crate) fn wants_record(&self, slot: &AgentSlot) -> bool {
+        self.agents.iter().any(|teammate| {
+            &teammate.slot == slot
+                && !teammate.presence.is_online()
+                && matches!(teammate.screen, Watched::Waiting)
+        })
+    }
+
+    /// Shows `text`, the record of the work of `slot`'s agent while it is offline, on a screen
+    /// of `rows` by `columns`, from its top, as a teammate's screen is shown.
+    pub(crate) fn set_record(&mut self, slot: &AgentSlot, text: &str, (rows, columns): (u16, u16)) {
+        let Some(teammate) = self
+            .agents
+            .iter_mut()
+            .find(|teammate| &teammate.slot == slot && !teammate.presence.is_online())
+        else {
+            return;
+        };
+        let mut screen = vt100::Parser::new(rows.max(1), columns.max(1), 0);
+        draw_from_top(&mut screen, text);
+        teammate.screen = Watched::Record(Box::new(screen));
+    }
+
+    /// Forgets the records of the offline agents' work, so they are read again at another
+    /// size.
+    pub(crate) fn forget_records(&mut self) {
+        for teammate in &mut self.agents {
+            if matches!(teammate.screen, Watched::Record(_)) {
+                teammate.screen = Watched::Waiting;
+            }
         }
     }
 
@@ -290,6 +328,9 @@ impl Teammates {
                 let teammate = self.agents.get_mut(index)?;
                 let back = !teammate.presence.is_online();
                 teammate.presence = Presence::Online(now);
+                if back {
+                    teammate.screen = Watched::Waiting;
+                }
                 return Some((teammate, back));
             }
             Err(index) if self.agents.len() < MOST_WATCHED => index,
@@ -326,6 +367,51 @@ impl Teammates {
 /// Says whether a screen `rows` by `columns` is small enough to be kept.
 fn fits(rows: u16, columns: u16) -> bool {
     u32::from(rows) * u32::from(columns) <= MOST_CELLS
+}
+
+/// Writes `text` into `screen` from its top, wrapping its long lines, and leaves out its
+/// control characters, which could move the cursor, its characters wider than the screen,
+/// and what does not fit, so the screen never scrolls.
+fn draw_from_top(screen: &mut vt100::Parser, text: &str) {
+    let (rows, columns) = screen.screen().size();
+    let columns = usize::from(columns);
+    let mut row = 0;
+    let mut encoded = [0; 4];
+    let mut next_row = |screen: &mut vt100::Parser| {
+        row += 1;
+        if row >= rows {
+            return false;
+        }
+        screen.process(b"\r\n");
+        true
+    };
+    for (index, line) in text.lines().enumerate() {
+        if index > 0 && !next_row(screen) {
+            return;
+        }
+        let mut width = 0;
+        let drawn = |&c: &char| (c == '\t' || !c.is_control()) && c.width().unwrap_or(0) <= columns;
+        for character in line.chars().filter(drawn) {
+            if width > 0 && width + char_width(character, width, columns) > columns {
+                if !next_row(screen) {
+                    return;
+                }
+                width = 0;
+            }
+            screen.process(character.encode_utf8(&mut encoded).as_bytes());
+            width += char_width(character, width, columns);
+        }
+    }
+}
+
+/// Returns how many columns `character` takes when written `width` columns into a row of
+/// `columns`, where a tab stops at the last column.
+fn char_width(character: char, width: usize, columns: usize) -> usize {
+    if character == '\t' {
+        (TAB_STOP - width % TAB_STOP).min(columns.saturating_sub(width + 1))
+    } else {
+        character.width().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -625,6 +711,73 @@ mod tests {
         assert!(!listed.contains(&"carol.claude".to_owned()));
         assert!(listed.contains(&"bob.codex".to_owned()));
         assert!(!teammates.add_offline(&known));
+    }
+
+    #[test]
+    fn a_record_of_an_offline_agents_work_shows_only_until_its_host_is_heard() {
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let codex = slot("bob.codex");
+        teammates.add_offline([&codex]);
+        assert!(teammates.wants_record(&codex));
+        teammates.set_record(&codex, "Turn 1:\n  asked: fix it", (4, 30));
+        assert!(!teammates.wants_record(&codex));
+        assert_eq!(
+            teammates.screen(&codex).map(vt100::Screen::contents),
+            Some("Turn 1:\n  asked: fix it".to_owned())
+        );
+        teammates.forget_records();
+        assert!(teammates.wants_record(&codex));
+        teammates.set_record(&codex, "again", (4, 30));
+        let now = Instant::now();
+        assert!(teammates.apply(
+            &bob(),
+            Body::Heartbeat {
+                slot: codex.clone()
+            },
+            now
+        ));
+        assert!(teammates.screen(&codex).is_none());
+        assert!(!teammates.wants_record(&codex));
+        teammates.set_record(&codex, "online", (4, 30));
+        assert!(teammates.screen(&codex).is_none());
+    }
+
+    #[test]
+    fn a_record_shows_from_its_top_with_long_lines_wrapped_and_no_control_characters() {
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let codex = slot("bob.codex");
+        teammates.add_offline([&codex]);
+        teammates.set_record(&codex, "first\n123456789\nthird\nfourth\nfifth", (4, 5));
+        assert_eq!(
+            teammates.screen(&codex).map(vt100::Screen::contents),
+            Some("first\n12345\n6789\nthird".to_owned())
+        );
+        teammates.forget_records();
+        teammates.set_record(&codex, "a\tb\n界界界", (3, 5));
+        assert_eq!(
+            teammates.screen(&codex).map(vt100::Screen::contents),
+            Some("a   b\n界界\n界".to_owned())
+        );
+        teammates.forget_records();
+        teammates.set_record(&codex, "a\x1b[2Jb\x07\u{9b}Hc\r\nd", (3, 10));
+        assert_eq!(
+            teammates.screen(&codex).map(vt100::Screen::contents),
+            Some("a[2JbHc\nd".to_owned())
+        );
+        for (text, size, shown) in [
+            ("a界b", (3, 1), "a\nb"),
+            ("abcd界x", (3, 5), "abcd\n界x"),
+            ("abc\tx", (3, 4), "abcx"),
+            ("abc\ndef\nghi", (2, 3), "abc\ndef"),
+        ] {
+            teammates.forget_records();
+            teammates.set_record(&codex, text, size);
+            assert_eq!(
+                teammates.screen(&codex).map(vt100::Screen::contents),
+                Some(shown.to_owned()),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
