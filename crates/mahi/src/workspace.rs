@@ -1158,7 +1158,7 @@ impl Workspace {
             entries.push(entry);
         };
         add(
-            "Threads".to_owned(),
+            "Go to the thread list".to_owned(),
             "0".to_owned(),
             Entry::Step(Step::To(0)),
         );
@@ -1169,7 +1169,16 @@ impl Workspace {
             } else {
                 String::new()
             };
-            add(tab.title.clone(), key, Entry::Step(Step::To(place)));
+            let shown = if place == self.selected {
+                " (shown)"
+            } else {
+                ""
+            };
+            add(
+                format!("Go to thread {}{shown}", tab.title),
+                key,
+                Entry::Step(Step::To(place)),
+            );
         }
         let shown = self
             .selected
@@ -1182,12 +1191,12 @@ impl Workspace {
                 .map(Entry::Agent)
                 .chain(slots.map(|(slot, _)| Entry::Teammate(slot.clone())));
             for (agent, entry) in tab.listed(teammates).iter().zip(entries) {
-                let item = format!("{}  {}", agent.label(), agent.state.as_str());
+                let item = format!("Show agent {} ({})", agent.label(), agent.state.as_str());
                 add(item, String::new(), entry);
             }
         }
         add(
-            "Next agent waiting for you".to_owned(),
+            "Go to the next agent waiting for you".to_owned(),
             "Space".to_owned(),
             Entry::Step(Step::Waiting),
         );
@@ -1199,7 +1208,7 @@ impl Workspace {
         );
         if self.shows_running() {
             add(
-                format!("Send {} to the agent", self.palette_name),
+                format!("Pass {} through to the agent", self.palette_name),
                 self.palette_name.clone(),
                 Entry::SendKey,
             );
@@ -1209,7 +1218,7 @@ impl Workspace {
                 add(choice.label().to_owned(), String::new(), Entry::Act(choice));
             }
         }
-        add("Quit".to_owned(), "q".to_owned(), Entry::Quit);
+        add("Quit mahi".to_owned(), "q".to_owned(), Entry::Quit);
         let title = shown.map_or("threads", |tab| tab.title.as_str());
         self.palette = Some(Palette {
             menu: Dialog::menu(title, items),
@@ -1833,12 +1842,13 @@ mod tests {
             .map(ratatui_core::buffer::Cell::symbol)
             .collect();
         for item in [
-            "Threads",
-            "agent  ✓ done",
-            "Next agent waiting for you",
+            "Go to the thread list",
+            "Go to thread a (shown)",
+            "Show agent agent (✓ done)",
+            "Go to the next agent waiting for you",
             "Hide the agents' list",
-            "Send Ctrl-Space to the agent",
-            "Quit",
+            "Pass Ctrl-Space through to the agent",
+            "Quit mahi",
         ] {
             assert!(drawn.contains(item), "{item}: {drawn}");
         }
@@ -1861,6 +1871,38 @@ mod tests {
         assert!(threads.is_empty());
         workspace.tabs[0].select(0, None);
         assert_eq!(workspace.shown_id(), Some(first_id));
+    }
+
+    #[test]
+    fn the_palette_marks_only_the_shown_tab_and_none_on_the_thread_list() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let first = running(&mut workspace, "sleep 5");
+        let second = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("a", vec![first]));
+        workspace.tabs.push(tab("b", vec![second]));
+        let drawn = |workspace: &mut Workspace| {
+            let mut threads = Vec::new();
+            workspace.type_keys(b"\x00", &mut threads);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
+            workspace.render_palette(buffer.area, &mut buffer);
+            workspace.type_keys(b"\x1b", &mut threads);
+            buffer
+                .content()
+                .iter()
+                .map(ratatui_core::buffer::Cell::symbol)
+                .collect::<String>()
+        };
+        workspace.selected = 2;
+        let shown = drawn(&mut workspace);
+        assert!(shown.contains("Go to thread a "), "{shown}");
+        assert!(!shown.contains("Go to thread a (shown)"), "{shown}");
+        assert!(shown.contains("Go to thread b (shown)"), "{shown}");
+        workspace.selected = 0;
+        let shown = drawn(&mut workspace);
+        assert!(!shown.contains("(shown)"), "{shown}");
     }
 
     #[test]
