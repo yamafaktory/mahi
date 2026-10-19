@@ -543,6 +543,27 @@ impl Workspace {
         self.selected == 0
     }
 
+    /// Shows the tab titled `title` when an agent runs in it, keeping its selected agent when
+    /// that one runs and otherwise selecting the first that does; returns whether it did, so
+    /// resuming its thread again starts no agent that would find its own already running.
+    pub(crate) fn show_running(&mut self, title: &str) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.title == title) else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return false;
+        };
+        let runs = |running: &Running| running.ending == Ending::Running;
+        if !tab.agents.get(tab.selected).is_some_and(runs) {
+            let Some(first) = tab.agents.iter().position(runs) else {
+                return false;
+            };
+            tab.select(first, None);
+        }
+        self.selected = index + 1;
+        true
+    }
+
     /// Starts the mahi command `words`, shown to the user as `shown`, as the agent `name` in the
     /// tab of the thread `title`, which opens if it is not open yet, or in a tab of its own
     /// when the thread is `new`, and shows it; the child gets the user's unlocked mahi `key`, if
@@ -1578,6 +1599,33 @@ mod tests {
         workspace.tabs[0].agents[0].ending = Ending::Failed;
         let shown = footer(&workspace);
         assert!(shown.contains("F5 0 threads"), "{shown}");
+    }
+
+    #[test]
+    fn resuming_a_thread_whose_agent_runs_shows_it_instead_of_starting_another() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let failed = running(&mut workspace, "sleep 5");
+        let agent = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("4799a3af", vec![failed, agent]));
+        workspace.tabs[0].agents[0].ending = Ending::Failed;
+        assert!(!workspace.show_running("other"));
+        assert!(workspace.show_running("4799a3af"));
+        assert_eq!((workspace.selected, workspace.tabs[0].selected), (1, 1));
+        workspace.selected = 0;
+        assert!(workspace.show_running("4799a3af"));
+        assert_eq!((workspace.selected, workspace.tabs[0].selected), (1, 1));
+        workspace.tabs[0].selected = 2;
+        workspace.tabs[0].watching = Some("bob.claude".parse().unwrap());
+        assert!(workspace.show_running("4799a3af"));
+        assert_eq!(workspace.tabs[0].selected, 1);
+        assert!(workspace.tabs[0].watching.is_none());
+        workspace.tabs[0].agents[1].ending = Ending::Drawn;
+        workspace.selected = 0;
+        assert!(!workspace.show_running("4799a3af"));
+        assert_eq!(workspace.selected, 0);
     }
 
     #[test]

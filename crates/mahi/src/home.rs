@@ -636,6 +636,9 @@ fn open_agent(
         HomeAction::AddAgent(thread) | HomeAction::Handoff(thread) => (short(thread), false),
         _ => (NEW_TAB.to_owned(), false),
     };
+    if resumes && workspace.show_running(&title) {
+        return Ok(());
+    }
     let needs_key = !matches!(action, HomeAction::New) || environment.live != LiveMode::Off;
     let words = command_words(action, store, environment)?;
     let name = if resumes {
