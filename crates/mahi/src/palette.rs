@@ -525,6 +525,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                 text,
                 scroll: state.scroll,
             }),
+            true_color: crate::ui::true_color(),
         };
         let drawn = view.draw(size.rows, size.cols, &mut state.out.palette_out())?;
         state.page = drawn.page;
@@ -673,6 +674,12 @@ mod tests {
         std::mem::take(&mut screen.lock().unwrap().out)
     }
 
+    fn shown(bytes: &[u8]) -> String {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(bytes);
+        parser.screen().contents()
+    }
+
     fn has_box(bytes: &[u8]) -> bool {
         String::from_utf8_lossy(bytes).contains('╭')
     }
@@ -810,7 +817,7 @@ mod tests {
         assert!(screen.is_open());
         let drawn = written(&screen);
         assert!(has_box(&drawn));
-        assert!(String::from_utf8_lossy(&drawn).contains("Ctrl-Space twice"));
+        assert!(shown(&drawn).contains("Ctrl-Space twice"));
         screen.output(b"one ").unwrap();
         screen.output(b"two").unwrap();
         assert!(written(&screen).is_empty());
@@ -898,9 +905,9 @@ mod tests {
         screen.open().unwrap();
         written(&screen);
         screen.typed(b"fix").unwrap();
-        assert!(String::from_utf8_lossy(&written(&screen)).contains("› fix"));
+        assert!(shown(&written(&screen)).contains("› fix"));
         screen.typed(b"\x7f").unwrap();
-        let shortened = String::from_utf8_lossy(&written(&screen)).into_owned();
+        let shortened = shown(&written(&screen));
         assert!(shortened.contains("› fi") && !shortened.contains("› fix"));
         screen.typed(b"\x1b[200~\x1b\r\x1b[201~").unwrap();
         assert!(screen.is_open());
@@ -1035,7 +1042,7 @@ mod tests {
         let name = mahi_core::ParticipantName::new("bob").unwrap();
         prompts.offer(name, [1; 16], mahi_live::PromptText::new(long).unwrap());
         screen.open().unwrap();
-        let first = String::from_utf8_lossy(&written(&screen)).into_owned();
+        let first = shown(&written(&screen));
         assert!(
             first.contains("step 1") && !first.contains("step 60"),
             "{first}"
@@ -1047,7 +1054,7 @@ mod tests {
         for _ in 0..3 {
             screen.typed(b"\x1b[6~").unwrap();
         }
-        let end = String::from_utf8_lossy(&written(&screen)).into_owned();
+        let end = shown(&written(&screen));
         assert!(end.contains("step 60"), "{end}");
         assert!(end.contains("Enter accepts"), "{end}");
         screen.typed(b"\r").unwrap();

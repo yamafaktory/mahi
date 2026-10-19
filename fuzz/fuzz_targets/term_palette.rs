@@ -70,6 +70,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
             text: &text,
             scroll: usize::from(split),
         }),
+        true_color: split % 2 == 0,
     };
     let rows = u16::from(split % 64);
     let columns = u16::from(split);

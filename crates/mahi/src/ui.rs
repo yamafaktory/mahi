@@ -103,6 +103,16 @@ pub(crate) fn set_true_color(true_color: bool) {
     TRUE_COLOR.store(true_color, Ordering::SeqCst);
 }
 
+/// Returns whether a terminal whose `COLORTERM` is `colorterm` draws 24-bit colour.
+pub(crate) fn draws_true_color(colorterm: Option<&str>) -> bool {
+    matches!(colorterm, Some("truecolor" | "24bit"))
+}
+
+/// Returns whether the terminal draws 24-bit colour.
+pub(crate) fn true_color() -> bool {
+    TRUE_COLOR.load(Ordering::SeqCst)
+}
+
 /// Returns a backend that draws on standard output, in 24-bit colour only when the terminal
 /// draws it.
 pub(crate) fn backend(rows: u16, columns: u16) -> AnsiBackend<io::Stdout> {
@@ -598,6 +608,14 @@ fn collect(reader: OwnedFd, lines: &Mutex<Vec<String>>, generation: &AtomicU64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_terminal_that_says_so_draws_24_bit_colour() {
+        assert!(draws_true_color(Some("truecolor")));
+        assert!(draws_true_color(Some("24bit")));
+        assert!(!draws_true_color(Some("256")));
+        assert!(!draws_true_color(None));
+    }
 
     #[test]
     fn only_text_of_one_line_is_put_on_the_clipboard_whatever_blank_lines_surround_it() {

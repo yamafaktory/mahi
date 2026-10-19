@@ -244,6 +244,7 @@ impl Composer {
             empty: EMPTY,
             hint: HINT,
             preview: None,
+            true_color: crate::ui::true_color(),
         };
         view.draw(rows, columns, out).map(|_| ())
     }

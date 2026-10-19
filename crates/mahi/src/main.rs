@@ -130,6 +130,7 @@ fn main() {
     if let Some(fd) = environment.command_fd {
         commands::connect(fd);
     }
+    ui::set_true_color(ui::draws_true_color(environment.colorterm.as_deref()));
     make_config_private(&environment);
     if required.is_some() {
         let loaded = ConfigDir::resolve(

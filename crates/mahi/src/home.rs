@@ -128,10 +128,6 @@ pub(crate) fn home(environment: &Environment) -> i32 {
         .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
     let identity = session::participant_from(environment.user.as_deref())
         .map_or_else(|_| "unknown".to_owned(), |name| name.to_string());
-    ui::set_true_color(matches!(
-        environment.colorterm.as_deref(),
-        Some("truecolor" | "24bit")
-    ));
     let saved = rustix::termios::tcgetattr(io::stdin()).ok();
     let screen = match Screen::enter() {
         Ok(screen) => screen,

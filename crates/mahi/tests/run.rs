@@ -1063,7 +1063,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         session.wait_for("ready");
         assert!(session.text().contains("Ctrl-Space opens mahi's palette"));
         session.type_keys(b"\0");
-        session.wait_for_screen("╭─ Teammates' prompts");
+        session.wait_for_screen("╭ Teammates' prompts");
         session.type_keys(b"abc");
         session.wait_for_screen("› abc");
         session.type_keys(b"\x1b");
@@ -1089,7 +1089,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         );
         session.wait_for("ready");
         session.type_keys(b"\0");
-        session.wait_for_screen("╭─ Teammates' prompts");
+        session.wait_for_screen("╭ Teammates' prompts");
         let (code, text) = session.finish();
         assert_eq!(code, 0, "{text}");
         let box_at = text.find('╭').unwrap();
@@ -1116,7 +1116,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         session.type_keys(b"\0\r");
         session.wait_for("^@");
         session.type_keys(b"\x1b[15~");
-        session.wait_for_screen("╭─ Teammates' prompts");
+        session.wait_for_screen("╭ Teammates' prompts");
         session.type_keys(b"\x1b[15~");
         session.type_keys(b"x\r");
         let (code, text) = session.finish();
@@ -4956,7 +4956,11 @@ echo stray > "$CODEX_HOME/history.jsonl"
             .unwrap();
         wait_until("bob to see the agent", || seen("ready"));
         keys.write_all(b"\0").unwrap();
-        wait_until("bob's palette", || seen("Enter sends"));
+        wait_until("bob's palette", || {
+            let mut screen = vt100::Parser::new(24, 200, 0);
+            screen.process(&watched.lock().unwrap());
+            screen.screen().contents().contains("Enter sends")
+        });
         keys.write_all(b"run the tests\r").unwrap();
         wait_until("the host to queue bob's prompt", || seen("waiting"));
 

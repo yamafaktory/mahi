@@ -4,7 +4,42 @@ use std::io::{
 };
 
 use mahi_core::is_invisible;
-use unicode_width::UnicodeWidthChar;
+use ratatui_core::{
+    backend::Backend as _,
+    buffer::{
+        Buffer,
+        Cell,
+        CellWidth as _,
+    },
+    layout::Rect,
+    style::{
+        Modifier,
+        Style,
+    },
+    text::{
+        Line,
+        Span,
+    },
+    widgets::Widget as _,
+};
+use ratatui_widgets::{
+    block::{
+        Block,
+        Padding,
+    },
+    borders::BorderType,
+    clear::Clear,
+};
+use unicode_width::{
+    UnicodeWidthChar,
+    UnicodeWidthStr,
+};
+
+use crate::{
+    AnsiBackend,
+    Theme,
+    dialog::key_hints,
+};
 
 const WIDEST: u16 = 72;
 const NARROWEST: u16 = 24;
@@ -13,10 +48,6 @@ const MOST_ITEMS_WITH_PREVIEW: usize = 5;
 const SAVE: &[u8] = b"\x1b7";
 const RESTORE: &[u8] = b"\x1b8";
 const RESET: &[u8] = b"\x1b[0m";
-const BORDER: &[u8] = b"\x1b[0;2m";
-const PLAIN: &[u8] = b"\x1b[0m";
-const SELECTED: &[u8] = b"\x1b[0;7m";
-const DIM: &[u8] = b"\x1b[0;2m";
 
 /// One line the palette lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,8 +58,8 @@ pub struct PaletteItem<'a> {
     pub detail: &'a str,
 }
 
-/// What the palette shows: a rounded box centred on the screen, with its title, a filter line,
-/// the items, and a hint about its keys.
+/// What the palette shows: a rounded box centred on the screen, drawn as mahi's dialogs are,
+/// with its title, a filter line, the items, and a hint about its keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaletteView<'a> {
     /// The title in the top border.
@@ -41,10 +72,12 @@ pub struct PaletteView<'a> {
     pub selected: usize,
     /// What the list says when it has no items.
     pub empty: &'a str,
-    /// The hint in the bottom border.
+    /// The hint below the items: keys and what they do, such as `Esc closes · Tab always`.
     pub hint: &'a str,
     /// The whole text of the selected item, shown below the list from line `scroll` on.
     pub preview: Option<Preview<'a>>,
+    /// Whether the terminal draws 24-bit colour; otherwise the nearest of 256 colours is used.
+    pub true_color: bool,
 }
 
 /// The whole text of the selected item, wrapped to the box, from a line on.
@@ -72,12 +105,6 @@ impl Drawn {
     pub fn shows_end(&self, scroll: usize) -> bool {
         scroll.saturating_add(self.page) >= self.lines
     }
-}
-
-struct Frame {
-    top: u16,
-    left: u16,
-    width: usize,
 }
 
 impl PaletteView<'_> {
@@ -110,34 +137,24 @@ impl PaletteView<'_> {
         let page = lines.len().min(room.saturating_sub(shown + 1));
         let preview_rows = if page > 0 { page + 1 } else { 0 };
         let height = u16::try_from(shown + 4 + preview_rows).unwrap_or(rows);
-        let frame = Frame {
-            top: (rows - height) / 2 + 1,
-            left: (columns - width) / 2 + 1,
-            width: usize::from(width),
-        };
+        let area = Rect::new((columns - width) / 2, (rows - height) / 2, width, height);
+        let scroll = self
+            .preview
+            .map_or(0, |preview| preview.scroll)
+            .min(lines.len().saturating_sub(page));
+        let previewed = lines.get(scroll..scroll + page).unwrap_or_default();
+        let mut buffer = Buffer::empty(area);
+        self.render(area, shown, previewed, &mut buffer);
         out.write_all(SAVE)?;
-        self.draw_top(&frame, out)?;
-        self.draw_filter(&frame, out)?;
-        frame.line(2, out)?;
-        out.write_all(BORDER)?;
-        out.write_all("├".as_bytes())?;
-        repeat("─", frame.width - 2, out)?;
-        out.write_all("┤".as_bytes())?;
-        self.draw_items(&frame, shown, out)?;
-        if page > 0 {
-            let scroll = self
-                .preview
-                .map_or(0, |preview| preview.scroll)
-                .min(lines.len() - page);
-            draw_preview(&frame, shown + 3, lines.get(scroll..scroll + page), out)?;
-        }
-        frame.line(u16::try_from(shown + 3 + preview_rows).unwrap_or(0), out)?;
-        out.write_all(BORDER)?;
-        out.write_all("╰─ ".as_bytes())?;
-        let used = fit(self.hint, frame.width - 6, false, out)?;
-        out.write_all(b" ")?;
-        repeat("─", frame.width - 5 - used, out)?;
-        out.write_all("╯".as_bytes())?;
+        let backend = AnsiBackend::new(&mut *out, rows, columns);
+        let mut backend = if self.true_color {
+            backend
+        } else {
+            backend.without_true_color()
+        };
+        backend.draw(cells(&buffer))?;
+        backend.flush()?;
+        drop(backend);
         out.write_all(RESET)?;
         out.write_all(RESTORE)?;
         Ok(Drawn {
@@ -146,95 +163,114 @@ impl PaletteView<'_> {
         })
     }
 
-    fn draw_top(&self, frame: &Frame, out: &mut impl Write) -> io::Result<()> {
-        frame.line(0, out)?;
-        out.write_all(BORDER)?;
-        out.write_all("╭─ ".as_bytes())?;
-        out.write_all(PLAIN)?;
-        let used = fit(self.title, frame.width - 6, false, out)?;
-        out.write_all(BORDER)?;
-        out.write_all(b" ")?;
-        repeat("─", frame.width - 5 - used, out)?;
-        out.write_all("╮".as_bytes())
-    }
-
-    fn draw_filter(&self, frame: &Frame, out: &mut impl Write) -> io::Result<()> {
-        frame.line(1, out)?;
-        out.write_all(BORDER)?;
-        out.write_all("│".as_bytes())?;
-        out.write_all(PLAIN)?;
-        out.write_all(" › ".as_bytes())?;
-        let room = frame.width - 5;
-        let used = fit_tail(self.filter, room - 1, out)?;
-        out.write_all(SELECTED)?;
-        out.write_all(b" ")?;
-        out.write_all(PLAIN)?;
-        repeat(" ", room - 1 - used, out)?;
-        out.write_all(BORDER)?;
-        out.write_all("│".as_bytes())
-    }
-
-    fn draw_items(&self, frame: &Frame, shown: usize, out: &mut impl Write) -> io::Result<()> {
+    fn render(&self, area: Rect, shown: usize, previewed: &[String], buffer: &mut Buffer) {
+        Clear.render(area, buffer);
+        let title = fitted(self.title, usize::from(area.width).saturating_sub(4), true);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(Theme::ACCENT))
+            .padding(Padding::horizontal(1))
+            .title(Line::from(format!(" {title} ")).style(Theme::title()));
+        let inner = block.inner(area);
+        block.render(area, buffer);
+        let room = usize::from(inner.width);
+        let mut rows = inner.rows();
+        if let Some(row) = rows.next() {
+            Line::from(vec![
+                Span::styled("› ", Theme::title()),
+                Span::raw(fitted_tail(self.filter, room.saturating_sub(3))),
+                Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
+            ])
+            .render(row, buffer);
+        }
         let selected = self.selected.min(self.items.len().saturating_sub(1));
         let first = selected.saturating_sub(shown - 1);
-        let room = frame.width - 4;
-        for row in 0..shown {
-            frame.line(u16::try_from(row + 3).unwrap_or(0), out)?;
-            out.write_all(BORDER)?;
-            out.write_all("│ ".as_bytes())?;
-            let used = match self.items.get(first + row) {
-                None if row == 0 => {
-                    out.write_all(DIM)?;
-                    fit(self.empty, room, true, out)?
-                }
-                None => 0,
-                Some(item) => {
-                    out.write_all(if first + row == selected {
-                        SELECTED
-                    } else {
-                        PLAIN
-                    })?;
-                    let label = fit(item.label, room, true, out)?;
-                    if label + 2 < room {
-                        out.write_all(b"  ")?;
-                        out.write_all(DIM)?;
-                        label + 2 + fit(item.detail, room - label - 2, true, out)?
-                    } else {
-                        label
-                    }
-                }
+        for index in 0..shown {
+            let Some(row) = rows.next() else {
+                break;
             };
-            repeat(" ", room - used, out)?;
-            out.write_all(BORDER)?;
-            out.write_all(" │".as_bytes())?;
+            let line = match self.items.get(first + index) {
+                None if index == 0 => Line::styled(fitted(self.empty, room, true), Theme::muted()),
+                None => Line::default(),
+                Some(item) => item_line(item, room, first + index == selected),
+            };
+            line.render(row, buffer);
         }
-        Ok(())
+        if !previewed.is_empty() {
+            if let Some(row) = rows.next() {
+                Line::styled("─".repeat(room), Theme::muted()).render(row, buffer);
+            }
+            for (text, row) in previewed.iter().zip(rows.by_ref()) {
+                Line::raw(fitted(text, room, false)).render(row, buffer);
+            }
+        }
+        if let Some(row) = rows.next() {
+            let pairs: Vec<(String, String)> = self
+                .hint
+                .split(" · ")
+                .map(|part| {
+                    let part = fitted(part, room, false);
+                    match part.split_once(' ') {
+                        Some((key, what)) => (key.to_owned(), what.to_owned()),
+                        None => (part, String::new()),
+                    }
+                })
+                .collect();
+            let pairs: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(key, what)| (key.as_str(), what.as_str()))
+                .collect();
+            let spans = key_hints(&pairs);
+            Line::from(cut_spans(spans, room)).render(row, buffer);
+        }
     }
 }
 
-fn draw_preview(
-    frame: &Frame,
-    at: usize,
-    lines: Option<&[String]>,
-    out: &mut impl Write,
-) -> io::Result<()> {
-    frame.line(u16::try_from(at).unwrap_or(0), out)?;
-    out.write_all(BORDER)?;
-    out.write_all("├".as_bytes())?;
-    repeat("─", frame.width - 2, out)?;
-    out.write_all("┤".as_bytes())?;
-    let room = frame.width - 4;
-    for (row, line) in lines.unwrap_or_default().iter().enumerate() {
-        frame.line(u16::try_from(at + 1 + row).unwrap_or(0), out)?;
-        out.write_all(BORDER)?;
-        out.write_all("│ ".as_bytes())?;
-        out.write_all(PLAIN)?;
-        let used = fit(line, room, false, out)?;
-        repeat(" ", room - used, out)?;
-        out.write_all(BORDER)?;
-        out.write_all(" │".as_bytes())?;
+fn item_line(item: &PaletteItem<'_>, room: usize, selected: bool) -> Line<'static> {
+    let label = fitted(item.label, room, true);
+    let used = label.width();
+    let mut spans = vec![Span::raw(label)];
+    if used + 2 < room {
+        let detail = fitted(item.detail, room - used - 2, true);
+        spans.push(Span::styled(format!("  {detail}"), Theme::muted()));
     }
-    Ok(())
+    let line = Line::from(spans);
+    if selected {
+        line.style(Theme::selected())
+    } else {
+        line
+    }
+}
+
+fn cut_spans(spans: Vec<Span<'static>>, room: usize) -> Vec<Span<'static>> {
+    let mut used = 0;
+    let mut kept = Vec::with_capacity(spans.len());
+    for span in spans {
+        let left = room.saturating_sub(used);
+        if left == 0 {
+            break;
+        }
+        let text = fitted(&span.content, left, false);
+        used += text.width();
+        kept.push(Span::styled(text, span.style));
+    }
+    kept
+}
+
+fn cells(buffer: &Buffer) -> impl Iterator<Item = (u16, u16, &Cell)> {
+    let area = buffer.area;
+    let mut skip = 0;
+    (area.top()..area.bottom())
+        .flat_map(move |y| (area.left()..area.right()).map(move |x| (x, y)))
+        .filter_map(move |(x, y)| {
+            if skip > 0 {
+                skip -= 1;
+                return None;
+            }
+            let cell = &buffer[(x, y)];
+            skip = usize::from(cell.cell_width()).saturating_sub(1);
+            Some((x, y, cell))
+        })
 }
 
 fn wrapped(text: &str, width: usize) -> Vec<String> {
@@ -265,19 +301,6 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-impl Frame {
-    fn line(&self, offset: u16, out: &mut impl Write) -> io::Result<()> {
-        write!(out, "\x1b[{};{}H", self.top + offset, self.left)
-    }
-}
-
-fn repeat(piece: &str, count: usize, out: &mut impl Write) -> io::Result<()> {
-    for _ in 0..count {
-        out.write_all(piece.as_bytes())?;
-    }
-    Ok(())
-}
-
 fn shown_chars(text: &str) -> impl Iterator<Item = (char, usize)> + '_ {
     text.chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
@@ -285,47 +308,45 @@ fn shown_chars(text: &str) -> impl Iterator<Item = (char, usize)> + '_ {
         .map(|c| (c, c.width().unwrap_or(0)))
 }
 
-fn fit(text: &str, room: usize, cut_mark: bool, out: &mut impl Write) -> io::Result<usize> {
+fn fitted(text: &str, room: usize, cut_mark: bool) -> String {
     let total: usize = shown_chars(text).map(|(_, width)| width).sum();
-    let limit = if total > room && cut_mark {
+    let cut = total > room;
+    let limit = if cut && cut_mark {
         room.saturating_sub(1)
     } else {
         room
     };
+    let mut kept = String::with_capacity(text.len());
     let mut used = 0;
-    let mut buffer = [0_u8; 4];
     for (c, width) in shown_chars(text) {
         if used + width > limit {
             break;
         }
-        out.write_all(c.encode_utf8(&mut buffer).as_bytes())?;
+        kept.push(c);
         used += width;
     }
-    if total > room && cut_mark && room > 0 {
-        out.write_all("…".as_bytes())?;
-        used += 1;
+    if cut && cut_mark && room > 0 {
+        kept.push('…');
     }
-    Ok(used)
+    kept
 }
 
-fn fit_tail(text: &str, room: usize, out: &mut impl Write) -> io::Result<usize> {
+fn fitted_tail(text: &str, room: usize) -> String {
     let total: usize = shown_chars(text).map(|(_, width)| width).sum();
     if total <= room {
-        return fit(text, room, false, out);
+        return fitted(text, room, false);
     }
-    out.write_all("…".as_bytes())?;
+    let mut kept = String::with_capacity(text.len());
+    kept.push('…');
     let mut skipped = 0;
-    let mut used = 1;
-    let mut buffer = [0_u8; 4];
     for (c, width) in shown_chars(text) {
         if skipped + room - 1 < total {
             skipped += width;
             continue;
         }
-        out.write_all(c.encode_utf8(&mut buffer).as_bytes())?;
-        used += width;
+        kept.push(c);
     }
-    Ok(used)
+    kept
 }
 
 #[cfg(test)]
@@ -350,7 +371,12 @@ mod tests {
             empty: "no prompts waiting",
             hint: "Esc close",
             preview: None,
+            true_color: true,
         }
+    }
+
+    fn is_selected(parser: &vt100::Parser, row: u16, column: u16) -> bool {
+        parser.screen().cell(row, column).unwrap().bgcolor() == vt100::Color::Rgb(0x83, 0x21, 0x61)
     }
 
     fn row(parser: &vt100::Parser, row: u16) -> String {
@@ -367,12 +393,12 @@ mod tests {
         let rows: Vec<String> = (0..24).map(|r| row(&parser, r)).collect();
         let top = rows.iter().position(|line| line.contains('╭')).unwrap();
         assert_eq!(top, 9);
-        assert!(rows[top].trim().starts_with("╭─ mahi ─"));
+        assert!(rows[top].trim().starts_with("╭ mahi ─"));
         assert!(rows[top].trim().ends_with('╮'));
         assert!(rows[top + 1].contains("│ › "));
-        assert!(rows[top + 2].trim().starts_with('├'));
-        assert!(rows[top + 3].contains("no prompts waiting"));
-        assert!(rows[top + 4].trim().starts_with("╰─ Esc close ─"));
+        assert!(rows[top + 2].contains("no prompts waiting"));
+        assert!(rows[top + 3].contains("│ Esc close"));
+        assert!(rows[top + 4].trim().starts_with('╰'));
         for line in &rows[top..=top + 4] {
             assert_eq!(line.trim().chars().count(), 72, "{line}");
             assert_eq!(line.find(|c: char| c != ' '), Some(4));
@@ -403,7 +429,7 @@ mod tests {
             .rposition(|line| line.contains("│ bob"))
             .unwrap();
         let (row, column) = (u16::try_from(last).unwrap(), 6);
-        assert!(parser.screen().cell(row, column).unwrap().inverse());
+        assert!(is_selected(&parser, row, column));
     }
 
     #[test]
@@ -447,6 +473,37 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    const RESTORE_TEXT: &str = "\x1b8";
+
+    #[test]
+    fn halfwidth_marks_ratatui_draws_two_columns_wide_never_push_the_border_out() {
+        let label = "\u{ff76}\u{ff9e}".repeat(40);
+        let items = [PaletteItem {
+            label: &label,
+            detail: "",
+        }];
+        let mut out = Vec::new();
+        view(&items, "").draw(24, 80, &mut out).unwrap();
+        let written = String::from_utf8(out).unwrap();
+        let marks: Vec<&str> = written.split('\u{ff9e}').skip(1).collect();
+        assert!(!marks.is_empty(), "{written:?}");
+        for after in marks {
+            let mut rest = after;
+            while let Some(sequence) = rest.strip_prefix("\x1b[") {
+                let end = sequence.find(|c: char| ('@'..='~').contains(&c)).unwrap();
+                if sequence.as_bytes()[end] != b'm' {
+                    break;
+                }
+                rest = &sequence[end + 1..];
+            }
+            assert!(
+                rest.starts_with("\x1b[") || rest.starts_with(RESTORE_TEXT),
+                "a mark is followed by {:?}",
+                after.chars().take(24).collect::<String>()
+            );
+        }
+    }
+
     #[test]
     fn wide_text_never_pushes_the_right_border_out_of_place() {
         let detail = "\u{4e2d}".repeat(60);
@@ -488,7 +545,7 @@ mod tests {
                 );
             }
             assert_eq!(borders, 6, "{columns}");
-            assert!(screen.cell(13, left + 2).unwrap().inverse(), "{columns}");
+            assert!(is_selected(&parser, 12, left + 2), "{columns}");
         }
     }
 
