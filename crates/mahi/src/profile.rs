@@ -58,6 +58,7 @@ use mahi_proxy::HostName;
 use rustix::{
     fs::{
         AtFlags,
+        Dir,
         FileType,
         Mode,
         OFlags,
@@ -74,6 +75,7 @@ use crate::environment::{
 
 const CODEX_LOG_DEPTH: usize = 3;
 const MOST_SESSION_ENTRIES: usize = 10_000;
+const CLAUDE_CODE_SESSIONS: &str = "sessions";
 
 /// Reads one line of an agent's own session log.
 pub(crate) type ReadLogLine = fn(&[u8]) -> Option<LogLine>;
@@ -487,6 +489,22 @@ impl Profile {
         }
     }
 
+    /// When the agent is Claude Code, removes the running sessions it lists in its state
+    /// directory `state`, which are all of an earlier run whose processes ended with its
+    /// sandbox, since Claude Code cannot see that they ended and `--continue` would skip their
+    /// conversations as running elsewhere; at most 10,000 entries, following no symbolic link
+    /// and leaving any directory inside.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sessions cannot be listed or one cannot be removed.
+    pub(crate) fn clear_sessions(&self, state: &OwnedFd) -> io::Result<()> {
+        match self.reader {
+            Some(Reader::ClaudeCode) => clear_claude_code_sessions(state),
+            Some(Reader::Codex) | None => Ok(()),
+        }
+    }
+
     /// When the agent is Codex, adds to its `config.toml` in the state directory `state`, found
     /// at `state_path`, the approvals of mahi's hooks the user gave in an earlier thread and
     /// mahi kept in `config`, so Codex does not ask for them again; a hook already recorded
@@ -782,6 +800,34 @@ fn install_claude_code(
     let mut bytes = serde_json::to_vec_pretty(&state_json).map_err(io::Error::other)?;
     bytes.push(b'\n');
     create_if_missing(state, ".claude.json", &bytes)
+}
+
+fn clear_claude_code_sessions(state: &OwnedFd) -> io::Result<()> {
+    let sessions = match rustix::fs::openat(
+        state,
+        CLAUDE_CODE_SESSIONS,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(sessions) => sessions,
+        Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut names = Vec::new();
+    for entry in Dir::read_from(&sessions)?.take(MOST_SESSION_ENTRIES) {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name != c"." && name != c".." && entry.file_type() != FileType::Directory {
+            names.push(name.to_owned());
+        }
+    }
+    for name in &names {
+        match rustix::fs::unlinkat(&sessions, name.as_c_str(), AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT | Errno::ISDIR) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 /// Returns whether `dir`, whose path in the session directory is `path`, holds a session log
@@ -1323,6 +1369,59 @@ content = "first\n"
             fs::symlink_metadata(linked.join(".claude.json"))
                 .unwrap()
                 .is_symlink()
+        );
+    }
+
+    #[test]
+    fn claude_codes_sessions_of_an_earlier_run_are_cleared_so_continue_finds_its_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let sessions = state.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("103.json"), "{\"kind\":\"bg\"}").unwrap();
+        fs::write(sessions.join("103.abc.key"), "key").unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, "kept").unwrap();
+        std::os::unix::fs::symlink(&outside, sessions.join("planted.json")).unwrap();
+        fs::create_dir(sessions.join("inside")).unwrap();
+        fs::write(sessions.join("inside/kept"), "kept").unwrap();
+        let log = state.join("projects/-w/69137a66.jsonl");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&log, "{}\n").unwrap();
+        codex_profile().clear_sessions(&open_dir(&state)).unwrap();
+        assert_eq!(fs::read_dir(&sessions).unwrap().count(), 4);
+        claude_code_profile()
+            .clear_sessions(&open_dir(&state))
+            .unwrap();
+        assert_eq!(
+            fs::read_dir(&sessions)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            ["inside"]
+        );
+        assert!(sessions.join("inside/kept").exists());
+        fs::write(sessions.join("104.json"), "{}").unwrap();
+        let own = Profile {
+            install: Install::Files(Vec::new()),
+            ..claude_code_profile()
+        };
+        own.clear_sessions(&open_dir(&state)).unwrap();
+        assert!(!sessions.join("104.json").exists());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "kept");
+        assert!(log.exists());
+        let linked = dir.path().join("linked");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&linked).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("103.json"), "kept").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, linked.join("sessions")).unwrap();
+        claude_code_profile()
+            .clear_sessions(&open_dir(&linked))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(elsewhere.join("103.json")).unwrap(),
+            "kept"
         );
     }
 

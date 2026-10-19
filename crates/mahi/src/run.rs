@@ -2427,6 +2427,13 @@ impl Launch<'_> {
         profile
             .install(&directory, &state_path, self.worktree, self.tools_config())
             .map_err(RunError::State)?;
+        if let Err(error) = profile.clear_sessions(&directory) {
+            eprintln!(
+                "mahi: the agent's sessions of an earlier run could not be cleared, so it may find \
+                 no conversation to continue: {}",
+                crate::describe(&error)
+            );
+        }
         if let Ok(config) = ConfigDir::resolve(
             self.environment.home.as_deref(),
             self.environment.xdg_config_home.as_deref(),
