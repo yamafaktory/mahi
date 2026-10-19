@@ -33,6 +33,7 @@ pub use home::{
     HomeAction,
     HomeRow,
     HomeView,
+    ThreadChoice,
 };
 pub use input::{
     PaletteInput,

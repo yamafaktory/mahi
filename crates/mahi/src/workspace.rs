@@ -53,6 +53,7 @@ use mahi_term::{
     Segment,
     TabBar,
     TabHit,
+    ThreadChoice,
     ThreadView,
     Typed,
     WorkspaceAgent,
@@ -337,7 +338,7 @@ pub(crate) struct Workspace {
     next_id: usize,
     scanner: KeyScanner,
     palette: Option<Palette>,
-    quitting: bool,
+    chosen: Option<Moved>,
     list_shown: bool,
     redraw: Option<RedrawWait>,
     palette_name: String,
@@ -501,6 +502,8 @@ pub(crate) enum Moved {
     New,
     /// Quit was chosen in the palette.
     Quit,
+    /// An action on the shown tab's thread was chosen in the palette.
+    Act(ThreadChoice, ThreadId),
 }
 
 /// The workspace's palette, open over what is shown: a menu of where to go and what to do,
@@ -520,8 +523,19 @@ enum Entry {
     Agent(usize),
     Teammate(AgentSlot),
     SendKey,
+    Act(ThreadChoice),
     Quit,
 }
+
+const THREAD_ACTIONS: [ThreadChoice; 7] = [
+    ThreadChoice::AddAgent,
+    ThreadChoice::Handoff,
+    ThreadChoice::Merge,
+    ThreadChoice::Land,
+    ThreadChoice::Push,
+    ThreadChoice::End,
+    ThreadChoice::Invite,
+];
 
 impl Workspace {
     /// Starts a workspace with no thread open, whose keys follow `palette_key`, and which
@@ -536,7 +550,7 @@ impl Workspace {
             next_id: 0,
             scanner: KeyScanner::new(palette_key),
             palette: None,
-            quitting: false,
+            chosen: None,
             list_shown: true,
             redraw: None,
             palette_name: palette_key.to_string(),
@@ -944,11 +958,11 @@ impl Workspace {
             }
         }
         self.mouse.joined = joined;
-        let quitting = std::mem::take(&mut self.quitting);
+        let chosen = self.chosen.take();
         if new {
             Moved::New
-        } else if quitting {
-            Moved::Quit
+        } else if let Some(chosen) = chosen {
+            chosen
         } else if self.view_state() == before {
             Moved::Nothing
         } else {
@@ -1190,6 +1204,11 @@ impl Workspace {
                 Entry::SendKey,
             );
         }
+        if shown.is_some_and(|tab| tab.thread.is_some()) {
+            for choice in THREAD_ACTIONS {
+                add(choice.label().to_owned(), String::new(), Entry::Act(choice));
+            }
+        }
         add("Quit".to_owned(), "q".to_owned(), Entry::Quit);
         let title = shown.map_or("threads", |tab| tab.title.as_str());
         self.palette = Some(Palette {
@@ -1241,11 +1260,26 @@ impl Workspace {
                 Some(Entry::SendKey) if self.shows_running() => {
                     self.send(&key.unwrap_or_default());
                 }
-                Some(Entry::Quit) => self.quitting = true,
+                Some(Entry::Act(choice)) => {
+                    self.chosen = self.shown_thread().map(|thread| Moved::Act(choice, thread));
+                }
+                Some(Entry::Quit) => self.chosen = Some(Moved::Quit),
                 Some(Entry::SendKey) | None => {}
             }
         }
         used
+    }
+
+    fn shown_thread(&self) -> Option<ThreadId> {
+        self.selected
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| tab.thread)
+    }
+
+    /// Shows the thread list, where an action's outcome is told.
+    pub(crate) fn show_threads(&mut self) {
+        self.step(Step::To(0));
     }
 
     fn show_agent(&mut self, index: usize) {
@@ -1827,6 +1861,46 @@ mod tests {
         assert!(threads.is_empty());
         workspace.tabs[0].select(0, None);
         assert_eq!(workspace.shown_id(), Some(first_id));
+    }
+
+    #[test]
+    fn the_palette_lists_the_actions_on_the_shown_thread_once_its_tab_knows_it() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let agent = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("a", vec![agent]));
+        workspace.selected = 1;
+        let mut threads = Vec::new();
+        workspace.type_keys(b"\x00", &mut threads);
+        let entries = &workspace.palette.as_ref().unwrap().entries;
+        assert!(!entries.iter().any(|entry| matches!(entry, Entry::Act(_))));
+        workspace.type_keys(b"\x1b", &mut threads);
+        let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        workspace.tabs[0].thread = Some(thread);
+        workspace.type_keys(b"\x00", &mut threads);
+        let entries = &workspace.palette.as_ref().unwrap().entries;
+        let actions: Vec<&Entry> = entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Act(_)))
+            .collect();
+        assert_eq!(
+            actions,
+            THREAD_ACTIONS.map(Entry::Act).iter().collect::<Vec<_>>()
+        );
+        assert_eq!(entries.last(), Some(&Entry::Quit));
+        let end = entries
+            .iter()
+            .position(|entry| *entry == Entry::Act(ThreadChoice::End))
+            .unwrap();
+        workspace.type_keys(&b"\x1b[B".repeat(end), &mut threads);
+        assert_eq!(
+            workspace.type_keys(b"\r", &mut threads),
+            Moved::Act(ThreadChoice::End, thread)
+        );
+        assert!(!workspace.palette_open());
+        assert_eq!(workspace.type_keys(b"x", &mut threads), Moved::Nothing);
     }
 
     #[test]

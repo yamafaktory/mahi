@@ -140,21 +140,33 @@ enum Pending {
     Help,
 }
 
+/// An action on a thread, as its menu lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThreadChoice {
+pub enum ThreadChoice {
+    /// Start the user's agent again where it stopped.
     Resume,
+    /// Run another of the user's agents in the thread.
     AddAgent,
+    /// Start the user's agent on another agent's latest work.
     Handoff,
+    /// Merge another agent's work into one of the user's agents.
     Merge,
+    /// Land the thread, confirmed.
     Land,
+    /// Push the thread's landed commits, with its trailers.
     Push,
+    /// End the thread, confirmed.
     End,
+    /// Purge the thread here and on the remote.
     Purge,
+    /// Invite a teammate to the thread.
     Invite,
 }
 
 impl ThreadChoice {
-    fn label(self) -> &'static str {
+    /// Returns what the menu says of the choice.
+    #[must_use]
+    pub fn label(self) -> &'static str {
         match self {
             Self::Resume => "Resume: start your agent again where it stopped",
             Self::AddAgent => "Add an agent: run another of yours in it, in its own worktree",
@@ -167,6 +179,41 @@ impl ThreadChoice {
             Self::Invite => {
                 "Invite: show a pairing code so a teammate can watch and prompt it live"
             }
+        }
+    }
+
+    /// Returns the action the choice takes on `thread`.
+    #[must_use]
+    pub fn action(self, thread: String) -> HomeAction {
+        match self {
+            Self::Resume => HomeAction::Resume(thread),
+            Self::AddAgent => HomeAction::AddAgent(thread),
+            Self::Handoff => HomeAction::Handoff(thread),
+            Self::Merge => HomeAction::Merge(thread),
+            Self::Land => HomeAction::Land(thread),
+            Self::Push => HomeAction::Push(thread),
+            Self::End => HomeAction::End(thread),
+            Self::Purge => HomeAction::Purge(thread),
+            Self::Invite => HomeAction::Invite(thread),
+        }
+    }
+}
+
+impl HomeAction {
+    /// Returns the question asked before the action runs, for the actions confirmed first.
+    #[must_use]
+    pub fn question(&self) -> Option<String> {
+        match self {
+            Self::Land(thread) => Some(format!(
+                "Land thread {thread}? Its agents' work is merged into a landing worktree on a \
+                 branch, where you turn it into commits with git, then push them with Push in \
+                 the thread's menu."
+            )),
+            Self::End(thread) => Some(format!(
+                "End thread {thread}? Its worktrees are recorded in a last snapshot, then removed. \
+                 Its history stays, and resuming it brings the worktrees back."
+            )),
+            _ => None,
         }
     }
 }
@@ -348,26 +395,20 @@ impl Home {
     }
 
     fn ask(&mut self, selected: Option<&HomeRow>, action: fn(String) -> HomeAction) {
-        let Some(row) = selected else {
-            return;
-        };
-        let action = action(row.thread.clone());
-        let question = match &action {
-            HomeAction::Land(thread) => format!(
-                "Land thread {thread}? Its agents' work is merged into a landing worktree on a \
-                 branch, where you turn it into commits with git, then push them with Push in \
-                 the thread's menu."
-            ),
-            HomeAction::End(thread) => format!(
-                "End thread {thread}? Its worktrees are recorded in a last snapshot, then removed. \
-                 Its history stays, and resuming it brings the worktrees back."
-            ),
-            _ => return,
+        if let Some(row) = selected {
+            self.confirm(action(row.thread.clone()));
+        }
+    }
+
+    fn confirm(&mut self, action: HomeAction) -> Option<HomeAction> {
+        let Some(question) = action.question() else {
+            return Some(action);
         };
         self.dialog = Some((
             Dialog::confirm("Confirm", vec![question]),
             Pending::Confirm(action),
         ));
+        None
     }
 
     fn open_help(&mut self) {
@@ -436,37 +477,11 @@ impl Home {
     fn answered(&mut self, answer: Answer, pending: Pending) -> Option<HomeAction> {
         match (answer, pending) {
             (Answer::Choice(index), Pending::ThreadMenu(thread, choices)) => {
-                match choices.get(index)? {
-                    ThreadChoice::Resume => Some(HomeAction::Resume(thread)),
-                    ThreadChoice::AddAgent => Some(HomeAction::AddAgent(thread)),
-                    ThreadChoice::Handoff => Some(HomeAction::Handoff(thread)),
-                    ThreadChoice::Merge => Some(HomeAction::Merge(thread)),
-                    ThreadChoice::Push => Some(HomeAction::Push(thread)),
-                    ThreadChoice::Invite => Some(HomeAction::Invite(thread)),
-                    ThreadChoice::Purge => Some(HomeAction::Purge(thread)),
-                    ThreadChoice::Land => {
-                        self.ask_for(thread, HomeAction::Land);
-                        None
-                    }
-                    ThreadChoice::End => {
-                        self.ask_for(thread, HomeAction::End);
-                        None
-                    }
-                }
+                self.confirm(choices.get(index)?.action(thread))
             }
             (Answer::Confirmed(true), Pending::Confirm(action)) => Some(action),
             _ => None,
         }
-    }
-
-    fn ask_for(&mut self, thread: String, make: fn(String) -> HomeAction) {
-        let row = HomeRow {
-            thread,
-            agents: String::new(),
-            worktree: true,
-            owned: true,
-        };
-        self.ask(Some(&row), make);
     }
 
     /// Draws the home screen into `area`, with `status`, the outcome of the last action, above

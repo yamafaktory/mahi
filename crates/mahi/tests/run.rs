@@ -1436,6 +1436,96 @@ cat parser.rs
     }
 
     #[test]
+    fn a_thread_action_chosen_in_the_workspaces_palette_asks_runs_and_tells_its_outcome() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "palette-action", "claude", agent);
+        script(&fixture, "palette-action", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let to_end = [b"\x1b[B".repeat(11), b"\r".to_vec()].concat();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("agent-ready", b"\x00"),
+                ("End: save its work", &to_end),
+                ("Its history stays", b"y"),
+                ("failed with exit code", b"q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let store = Store::open(&fixture.repo).unwrap();
+        let (thread_ref, _) = store
+            .thread_refs()
+            .unwrap()
+            .into_iter()
+            .find(|(thread_ref, _)| matches!(thread_ref.kind(), RefKind::Snapshots(_)))
+            .unwrap();
+        let thread = thread_ref.thread();
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        let screens: Vec<String> = output
+            .as_bytes()
+            .chunks(16)
+            .map(|chunk| {
+                parser.process(chunk);
+                parser
+                    .screen()
+                    .contents()
+                    .chars()
+                    .filter(|letter| !letter.is_whitespace() && *letter != '│')
+                    .collect()
+            })
+            .collect();
+        let asked = format!("Endthread{thread}?");
+        let told = format!("mahiend{thread}failedwithexitcode");
+        assert!(
+            screens.iter().any(|screen| screen.contains(&asked)),
+            "{output}"
+        );
+        assert!(
+            screens.iter().any(|screen| screen.contains(&told)),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn declining_a_thread_action_from_the_workspaces_palette_draws_the_tab_again_whole() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nread line\necho \"got-$line\"\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "palette-declined", "claude", agent);
+        script(&fixture, "palette-declined", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let to_end = [b"\x1b[B".repeat(11), b"\r".to_vec()].concat();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("agent-ready", b"\x00"),
+                ("End: save its work", &to_end),
+                ("Its history stays", b"n"),
+                ("working…", b"go\r"),
+                ("got-go", b"\x00q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        let screen = output
+            .as_bytes()
+            .chunks(16)
+            .find_map(|chunk| {
+                parser.process(chunk);
+                let screen = parser.screen().contents();
+                screen.contains("got-go").then_some(screen)
+            })
+            .unwrap();
+        assert!(!screen.contains("working…"), "{screen}");
+    }
+
+    #[test]
     fn quitting_while_an_agent_runs_stops_it_after_a_confirmation() {
         let fixture = fixture();
         let agent =

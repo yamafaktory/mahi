@@ -185,6 +185,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
             }
             Ok(Chosen::Action(action)) => {
                 status = act(action, &mut store, environment);
+                workspace.show_threads();
                 ui::keys_make_signals(false);
                 workspace.set_screen(terminal::size(), true);
                 if let Err(error) = Screen::restore() {
@@ -356,10 +357,14 @@ fn choose(
             Moved::Nothing => {}
             Moved::Shown => dirty = true,
             Moved::New => return Ok(Chosen::Action(HomeAction::New)),
-            Moved::Quit => {
+            moved => {
                 let view = home_view(place, &remote, &rows, &activity);
                 draw(&mut terminal, home, &view, status, workspace)?;
-                return Ok(Chosen::Quit);
+                if let Some(chosen) = chosen_in_palette(moved) {
+                    return Ok(chosen);
+                }
+                terminal.clear()?;
+                dirty = true;
             }
         }
         if for_threads.is_empty() || ignore_until.is_some_and(|until| Instant::now() < until) {
@@ -566,6 +571,26 @@ fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> Stri
         Ok(words) => run_words(&words, environment),
         Err(told) => told,
     }
+}
+
+/// Returns what the workspace's palette chose with `moved`, once confirmed: quitting, or an
+/// action on a thread.
+fn chosen_in_palette(moved: Moved) -> Option<Chosen> {
+    match moved {
+        Moved::Quit => Some(Chosen::Quit),
+        Moved::Act(choice, thread) => Some(choice.action(thread.to_string()))
+            .filter(confirmed)
+            .map(Chosen::Action),
+        Moved::Nothing | Moved::Shown | Moved::New => None,
+    }
+}
+
+/// Asks the question `action` is confirmed with, if any; returns whether it runs.
+fn confirmed(action: &HomeAction) -> bool {
+    action.question().is_none_or(|question| {
+        let answer = DialogPrompt::default().ask(Dialog::confirm("Confirm", vec![question]));
+        matches!(answer, Ok(Answer::Confirmed(true)))
+    })
 }
 
 /// Asks whether to stop the agents the workspace runs in order to quit; returns whether the
