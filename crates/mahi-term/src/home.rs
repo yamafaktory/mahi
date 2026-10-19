@@ -41,6 +41,7 @@ use ratatui_widgets::{
         TableState,
     },
 };
+use unicode_width::UnicodeWidthStr as _;
 
 use crate::{
     Answer,
@@ -62,9 +63,13 @@ const MENU: [(&str, &str); 8] = [
     ("Quit", "q"),
 ];
 const SIDEBAR_WIDTH: u16 = 24;
-const DETAILS_HEIGHT: u16 = 5;
 const ACTIVITY_HEIGHT: u16 = 8;
 const ACTIVITY_LEAST: u16 = 3;
+const THREADS_LEAST: u16 = 4;
+const THREAD_WIDTH: u16 = 34;
+const SHORT_THREAD: u16 = 8;
+const AGENTS_LEAST: u16 = 16;
+const ALWAYS_HINTED: [(&str, &str); 2] = [("?", "help"), ("q", "quit")];
 
 /// One thread as the home screen lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,20 +508,14 @@ impl Home {
                 .areas(body);
         self.render_menu(sidebar, buffer);
         let activity_rows = ACTIVITY_HEIGHT
-            .min(main.height.saturating_sub(DETAILS_HEIGHT + 3))
+            .min(main.height.saturating_sub(THREADS_LEAST))
             .max(ACTIVITY_LEAST)
             .min(main.height);
-        let details_rows = DETAILS_HEIGHT.min(main.height - activity_rows);
-        let [threads, details, activity] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(details_rows),
-            Constraint::Length(activity_rows),
-        ])
-        .areas(main);
+        let [threads, activity] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(activity_rows)]).areas(main);
         self.render_threads(view.rows, threads, buffer);
-        self.render_details(view.rows, details, buffer);
         Self::render_activity(view.activity, self.note.unwrap_or(status), activity, buffer);
-        Line::from(self.footer_hints()).render(footer, buffer);
+        Line::from(self.footer_hints(usize::from(footer.width))).render(footer, buffer);
         if let Some((dialog, _)) = &self.dialog {
             dialog.render(area, buffer);
         }
@@ -580,10 +579,11 @@ impl Home {
             .render(inner, buffer);
             return;
         }
+        let full = block.inner(area).width >= THREAD_WIDTH + 9 + 9 + 5 + AGENTS_LEAST;
         let table = Table::new(
-            rows.iter().map(row),
+            rows.iter().map(|thread| row(thread, full)),
             [
-                Constraint::Length(34),
+                Constraint::Length(if full { THREAD_WIDTH } else { SHORT_THREAD }),
                 Constraint::Fill(1),
                 Constraint::Length(9),
                 Constraint::Length(9),
@@ -602,42 +602,6 @@ impl Home {
         .highlight_symbol("› ");
         let mut state = TableState::new().with_selected(self.selected);
         StatefulWidget::render(table, area, buffer, &mut state);
-    }
-
-    fn render_details(&self, rows: &[HomeRow], area: Rect, buffer: &mut Buffer) {
-        let block = panel("Selected", false);
-        let inner = block.inner(area);
-        block.render(area, buffer);
-        let Some(row) = rows.get(self.selected) else {
-            Line::styled("  nothing selected", Theme::muted()).render(inner, buffer);
-            return;
-        };
-        let worktree = if row.worktree {
-            "its worktree is here"
-        } else {
-            "its worktree is gone; resuming rebuilds it"
-        };
-        let owner = if row.owned {
-            "you own it"
-        } else {
-            "a teammate owns it"
-        };
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(format!(" {}", shown(&row.thread)), Theme::title()),
-                Span::styled(format!("  {}", shown(&row.agents)), Style::new()),
-            ]),
-            Line::styled(format!(" {owner} · {worktree}"), Theme::muted()),
-            Line::from(key_hints(&[
-                ("enter", "actions"),
-                ("r", "resume"),
-                ("l", "land"),
-                ("e", "end"),
-                ("p", "purge"),
-                ("i", "invite"),
-            ])),
-        ])
-        .render(inner, buffer);
     }
 
     /// Draws what mahi's commands printed, oldest first, with `status`, the outcome of the last
@@ -684,28 +648,41 @@ impl Home {
         }
     }
 
-    fn footer_hints(&self) -> Vec<Span<'static>> {
+    /// Returns the keys of the focused part that fit in `width` columns, dropping the last of
+    /// them first, but never help and quit.
+    fn footer_hints(&self, width: usize) -> Vec<Span<'static>> {
         if self.dialog.is_some() {
             return Vec::new();
         }
-        match self.focus {
-            Focus::Menu => key_hints(&[
-                ("↑↓ jk", "move"),
-                ("enter", "open"),
-                ("tab", "threads"),
-                ("?", "help"),
-                ("q", "quit"),
-            ]),
-            Focus::Threads => key_hints(&[
+        let focused: &[(&str, &str)] = match self.focus {
+            Focus::Menu => &[("↑↓ jk", "move"), ("enter", "open"), ("tab", "threads")],
+            Focus::Threads => &[
                 ("↑↓ jk", "move"),
                 ("enter", "actions"),
+                ("r", "resume"),
+                ("l", "land"),
+                ("e", "end"),
+                ("p", "purge"),
+                ("i", "invite"),
                 ("n", "new"),
                 ("c", "join"),
                 ("tab", "menu"),
-                ("?", "help"),
-                ("q", "quit"),
-            ]),
-        }
+            ],
+        };
+        let hint_width = |(key, what): &(&str, &str)| key.width() + what.width() + 3;
+        let mut left = (width + 2).saturating_sub(ALWAYS_HINTED.iter().map(hint_width).sum());
+        let mut pairs: Vec<(&str, &str)> = focused
+            .iter()
+            .take_while(|pair| {
+                let wanted = hint_width(pair);
+                let fits = wanted <= left;
+                left = left.saturating_sub(wanted);
+                fits
+            })
+            .copied()
+            .collect();
+        pairs.extend(ALWAYS_HINTED);
+        key_hints(&pairs)
     }
 }
 
@@ -757,9 +734,19 @@ fn panel<'a>(title: &str, focused: bool) -> Block<'a> {
         }))
 }
 
-fn row(row: &HomeRow) -> Row<'_> {
+fn row(row: &HomeRow, full: bool) -> Row<'_> {
+    let thread = if full {
+        shown(&row.thread)
+    } else {
+        Cow::Owned(
+            shown(&row.thread)
+                .chars()
+                .take(usize::from(SHORT_THREAD))
+                .collect(),
+        )
+    };
     Row::new([
-        shown(&row.thread),
+        thread,
         shown(&row.agents),
         Cow::Borrowed(if row.worktree { "here" } else { "gone" }),
         Cow::Borrowed(if row.owned { "you" } else { "teammate" }),
@@ -768,8 +755,6 @@ fn row(row: &HomeRow) -> Row<'_> {
 
 #[cfg(test)]
 mod tests {
-    use unicode_width::UnicodeWidthStr as _;
-
     use super::*;
 
     fn rows() -> Vec<HomeRow> {
@@ -1126,7 +1111,34 @@ mod tests {
     }
 
     #[test]
-    fn the_screen_shows_header_menu_threads_details_and_activity() {
+    fn an_80_column_screen_keeps_help_quit_and_the_agents_and_a_short_one_a_thread() {
+        let rows = vec![HomeRow {
+            thread: "0123456789abcdef0123456789abcdef".to_owned(),
+            agents: "you.claude, bob.codex".to_owned(),
+            worktree: true,
+            owned: true,
+        }];
+        let home = Home::default();
+        let drawn = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
+        let keys = drawn.lines().last().unwrap();
+        assert!(keys.contains("? help  q quit"), "{drawn}");
+        assert!(keys.contains("r resume"), "{drawn}");
+        assert!(drawn.contains("you.claude, bob.codex"), "{drawn}");
+        assert!(drawn.contains("› 01234567 "), "{drawn}");
+        let wide = screen_in(&home, &rows, "", Rect::new(0, 0, 99, 24));
+        assert!(
+            wide.contains("› 0123456789abcdef0123456789abcdef"),
+            "{wide}"
+        );
+        assert!(wide.contains("you.claude"), "{wide}");
+        let narrower = screen_in(&home, &rows, "", Rect::new(0, 0, 98, 24));
+        assert!(narrower.contains("› 01234567 "), "{narrower}");
+        let short = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 13));
+        assert!(short.contains("› 01234567"), "{short}");
+    }
+
+    #[test]
+    fn the_screen_shows_header_menu_threads_and_activity() {
         let rows = rows();
         let home = Home::default();
         let drawn = screen(&home, &rows, "resumed t1\u{1b}[2J");
@@ -1141,8 +1153,6 @@ mod tests {
             "› t1",
             "you.claude",
             "teammate",
-            "Selected",
-            "you own it",
             "Activity",
             "cannot reach the remote",
             "resumed t1?[2J",
@@ -1150,6 +1160,12 @@ mod tests {
         ] {
             assert!(drawn.contains(wanted), "{wanted:?} missing:\n{drawn}");
         }
+        assert!(!drawn.contains("Selected"), "{drawn}");
+        let keys = screen(&home, &rows, "");
+        assert!(
+            keys.contains("enter actions  r resume  l land  e end  p purge  i invite  n new"),
+            "{keys}"
+        );
         let empty = screen(&home, &[], "");
         assert!(empty.contains("No threads yet"), "{empty}");
         for (width, height) in [(0, 0), (1, 1), (20, 6), (60, 12)] {

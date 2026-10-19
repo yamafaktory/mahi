@@ -2092,7 +2092,12 @@ cat parser.rs
     }
 
     fn read_until(reader: &mut impl Read, seen: &mut Vec<u8>, text: &str) {
-        while !String::from_utf8_lossy(seen).contains(text) {
+        let shown = |seen: &[u8]| {
+            let mut screen = vt100::Parser::new(24, 200, 0);
+            screen.process(seen);
+            screen.screen().contents().contains(text)
+        };
+        while !String::from_utf8_lossy(seen).contains(text) && !shown(seen) {
             let mut chunk = [0_u8; 4096];
             let read = reader.read(&mut chunk).unwrap();
             assert_ne!(read, 0);
