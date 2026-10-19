@@ -99,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_pipe_is_taken_once_two_at_most_and_a_standard_stream_never() {
+    fn each_pipe_is_taken_once_as_many_as_can_be_passed_and_a_standard_stream_never() {
         assert_eq!(
             inherited_pipe(1).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
@@ -130,11 +130,14 @@ mod tests {
             inherited_pipe(taken.as_raw_fd()).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
-        let (second, _writer) = rustix::pipe::pipe().unwrap();
-        let _second = inherited_pipe(second.into_raw_fd()).unwrap();
-        let (third, _writer) = rustix::pipe::pipe().unwrap();
+        let mut kept = Vec::new();
+        for _ in 1..crate::MAX_PASSED {
+            let (more, writer) = rustix::pipe::pipe().unwrap();
+            kept.push((inherited_pipe(more.into_raw_fd()).unwrap(), writer));
+        }
+        let (past, _writer) = rustix::pipe::pipe().unwrap();
         assert_eq!(
-            inherited_pipe(third.into_raw_fd()).unwrap_err().kind(),
+            inherited_pipe(past.into_raw_fd()).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
     }

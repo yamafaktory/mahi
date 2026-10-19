@@ -74,7 +74,7 @@ pub struct WindowSize {
 }
 
 /// The most descriptors [`PtyCommand::pass_fd`] passes to one program.
-pub const MAX_PASSED: usize = 2;
+pub const MAX_PASSED: usize = 3;
 
 /// A program to run in a new pseudo-terminal.
 ///
@@ -197,7 +197,9 @@ impl PtyCommand {
         if self.too_many_passed {
             return Err(PtyError::Spawn(
                 self.program,
-                io::Error::other("a program can be given at most two descriptors"),
+                io::Error::other(format!(
+                    "a program can be given at most {MAX_PASSED} descriptors"
+                )),
             ));
         }
         if self.sandbox.is_some() && !self.passed.is_empty() {
@@ -638,19 +640,21 @@ mod tests {
     }
 
     #[test]
-    fn two_passed_descriptors_both_stay_open_in_the_program() {
+    fn as_many_passed_descriptors_as_allowed_all_stay_open_in_the_program() {
         let mut pipes = Vec::new();
-        for text in [&b"first"[..], b"second"] {
+        for text in [&b"first"[..], b"second", b"third"] {
             let (reader, writer) = rustix::pipe::pipe().unwrap();
             rustix::io::fcntl_setfd(&reader, FdFlags::CLOEXEC).unwrap();
             let mut writer = File::from(writer);
             std::io::Write::write_all(&mut writer, text).unwrap();
             pipes.push(reader);
         }
+        assert_eq!(pipes.len(), MAX_PASSED);
         let script = format!(
-            "cat <&{}; echo; cat <&{}",
+            "cat <&{}; echo; cat <&{}; echo; cat <&{}",
             pipes[0].as_raw_fd(),
-            pipes[1].as_raw_fd()
+            pipes[1].as_raw_fd(),
+            pipes[2].as_raw_fd()
         );
         let mut command = PtyCommand::new(Path::new("/bin/sh"), Path::new("/"), SIZE)
             .arg("-c")
@@ -662,7 +666,7 @@ mod tests {
         let mut output = String::new();
         let _ = child.reader().unwrap().read_to_string(&mut output);
         assert!(
-            output.contains("first") && output.contains("second"),
+            output.contains("first") && output.contains("second") && output.contains("third"),
             "{output}"
         );
     }

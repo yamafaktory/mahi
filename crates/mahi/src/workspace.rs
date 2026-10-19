@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     ffi::OsStr,
+    fs::File,
     io::{
         self,
         Read,
@@ -72,6 +73,7 @@ use ratatui_core::{
 
 use crate::{
     environment::{
+        COMMAND_FD,
         Environment,
         KEY_FD,
         REPORT_FD,
@@ -118,7 +120,7 @@ pub(crate) enum ChildEvent {
 fn read_reports(reports: OwnedFd, id: usize, events: &mpsc::SyncSender<ChildEvent>) {
     let events = events.clone();
     thread::spawn(move || {
-        let mut pipe = std::fs::File::from(reports);
+        let mut pipe = File::from(reports);
         let mut reader = ReportReader::default();
         let mut chunk = [0_u8; 512];
         while let Ok(read) = pipe.read(&mut chunk) {
@@ -163,7 +165,7 @@ impl Child {
         words: &[&OsStr],
         (cwd, size): (&Path, WindowSize),
         key: Option<&LocalIdentity>,
-    ) -> io::Result<Option<(PtyCommand, OwnedFd)>> {
+    ) -> io::Result<Option<(PtyCommand, OwnedFd, File)>> {
         let Some(program) = environment.mahi_exe.as_deref() else {
             return Ok(None);
         };
@@ -172,7 +174,9 @@ impl Child {
             command = command.arg(word);
         }
         for (name, value) in &environment.whole {
-            let ours = [KEY_FD, REPORT_FD].iter().any(|own| name == own);
+            let ours = [KEY_FD, REPORT_FD, COMMAND_FD]
+                .iter()
+                .any(|own| name == own);
             if name != "TERM" && !ours && !TERMINAL_OWN.iter().any(|own| name == own) {
                 command = command.env(name, OsStr::from_bytes(value));
             }
@@ -187,7 +191,16 @@ impl Child {
         command = command
             .env(REPORT_FD, report_end.as_raw_fd().to_string())
             .pass_fd(report_end);
-        Ok(Some((command.env("TERM", CHILD_TERM), reports)))
+        let (command_end, commands) = closed_on_exec_pipe()?;
+        rustix::fs::fcntl_setfl(&commands, rustix::fs::OFlags::NONBLOCK)?;
+        command = command
+            .env(COMMAND_FD, command_end.as_raw_fd().to_string())
+            .pass_fd(command_end);
+        Ok(Some((
+            command.env("TERM", CHILD_TERM),
+            reports,
+            File::from(commands),
+        )))
     }
 
     /// Starts `command`, made for a terminal of `size`, as the workspace's child `id`, whose
@@ -468,6 +481,7 @@ struct Running {
     state: AgentState,
     prompts: u16,
     told_asks: Option<Instant>,
+    commands: Option<File>,
 }
 
 impl Running {
@@ -525,6 +539,7 @@ enum Entry {
     Step(Step),
     Agent(usize),
     Teammate(AgentSlot),
+    AgentPalette,
     SendKey,
     Act(ThreadChoice),
     Quit,
@@ -635,7 +650,7 @@ impl Workspace {
         let failed = |error: &dyn std::fmt::Display| format!("{shown} cannot start: {error}");
         let cwd = std::env::current_dir().map_err(|error| failed(&error))?;
         let words: Vec<&OsStr> = words.iter().map(OsStr::new).collect();
-        let (command, reports) = Child::mahi(environment, &words, (&cwd, self.size), key)
+        let (command, reports, commands) = Child::mahi(environment, &words, (&cwd, self.size), key)
             .map_err(|error| failed(&error))?
             .ok_or_else(|| failed(&"mahi cannot find its own program"))?;
         let id = self.next_id;
@@ -653,6 +668,7 @@ impl Workspace {
             state: AgentState::Done,
             prompts: 0,
             told_asks: None,
+            commands: Some(commands),
         };
         let open = (!new)
             .then(|| self.tabs.iter().position(|tab| tab.title == title))
@@ -1235,6 +1251,11 @@ impl Workspace {
         );
         if self.shows_running() {
             add(
+                "Show this agent's teammates' prompts".to_owned(),
+                "p".to_owned(),
+                Entry::AgentPalette,
+            );
+            add(
                 format!("Pass {} through to the agent", self.palette_name),
                 self.palette_name.clone(),
                 Entry::SendKey,
@@ -1272,6 +1293,7 @@ impl Workspace {
                 PaletteInput::Text('b') => Some(Entry::Step(Step::List)),
                 PaletteInput::Text(' ') => Some(Entry::Step(Step::Waiting)),
                 PaletteInput::Text('q') => Some(Entry::Quit),
+                PaletteInput::Text('p') => Some(Entry::AgentPalette),
                 PaletteInput::Left => Some(Entry::Step(Step::Previous)),
                 PaletteInput::Right => Some(Entry::Step(Step::Next)),
                 other => match palette.menu.key(other) {
@@ -1293,6 +1315,7 @@ impl Workspace {
                 Some(Entry::Step(step)) => self.step(step),
                 Some(Entry::Agent(index)) => self.show_agent(index),
                 Some(Entry::Teammate(slot)) => self.show_teammate(&slot),
+                Some(Entry::AgentPalette) if self.shows_running() => self.open_agent_palette(),
                 Some(Entry::SendKey) if self.shows_running() => {
                     self.send(&key.unwrap_or_default());
                 }
@@ -1300,7 +1323,7 @@ impl Workspace {
                     self.chosen = self.shown_thread().map(|thread| Moved::Act(choice, thread));
                 }
                 Some(Entry::Quit) => self.chosen = Some(Moved::Quit),
-                Some(Entry::SendKey) | None => {}
+                Some(Entry::AgentPalette | Entry::SendKey) | None => {}
             }
         }
         used
@@ -1358,6 +1381,17 @@ impl Workspace {
             threads.extend_from_slice(bytes);
         } else {
             self.send(bytes);
+        }
+    }
+
+    /// Asks the shown agent's mahi to open its own palette; a request its pipe has no room for
+    /// is dropped, so a child that stops reading never holds the workspace up.
+    fn open_agent_palette(&mut self) {
+        if let Some(commands) = self
+            .shown_mut()
+            .and_then(|running| running.commands.as_mut())
+        {
+            let _ = commands.write_all(&[crate::commands::OPEN_PALETTE]);
         }
     }
 
@@ -1694,6 +1728,7 @@ mod tests {
             state: AgentState::Done,
             prompts: 0,
             told_asks: None,
+            commands: None,
         }
     }
 
@@ -1873,6 +1908,7 @@ mod tests {
                 Entry::Agent(1),
                 Entry::Step(Step::Waiting),
                 Entry::Step(Step::List),
+                Entry::AgentPalette,
                 Entry::SendKey,
                 Entry::Quit,
             ]
@@ -1890,6 +1926,7 @@ mod tests {
             "Show agent agent (✓ done)",
             "Go to the next agent waiting for you",
             "Hide the agents' list",
+            "Show this agent's teammates' prompts",
             "Pass Ctrl-Space through to the agent",
             "Quit mahi",
         ] {
@@ -2092,7 +2129,7 @@ mod tests {
         let mut threads = Vec::new();
         workspace.type_keys(b"\x00\x00x", &mut threads);
         assert!(!workspace.palette_open());
-        workspace.type_keys(b"\x00\x1b[B\x1b[B\x1b[B\x1b[B\r", &mut threads);
+        workspace.type_keys(b"\x00\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r", &mut threads);
         workspace.type_keys(b"\x00\x1b[32;5u\x1b[32;5u", &mut threads);
         let mut out = Vec::new();
         settle(&mut workspace, &mut out, |workspace| {
@@ -2424,6 +2461,44 @@ mod tests {
             out,
             b"\x1b]9;mahi 3e5c8646: bob sent a prompt: fix it\x07\x07"
         );
+    }
+
+    #[test]
+    fn p_asks_the_shown_agents_mahi_to_open_its_palette_and_sends_its_agent_nothing() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let mut agent = running(&mut workspace, "stty raw -echo; echo ready; exec cat -v");
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        agent.commands = Some(File::from(writer));
+        workspace.tabs.push(tab("a", vec![agent]));
+        workspace.selected = 1;
+        let mut out = Vec::new();
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .contains("ready")
+        });
+        let mut threads = Vec::new();
+        workspace.type_keys(b"\x00p", &mut threads);
+        workspace.type_keys(b"x", &mut threads);
+        let mut asked = [0_u8; 8];
+        let read = rustix::io::read(&reader, &mut asked).unwrap();
+        assert_eq!(&asked[..read], b"p");
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .split_once("ready")
+                .is_some_and(|(_, after)| after.contains('x'))
+        });
+        let shown = workspace.tabs[0].agents[0].child.screen().contents();
+        assert!(!shown.contains("^@"), "{shown}");
+        assert!(!workspace.palette_open());
     }
 
     #[test]

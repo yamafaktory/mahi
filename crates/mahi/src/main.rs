@@ -2,6 +2,7 @@
 
 mod claims;
 mod cli;
+mod commands;
 mod compose;
 mod credentials;
 mod end;
@@ -125,6 +126,9 @@ fn main() {
     }
     if let Some(fd) = environment.report_fd {
         report::connect(fd);
+    }
+    if let Some(fd) = environment.command_fd {
+        commands::connect(fd);
     }
     make_config_private(&environment);
     if required.is_some() {

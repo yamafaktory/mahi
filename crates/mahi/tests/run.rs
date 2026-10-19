@@ -1442,7 +1442,7 @@ cat parser.rs
         let claude = script(&fixture, "palette-action", "claude", agent);
         script(&fixture, "palette-action", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_end = [b"\x1b[B".repeat(10), b"\r".to_vec()].concat();
+        let to_end = [b"\x1b[B".repeat(11), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
@@ -1506,7 +1506,7 @@ cat parser.rs
             .unwrap();
         std::os::unix::fs::symlink(sleep, tools.join("sleep")).unwrap();
         let path = format!("{}:{}", claude.parent().unwrap().display(), tools.display());
-        let to_add = [b"\x1b[B".repeat(5), b"\r".to_vec()].concat();
+        let to_add = [b"\x1b[B".repeat(6), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
@@ -1520,13 +1520,36 @@ cat parser.rs
         assert_eq!(code, 0, "{output}");
     }
 
+    #[test]
+    fn the_palette_key_twice_in_the_workspace_reaches_the_agent_and_p_opens_its_palette() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nstty raw -echo\nexec cat -v\n";
+        let claude = script(&fixture, "palette-relay", "claude", agent);
+        script(&fixture, "palette-relay", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("agent-ready", b"x\x00\x00y"),
+                ("x^@y", b"\x00p"),
+                ("Teammates' prompts", b"z"),
+                ("› z", b"\x00\x00w"),
+                ("^@w", b"\x00q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+    }
+
     fn declined_from_a_tab(name: &str, answers: &[(&str, &[u8])]) {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
         let claude = script(&fixture, name, "claude", agent);
         script(&fixture, name, "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_add = [b"\x1b[B".repeat(5), b"\r".to_vec()].concat();
+        let to_add = [b"\x1b[B".repeat(6), b"\r".to_vec()].concat();
         let mut typed: Vec<(&str, &[u8])> = vec![
             ("Threads", b"n"),
             ("Which agent should start the thread?", b"1"),
@@ -1570,7 +1593,7 @@ cat parser.rs
         let claude = script(&fixture, "palette-declined", "claude", agent);
         script(&fixture, "palette-declined", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_end = [b"\x1b[B".repeat(10), b"\r".to_vec()].concat();
+        let to_end = [b"\x1b[B".repeat(11), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[

@@ -2645,14 +2645,26 @@ fn relay(
         palette_key,
         prompts.clone(),
     ));
-    let input = palette.map(|(key, _)| (Arc::clone(&screen), KeyScanner::new(key)));
+    let running = Arc::new(AtomicBool::new(palette.is_some()));
+    let commands = palette.and_then(|_| crate::commands::take());
+    let key_opens = commands.is_none();
+    if let Some(commands) = commands {
+        let (opener, open) = (Arc::clone(&screen), Arc::clone(&running));
+        thread::spawn(move || {
+            crate::commands::listen(commands, || {
+                if open.load(Ordering::SeqCst) {
+                    let _ = open_palette(&opener);
+                }
+            });
+        });
+    }
+    let input = palette.map(|(key, _)| (Arc::clone(&screen), KeyScanner::new(key), key_opens));
     let (input_writer, input_activity) = (Arc::clone(&writer), Arc::clone(activity));
     let (quit, quitting) = UnixStream::pair().map_err(RunError::Output)?;
     let input_quitting = quitting.try_clone().map_err(RunError::Output)?;
     let forwarding = thread::spawn(move || {
         forward_input(&input_writer, input, &input_activity, &input_quitting);
     });
-    let running = Arc::new(AtomicBool::new(palette.is_some()));
     spawn_ticker(
         Arc::clone(&screen),
         Arc::clone(&running),
@@ -3024,7 +3036,7 @@ type UserScreen = Screen<Out, Repainter>;
 
 fn forward_input(
     writer: &Mutex<File>,
-    mut palette: Option<(Arc<UserScreen>, KeyScanner)>,
+    mut palette: Option<(Arc<UserScreen>, KeyScanner, bool)>,
     activity: &Activity,
     quitting: &UnixStream,
 ) {
@@ -3047,7 +3059,7 @@ fn forward_input(
         };
         let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
             match &palette {
-                Some((screen, _)) => {
+                Some((screen, ..)) => {
                     let _ = screen.close();
                 }
                 None => end_input(&mut writer, last),
@@ -3055,8 +3067,13 @@ fn forward_input(
             return;
         };
         activity.touched();
-        let forwarded = if let Some((screen, scanner)) = &mut palette {
-            route_keys(chunk, scanner, screen, (&mut writer, activity))
+        let forwarded = if let Some((screen, scanner, key_opens)) = &mut palette {
+            route_keys(
+                chunk,
+                (scanner, *key_opens),
+                screen,
+                (&mut writer, activity),
+            )
         } else {
             activity.keys(chunk);
             writer.write_all(chunk)
@@ -3068,29 +3085,40 @@ fn forward_input(
     }
 }
 
+/// Routes the keys in `chunk` to the agent or to its palette while it is open; the palette
+/// key closes an open palette and reaches the agent, and opens a closed one only when
+/// `key_opens`, since a workspace that started this mahi opens it otherwise.
 fn route_keys(
     chunk: &[u8],
-    scanner: &mut KeyScanner,
+    (scanner, key_opens): (&mut KeyScanner, bool),
     screen: &UserScreen,
     (writer, activity): (&mut File, &Activity),
 ) -> io::Result<()> {
     for segment in scanner.scan(chunk) {
         match segment {
-            Segment::Palette(key) if screen.is_open() => {
-                screen.close()?;
+            Segment::Palette(key) if screen.is_open() || !key_opens => {
+                if screen.is_open() {
+                    screen.close()?;
+                }
                 activity.keys(key);
                 writer.write_all(key)?;
             }
             Segment::Palette(_) => open_palette(screen)?,
-            Segment::Pass(bytes) => {
-                let used = screen.typed(bytes)?;
-                let forwarded = bytes.get(used..).unwrap_or_default();
-                activity.keys(forwarded);
-                writer.write_all(forwarded)?;
-            }
+            Segment::Pass(bytes) => pass_keys(bytes, screen, (writer, activity))?,
         }
     }
     Ok(())
+}
+
+fn pass_keys(
+    bytes: &[u8],
+    screen: &UserScreen,
+    (writer, activity): (&mut File, &Activity),
+) -> io::Result<()> {
+    let used = screen.typed(bytes)?;
+    let forwarded = bytes.get(used..).unwrap_or_default();
+    activity.keys(forwarded);
+    writer.write_all(forwarded)
 }
 
 fn open_palette(screen: &UserScreen) -> io::Result<()> {
