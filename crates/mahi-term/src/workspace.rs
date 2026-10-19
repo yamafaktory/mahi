@@ -407,6 +407,21 @@ impl WorkspaceAgent<'_> {
             None => shown(self.name).into_owned(),
         }
     }
+
+    /// Returns how the workspace's palette offers to show the agent: its name and state, or a
+    /// teammate's named after its owner and marked read-only.
+    #[must_use]
+    pub fn palette_label(&self) -> String {
+        let state = self.state.as_str();
+        match self.owner {
+            Some(owner) => format!(
+                "Show {}'s agent {} (read-only, {state})",
+                shown(owner),
+                shown(self.name)
+            ),
+            None => format!("Show agent {} ({state})", shown(self.name)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -531,6 +546,25 @@ mod tests {
         }
         .render(Some(parser.screen()), area, &mut buffer);
         assert_eq!(cursor, Some(Position::new(71, 1)));
+    }
+
+    #[test]
+    fn the_palette_offers_an_agent_by_its_name_and_a_teammates_by_its_owner_read_only() {
+        let own = WorkspaceAgent {
+            owner: None,
+            name: "claude",
+            state: AgentState::Done,
+        };
+        assert_eq!(own.palette_label(), "Show agent claude (✓ done)");
+        let teammates = WorkspaceAgent {
+            owner: Some("bob\x1b[2J"),
+            name: "claude\n",
+            state: AgentState::Live,
+        };
+        assert_eq!(
+            teammates.palette_label(),
+            "Show bob?[2J's agent claude? (read-only, ◉ live)"
+        );
     }
 
     #[test]

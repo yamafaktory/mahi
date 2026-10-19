@@ -527,14 +527,14 @@ enum Entry {
     Quit,
 }
 
-const THREAD_ACTIONS: [ThreadChoice; 7] = [
-    ThreadChoice::AddAgent,
-    ThreadChoice::Handoff,
-    ThreadChoice::Merge,
-    ThreadChoice::Land,
-    ThreadChoice::Push,
-    ThreadChoice::End,
-    ThreadChoice::Invite,
+const THREAD_ACTIONS: [(ThreadChoice, &str); 7] = [
+    (ThreadChoice::AddAgent, "Add an agent to this thread"),
+    (ThreadChoice::Handoff, "Hand off to another of your agents"),
+    (ThreadChoice::Merge, "Merge another agent's work"),
+    (ThreadChoice::Land, "Land this thread"),
+    (ThreadChoice::Push, "Push the landed commits"),
+    (ThreadChoice::End, "End this thread"),
+    (ThreadChoice::Invite, "Invite a teammate"),
 ];
 
 impl Workspace {
@@ -1191,7 +1191,7 @@ impl Workspace {
                 .map(Entry::Agent)
                 .chain(slots.map(|(slot, _)| Entry::Teammate(slot.clone())));
             for (agent, entry) in tab.listed(teammates).iter().zip(entries) {
-                let item = format!("Show agent {} ({})", agent.label(), agent.state.as_str());
+                let item = agent.palette_label();
                 add(item, String::new(), entry);
             }
         }
@@ -1214,8 +1214,8 @@ impl Workspace {
             );
         }
         if shown.is_some_and(|tab| tab.thread.is_some()) {
-            for choice in THREAD_ACTIONS {
-                add(choice.label().to_owned(), String::new(), Entry::Act(choice));
+            for (choice, label) in THREAD_ACTIONS {
+                add(label.to_owned(), String::new(), Entry::Act(choice));
             }
         }
         add("Quit mahi".to_owned(), "q".to_owned(), Entry::Quit);
@@ -1929,9 +1929,41 @@ mod tests {
             .collect();
         assert_eq!(
             actions,
-            THREAD_ACTIONS.map(Entry::Act).iter().collect::<Vec<_>>()
+            THREAD_ACTIONS
+                .map(|(choice, _)| Entry::Act(choice))
+                .iter()
+                .collect::<Vec<_>>()
         );
         assert_eq!(entries.last(), Some(&Entry::Quit));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
+        workspace.render_palette(buffer.area, &mut buffer);
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let row_of = |item: &str| {
+            rows.iter()
+                .find(|row| row.contains(item))
+                .unwrap_or_else(|| panic!("{item} missing: {rows:#?}"))
+        };
+        for item in [
+            "Add an agent to this thread",
+            "Hand off to another of your agents",
+            "Merge another agent's work",
+            "Land this thread",
+            "Push the landed commits",
+            "End this thread",
+            "Invite a teammate",
+        ] {
+            row_of(item);
+        }
+        let sent = row_of("Pass Ctrl-Space through to the agent");
+        assert_eq!(sent.matches("Ctrl-Space").count(), 2, "{rows:#?}");
+        let quit = row_of("Quit mahi").trim_end_matches(['│', '╯', ' ']);
+        assert!(quit.ends_with(" q"), "{rows:#?}");
         let end = entries
             .iter()
             .position(|entry| *entry == Entry::Act(ThreadChoice::End))
