@@ -262,6 +262,45 @@ impl vt100::Callbacks for Passed {
     }
 }
 
+/// Starts an empty `vt100` screen of `rows` and `columns`, at least two of each, since `vt100`
+/// cannot draw a wide character or scroll in less.
+#[must_use]
+pub fn new_screen(rows: u16, columns: u16) -> vt100::Parser {
+    vt100::Parser::new(rows.max(SMALLEST), columns.max(SMALLEST), 0)
+}
+
+/// Gives `parser`'s screen `rows` and `columns`, at least two of each, since `vt100` cannot
+/// draw a wide character or scroll in less, when it does not have them yet; returns whether
+/// the screen starts blank, as one that gets narrower does, with the modes it had, since
+/// `vt100` panics on a wide character a narrower row cuts in two.
+pub fn resize_screen<C: vt100::Callbacks + Default>(
+    parser: &mut vt100::Parser<C>,
+    rows: u16,
+    columns: u16,
+) -> bool {
+    let (rows, columns) = (rows.max(SMALLEST), columns.max(SMALLEST));
+    let (_, before) = parser.screen().size();
+    if parser.screen().size() == (rows, columns) {
+        return false;
+    }
+    if columns >= before {
+        parser.screen_mut().set_size(rows, columns);
+        return false;
+    }
+    let screen = parser.screen();
+    let mut modes = screen.input_mode_formatted();
+    if screen.alternate_screen() {
+        modes.extend_from_slice(b"\x1b[?1049h");
+    }
+    if screen.hide_cursor() {
+        modes.extend_from_slice(b"\x1b[?25l");
+    }
+    let callbacks = std::mem::take(parser.callbacks_mut());
+    *parser = vt100::Parser::new_with_callbacks(rows, columns, 0, callbacks);
+    parser.process(&modes);
+    true
+}
+
 impl AgentScreen {
     /// Starts an empty screen of `rows` and `columns`, at least two of each, for a terminal on
     /// which the home screen left bracketed paste on.
@@ -290,26 +329,9 @@ impl AgentScreen {
     /// narrower starts blank, with the agent's modes, since `vt100` panics on a wide character
     /// a narrower row cuts in two; the agent redraws for its new size anyway.
     pub fn set_size(&mut self, rows: u16, columns: u16) {
-        let (rows, columns) = (rows.max(SMALLEST), columns.max(SMALLEST));
-        let (_, before) = self.parser.screen().size();
-        if self.parser.screen().size() == (rows, columns) {
+        if !resize_screen(&mut self.parser, rows, columns) {
             return;
         }
-        if columns >= before {
-            self.parser.screen_mut().set_size(rows, columns);
-            return;
-        }
-        let screen = self.parser.screen();
-        let mut modes = screen.input_mode_formatted();
-        if screen.alternate_screen() {
-            modes.extend_from_slice(b"\x1b[?1049h");
-        }
-        if screen.hide_cursor() {
-            modes.extend_from_slice(b"\x1b[?25l");
-        }
-        let passed = std::mem::take(self.parser.callbacks_mut());
-        self.parser = vt100::Parser::new_with_callbacks(rows, columns, 0, passed);
-        self.parser.process(&modes);
         match self.string {
             Str::Inside(_) => self.string = Str::Dropping,
             Str::Escape => self.parser.process(&[ESC]),
@@ -582,6 +604,25 @@ mod tests {
         screen.set_size(30, 100);
         screen.feed("界界".as_bytes());
         assert_eq!(screen.screen().size(), (30, 100));
+    }
+
+    #[test]
+    fn a_resized_screen_keeps_what_it_drew_unless_narrower_and_is_never_under_two_by_two() {
+        let mut parser = new_screen(1, 1);
+        assert_eq!(parser.screen().size(), (2, 2));
+        parser.process("界".as_bytes());
+        assert!(!resize_screen(&mut parser, 3, 6));
+        assert_eq!(parser.screen().contents(), "界");
+        assert!(!resize_screen(&mut parser, 3, 6));
+        parser.process(b"\x1b[?1h\x1b[?1049h\x1b[?25l\x1b[1;5H");
+        parser.process("界".as_bytes());
+        assert!(resize_screen(&mut parser, 1, 1));
+        assert_eq!(parser.screen().size(), (2, 2));
+        assert_eq!(parser.screen().contents(), "");
+        assert!(parser.screen().application_cursor());
+        assert!(parser.screen().alternate_screen());
+        assert!(parser.screen().hide_cursor());
+        parser.process("界界x".as_bytes());
     }
 
     #[test]

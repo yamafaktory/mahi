@@ -195,7 +195,7 @@ impl Pane {
     fn overlay(&mut self) -> &mut Overlay {
         let (rows, columns) = self.screen.screen().size();
         self.overlay
-            .get_or_insert_with(|| Overlay(vt100::Parser::new(rows, columns, 0)))
+            .get_or_insert_with(|| Overlay(mahi_term::new_screen(rows, columns)))
     }
 
     fn draw(&mut self) -> io::Result<()> {

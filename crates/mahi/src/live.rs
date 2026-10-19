@@ -428,7 +428,7 @@ impl HostTap {
         let Ok(mut screen) = self.screen.lock() else {
             return;
         };
-        screen.parser.screen_mut().set_size(size.rows, size.cols);
+        mahi_term::resize_screen(&mut screen.parser, size.rows, size.cols);
         screen.taken += 1;
         let taken = screen.taken;
         self.enqueue(Tapped::Resize(self.agent, taken, size));
@@ -440,7 +440,7 @@ impl HostTap {
         let Ok(mut copy) = self.screen.lock() else {
             return;
         };
-        copy.parser = vt100::Parser::new(size.rows, size.cols, 0);
+        copy.parser = mahi_term::new_screen(size.rows, size.cols);
         copy.parser.process(screen);
         copy.taken += 1;
         self.dropped.store(true, Ordering::SeqCst);
@@ -536,7 +536,7 @@ impl Registry {
         let id = self.next;
         self.next = self.next.checked_add(1)?;
         let screen = Arc::new(Mutex::new(Screen {
-            parser: vt100::Parser::new(size.rows, size.cols, 0),
+            parser: mahi_term::new_screen(size.rows, size.cols),
             taken: 0,
         }));
         self.agents.push(Hosted {

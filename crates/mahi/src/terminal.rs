@@ -6,6 +6,10 @@ use std::{
     },
 };
 
+use mahi_live::{
+    MIN_COLUMNS,
+    MIN_ROWS,
+};
 use mahi_sandbox::WindowSize;
 use rustix::termios::{
     OptionalActions,
@@ -56,8 +60,8 @@ pub(crate) fn size() -> WindowSize {
 fn size_of_terminal(terminal: BorrowedFd<'_>) -> Option<WindowSize> {
     let size = rustix::termios::tcgetwinsize(terminal).ok()?;
     (size.ws_row > 0 && size.ws_col > 0).then_some(WindowSize {
-        rows: size.ws_row,
-        cols: size.ws_col,
+        rows: size.ws_row.max(MIN_ROWS),
+        cols: size.ws_col.max(MIN_COLUMNS),
     })
 }
 
@@ -109,6 +113,20 @@ mod tests {
                 rows: 40,
                 cols: 120
             })
+        );
+    }
+
+    #[test]
+    fn a_terminal_one_row_high_or_one_column_wide_is_read_as_two() {
+        let (_master, slave) = pty_pair(40, 1);
+        assert_eq!(
+            size_of_terminal(slave.as_fd()),
+            Some(WindowSize { rows: 40, cols: 2 })
+        );
+        let (_master, slave) = pty_pair(1, 80);
+        assert_eq!(
+            size_of_terminal(slave.as_fd()),
+            Some(WindowSize { rows: 2, cols: 80 })
         );
     }
 

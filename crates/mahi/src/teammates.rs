@@ -137,7 +137,7 @@ impl Teammates {
                 }
                 match &mut teammate.screen {
                     Watched::Drawn(screen) => {
-                        screen.screen_mut().set_size(rows, columns);
+                        mahi_term::resize_screen(screen.as_mut(), rows, columns);
                         true
                     }
                     Watched::TooLarge => {
@@ -778,6 +778,31 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_teammates_screen_narrowed_past_a_wide_character_or_one_row_high_still_draws() {
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let now = Instant::now();
+        let claude = slot("bob.claude");
+        assert!(teammates.apply(
+            &bob(),
+            screen("bob.claude", (3, 4), "\x1b[1;3H界".as_bytes()),
+            now
+        ));
+        let narrower = Body::Resize {
+            slot: claude.clone(),
+            rows: 3,
+            columns: 3,
+        };
+        assert!(teammates.apply(&bob(), narrower, now));
+        assert!(teammates.apply(&bob(), output("bob.claude", b"\x1b[1;3Hx"), now));
+        assert_eq!(teammates.screen(&claude).unwrap().contents(), "  x");
+        assert!(teammates.apply(&bob(), screen("bob.claude", (1, 4), b""), now));
+        assert!(teammates.apply(&bob(), output("bob.claude", b"abcdef"), now));
+        let shown = teammates.screen(&claude).unwrap();
+        assert_eq!(shown.size(), (2, 4));
+        assert_eq!(shown.contents(), "abcdef");
     }
 
     #[test]

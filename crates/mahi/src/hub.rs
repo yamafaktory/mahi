@@ -39,6 +39,8 @@ use mahi_live::{
     MAX_CHUNK_BYTES,
     MAX_COLUMNS,
     MAX_ROWS,
+    MIN_COLUMNS,
+    MIN_ROWS,
     PromptOutcome,
 };
 use mahi_sandbox::WindowSize;
@@ -97,7 +99,7 @@ impl OutputTap {
         let size = bounded(size);
         Self {
             state: Arc::new(Mutex::new(TapState {
-                mirror: vt100::Parser::new(size.rows, size.cols, 0),
+                mirror: mahi_term::new_screen(size.rows, size.cols),
                 target: Target::Nobody,
             })),
         }
@@ -136,7 +138,7 @@ impl OutputTap {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state.mirror.screen_mut().set_size(size.rows, size.cols);
+        mahi_term::resize_screen(&mut state.mirror, size.rows, size.cols);
         match &state.target {
             Target::Nobody => {}
             Target::Host(tap) => tap.resize(size),
@@ -199,8 +201,8 @@ impl OutputTap {
 
 fn bounded(size: WindowSize) -> WindowSize {
     WindowSize {
-        rows: size.rows.clamp(1, MAX_ROWS),
-        cols: size.cols.clamp(1, MAX_COLUMNS),
+        rows: size.rows.clamp(MIN_ROWS, MAX_ROWS),
+        cols: size.cols.clamp(MIN_COLUMNS, MAX_COLUMNS),
     }
 }
 
@@ -849,7 +851,7 @@ mod tests {
             tap.drawn().0,
             WindowSize {
                 rows: MAX_ROWS,
-                cols: 1
+                cols: MIN_COLUMNS
             }
         );
         link.close();

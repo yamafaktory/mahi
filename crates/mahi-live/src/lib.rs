@@ -37,6 +37,8 @@ pub use frame::{
     MAX_PROMPTS_PER_RUN,
     MAX_ROWS,
     MAX_SCREEN_PARTS,
+    MIN_COLUMNS,
+    MIN_ROWS,
     PROMPT_ID_BYTES,
     PromptOutcome,
     PromptText,

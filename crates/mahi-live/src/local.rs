@@ -19,6 +19,8 @@ use crate::frame::{
     MAX_CLAIM_BYTES,
     MAX_COLUMNS,
     MAX_ROWS,
+    MIN_COLUMNS,
+    MIN_ROWS,
     PROMPT_ID_BYTES,
     PromptOutcome,
     PromptText,
@@ -313,7 +315,7 @@ fn put_size(out: &mut Vec<u8>, rows: u16, columns: u16) -> Result<(), LocalError
 }
 
 fn valid_size(rows: u16, columns: u16) -> bool {
-    (1..=MAX_ROWS).contains(&rows) && (1..=MAX_COLUMNS).contains(&columns)
+    (MIN_ROWS..=MAX_ROWS).contains(&rows) && (MIN_COLUMNS..=MAX_COLUMNS).contains(&columns)
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -454,8 +456,8 @@ mod tests {
                 screen: b"\x1b[Hhello".to_vec(),
             },
             LocalMessage::Screen {
-                rows: 1,
-                columns: 1,
+                rows: MIN_ROWS,
+                columns: MIN_COLUMNS,
                 screen: Vec::new(),
             },
             LocalMessage::Output(b"out\x00put".to_vec()),
@@ -481,7 +483,14 @@ mod tests {
     #[test]
     fn sizes_out_of_bounds_are_refused_both_ways() {
         let mut frame = Vec::new();
-        for (rows, columns) in [(0, 80), (24, 0), (MAX_ROWS + 1, 80), (24, MAX_COLUMNS + 1)] {
+        for (rows, columns) in [
+            (0, 80),
+            (24, 0),
+            (24, 1),
+            (1, 80),
+            (MAX_ROWS + 1, 80),
+            (24, MAX_COLUMNS + 1),
+        ] {
             assert!(matches!(
                 LocalMessage::Resize { rows, columns }.encode(&mut frame),
                 Err(LocalError::Malformed)

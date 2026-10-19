@@ -309,7 +309,7 @@ impl View {
                 columns,
             } => {
                 if let Some(screen) = self.followed_screen(&slot) {
-                    screen.screen_mut().set_size(rows, columns);
+                    mahi_term::resize_screen(screen, rows, columns);
                     self.shown = None;
                     self.changed = true;
                 }

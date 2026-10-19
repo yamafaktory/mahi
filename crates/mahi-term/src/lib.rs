@@ -17,7 +17,11 @@ mod screen;
 mod view;
 mod workspace;
 
-pub use agent_screen::AgentScreen;
+pub use agent_screen::{
+    AgentScreen,
+    new_screen,
+    resize_screen,
+};
 pub use dialog::{
     Answer,
     Dialog,

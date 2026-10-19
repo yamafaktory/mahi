@@ -59,7 +59,7 @@ impl Rebuilding {
             return None;
         }
         let screen = rebuilding.take()?;
-        let mut parser = vt100::Parser::new(screen.rows, screen.columns, 0);
+        let mut parser = mahi_term::new_screen(screen.rows, screen.columns);
         for bytes in screen.parts.into_iter().flatten() {
             parser.process(&bytes);
         }

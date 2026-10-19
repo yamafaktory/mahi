@@ -47,6 +47,10 @@ pub const MAX_SCREEN_PARTS: u16 = 64;
 pub const MAX_ROWS: u16 = 1000;
 /// The most columns a screen or a resize may have.
 pub const MAX_COLUMNS: u16 = 1000;
+/// The fewest rows a screen or a resize may have, so a line that wraps can scroll.
+pub const MIN_ROWS: u16 = 2;
+/// The fewest columns a screen or a resize may have, so a wide character fits in a row.
+pub const MIN_COLUMNS: u16 = 2;
 
 const SIGNED_LABEL: &[u8] = b"mahi-live-v1";
 const TOPIC_INFO: &[u8] = b"mahi-live-topic-v1";
@@ -940,7 +944,7 @@ fn check_prompt(text: &str) -> Result<(), FrameError> {
 }
 
 fn check_size(rows: u16, columns: u16) -> Result<(), FrameError> {
-    if rows == 0 || columns == 0 || rows > MAX_ROWS || columns > MAX_COLUMNS {
+    if rows < MIN_ROWS || columns < MIN_COLUMNS || rows > MAX_ROWS || columns > MAX_COLUMNS {
         return Err(FrameError::Malformed);
     }
     Ok(())
@@ -1460,6 +1464,22 @@ mod tests {
             })
             .unwrap();
         assert_eq!(viewer.open(&zero_rows), Err(FrameError::Malformed));
+        let one_column = mallory
+            .seal_wire(WireBody::Resize {
+                slot: "mallory.claude",
+                rows: 24,
+                columns: 1,
+            })
+            .unwrap();
+        assert_eq!(viewer.open(&one_column), Err(FrameError::Malformed));
+        let one_row = mallory
+            .seal_wire(WireBody::Resize {
+                slot: "mallory.claude",
+                rows: 1,
+                columns: 80,
+            })
+            .unwrap();
+        assert_eq!(viewer.open(&one_row), Err(FrameError::Malformed));
         assert!(!format!("{mallory:?}").contains(&format!("{:?}", [3_u8; 32])));
     }
 
