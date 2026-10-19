@@ -374,17 +374,21 @@ impl<'a> ThreadView<'a> {
         let Some(agent) = self.agents.get(index) else {
             return Line::default();
         };
-        let line = Line::from(vec![
+        if index != self.selected {
+            return Line::from(vec![
+                Span::raw(" "),
+                agent.state.mark(),
+                Span::raw(" "),
+                Span::raw(shown(agent.name)),
+            ]);
+        }
+        Line::from(vec![
             Span::raw(" "),
-            agent.state.mark(),
+            Span::raw(agent.state.symbol()),
             Span::raw(" "),
             Span::raw(shown(agent.name)),
-        ]);
-        if index == self.selected {
-            line.style(Theme::selected())
-        } else {
-            line
-        }
+        ])
+        .style(Theme::selected())
     }
 
     fn render_list(&self, area: Rect, buffer: &mut Buffer) {
@@ -566,6 +570,10 @@ mod tests {
             "{shown}"
         );
         assert_ne!(buffer[(78, 5)].style().bg, selected);
+        assert_eq!(buffer[(78, claude_row)].symbol(), "●");
+        assert_eq!(buffer[(78, claude_row)].style().fg, Theme::selected().fg);
+        assert_eq!(buffer[(78, 5)].symbol(), "✓");
+        assert_eq!(buffer[(78, 5)].style().fg, Some(Theme::OK));
         assert!(rows[13].contains("ctrl-space workspace"), "{rows:#?}");
         assert_eq!(cursor, Some(Position::new(18, 1)));
     }
