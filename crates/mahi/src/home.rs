@@ -356,6 +356,7 @@ fn choose(
             Moved::Nothing => {}
             Moved::Shown => dirty = true,
             Moved::New => return Ok(Chosen::Action(HomeAction::New)),
+            Moved::Quit => return Ok(Chosen::Quit),
         }
         if for_threads.is_empty() || ignore_until.is_some_and(|until| Instant::now() < until) {
             continue;
@@ -486,9 +487,10 @@ fn draw(
         let cursor = workspace.render(bar, body, frame.buffer_mut());
         if workspace.shows_threads() {
             home.render(view, status, body, frame.buffer_mut());
-        } else if let Some(cursor) = cursor {
+        } else if let Some(cursor) = cursor.filter(|_| !workspace.palette_open()) {
             frame.set_cursor_position(cursor);
         }
+        workspace.render_palette(body, frame.buffer_mut());
     })?;
     ui::keep_backdrop(drawn.buffer);
     Ok(())

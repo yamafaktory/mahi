@@ -133,6 +133,10 @@ enum Kind {
         items: Vec<String>,
         selected: usize,
     },
+    Menu {
+        items: Vec<(String, String)>,
+        selected: usize,
+    },
 }
 
 /// What a dialog's user chose; a typed line never shows in `Debug` output.
@@ -230,11 +234,27 @@ impl Dialog {
         Self::with(title, lines, Kind::Choose { items, selected: 0 })
     }
 
+    /// Makes a menu of `items`, each an action and the key that does it at once, which the
+    /// caller reads; the menu itself only moves between them and picks one.
+    #[must_use]
+    pub fn menu(title: &str, items: Vec<(String, String)>) -> Self {
+        Self::with(title, Vec::new(), Kind::Menu { items, selected: 0 })
+    }
+
     fn with(title: &str, lines: Vec<String>, kind: Kind) -> Self {
         Self {
             title: title.to_owned(),
             lines,
             kind,
+        }
+    }
+
+    /// Returns which item of a list or a menu is selected; `None` for any other dialog.
+    #[must_use]
+    pub fn selected(&self) -> Option<usize> {
+        match &self.kind {
+            Kind::Choose { selected, .. } | Kind::Menu { selected, .. } => Some(*selected),
+            _ => None,
         }
     }
 
@@ -313,6 +333,18 @@ impl Dialog {
                     .map(Answer::Choice),
                 _ => None,
             },
+            Kind::Menu { items, selected } => match input {
+                PaletteInput::Up | PaletteInput::Text('k') => {
+                    *selected = selected.saturating_sub(1);
+                    None
+                }
+                PaletteInput::Down | PaletteInput::Text('j') if *selected + 1 < items.len() => {
+                    *selected += 1;
+                    None
+                }
+                PaletteInput::Enter if !items.is_empty() => Some(Answer::Choice(*selected)),
+                _ => None,
+            },
         }
     }
 
@@ -331,6 +363,7 @@ impl Dialog {
             Kind::Message | Kind::Notice => 0,
             Kind::Confirm { .. } | Kind::Input { .. } => 2,
             Kind::Choose { items, .. } => items.len() + 1,
+            Kind::Menu { items, .. } => items.len(),
             Kind::Table { rows, .. } => rows.len() + 2,
         };
         let tight = text_rows + extra_rows + 3;
@@ -396,6 +429,10 @@ impl Dialog {
                 .enumerate()
                 .map(|(index, item)| digits(index + 1) + Span::raw(shown(item)).width() + 7)
                 .max(),
+            Kind::Menu { items, .. } => {
+                let (action, key) = menu_widths(items);
+                Some(action + key + 7)
+            }
             Kind::Table { header, rows, .. } => {
                 let [first, second, third] = column_widths(header, rows);
                 Some(first + second + third + 2 * TABLE_GAP + 4)
@@ -469,6 +506,17 @@ impl Dialog {
                 let mut state = ListState::default().with_selected(Some(*selected));
                 StatefulWidget::render(list, rest, buffer, &mut state);
             }
+            Kind::Menu { items, selected } => {
+                let (action_width, _) = menu_widths(items);
+                let list = List::new(
+                    items
+                        .iter()
+                        .map(|(item, key)| ListItem::new(menu_line(item, key, action_width))),
+                )
+                .highlight_style(Theme::selected());
+                let mut state = ListState::default().with_selected(Some(*selected));
+                StatefulWidget::render(list, area, buffer, &mut state);
+            }
         }
     }
 
@@ -485,6 +533,7 @@ impl Dialog {
             ],
             Kind::Input { .. } => &[("enter", "done"), ("esc", "cancel")],
             Kind::Choose { .. } => &[("↑↓ jk", "move"), ("enter", "pick"), ("esc", "cancel")],
+            Kind::Menu { .. } => &[("↑↓", "move"), ("enter", "run"), ("esc", "close")],
         };
         key_hints(pairs)
     }
@@ -528,6 +577,26 @@ fn column_widths(header: &[String; 3], rows: &[[String; 3]]) -> [usize; 3] {
 
 fn digits(number: usize) -> usize {
     number.checked_ilog10().map_or(1, |log| log as usize + 1)
+}
+
+fn menu_widths(items: &[(String, String)]) -> (usize, usize) {
+    items
+        .iter()
+        .fold((0, 0), |(action, key), (item, item_key)| {
+            (
+                action.max(Span::raw(shown(item)).width()),
+                key.max(Span::raw(shown(item_key)).width()),
+            )
+        })
+}
+
+fn menu_line(item: &str, key: &str, action_width: usize) -> Line<'static> {
+    let item = shown(item);
+    let pad = action_width.saturating_sub(Span::raw(item.as_ref()).width());
+    Line::from(vec![
+        Span::raw(format!(" {item}{}", " ".repeat(pad + 2))),
+        Span::styled(format!("{} ", shown(key)), Theme::title()),
+    ])
 }
 
 fn choice(index: usize, item: &str) -> Line<'static> {
@@ -627,6 +696,34 @@ mod tests {
                     + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn a_menu_shows_each_action_with_its_key_and_leaves_the_keys_to_its_caller() {
+        let mut menu = Dialog::menu(
+            "4799a3af",
+            vec![
+                ("Threads".to_owned(), "0".to_owned()),
+                ("Next agent waiting for you".to_owned(), "Space".to_owned()),
+            ],
+        );
+        let shown = drawn(&menu);
+        assert!(shown.contains(" 4799a3af "), "{shown}");
+        assert!(shown.contains(" Threads                     0 "), "{shown}");
+        assert!(
+            shown.contains(" Next agent waiting for you  Space "),
+            "{shown}"
+        );
+        assert!(shown.contains("↑↓ move  enter run  esc close"), "{shown}");
+        assert_eq!(menu.key(PaletteInput::Text('2')), None);
+        assert_eq!(menu.key(PaletteInput::Text('q')), None);
+        assert_eq!(menu.key(PaletteInput::Down), None);
+        assert_eq!(menu.key(PaletteInput::Down), None);
+        assert_eq!(menu.selected(), Some(1));
+        assert_eq!(menu.key(PaletteInput::Enter), Some(Answer::Choice(1)));
+        assert_eq!(menu.key(PaletteInput::Text('k')), None);
+        assert_eq!(menu.key(PaletteInput::Enter), Some(Answer::Choice(0)));
+        assert_eq!(menu.key(PaletteInput::Escape), Some(Answer::Cancelled));
     }
 
     #[test]

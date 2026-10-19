@@ -38,12 +38,16 @@ use mahi_sandbox::{
 use mahi_term::{
     AgentScreen,
     AgentState,
+    Answer,
+    Dialog,
     KeyScanner,
     ListHit,
     ListPlace,
     MouseEvent,
     Notice,
+    PaletteInput,
     PaletteKey,
+    PaletteKeys,
     Report,
     ReportReader,
     Segment,
@@ -332,11 +336,11 @@ pub(crate) struct Workspace {
     sender: mpsc::SyncSender<ChildEvent>,
     next_id: usize,
     scanner: KeyScanner,
-    armed: bool,
+    palette: Option<Palette>,
+    quitting: bool,
     list_shown: bool,
     redraw: Option<RedrawWait>,
-    palette: String,
-    palette_then_zero: String,
+    palette_name: String,
     size: WindowSize,
     passed: Vec<u8>,
     applied: Option<usize>,
@@ -420,6 +424,15 @@ impl Tab {
 
     /// Selects again the teammate's agent selected before the list of `teammates` changed,
     /// or the user's last agent when it is no longer listed.
+    fn select_teammate(&mut self, slot: &AgentSlot, teammates: Option<&Teammates>) {
+        let Some(at) =
+            teammates.and_then(|watched| watched.agents().position(|(listed, _)| listed == slot))
+        else {
+            return;
+        };
+        self.select(self.agents.len() + at, teammates);
+    }
+
     fn reselect(&mut self, teammates: Option<&Teammates>) {
         let Some(slot) = &self.watching else {
             return;
@@ -482,10 +495,32 @@ enum Ending {
 pub(crate) enum Moved {
     /// Nothing the screen shows changed.
     Nothing,
-    /// Another tab or agent is shown, or the list was hidden or shown.
+    /// Another tab or agent is shown, the list was hidden or shown, or the palette changed.
     Shown,
     /// `+` was clicked, to open another thread.
     New,
+    /// Quit was chosen in the palette.
+    Quit,
+}
+
+/// The workspace's palette, open over what is shown: a menu of where to go and what to do,
+/// whose keys also act at once, read as the palette reads them.
+#[derive(Debug)]
+struct Palette {
+    menu: Dialog,
+    entries: Vec<Entry>,
+    keys: PaletteKeys,
+    key: Vec<u8>,
+}
+
+/// What an entry of the workspace's palette does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Entry {
+    Step(Step),
+    Agent(usize),
+    Teammate(AgentSlot),
+    SendKey,
+    Quit,
 }
 
 impl Workspace {
@@ -500,11 +535,11 @@ impl Workspace {
             sender,
             next_id: 0,
             scanner: KeyScanner::new(palette_key),
-            armed: false,
+            palette: None,
+            quitting: false,
             list_shown: true,
             redraw: None,
-            palette: palette_key.to_string(),
-            palette_then_zero: format!("{palette_key} 0"),
+            palette_name: palette_key.to_string(),
             size: WindowSize { rows: 2, cols: 2 },
             passed: Vec::new(),
             applied: None,
@@ -620,6 +655,7 @@ impl Workspace {
             tab.select(tab.agents.len() - 1, None);
         }
         self.selected = index + 1;
+        self.palette = None;
         Ok(())
     }
 
@@ -727,6 +763,7 @@ impl Workspace {
                 .any(|running| running.ending == Ending::Closed)
             {
                 changed = true;
+                self.palette = None;
                 let selected = tab.agents.get(tab.selected).map(|running| running.id);
                 for running in &mut tab.agents {
                     if running.ending == Ending::Closed && self.applied == Some(running.id) {
@@ -773,9 +810,7 @@ impl Workspace {
             }
             self.tabs.retain(|tab| !tab.agents.is_empty());
             self.selected = selected;
-            if self.tabs.is_empty() {
-                self.armed = false;
-            }
+            self.palette = None;
         }
         (told.or_else(|| self.live_told.take()), changed)
     }
@@ -899,7 +934,7 @@ impl Workspace {
     /// on a thread's tab the rest, for its shown agent; on the thread list the rest goes to
     /// `threads`.
     pub(crate) fn type_keys(&mut self, typed: &[u8], threads: &mut Vec<u8>) -> Moved {
-        let before = (self.shown_place(), self.shown_id(), self.list_shown);
+        let before = self.view_state();
         let mut joined = std::mem::take(&mut self.mouse.joined);
         let mut new = false;
         for piece in split_mouse(self.join_carried(typed, &mut joined)) {
@@ -909,13 +944,27 @@ impl Workspace {
             }
         }
         self.mouse.joined = joined;
+        let quitting = std::mem::take(&mut self.quitting);
         if new {
             Moved::New
-        } else if (self.shown_place(), self.shown_id(), self.list_shown) == before {
+        } else if quitting {
+            Moved::Quit
+        } else if self.view_state() == before {
             Moved::Nothing
         } else {
             Moved::Shown
         }
+    }
+
+    fn view_state(&self) -> ViewState {
+        (
+            self.shown_place(),
+            self.shown_id(),
+            self.list_shown,
+            self.palette
+                .as_ref()
+                .and_then(|palette| palette.menu.selected()),
+        )
     }
 
     /// Takes what was typed while no tab is open: every key goes to `threads`, and a mouse
@@ -955,7 +1004,8 @@ impl Workspace {
 
     /// Acts on a mouse event: a click on the row of tabs or the list of agents is the
     /// workspace's, and the rest of a thread's tab is the shown agent's, when it asked for the
-    /// mouse, as is all of a drag that began in its pane; returns whether `+` was clicked.
+    /// mouse, as is all of a drag that began in its pane, even once the palette opened over it,
+    /// which takes no other mouse event; returns whether `+` was clicked.
     fn click(&mut self, event: MouseEvent) -> bool {
         let position = Position::new(event.column, event.row);
         let area = Rect::new(0, 0, self.screen.cols, self.screen.rows);
@@ -966,6 +1016,9 @@ impl Workspace {
         }
         if dragged {
             self.give_agent(event, body, position, true);
+            return false;
+        }
+        if self.palette.is_some() {
             return false;
         }
         if bar.contains(position) {
@@ -1065,25 +1118,169 @@ impl Workspace {
         for segment in scanner.scan(typed) {
             match segment {
                 Segment::Palette(key) => {
-                    if self.armed {
-                        self.armed = false;
+                    if self.palette.take().is_some() {
                         self.send(key);
                     } else {
-                        self.armed = true;
+                        self.open_palette(key);
                     }
                 }
-                Segment::Pass(bytes) if self.armed => {
-                    self.armed = false;
-                    let (step, rest) = workspace_key(bytes);
-                    if let Some(step) = step {
-                        self.step(step);
-                    }
-                    self.pass(rest, threads);
+                Segment::Pass(bytes) => {
+                    let used = self.palette_keys(bytes);
+                    self.pass(bytes.get(used..).unwrap_or_default(), threads);
                 }
-                Segment::Pass(bytes) => self.pass(bytes, threads),
             }
         }
         self.scanner = scanner;
+    }
+
+    /// Opens the palette, which the palette key `key` opened, with the entries for what is
+    /// shown: the thread list and the tabs, the shown tab's agents, the next agent waiting,
+    /// the list, the palette key itself for the shown agent, and quitting.
+    fn open_palette(&mut self, key: &[u8]) {
+        let mut items = Vec::new();
+        let mut entries = Vec::new();
+        let mut add = |item: String, key: String, entry: Entry| {
+            items.push((item, key));
+            entries.push(entry);
+        };
+        add(
+            "Threads".to_owned(),
+            "0".to_owned(),
+            Entry::Step(Step::To(0)),
+        );
+        for (index, tab) in self.tabs.iter().enumerate() {
+            let place = index + 1;
+            let key = if place <= 9 {
+                place.to_string()
+            } else {
+                String::new()
+            };
+            add(tab.title.clone(), key, Entry::Step(Step::To(place)));
+        }
+        let shown = self
+            .selected
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get(index));
+        if let Some(tab) = shown {
+            let teammates = teammates_of(self.live.as_ref(), tab.thread);
+            let slots = teammates.into_iter().flat_map(Teammates::agents);
+            let entries = (0..tab.agents.len())
+                .map(Entry::Agent)
+                .chain(slots.map(|(slot, _)| Entry::Teammate(slot.clone())));
+            for (agent, entry) in tab.listed(teammates).iter().zip(entries) {
+                let item = format!("{}  {}", agent.label(), agent.state.as_str());
+                add(item, String::new(), entry);
+            }
+        }
+        add(
+            "Next agent waiting for you".to_owned(),
+            "Space".to_owned(),
+            Entry::Step(Step::Waiting),
+        );
+        let list = if self.list_shown { "Hide" } else { "Show" };
+        add(
+            format!("{list} the agents' list"),
+            "b".to_owned(),
+            Entry::Step(Step::List),
+        );
+        if self.shows_running() {
+            add(
+                format!("Send {} to the agent", self.palette_name),
+                self.palette_name.clone(),
+                Entry::SendKey,
+            );
+        }
+        add("Quit".to_owned(), "q".to_owned(), Entry::Quit);
+        let title = shown.map_or("threads", |tab| tab.title.as_str());
+        self.palette = Some(Palette {
+            menu: Dialog::menu(title, items),
+            entries,
+            keys: PaletteKeys::default(),
+            key: key.to_vec(),
+        });
+    }
+
+    /// Reads `bytes` as the open palette's keys, doing what they choose and closing it when
+    /// one does; returns how many it used, none when it is closed, so the rest goes on.
+    fn palette_keys(&mut self, bytes: &[u8]) -> usize {
+        let Some(palette) = self.palette.as_mut() else {
+            return 0;
+        };
+        let mut chosen = None;
+        let mut closed = false;
+        let used = palette.keys.read(bytes, |input| {
+            let entry = match input {
+                PaletteInput::Text(digit @ '0'..='9') => digit
+                    .to_digit(10)
+                    .and_then(|digit| usize::try_from(digit).ok())
+                    .map(|place| Entry::Step(Step::To(place))),
+                PaletteInput::Text('b') => Some(Entry::Step(Step::List)),
+                PaletteInput::Text(' ') => Some(Entry::Step(Step::Waiting)),
+                PaletteInput::Text('q') => Some(Entry::Quit),
+                PaletteInput::Left => Some(Entry::Step(Step::Previous)),
+                PaletteInput::Right => Some(Entry::Step(Step::Next)),
+                other => match palette.menu.key(other) {
+                    Some(Answer::Choice(index)) => palette.entries.get(index).cloned(),
+                    Some(Answer::Cancelled) => {
+                        closed = true;
+                        None
+                    }
+                    _ => None,
+                },
+            };
+            closed |= entry.is_some();
+            chosen = entry;
+            !closed
+        });
+        if closed {
+            let key = self.palette.take().map(|palette| palette.key);
+            match chosen {
+                Some(Entry::Step(step)) => self.step(step),
+                Some(Entry::Agent(index)) => self.show_agent(index),
+                Some(Entry::Teammate(slot)) => self.show_teammate(&slot),
+                Some(Entry::SendKey) if self.shows_running() => {
+                    self.send(&key.unwrap_or_default());
+                }
+                Some(Entry::Quit) => self.quitting = true,
+                Some(Entry::SendKey) | None => {}
+            }
+        }
+        used
+    }
+
+    fn show_agent(&mut self, index: usize) {
+        if let Some(tab) = self
+            .selected
+            .checked_sub(1)
+            .and_then(|at| self.tabs.get_mut(at))
+            .filter(|tab| index < tab.agents.len())
+        {
+            let teammates = teammates_of(self.live.as_ref(), tab.thread);
+            tab.select(index, teammates);
+        }
+    }
+
+    fn show_teammate(&mut self, slot: &AgentSlot) {
+        if let Some(tab) = self
+            .selected
+            .checked_sub(1)
+            .and_then(|at| self.tabs.get_mut(at))
+        {
+            let teammates = teammates_of(self.live.as_ref(), tab.thread);
+            tab.select_teammate(slot, teammates);
+        }
+    }
+
+    /// Says whether the palette is open.
+    pub(crate) fn palette_open(&self) -> bool {
+        self.palette.is_some()
+    }
+
+    /// Draws the open palette over `area`.
+    pub(crate) fn render_palette(&self, area: Rect, buffer: &mut Buffer) {
+        if let Some(palette) = &self.palette {
+            palette.menu.render(area, buffer);
+        }
     }
 
     fn pass(&mut self, bytes: &[u8], threads: &mut Vec<u8>) {
@@ -1114,25 +1311,6 @@ impl Workspace {
             Step::To(_) => {}
             Step::Next => self.selected = (self.selected + 1) % (last + 1),
             Step::Previous => self.selected = (self.selected + last) % (last + 1),
-            Step::NextAgent | Step::PreviousAgent => {
-                if let Some(tab) = self
-                    .selected
-                    .checked_sub(1)
-                    .and_then(|index| self.tabs.get_mut(index))
-                {
-                    let teammates = teammates_of(self.live.as_ref(), tab.thread);
-                    let count =
-                        tab.agents.len() + teammates.map_or(0, |watched| watched.agents().len());
-                    if count > 0 {
-                        let forward = if step == Step::NextAgent {
-                            1
-                        } else {
-                            count - 1
-                        };
-                        tab.select((tab.selected + forward) % count, teammates);
-                    }
-                }
-            }
             Step::List => self.list_shown = !self.list_shown,
             Step::Waiting => self.show_next_waiting(),
         }
@@ -1164,17 +1342,9 @@ impl Workspace {
         let screen = tab.screen(teammates);
         let failed_hints = [
             ("any key", "close it"),
-            (self.palette_then_zero.as_str(), "threads"),
+            (self.palette_name.as_str(), "palette"),
         ];
-        let hints = [
-            (self.palette.as_str(), "then:"),
-            ("←→", "tab"),
-            ("0-9", "tab"),
-            ("↑↓", "agent"),
-            ("b", "list"),
-            ("␣", "waiting"),
-            (self.palette.as_str(), "again: to the agent"),
-        ];
+        let hints = [(self.palette_name.as_str(), "palette")];
         let cursor = ThreadView {
             agents: &agents,
             selected: tab.selected,
@@ -1352,6 +1522,10 @@ impl Workspace {
     }
 }
 
+/// What decides whether the screen changed: the place shown, the agent shown, whether the
+/// list is shown, and the palette's selection while it is open.
+type ViewState = ((usize, Option<usize>), Option<usize>, bool, Option<usize>);
+
 /// A move the workspace's keys make between tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -1359,57 +1533,7 @@ enum Step {
     To(usize),
     Next,
     Previous,
-    NextAgent,
-    PreviousAgent,
     List,
-}
-
-/// Reads the workspace key at the start of `bytes`, typed after the palette key, and returns
-/// the move it makes, if any, and what follows it.
-fn workspace_key(bytes: &[u8]) -> (Option<Step>, &[u8]) {
-    for (sequence, step) in [
-        (&b"\x1b[C"[..], Step::Next),
-        (b"\x1bOC", Step::Next),
-        (b"\x1b[D", Step::Previous),
-        (b"\x1bOD", Step::Previous),
-        (b"\x1b[B", Step::NextAgent),
-        (b"\x1bOB", Step::NextAgent),
-        (b"\x1b[A", Step::PreviousAgent),
-        (b"\x1bOA", Step::PreviousAgent),
-        (b"b", Step::List),
-        (b" ", Step::Waiting),
-    ] {
-        if let Some(rest) = bytes.strip_prefix(sequence) {
-            return (Some(step), rest);
-        }
-    }
-    match bytes.split_first() {
-        Some((digit @ b'0'..=b'9', rest)) => (Some(Step::To(usize::from(digit - b'0'))), rest),
-        _ => (None, bytes.get(key_length(bytes)..).unwrap_or_default()),
-    }
-}
-
-/// Returns how many bytes the key at the start of `bytes` takes: an escape sequence (CSI up
-/// to its final byte, SS3 and the byte after it, or Escape and one byte), a character in
-/// UTF-8, or one byte.
-fn key_length(bytes: &[u8]) -> usize {
-    match bytes {
-        [0x1b, b'[', rest @ ..] => {
-            2 + rest
-                .iter()
-                .position(|byte| (0x40..=0x7e).contains(byte))
-                .map_or(rest.len(), |at| at + 1)
-        }
-        [0x1b, b'O', _, ..] => 3,
-        [0x1b, _, ..] => 2,
-        [first, ..] => match first.leading_ones() {
-            2..=4 => usize::try_from(first.leading_ones())
-                .unwrap_or(1)
-                .min(bytes.len()),
-            _ => 1,
-        },
-        [] => 0,
-    }
 }
 
 /// Returns the read end of a pipe holding `key`'s secret, its write end closed; both ends are
@@ -1469,21 +1593,6 @@ mod tests {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-    }
-
-    #[test]
-    fn a_workspace_key_after_the_palette_key_is_read_from_the_start_of_what_follows() {
-        assert_eq!(workspace_key(b"\x1b[Cxy"), (Some(Step::Next), &b"xy"[..]));
-        assert_eq!(workspace_key(b"\x1bOD"), (Some(Step::Previous), &b""[..]));
-        assert_eq!(workspace_key(b"3rest"), (Some(Step::To(3)), &b"rest"[..]));
-        assert_eq!(workspace_key(b"zrest"), (None, &b"rest"[..]));
-        assert_eq!(
-            workspace_key(b"\x1b[Arest"),
-            (Some(Step::PreviousAgent), &b"rest"[..])
-        );
-        assert_eq!(workspace_key(b"\x1b[1;5Arest"), (None, &b"rest"[..]));
-        assert_eq!(workspace_key("érest".as_bytes()), (None, &b"rest"[..]));
-        assert_eq!(workspace_key(b""), (None, &b""[..]));
     }
 
     fn running(workspace: &mut Workspace, script: &str) -> Running {
@@ -1593,12 +1702,10 @@ mod tests {
                 .collect::<String>()
         };
         let shown = footer(&workspace);
-        assert!(shown.starts_with("F5 then:"), "{shown}");
-        assert!(shown.contains("F5 again: to the agent"), "{shown}");
-        assert!(!shown.contains("palette key"), "{shown}");
+        assert_eq!(shown.trim_end(), "F5 palette");
         workspace.tabs[0].agents[0].ending = Ending::Failed;
         let shown = footer(&workspace);
-        assert!(shown.contains("F5 0 threads"), "{shown}");
+        assert_eq!(shown.trim_end(), "any key close it  F5 palette");
     }
 
     #[test]
@@ -1658,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn the_arrows_up_and_down_choose_the_agent_and_b_hides_the_list() {
+    fn the_palette_lists_where_to_go_and_what_to_do_and_its_keys_act_at_once() {
         let mut workspace = Workspace::new(
             PaletteKey::default(),
             Notice::for_terminal(TerminalHints::default()),
@@ -1669,20 +1776,141 @@ mod tests {
         workspace.tabs.push(tab("a", vec![first, second]));
         workspace.selected = 1;
         let mut threads = Vec::new();
+        assert_eq!(workspace.type_keys(b"\x00", &mut threads), Moved::Shown);
+        let palette = workspace.palette.as_ref().unwrap();
         assert_eq!(
-            workspace.type_keys(b"\x00\x1b[B", &mut threads),
+            palette.entries,
+            [
+                Entry::Step(Step::To(0)),
+                Entry::Step(Step::To(1)),
+                Entry::Agent(0),
+                Entry::Agent(1),
+                Entry::Step(Step::Waiting),
+                Entry::Step(Step::List),
+                Entry::SendKey,
+                Entry::Quit,
+            ]
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
+        workspace.render_palette(buffer.area, &mut buffer);
+        let drawn: String = buffer
+            .content()
+            .iter()
+            .map(ratatui_core::buffer::Cell::symbol)
+            .collect();
+        for item in [
+            "Threads",
+            "agent  ✓ done",
+            "Next agent waiting for you",
+            "Hide the agents' list",
+            "Send Ctrl-Space to the agent",
+            "Quit",
+        ] {
+            assert!(drawn.contains(item), "{item}: {drawn}");
+        }
+        assert_eq!(
+            workspace.type_keys(b"\x1b[B\x1b[B\x1b[B", &mut threads),
             Moved::Shown
         );
-        assert_eq!(workspace.shown_id(), Some(second_id));
-        workspace.type_keys(b"\x00\x1b[B", &mut threads);
-        assert_eq!(workspace.shown_id(), Some(first_id));
-        workspace.type_keys(b"\x00\x1bOA", &mut threads);
+        assert_eq!(workspace.type_keys(b"\r", &mut threads), Moved::Shown);
+        assert!(!workspace.palette_open());
         assert_eq!(workspace.shown_id(), Some(second_id));
         assert_eq!(workspace.list_place(120), ListPlace::Beside);
         assert_eq!(workspace.type_keys(b"\x00b", &mut threads), Moved::Shown);
         assert_eq!(workspace.list_place(120), ListPlace::Hidden);
         workspace.type_keys(b"\x00b", &mut threads);
         assert_eq!(workspace.list_place(80), ListPlace::Over);
+        workspace.type_keys(b"\x00", &mut threads);
+        assert_eq!(workspace.type_keys(b"\x1b", &mut threads), Moved::Shown);
+        assert!(!workspace.palette_open());
+        assert_eq!(workspace.type_keys(b"\x00q", &mut threads), Moved::Quit);
+        assert!(threads.is_empty());
+        workspace.tabs[0].select(0, None);
+        assert_eq!(workspace.shown_id(), Some(first_id));
+    }
+
+    #[test]
+    fn the_palettes_choices_never_act_on_what_changed_since_it_opened() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let first = running(&mut workspace, "sleep 5");
+        let second = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("a", vec![first, second]));
+        workspace.selected = 1;
+        let mut threads = Vec::new();
+        workspace.type_keys(b"\x00", &mut threads);
+        workspace.tabs[0].agents[0].ending = Ending::Closed;
+        workspace.take_ended();
+        assert!(!workspace.palette_open());
+        workspace.type_keys(b"\x00", &mut threads);
+        workspace.tabs[0].agents[0].ending = Ending::Failed;
+        let send = workspace.palette.as_ref().unwrap().entries.len() - 2;
+        let mut keys = b"\x1b[B".repeat(send);
+        keys.push(b'\r');
+        workspace.type_keys(&keys, &mut threads);
+        assert!(!workspace.palette_open());
+        assert_eq!(workspace.tabs[0].agents[0].ending, Ending::Failed);
+        workspace.set_screen(WindowSize { rows: 24, cols: 80 }, false);
+        workspace.type_keys(b"\x00", &mut threads);
+        assert_eq!(
+            workspace.type_keys(b"\x1b[<0;3;1M\x1b[<0;3;1m", &mut threads),
+            Moved::Nothing
+        );
+        assert_eq!(workspace.selected, 1);
+        assert!(workspace.palette_open());
+        workspace.mouse.dragging = true;
+        workspace.type_keys(b"\x1b[<0;10;10m", &mut threads);
+        assert!(!workspace.mouse.dragging);
+        assert!(workspace.palette_open());
+    }
+
+    #[test]
+    fn a_teammates_agent_chosen_by_its_slot_is_found_wherever_the_list_moved_it() {
+        let mut both = Teammates::new("alice".parse().unwrap());
+        heard(&mut both, "bob.claude");
+        heard(&mut both, "bob.codex");
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let own = running(&mut workspace, "sleep 5");
+        let mut tab = tab("a", vec![own]);
+        let codex: AgentSlot = "bob.codex".parse().unwrap();
+        tab.select_teammate(&codex, Some(&both));
+        assert_eq!((tab.selected, tab.watching.as_ref()), (2, Some(&codex)));
+        let mut one = Teammates::new("alice".parse().unwrap());
+        heard(&mut one, "bob.codex");
+        tab.select(0, Some(&one));
+        tab.select_teammate(&codex, Some(&one));
+        assert_eq!((tab.selected, tab.watching.as_ref()), (1, Some(&codex)));
+        tab.select_teammate(&"bob.gone".parse().unwrap(), Some(&one));
+        assert_eq!((tab.selected, tab.watching.as_ref()), (1, Some(&codex)));
+    }
+
+    #[test]
+    fn the_palette_key_twice_reaches_the_agent_as_does_its_entry() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let agent = running(&mut workspace, "stty raw -echo; cat -v");
+        workspace.tabs.push(tab("a", vec![agent]));
+        workspace.selected = 1;
+        let mut threads = Vec::new();
+        workspace.type_keys(b"\x00\x00x", &mut threads);
+        assert!(!workspace.palette_open());
+        workspace.type_keys(b"\x00\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r", &mut threads);
+        workspace.type_keys(b"\x00\x1b[32;5u\x1b[32;5u", &mut threads);
+        let mut out = Vec::new();
+        settle(&mut workspace, &mut out, |workspace| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .contains("^@x^@^[[32;5u")
+        });
         assert!(threads.is_empty());
     }
 
@@ -2132,10 +2360,10 @@ mod tests {
         assert!(!workspace.is_running());
         let mut threads = Vec::new();
         workspace.type_keys(b"x\x00", &mut threads);
-        assert!(workspace.armed);
+        assert!(workspace.palette_open());
         assert_eq!(workspace.take_ended(), (None, true));
         assert!(!workspace.has_tabs());
-        assert!(!workspace.armed);
+        assert!(!workspace.palette_open());
         assert_eq!(workspace.selected, 0);
     }
 

@@ -1367,7 +1367,7 @@ cat parser.rs
         );
         assert!(rows[3].contains("claude ✓ done"), "{rows:#?}");
         assert!(rows[22].starts_with("╰──"), "{rows:#?}");
-        assert!(rows[23].contains("0-9 tab"), "{rows:#?}");
+        assert!(rows[23].contains("Ctrl-Space palette"), "{rows:#?}");
         assert_eq!(screen.cursor_position().1, 1);
     }
 
@@ -1387,7 +1387,7 @@ cat parser.rs
                 ("Menu", b"q"),
                 ("stop it and quit?", b"n"),
                 ("the agents keep running", b"\x001"),
-                ("0-9 tab", b"hello\r"),
+                ("Ctrl-Space palette", b"hello\r"),
                 ("mahi run claude: done", b"q"),
             ],
         );
@@ -1490,7 +1490,7 @@ cat parser.rs
         );
         assert_eq!(code, 0, "{output}");
         assert!(
-            pane_at(&output, "close it").contains("broken-agent"),
+            pane_at(&output, "✗ failed").contains("broken-agent"),
             "{output}"
         );
         assert!(output.contains("✗ failed"), "{output}");

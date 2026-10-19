@@ -28,6 +28,10 @@ pub enum PaletteInput {
     Up,
     /// The down arrow.
     Down,
+    /// The left arrow.
+    Left,
+    /// The right arrow.
+    Right,
     /// Page Up.
     PageUp,
     /// Page Down.
@@ -174,6 +178,8 @@ fn escape(rest: &[u8]) -> (usize, Option<PaletteInput>) {
         Some(b'O') => match rest.get(2) {
             Some(b'A') => (3, Some(PaletteInput::Up)),
             Some(b'B') => (3, Some(PaletteInput::Down)),
+            Some(b'C') => (3, Some(PaletteInput::Right)),
+            Some(b'D') => (3, Some(PaletteInput::Left)),
             Some(byte) if (0x40..=0x7e).contains(byte) => (3, None),
             _ => (2, None),
         },
@@ -196,6 +202,8 @@ fn csi(rest: &[u8]) -> (usize, Option<PaletteInput>) {
     let input = match last {
         b'A' => Some(PaletteInput::Up),
         b'B' => Some(PaletteInput::Down),
+        b'C' => Some(PaletteInput::Right),
+        b'D' => Some(PaletteInput::Left),
         b'u' => kitty(params),
         b'~' => page(params),
         _ => None,
@@ -325,7 +333,16 @@ mod tests {
             inputs(&["\u{e9}\u{4e2d}".as_bytes()]),
             text("\u{e9}\u{4e2d}")
         );
-        assert!(inputs(&[b"\x01\x1bx\x1b[1;5C\x1b[<0;1;1M\xff\x1bOZ"]).is_empty());
+        assert!(inputs(&[b"\x01\x1bx\x1b[<0;1;1M\xff\x1bOZ"]).is_empty());
+        assert_eq!(
+            inputs(&[b"\x1b[D\x1bOC\x1b[1;5C\x1bOD"]),
+            [
+                PaletteInput::Left,
+                PaletteInput::Right,
+                PaletteInput::Right,
+                PaletteInput::Left
+            ]
+        );
     }
 
     #[test]

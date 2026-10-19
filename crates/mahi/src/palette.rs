@@ -385,7 +385,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                         closing |= decision != Decision::Reject;
                     }
                 }
-                PaletteInput::Up => {}
+                PaletteInput::Up | PaletteInput::Left | PaletteInput::Right => {}
             }
             !escaped && !closing
         });

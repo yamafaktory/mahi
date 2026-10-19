@@ -53,15 +53,28 @@ pub enum AgentState {
 }
 
 impl AgentState {
-    fn mark(self) -> Span<'static> {
+    /// Returns how the list shows the state, such as `✓ done`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Working => Span::styled("● working", Style::new().fg(Theme::ACCENT)),
-            Self::Done => Span::styled("✓ done", Style::new().fg(Theme::OK)),
-            Self::AsksYou => Span::styled("! asks you", Theme::code()),
-            Self::Live => Span::styled("◉ live", Style::new().fg(Theme::ACCENT)),
-            Self::Offline => Span::styled("○ offline", Theme::muted()),
-            Self::Failed => Span::styled("✗ failed", Style::new().fg(Theme::ERROR)),
+            Self::Working => "● working",
+            Self::Done => "✓ done",
+            Self::AsksYou => "! asks you",
+            Self::Live => "◉ live",
+            Self::Offline => "○ offline",
+            Self::Failed => "✗ failed",
         }
+    }
+
+    fn mark(self) -> Span<'static> {
+        let style = match self {
+            Self::Working | Self::Live => Style::new().fg(Theme::ACCENT),
+            Self::Done => Style::new().fg(Theme::OK),
+            Self::AsksYou => Theme::code(),
+            Self::Offline => Theme::muted(),
+            Self::Failed => Style::new().fg(Theme::ERROR),
+        };
+        Span::styled(self.as_str(), style)
     }
 }
 
@@ -249,7 +262,7 @@ impl ThreadView<'_> {
         let title = self
             .agents
             .get(self.selected)
-            .map_or_else(String::new, |agent| format!(" {} ", label(agent)));
+            .map_or_else(String::new, |agent| format!(" {} ", agent.label()));
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(Theme::ACCENT))
@@ -385,10 +398,14 @@ impl ThreadView<'_> {
     }
 }
 
-fn label(agent: &WorkspaceAgent<'_>) -> String {
-    match agent.owner {
-        Some(owner) => format!("{}.{} (read-only)", shown(owner), shown(agent.name)),
-        None => shown(agent.name).into_owned(),
+impl WorkspaceAgent<'_> {
+    /// Returns how the list names the agent: its name, or a teammate's slot marked read-only.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self.owner {
+            Some(owner) => format!("{}.{} (read-only)", shown(owner), shown(self.name)),
+            None => shown(self.name).into_owned(),
+        }
     }
 }
 

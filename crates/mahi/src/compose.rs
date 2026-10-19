@@ -177,6 +177,8 @@ impl Composer {
                             | PaletteInput::Reject
                             | PaletteInput::Up
                             | PaletteInput::Down
+                            | PaletteInput::Left
+                            | PaletteInput::Right
                             | PaletteInput::PageUp
                             | PaletteInput::PageDown => {}
                         }
