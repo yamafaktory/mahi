@@ -90,6 +90,8 @@ const TERMINAL_OWN: [&str; 6] = [
 ];
 const CHILD_TERM: &str = "xterm-256color";
 const HOST_AGAIN: Duration = Duration::from_secs(2);
+const REDRAW_WAIT: Duration = Duration::from_millis(250);
+const REDRAW_QUIET: Duration = Duration::from_millis(15);
 pub(crate) const NEW_TAB: &str = "new";
 const SHORT_THREAD: usize = 8;
 
@@ -332,6 +334,7 @@ pub(crate) struct Workspace {
     scanner: KeyScanner,
     armed: bool,
     list_shown: bool,
+    redraw: Option<RedrawWait>,
     palette: String,
     palette_then_zero: String,
     size: WindowSize,
@@ -355,6 +358,14 @@ struct MouseState {
     carried: Vec<u8>,
     joined: Vec<u8>,
     encoded: Vec<u8>,
+}
+
+/// How long drawing waits for the shown agent to redraw at a new size, and when it last
+/// wrote since.
+#[derive(Debug, Clone, Copy)]
+struct RedrawWait {
+    until: Instant,
+    heard: Option<Instant>,
 }
 
 /// A thread's tab: the agents the workspace runs for it.
@@ -491,6 +502,7 @@ impl Workspace {
             scanner: KeyScanner::new(palette_key),
             armed: false,
             list_shown: true,
+            redraw: None,
             palette: palette_key.to_string(),
             palette_then_zero: format!("{palette_key} 0"),
             size: WindowSize { rows: 2, cols: 2 },
@@ -596,6 +608,7 @@ impl Workspace {
     pub(crate) fn take_output(&mut self, out: &mut Vec<u8>) -> bool {
         let shown = self.shown_id().filter(|&id| self.applied == Some(id));
         let mut changed = false;
+        let mut shown_wrote = false;
         while let Ok(event) = self.events.try_recv() {
             match event {
                 ChildEvent::Output(id, bytes) => {
@@ -608,6 +621,7 @@ impl Workspace {
                     if is_shown {
                         out.extend_from_slice(&passed);
                         changed = true;
+                        shown_wrote = true;
                     }
                     self.passed = passed;
                 }
@@ -621,6 +635,9 @@ impl Workspace {
                     }
                 }
             }
+        }
+        if let Some(wait) = self.redraw.as_mut().filter(|_| shown_wrote) {
+            wait.heard = Some(Instant::now());
         }
         changed | self.watch_teammates()
     }
@@ -825,9 +842,36 @@ impl Workspace {
         for running in self.tabs.iter_mut().flat_map(|tab| tab.agents.iter_mut()) {
             let _ = running.child.resize(size);
         }
+        let now = Instant::now();
+        let until = self
+            .redraw
+            .map(|wait| wait.until)
+            .filter(|&until| now < until)
+            .unwrap_or(now + REDRAW_WAIT);
+        self.redraw = self
+            .shows_running()
+            .then_some(RedrawWait { until, heard: None });
         if let Some(live) = self.live.as_mut() {
             live.forget_records();
         }
+    }
+
+    /// Says whether drawing waits at `now` for the shown agent, still running, to redraw at
+    /// the size it was last given, so its pane is not drawn half blank in between: until the
+    /// agent wrote and then stayed quiet for 15 ms, and at most 250 ms after the first resize
+    /// it waits for, so resizing without pause cannot hold drawing longer.
+    pub(crate) fn waits_for_redraw(&self, now: Instant) -> bool {
+        self.redraw.is_some_and(|wait| {
+            now < wait.until && wait.heard.is_none_or(|heard| now < heard + REDRAW_QUIET)
+        }) && self.shows_running()
+    }
+
+    fn shows_running(&self) -> bool {
+        self.selected
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get(index))
+            .and_then(|tab| tab.agents.get(tab.selected))
+            .is_some_and(|running| running.ending == Ending::Running)
     }
 
     /// Takes what the user typed: the workspace's own keys, which follow the palette key, and
@@ -1455,6 +1499,56 @@ mod tests {
             workspace.apply_shown(out);
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn drawing_waits_after_a_resize_until_the_shown_agent_redraws_or_briefly() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let agent = running(
+            &mut workspace,
+            "trap 'printf redrawn' WINCH; printf ready; while :; do sleep 0.01; done",
+        );
+        workspace.tabs.push(tab("a", vec![agent]));
+        workspace.selected = 1;
+        let mut out = Vec::new();
+        let shown = |workspace: &Workspace, text: &str| {
+            workspace.tabs[0].agents[0]
+                .child
+                .screen()
+                .contents()
+                .contains(text)
+        };
+        settle(&mut workspace, &mut out, |workspace| {
+            shown(workspace, "ready")
+        });
+        assert!(!workspace.waits_for_redraw(Instant::now()));
+        let start = Instant::now();
+        workspace.resize(WindowSize { rows: 6, cols: 30 });
+        let until = workspace.redraw.unwrap().until;
+        assert!(until >= start + REDRAW_WAIT);
+        assert!(workspace.waits_for_redraw(start));
+        assert!(!workspace.waits_for_redraw(until));
+        let far = start + Duration::from_secs(600);
+        workspace.redraw.as_mut().unwrap().until = far;
+        settle(&mut workspace, &mut out, |workspace| {
+            shown(workspace, "redrawn")
+        });
+        let heard = workspace.redraw.unwrap().heard.unwrap();
+        assert!(workspace.waits_for_redraw(heard + REDRAW_QUIET / 2));
+        assert!(!workspace.waits_for_redraw(heard + REDRAW_QUIET));
+        workspace.resize(SIZE);
+        let again = workspace.redraw.unwrap();
+        assert_eq!((again.until, again.heard), (far, None));
+        assert!(workspace.waits_for_redraw(heard + REDRAW_QUIET));
+        workspace.selected = 0;
+        assert!(!workspace.waits_for_redraw(start));
+        workspace.selected = 1;
+        workspace.tabs[0].agents[0].ending = Ending::Drawn;
+        workspace.resize(WindowSize { rows: 6, cols: 30 });
+        assert!(!workspace.waits_for_redraw(start));
     }
 
     #[test]

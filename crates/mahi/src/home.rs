@@ -333,7 +333,7 @@ fn choose(
         }
         workspace.set_screen(size, false);
         workspace.resize(agents_size(size, workspace));
-        if dirty {
+        if dirty && !workspace.waits_for_redraw(Instant::now()) {
             let view = home_view(place, &remote, &rows, &activity);
             draw(&mut terminal, home, &view, status, workspace)?;
             dirty = false;
