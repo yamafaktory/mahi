@@ -662,21 +662,18 @@ fn open_agent(
     workspace: &mut Workspace,
     identity_file: Option<&Path>,
 ) -> Result<(), String> {
-    let (title, resumes) = match &action {
-        HomeAction::Resume(thread) => (short(thread), true),
-        HomeAction::AddAgent(thread) | HomeAction::Handoff(thread) => (short(thread), false),
-        _ => (NEW_TAB.to_owned(), false),
+    let (title, resumed_thread) = match &action {
+        HomeAction::Resume(thread) => (short(thread), Some(thread.as_str())),
+        HomeAction::AddAgent(thread) | HomeAction::Handoff(thread) => (short(thread), None),
+        _ => (NEW_TAB.to_owned(), None),
     };
-    if resumes && workspace.show_running(&title) {
+    if resumed_thread.is_some() && workspace.show_running(&title) {
         return Ok(());
     }
+    let resumed = resumed_thread.map(|thread| resumed_name(store, thread, environment));
     let needs_key = !matches!(action, HomeAction::New) || environment.live != LiveMode::Off;
     let words = command_words(action, store, environment)?;
-    let name = if resumes {
-        "agent".to_owned()
-    } else {
-        words.last().cloned().unwrap_or_default()
-    };
+    let name = resumed.unwrap_or_else(|| words.last().cloned().unwrap_or_default());
     let key = match identity_file {
         Some(file) if needs_key => Some(unlocked::identity(
             file,
@@ -697,6 +694,21 @@ fn open_agent(
         (&words, title == NEW_TAB),
         key.as_ref(),
     )
+}
+
+/// Returns the name of the user's agent that resuming `thread` starts, or `agent` when the
+/// thread names none or several.
+fn resumed_name(store: &Store, thread: &str, environment: &Environment) -> String {
+    session::participant_from(environment.user.as_deref())
+        .ok()
+        .zip(thread.parse().ok())
+        .and_then(|(participant, thread)| {
+            session::pick_slot(store, thread, &participant, None).ok()
+        })
+        .map_or_else(
+            || "agent".to_owned(),
+            |slot| slot.agent().as_str().to_owned(),
+        )
 }
 
 fn short(thread: &str) -> String {

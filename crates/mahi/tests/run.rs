@@ -1878,6 +1878,38 @@ cat parser.rs
     }
 
     #[test]
+    fn a_resumed_agent_is_listed_by_its_name_in_the_thread() {
+        let fixture = fixture();
+        let (thread, _) = worked_thread(&fixture);
+        let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "resumed-name", "claude", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let passphrase = format!("{PASSPHRASE}\r");
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                (&thread, b"r"),
+                ("Passphrase", passphrase.as_bytes()),
+                ("agent-ready", b"\x00q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        let screen = output
+            .as_bytes()
+            .chunks(16)
+            .find_map(|chunk| {
+                parser.process(chunk);
+                let screen = parser.screen().contents();
+                screen.contains("agent-ready").then_some(screen)
+            })
+            .unwrap();
+        assert!(screen.contains("│ claude"), "{screen}");
+        assert!(!screen.contains("│ agent"), "{screen}");
+    }
+
+    #[test]
     fn the_home_screen_asks_the_passphrase_once_for_actions_that_follow() {
         let fixture = fixture();
         let (thread, claude) = worked_thread(&fixture);
