@@ -1396,6 +1396,46 @@ cat parser.rs
     }
 
     #[test]
+    fn quitting_from_the_workspaces_palette_asks_on_a_screen_the_palette_left() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "palette-quit", "claude", agent);
+        script(&fixture, "palette-quit", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("agent-ready", b"\x00"),
+                ("enter run", b"q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        let mut palette_shown = false;
+        let screen = output
+            .as_bytes()
+            .chunks(16)
+            .find_map(|chunk| {
+                parser.process(chunk);
+                let screen = parser.screen().contents();
+                palette_shown |= screen.contains("enter run");
+                (screen.contains("stop it and quit?") && screen.contains("esc cancel"))
+                    .then_some(screen)
+            })
+            .unwrap();
+        assert!(palette_shown, "{output}");
+        let tab = screen
+            .lines()
+            .next()
+            .and_then(|bar| bar.split(" │ ").nth(1))
+            .unwrap();
+        assert!(!screen.contains(&format!("╭ {tab} ")), "{screen}");
+    }
+
+    #[test]
     fn quitting_while_an_agent_runs_stops_it_after_a_confirmation() {
         let fixture = fixture();
         let agent =

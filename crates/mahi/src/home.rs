@@ -356,7 +356,11 @@ fn choose(
             Moved::Nothing => {}
             Moved::Shown => dirty = true,
             Moved::New => return Ok(Chosen::Action(HomeAction::New)),
-            Moved::Quit => return Ok(Chosen::Quit),
+            Moved::Quit => {
+                let view = home_view(place, &remote, &rows, &activity);
+                draw(&mut terminal, home, &view, status, workspace)?;
+                return Ok(Chosen::Quit);
+            }
         }
         if for_threads.is_empty() || ignore_until.is_some_and(|until| Instant::now() < until) {
             continue;
