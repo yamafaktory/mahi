@@ -1491,6 +1491,79 @@ cat parser.rs
     }
 
     #[test]
+    fn an_agent_that_cannot_start_from_a_tab_shows_why_on_the_thread_list() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "palette-refused", "claude", agent);
+        let tools = claude
+            .parent()
+            .unwrap()
+            .with_file_name("palette-refused-tools");
+        fs::create_dir_all(&tools).unwrap();
+        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .find(|sleep| Path::new(sleep).exists())
+            .unwrap();
+        std::os::unix::fs::symlink(sleep, tools.join("sleep")).unwrap();
+        let path = format!("{}:{}", claude.parent().unwrap().display(), tools.display());
+        let to_add = [b"\x1b[B".repeat(5), b"\r".to_vec()].concat();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("agent-ready", b"\x00"),
+                ("Add an agent to this thread", &to_add),
+                ("already yours here", b"q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+    }
+
+    fn declined_from_a_tab(name: &str, answers: &[(&str, &[u8])]) {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, name, "claude", agent);
+        script(&fixture, name, "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let to_add = [b"\x1b[B".repeat(5), b"\r".to_vec()].concat();
+        let mut typed: Vec<(&str, &[u8])> = vec![
+            ("Threads", b"n"),
+            ("Which agent should start the thread?", b"1"),
+            ("agent-ready", b"\x00"),
+            ("Add an agent to this thread", &to_add),
+        ];
+        typed.extend_from_slice(answers);
+        typed.extend_from_slice(&[
+            ("working…", b"\x00"),
+            ("(shown)", b"q"),
+            ("stop it and quit?", b"y"),
+        ]);
+        let (code, output) =
+            in_terminal_typing(terminal_command(&fixture, &[]).env("PATH", &path), &typed);
+        assert_eq!(code, 0, "{output}");
+    }
+
+    #[test]
+    fn declining_a_new_agents_question_from_a_tab_stays_on_the_tab() {
+        declined_from_a_tab(
+            "declined-question",
+            &[("What should its worktree start from?", b"\x1b")],
+        );
+    }
+
+    #[test]
+    fn declining_the_passphrase_for_a_new_agent_from_a_tab_stays_on_the_tab() {
+        declined_from_a_tab(
+            "declined-passphrase",
+            &[
+                ("What should its worktree start from?", b"1"),
+                ("Passphrase", b"\x1b"),
+            ],
+        );
+    }
+
+    #[test]
     fn declining_a_thread_action_from_the_workspaces_palette_draws_the_tab_again_whole() {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho agent-ready\nread line\necho \"got-$line\"\nwhile :; do sleep 1; done\n";

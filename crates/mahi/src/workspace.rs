@@ -100,6 +100,7 @@ const REDRAW_QUIET: Duration = Duration::from_millis(15);
 pub(crate) const NEW_TAB: &str = "new";
 const SHORT_THREAD: usize = 8;
 const ASKS_TOLD_EVERY: Duration = Duration::from_secs(30);
+const MAX_CHILDREN: usize = 16;
 
 /// What the thread reading a child's terminal tells the workspace.
 #[derive(Debug)]
@@ -630,6 +631,7 @@ impl Workspace {
         (words, new): (&[String], bool),
         key: Option<&LocalIdentity>,
     ) -> Result<(), String> {
+        self.room_for_agent()?;
         let failed = |error: &dyn std::fmt::Display| format!("{shown} cannot start: {error}");
         let cwd = std::env::current_dir().map_err(|error| failed(&error))?;
         let words: Vec<&OsStr> = words.iter().map(OsStr::new).collect();
@@ -862,6 +864,18 @@ impl Workspace {
             running.child.show(out);
         }
         self.applied = shown;
+    }
+
+    /// Says whether another agent can start, since the workspace runs at most 16 at once, or
+    /// what to tell the user when none can.
+    pub(crate) fn room_for_agent(&self) -> Result<(), String> {
+        if self.running_count() < MAX_CHILDREN {
+            Ok(())
+        } else {
+            Err(format!(
+                "the workspace runs at most {MAX_CHILDREN} agents at once: stop one to start another"
+            ))
+        }
     }
 
     /// Returns how many agents run in the workspace's tabs.
@@ -2410,6 +2424,30 @@ mod tests {
             out,
             b"\x1b]9;mahi 3e5c8646: bob sent a prompt: fix it\x07\x07"
         );
+    }
+
+    #[test]
+    fn the_workspace_starts_no_17th_agent_while_16_run() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let agents: Vec<Running> = (0..MAX_CHILDREN - 1)
+            .map(|_| running(&mut workspace, "sleep 5"))
+            .collect();
+        workspace.tabs.push(tab("a", agents));
+        assert_eq!(workspace.room_for_agent(), Ok(()));
+        let last = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("b", vec![last]));
+        assert_eq!(
+            workspace.room_for_agent(),
+            Err(
+                "the workspace runs at most 16 agents at once: stop one to start another"
+                    .to_owned()
+            )
+        );
+        workspace.tabs[1].agents[0].ending = Ending::Failed;
+        assert_eq!(workspace.room_for_agent(), Ok(()));
     }
 
     #[test]

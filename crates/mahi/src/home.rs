@@ -652,10 +652,27 @@ fn workspace_live(
     WorkspaceLive::new(environment, config?, store.common_dir())
 }
 
+/// Starts the agent `action` runs, as `start_agent` does, and shows the thread list when it
+/// does not start, where what it returns to tell the user is drawn, unless the user only
+/// declined one of its questions.
+fn open_agent(
+    action: HomeAction,
+    store: &mut Store,
+    environment: &Environment,
+    workspace: &mut Workspace,
+    identity_file: Option<&Path>,
+) -> Result<(), String> {
+    let started = start_agent(action, store, environment, workspace, identity_file);
+    if started.as_ref().is_err_and(|told| !told.is_empty()) {
+        workspace.show_threads();
+    }
+    started
+}
+
 /// Starts the agent `action` runs in its thread's tab of the workspace, with the user's mahi
 /// key unlocked first when the agent needs it, from the `identity_file`; returns what to tell
 /// the user when it does not start.
-fn open_agent(
+fn start_agent(
     action: HomeAction,
     store: &mut Store,
     environment: &Environment,
@@ -670,6 +687,7 @@ fn open_agent(
     if resumed_thread.is_some() && workspace.show_running(&title) {
         return Ok(());
     }
+    workspace.room_for_agent()?;
     let resumed = resumed_thread.map(|thread| resumed_name(store, thread, environment));
     let needs_key = !matches!(action, HomeAction::New) || environment.live != LiveMode::Off;
     let words = command_words(action, store, environment)?;
@@ -680,7 +698,10 @@ fn open_agent(
             || {
                 TerminalPrompt::open()
                     .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
-                    .map_err(|error| format!("the passphrase cannot be asked: {error}"))
+                    .map_err(|error| match error.kind() {
+                        io::ErrorKind::Interrupted => String::new(),
+                        _ => format!("the passphrase cannot be asked: {error}"),
+                    })
             },
             |error| format!("the mahi key cannot be unlocked: {error}"),
         )?),
@@ -883,7 +904,7 @@ fn agent_to_run(
                     .get(index)
                     .map(|program| (*program).to_owned())
                     .ok_or_else(|| "no agent was chosen".to_owned()),
-                Ok(_) => Err("no agent was chosen".to_owned()),
+                Ok(_) => Err(String::new()),
                 Err(error) => Err(format!("cannot ask which agent: {error}")),
             }
         }
