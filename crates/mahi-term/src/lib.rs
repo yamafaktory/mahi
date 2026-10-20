@@ -77,11 +77,13 @@ pub use view::{
 };
 pub use workspace::{
     AgentState,
+    Header,
     ListHit,
     ListPlace,
     TabBar,
     TabHit,
     ThreadView,
+    TopBar,
     WorkspaceAgent,
     WorkspaceTab,
 };

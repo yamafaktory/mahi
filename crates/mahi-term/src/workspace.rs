@@ -8,7 +8,10 @@ use ratatui_core::{
         Position,
         Rect,
     },
-    style::Style,
+    style::{
+        Color,
+        Style,
+    },
     text::{
         Line,
         Span,
@@ -30,7 +33,8 @@ use crate::{
 
 const LIST_COLUMNS: u16 = 24;
 const NARROW_COLUMNS: u16 = 100;
-const TAB_ROWS: u16 = 1;
+const TOP_ROWS: u16 = 1;
+const BAR: Color = Color::Indexed(236);
 const HINT_ROWS: u16 = 1;
 const BORDER: u16 = 2;
 const SMALLEST: u16 = 2;
@@ -133,7 +137,7 @@ impl ListPlace {
     }
 }
 
-/// What a click on the row of tabs is on.
+/// What a click on the top row is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabHit {
     /// A tab: 0 for the thread list, `n` for the `n`th thread's.
@@ -153,7 +157,93 @@ pub enum ListHit {
     Elsewhere,
 }
 
-/// The workspace's row of tabs: the thread list, each open thread, and `+` to open another.
+/// What the top row says on its right: the repository, the remote threads are pushed to and
+/// the user.
+#[derive(Debug, Clone, Copy)]
+pub struct Header<'a> {
+    /// The repository's name.
+    pub repository: &'a str,
+    /// The remote threads are pushed to, or that none is chosen.
+    pub remote: &'a str,
+    /// Whether a remote, or not pushing, was chosen; when not, the remote reads as a warning.
+    pub remote_chosen: bool,
+    /// Whether `m` chooses the remote where the row is drawn, so it is named beside a remote
+    /// not chosen.
+    pub remote_key: bool,
+    /// The user's participant name.
+    pub identity: &'a str,
+}
+
+impl<'a> Header<'a> {
+    fn spans(&self) -> Vec<Span<'a>> {
+        let mut spans = Vec::with_capacity(8);
+        spans.push(Span::styled(shown(self.repository), Theme::title()));
+        spans.push(Span::styled(" · ", Theme::muted()));
+        spans.push(Span::styled("remote ", Theme::muted()));
+        if self.remote_chosen {
+            spans.push(Span::raw(shown(self.remote)));
+        } else {
+            spans.push(Span::styled(
+                shown(self.remote),
+                Style::new().fg(Theme::WARN),
+            ));
+            if self.remote_key {
+                spans.push(Span::styled(" (m)", Theme::muted()));
+            }
+        }
+        spans.push(Span::styled(" · ", Theme::muted()));
+        spans.push(Span::raw(shown(self.identity)));
+        spans.push(Span::raw(" "));
+        spans
+    }
+}
+
+/// The screen's top row: mahi's badge, the workspace's tabs when it has any, and the header on
+/// the right, left out, the repository first, when the row is too narrow for it.
+#[derive(Debug, Clone, Copy)]
+pub struct TopBar<'a> {
+    /// The workspace's tabs, when one is open.
+    pub tabs: Option<TabBar<'a>>,
+    /// What the row says on its right.
+    pub header: Header<'a>,
+}
+
+impl TopBar<'_> {
+    /// Splits a terminal's `area` into the top row and what lies below it.
+    #[must_use]
+    pub fn split(area: Rect) -> (Rect, Rect) {
+        let [top, body] =
+            Layout::vertical([Constraint::Length(TOP_ROWS), Constraint::Fill(1)]).areas(area);
+        (top, body)
+    }
+
+    /// Draws the row into `area`.
+    pub fn render(&self, area: Rect, buffer: &mut Buffer) {
+        buffer.set_style(area, Style::new().bg(BAR));
+        let left = match &self.tabs {
+            Some(tabs) => Line::from(tabs.spans().map(|(span, _)| span).collect::<Vec<_>>()),
+            None => Line::from(badge()),
+        };
+        let room = usize::from(area.width).saturating_sub(left.width() + 1);
+        left.render(area, buffer);
+        let mut right = Line::from(self.header.spans());
+        if right.width() > room {
+            right.spans.drain(..2);
+        }
+        if right.width() <= room {
+            let width = u16::try_from(right.width()).unwrap_or(u16::MAX);
+            let at = Rect {
+                x: area.right().saturating_sub(width),
+                width,
+                ..area
+            };
+            right.render(at, buffer);
+        }
+    }
+}
+
+/// The workspace's tabs, after mahi's badge on the top row: the thread list, each open thread,
+/// and `+` to open another.
 #[derive(Debug, Clone, Copy)]
 pub struct TabBar<'a> {
     /// The open threads' tabs.
@@ -163,21 +253,7 @@ pub struct TabBar<'a> {
 }
 
 impl<'a> TabBar<'a> {
-    /// Splits a terminal's `area` into the row of tabs and what lies below it.
-    #[must_use]
-    pub fn split(area: Rect) -> (Rect, Rect) {
-        let [tabs, body] =
-            Layout::vertical([Constraint::Length(TAB_ROWS), Constraint::Fill(1)]).areas(area);
-        (tabs, body)
-    }
-
-    /// Draws the row of tabs into `area`.
-    pub fn render(&self, area: Rect, buffer: &mut Buffer) {
-        let spans: Vec<Span<'a>> = self.spans().map(|(span, _)| span).collect();
-        Line::from(spans).render(area, buffer);
-    }
-
-    /// Returns what is drawn at `column` of the row of tabs, counted from the row's left.
+    /// Returns what is drawn at `column` of the top row, counted from the row's left.
     #[must_use]
     pub fn tab_at(&self, column: u16) -> TabHit {
         let mut right = 0_usize;
@@ -198,7 +274,14 @@ impl<'a> TabBar<'a> {
                 std::iter::once((Span::styled("│", Theme::muted()), TabHit::Nothing))
                     .chain(self.tab(index + 1, shown(tab.title), mark))
             });
-        threads.into_iter().chain(tabs).chain([
+        [
+            (badge(), TabHit::Nothing),
+            (Span::raw(" "), TabHit::Nothing),
+        ]
+        .into_iter()
+        .chain(threads)
+        .chain(tabs)
+        .chain([
             (Span::styled("│", Theme::muted()), TabHit::Nothing),
             (Span::styled(" + ", Theme::title()), TabHit::New),
         ])
@@ -223,6 +306,10 @@ impl<'a> TabBar<'a> {
             (Span::styled(" ", style), hit),
         ]
     }
+}
+
+fn badge() -> Span<'static> {
+    Span::styled(" mahi ", Theme::selected())
 }
 
 /// A thread's tab: one of its agents at full size, the list of its agents, the teammates'
@@ -252,13 +339,13 @@ impl<'a> ThreadView<'a> {
             0
         };
         (
-            rows.saturating_sub(TAB_ROWS + HINT_ROWS + BORDER)
+            rows.saturating_sub(TOP_ROWS + HINT_ROWS + BORDER)
                 .max(SMALLEST),
             columns.saturating_sub(BORDER + beside).max(SMALLEST),
         )
     }
 
-    /// Draws the tab into `area`, below the row of tabs, with the selected agent's `screen`
+    /// Draws the tab into `area`, below the top row, with the selected agent's `screen`
     /// in its pane; returns where the agent's cursor is when it shows it and nothing lies over
     /// it.
     pub fn render(
@@ -296,7 +383,7 @@ impl<'a> ThreadView<'a> {
     }
 
     /// Returns what of the list is at `position`, when the tab is drawn in `area`, below the
-    /// row of tabs: nothing when the list is not there, so the click is the agent's.
+    /// top row: nothing when the list is not there, so the click is the agent's.
     #[must_use]
     pub fn list_at(&self, area: Rect, position: Position) -> Option<ListHit> {
         let [body, _] =
@@ -319,7 +406,7 @@ impl<'a> ThreadView<'a> {
     }
 
     /// Returns the cell of the agent's screen at `position`, when the tab is drawn in `area`,
-    /// below the row of tabs; a position past the pane gives its nearest cell when `clamp`,
+    /// below the top row; a position past the pane gives its nearest cell when `clamp`,
     /// as a drag that leaves it does, and nothing otherwise.
     #[must_use]
     pub fn pane_point(&self, area: Rect, position: Position, clamp: bool) -> Option<(u16, u16)> {
@@ -505,15 +592,117 @@ mod tests {
         ];
         let area = Rect::new(0, 0, 60, 1);
         let mut buffer = Buffer::empty(area);
-        TabBar {
-            tabs: &tabs,
-            selected: 1,
+        TopBar {
+            tabs: Some(TabBar {
+                tabs: &tabs,
+                selected: 1,
+            }),
+            header: HEADER,
         }
         .render(area, &mut buffer);
         let row = rows(&buffer).remove(0);
-        assert!(row.starts_with(" ⌂ threads │ 7f3a │ 9a48 ! │ + "), "{row}");
-        assert_eq!(buffer[(13, 0)].style().bg, Theme::selected().bg);
-        assert_ne!(buffer[(1, 0)].style().bg, Theme::selected().bg);
+        assert!(
+            row.starts_with(" mahi   ⌂ threads │ 7f3a │ 9a48 ! │ + "),
+            "{row}"
+        );
+        assert_eq!(buffer[(20, 0)].style().bg, Theme::selected().bg);
+        assert_ne!(buffer[(8, 0)].style().bg, Theme::selected().bg);
+    }
+
+    const HEADER: Header<'static> = Header {
+        repository: "project",
+        remote: "none chosen",
+        remote_chosen: false,
+        remote_key: true,
+        identity: "davy",
+    };
+
+    fn top_row(top: TopBar<'_>, width: u16) -> (String, Buffer) {
+        let area = Rect::new(0, 0, width, 1);
+        let mut buffer = Buffer::empty(area);
+        top.render(area, &mut buffer);
+        (rows(&buffer).remove(0), buffer)
+    }
+
+    #[test]
+    fn the_top_row_ends_with_the_repository_the_remote_and_the_user() {
+        let (row, buffer) = top_row(
+            TopBar {
+                tabs: None,
+                header: HEADER,
+            },
+            80,
+        );
+        assert!(row.starts_with(" mahi "), "{row}");
+        assert!(
+            row.ends_with("project · remote none chosen (m) · davy "),
+            "{row}"
+        );
+        let remote = row.find("none chosen").unwrap();
+        let column = u16::try_from(row[..remote].chars().count()).unwrap();
+        assert_eq!(buffer[(column, 0)].style().fg, Some(Theme::WARN));
+        let chosen = Header {
+            remote: "origin (private)",
+            remote_chosen: true,
+            ..HEADER
+        };
+        let (row, _) = top_row(
+            TopBar {
+                tabs: None,
+                header: chosen,
+            },
+            80,
+        );
+        assert!(row.ends_with("remote origin (private) · davy "), "{row}");
+        let elsewhere = Header {
+            remote_key: false,
+            ..HEADER
+        };
+        let (row, _) = top_row(
+            TopBar {
+                tabs: None,
+                header: elsewhere,
+            },
+            80,
+        );
+        assert!(row.ends_with("remote none chosen · davy "), "{row}");
+        let hidden = Header {
+            repository: "repo\u{202e}",
+            ..HEADER
+        };
+        let (row, _) = top_row(
+            TopBar {
+                tabs: None,
+                header: hidden,
+            },
+            80,
+        );
+        assert!(row.contains("repo? · remote"), "{row}");
+    }
+
+    #[test]
+    fn a_narrow_top_row_leaves_out_the_repository_then_the_whole_header_but_never_a_tab() {
+        let tabs = [WorkspaceTab {
+            title: "7f3a",
+            asks: false,
+        }];
+        let top = TopBar {
+            tabs: Some(TabBar {
+                tabs: &tabs,
+                selected: 0,
+            }),
+            header: HEADER,
+        };
+        let (row, _) = top_row(top, 90);
+        assert!(row.contains("project · remote"), "{row}");
+        let (row, _) = top_row(top, 60);
+        assert!(!row.contains("project"), "{row}");
+        assert!(row.ends_with("remote none chosen (m) · davy "), "{row}");
+        let (row, _) = top_row(top, 40);
+        assert_eq!(row.trim_end(), " mahi   ⌂ threads │ 7f3a │ +", "{row}");
+        for width in [0, 1, 5] {
+            top_row(top, width);
+        }
     }
 
     #[test]
@@ -674,7 +863,7 @@ mod tests {
             let corner = format!("\x1b[{rows};{columns}H#");
             parser.process(corner.as_bytes());
             let screen = Rect::new(0, 0, 120, 30);
-            let (_, body) = TabBar::split(screen);
+            let (_, body) = TopBar::split(screen);
             let mut buffer = Buffer::empty(screen);
             ThreadView {
                 agents: &AGENTS,
@@ -707,14 +896,16 @@ mod tests {
             tabs: &tabs,
             selected: 1,
         };
-        assert_eq!(bar.tab_at(0), TabHit::Tab(0));
-        assert_eq!(bar.tab_at(10), TabHit::Tab(0));
-        assert_eq!(bar.tab_at(11), TabHit::Nothing);
-        assert_eq!(bar.tab_at(12), TabHit::Tab(1));
-        assert_eq!(bar.tab_at(19), TabHit::Tab(2));
-        assert_eq!(bar.tab_at(27), TabHit::Nothing);
-        assert_eq!(bar.tab_at(28), TabHit::New);
-        assert_eq!(bar.tab_at(40), TabHit::Nothing);
+        assert_eq!(bar.tab_at(0), TabHit::Nothing);
+        assert_eq!(bar.tab_at(6), TabHit::Nothing);
+        assert_eq!(bar.tab_at(7), TabHit::Tab(0));
+        assert_eq!(bar.tab_at(17), TabHit::Tab(0));
+        assert_eq!(bar.tab_at(18), TabHit::Nothing);
+        assert_eq!(bar.tab_at(19), TabHit::Tab(1));
+        assert_eq!(bar.tab_at(26), TabHit::Tab(2));
+        assert_eq!(bar.tab_at(34), TabHit::Nothing);
+        assert_eq!(bar.tab_at(35), TabHit::New);
+        assert_eq!(bar.tab_at(47), TabHit::Nothing);
         let view = ThreadView {
             agents: &AGENTS,
             selected: 0,
@@ -792,9 +983,12 @@ mod tests {
                 }
                 .render(Some(parser.screen()), area, &mut buffer);
             }
-            TabBar {
-                tabs: &[],
-                selected: 0,
+            TopBar {
+                tabs: Some(TabBar {
+                    tabs: &[],
+                    selected: 0,
+                }),
+                header: HEADER,
             }
             .render(area, &mut buffer);
         }

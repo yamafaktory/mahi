@@ -299,14 +299,42 @@ pub(crate) fn stop_pushing(store: &Store) -> Result<(), RemoteError> {
     turn_off(store)
 }
 
-/// Returns a short description of where the clone pushes its threads, for a header.
-pub(crate) fn summary(store: &Store) -> String {
-    match setting(store) {
-        Ok(Some(Setting::Remote(remote))) => format!("{} ({})", remote.name, remote.visibility),
-        Ok(Some(Setting::Off)) => "off".to_owned(),
-        Ok(None) => "none chosen".to_owned(),
-        Err(_) => "unreadable".to_owned(),
+/// Where the clone pushes its threads, described for a header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Summary {
+    text: String,
+    chosen: bool,
+}
+
+impl Summary {
+    /// Returns the description, such as `origin (private)`.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
     }
+
+    /// Returns whether a remote, or not pushing, was chosen.
+    pub(crate) fn chosen(&self) -> bool {
+        self.chosen
+    }
+}
+
+impl fmt::Display for Summary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.text)
+    }
+}
+
+/// Returns a short description of where the clone pushes its threads, for a header.
+pub(crate) fn summary(store: &Store) -> Summary {
+    let (text, chosen) = match setting(store) {
+        Ok(Some(Setting::Remote(remote))) => {
+            (format!("{} ({})", remote.name, remote.visibility), true)
+        }
+        Ok(Some(Setting::Off)) => ("off".to_owned(), true),
+        Ok(None) => ("none chosen".to_owned(), false),
+        Err(_) => ("unreadable".to_owned(), false),
+    };
+    Summary { text, chosen }
 }
 
 /// Where a remote is reached: over SSH, or over HTTPS.
@@ -545,12 +573,15 @@ mod tests {
     #[test]
     fn a_remote_chosen_from_the_home_screen_is_kept_and_summarised() {
         let (_dir, store) = store_with(ORIGIN_OVER_SSH);
-        assert_eq!(summary(&store), "none chosen");
+        assert_eq!(summary(&store).text(), "none chosen");
+        assert!(!summary(&store).chosen());
         let told = choose(&store, &name("origin"), Visibility::Private).unwrap();
         assert!(told.contains("a private remote"), "{told}");
-        assert_eq!(summary(&store), "origin (private)");
+        assert_eq!(summary(&store).text(), "origin (private)");
+        assert!(summary(&store).chosen());
         stop_pushing(&store).unwrap();
-        assert_eq!(summary(&store), "off");
+        assert_eq!(summary(&store).text(), "off");
+        assert!(summary(&store).chosen());
         assert!(choose(&store, &name("missing"), Visibility::Public).is_err());
         assert_eq!(store.remote_names(), ["origin"]);
     }

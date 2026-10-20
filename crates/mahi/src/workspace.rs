@@ -41,6 +41,7 @@ use mahi_term::{
     AgentState,
     Answer,
     Dialog,
+    Header,
     KeyScanner,
     ListHit,
     ListPlace,
@@ -56,6 +57,7 @@ use mahi_term::{
     TabHit,
     ThreadChoice,
     ThreadView,
+    TopBar,
     Typed,
     WorkspaceAgent,
     WorkspaceTab,
@@ -1061,7 +1063,7 @@ impl Workspace {
     fn click(&mut self, event: MouseEvent) -> bool {
         let position = Position::new(event.column, event.row);
         let area = Rect::new(0, 0, self.screen.cols, self.screen.rows);
-        let (bar, body) = TabBar::split(area);
+        let (bar, body) = TopBar::split(area);
         let dragged = self.mouse.dragging && (event.is_motion() || !event.pressed);
         if !event.pressed {
             self.mouse.dragging = false;
@@ -1429,13 +1431,22 @@ impl Workspace {
         }
     }
 
-    /// Draws the row of tabs into `bar` and, on a thread's tab, the tab into `body`; returns
-    /// where the shown agent's cursor is.
-    pub(crate) fn render(&self, bar: Rect, body: Rect, buffer: &mut Buffer) -> Option<Position> {
+    /// Draws the top row, its tabs and `header`, into `bar` and, on a thread's tab, the tab
+    /// into `body`; returns where the shown agent's cursor is.
+    pub(crate) fn render(
+        &self,
+        header: Header<'_>,
+        bar: Rect,
+        body: Rect,
+        buffer: &mut Buffer,
+    ) -> Option<Position> {
         let tabs: Vec<WorkspaceTab<'_>> = self.tab_titles().collect();
-        TabBar {
-            tabs: &tabs,
-            selected: self.selected,
+        TopBar {
+            tabs: Some(TabBar {
+                tabs: &tabs,
+                selected: self.selected,
+            }),
+            header,
         }
         .render(bar, buffer);
         let tab = self.tabs.get(self.selected.checked_sub(1)?)?;
@@ -1815,6 +1826,13 @@ mod tests {
         let footer = |workspace: &Workspace| {
             let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 12));
             workspace.render(
+                Header {
+                    repository: "r",
+                    remote: "none chosen",
+                    remote_chosen: false,
+                    remote_key: false,
+                    identity: "me",
+                },
                 Rect::new(0, 0, 120, 1),
                 Rect::new(0, 1, 120, 11),
                 &mut buffer,
@@ -2278,7 +2296,7 @@ mod tests {
         }
         let mut threads = Vec::new();
         assert_eq!(
-            workspace.type_keys(b"\x1b[<0;14;1M", &mut threads),
+            workspace.type_keys(b"\x1b[<0;21;1M", &mut threads),
             Moved::Shown
         );
         assert_eq!(workspace.selected, 1);
@@ -2286,16 +2304,21 @@ mod tests {
             workspace.type_keys(b"\x1b[<0;", &mut threads),
             Moved::Nothing
         );
-        assert_eq!(workspace.type_keys(b"2;1M", &mut threads), Moved::Shown);
+        assert_eq!(workspace.type_keys(b"9;1M", &mut threads), Moved::Shown);
         assert_eq!(workspace.selected, 0);
         assert_eq!(
-            workspace.type_keys(b"\x1b[<0;22;1M", &mut threads),
+            workspace.type_keys(b"\x1b[<0;29;1M", &mut threads),
             Moved::New
         );
         assert_eq!(
-            workspace.type_keys(b"\x1b[<0;22;1m", &mut threads),
+            workspace.type_keys(b"\x1b[<0;29;1m", &mut threads),
             Moved::Nothing
         );
+        assert_eq!(
+            workspace.type_keys(b"\x1b[<0;3;1M", &mut threads),
+            Moved::Nothing
+        );
+        assert_eq!(workspace.selected, 0);
         assert!(threads.is_empty(), "{threads:?}");
         let mut out = Vec::new();
         workspace.apply_shown(&mut out);

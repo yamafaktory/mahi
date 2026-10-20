@@ -46,6 +46,7 @@ use unicode_width::UnicodeWidthStr as _;
 use crate::{
     Answer,
     Dialog,
+    Header,
     PaletteInput,
     Theme,
     dialog::shown,
@@ -88,12 +89,8 @@ pub struct HomeRow {
 /// who the user is, and what the last actions printed.
 #[derive(Debug, Clone, Copy)]
 pub struct HomeView<'a> {
-    /// The repository's name.
-    pub repository: &'a str,
-    /// The remote threads are pushed to, or that none is chosen.
-    pub remote: &'a str,
-    /// The user's participant name.
-    pub identity: &'a str,
+    /// What the top row says on its right.
+    pub header: Header<'a>,
     /// The repository's threads.
     pub rows: &'a [HomeRow],
     /// What mahi's commands printed, oldest first.
@@ -496,13 +493,8 @@ impl Home {
     /// Draws the home screen into `area`, with `status`, the outcome of the last action, on the
     /// Activity panel's last rows.
     pub fn render(&self, view: &HomeView<'_>, status: &str, area: Rect, buffer: &mut Buffer) {
-        let [header, body, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-        Self::render_header(view, header, buffer);
+        let [body, footer] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
         let [sidebar, main] =
             Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
                 .areas(body);
@@ -519,23 +511,6 @@ impl Home {
         if let Some((dialog, _)) = &self.dialog {
             dialog.render(area, buffer);
         }
-    }
-
-    fn render_header(view: &HomeView<'_>, area: Rect, buffer: &mut Buffer) {
-        let bar = Style::new().bg(ratatui_core::style::Color::Indexed(236));
-        buffer.set_style(area, bar);
-        Line::from(vec![
-            Span::styled(" mahi ", Theme::selected()),
-            Span::styled(
-                format!(" {} ", shown(view.repository)),
-                Theme::title().patch(bar),
-            ),
-            Span::styled("· remote ", Theme::muted().patch(bar)),
-            Span::styled(shown(view.remote).into_owned(), bar),
-            Span::styled("  · you ", Theme::muted().patch(bar)),
-            Span::styled(shown(view.identity).into_owned(), bar),
-        ])
-        .render(area, buffer);
     }
 
     fn render_menu(&self, area: Rect, buffer: &mut Buffer) {
@@ -792,9 +767,13 @@ mod tests {
             "mahi: cannot reach the remote".to_owned(),
         ];
         let view = HomeView {
-            repository: "repo\u{202e}",
-            remote: "origin (private)",
-            identity: "davy",
+            header: Header {
+                repository: "repo\u{202e}",
+                remote: "origin (private)",
+                remote_chosen: true,
+                remote_key: true,
+                identity: "davy",
+            },
             rows,
             activity: &activity,
         };
@@ -1138,15 +1117,11 @@ mod tests {
     }
 
     #[test]
-    fn the_screen_shows_header_menu_threads_and_activity() {
+    fn the_screen_shows_menu_threads_and_activity() {
         let rows = rows();
         let home = Home::default();
         let drawn = screen(&home, &rows, "resumed t1\u{1b}[2J");
         for wanted in [
-            "mahi",
-            "repo?",
-            "origin (private)",
-            "davy",
             "Menu",
             "New thread",
             "Threads · 2",
@@ -1172,9 +1147,13 @@ mod tests {
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
             let view = HomeView {
-                repository: "r",
-                remote: "none",
-                identity: "me",
+                header: Header {
+                    repository: "r",
+                    remote: "none",
+                    remote_chosen: false,
+                    remote_key: true,
+                    identity: "me",
+                },
                 rows: &rows,
                 activity: &[],
             };

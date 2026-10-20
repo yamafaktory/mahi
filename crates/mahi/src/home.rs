@@ -40,14 +40,15 @@ use mahi_term::{
     AnsiBackend,
     Answer,
     Dialog,
+    Header,
     Home,
     HomeAction,
     HomeRow,
     HomeView,
     PaletteInput,
     PaletteKeys,
-    TabBar,
     ThreadView,
+    TopBar,
 };
 use mahi_thread::ParticipantKey;
 use ratatui_core::terminal::Terminal;
@@ -461,14 +462,18 @@ fn route_keys(workspace: &mut Workspace, typed: &[u8], for_threads: &mut Vec<u8>
 /// `activity` it caught.
 fn home_view<'a>(
     place: &'a Place<'_>,
-    remote: &'a str,
+    remote: &'a remote::Summary,
     rows: &'a [HomeRow],
     activity: &'a [String],
 ) -> HomeView<'a> {
     HomeView {
-        repository: place.repository,
-        remote,
-        identity: place.identity,
+        header: Header {
+            repository: place.repository,
+            remote: remote.text(),
+            remote_chosen: remote.chosen(),
+            remote_key: true,
+            identity: place.identity,
+        },
         rows,
         activity,
     }
@@ -483,13 +488,21 @@ fn draw(
     workspace: &Workspace,
 ) -> io::Result<()> {
     let drawn = terminal.draw(|frame| {
-        let area = frame.area();
+        let (top, body) = TopBar::split(frame.area());
         if !workspace.has_tabs() {
-            home.render(view, status, area, frame.buffer_mut());
+            TopBar {
+                tabs: None,
+                header: view.header,
+            }
+            .render(top, frame.buffer_mut());
+            home.render(view, status, body, frame.buffer_mut());
             return;
         }
-        let (bar, body) = TabBar::split(area);
-        let cursor = workspace.render(bar, body, frame.buffer_mut());
+        let header = Header {
+            remote_key: workspace.shows_threads(),
+            ..view.header
+        };
+        let cursor = workspace.render(header, top, body, frame.buffer_mut());
         if workspace.shows_threads() {
             home.render(view, status, body, frame.buffer_mut());
         } else if let Some(cursor) = cursor.filter(|_| !workspace.palette_open()) {

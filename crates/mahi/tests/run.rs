@@ -1346,17 +1346,18 @@ cat parser.rs
         );
         assert_eq!(code, 0, "{output}");
         let ready = output.find("agent-ready").unwrap();
-        let home = ready + output[ready..].find("· remote").unwrap();
+        let home = ready + output[ready..].find("Threads · ").unwrap();
         let end = output[..home]
-            .rfind("\x1b[1;1H")
+            .rfind("\x1b[?25")
             .filter(|&back| back > ready)
+            .and_then(|back| output[back..home].find("\x1b[1;").map(|at| back + at))
             .unwrap_or(home);
         let mut parser = vt100::Parser::new(24, 200, 0);
         parser.process(&output.as_bytes()[..end]);
         let screen = parser.screen();
         let rows: Vec<String> = screen.rows(0, 200).collect();
         assert!(
-            rows[0].starts_with(" ⌂ threads │ ") && rows[0].contains(" │ + "),
+            rows[0].starts_with(" mahi   ⌂ threads │ ") && rows[0].contains(" │ + "),
             "{rows:#?}"
         );
         assert!(rows[1].starts_with("╭ claude "), "{rows:#?}");
@@ -1693,7 +1694,7 @@ cat parser.rs
         parser.process(&output.as_bytes()[..end]);
         let rows: Vec<String> = parser.screen().rows(0, 200).collect();
         assert!(
-            rows[0].starts_with(&format!(" ⌂ threads │ {short} │ + ")),
+            rows[0].starts_with(&format!(" mahi   ⌂ threads │ {short} │ + ")),
             "{rows:#?}"
         );
     }
@@ -2080,7 +2081,7 @@ cat parser.rs
     /// screen came back.
     fn pane_at(output: &str, marker: &str) -> String {
         let at = output.find(marker).unwrap();
-        let end = ["\x1b[?1049h", "· remote"]
+        let end = ["\x1b[?1049h", "Threads · "]
             .iter()
             .filter_map(|next| output[at..].find(next))
             .min()
