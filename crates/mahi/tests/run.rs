@@ -1357,7 +1357,7 @@ cat parser.rs
         let screen = parser.screen();
         let rows: Vec<String> = screen.rows(0, 200).collect();
         assert!(
-            rows[0].starts_with(" mahi   ⌂ threads │ ") && rows[0].contains(" │ + "),
+            rows[0].starts_with(" mahi   ⌂ threads   ") && rows[0].contains("   + "),
             "{rows:#?}"
         );
         assert!(rows[1].starts_with("╭ claude "), "{rows:#?}");
@@ -1431,8 +1431,12 @@ cat parser.rs
         let tab = screen
             .lines()
             .next()
-            .and_then(|bar| bar.split(" │ ").nth(1))
+            .and_then(|bar| bar.split("   ").nth(2))
             .unwrap();
+        assert!(
+            !tab.is_empty() && tab.chars().all(|c| c.is_ascii_alphanumeric()),
+            "{tab:?}"
+        );
         assert!(!screen.contains(&format!("╭ {tab} ")), "{screen}");
     }
 
@@ -1694,7 +1698,7 @@ cat parser.rs
         parser.process(&output.as_bytes()[..end]);
         let rows: Vec<String> = parser.screen().rows(0, 200).collect();
         assert!(
-            rows[0].starts_with(&format!(" mahi   ⌂ threads │ {short} │ + ")),
+            rows[0].starts_with(&format!(" mahi   ⌂ threads   {short}   + ")),
             "{rows:#?}"
         );
     }

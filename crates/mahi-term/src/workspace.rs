@@ -8,10 +8,7 @@ use ratatui_core::{
         Position,
         Rect,
     },
-    style::{
-        Color,
-        Style,
-    },
+    style::Style,
     text::{
         Line,
         Span,
@@ -34,7 +31,6 @@ use crate::{
 const LIST_COLUMNS: u16 = 24;
 const NARROW_COLUMNS: u16 = 100;
 const TOP_ROWS: u16 = 1;
-const BAR: Color = Color::Indexed(236);
 const HINT_ROWS: u16 = 1;
 const BORDER: u16 = 2;
 const SMALLEST: u16 = 2;
@@ -219,7 +215,6 @@ impl TopBar<'_> {
 
     /// Draws the row into `area`.
     pub fn render(&self, area: Rect, buffer: &mut Buffer) {
-        buffer.set_style(area, Style::new().bg(BAR));
         let left = match &self.tabs {
             Some(tabs) => Line::from(tabs.spans().map(|(span, _)| span).collect::<Vec<_>>()),
             None => Line::from(badge()),
@@ -268,12 +263,14 @@ impl<'a> TabBar<'a> {
 
     fn spans(&self) -> impl Iterator<Item = (Span<'a>, TabHit)> + '_ {
         let threads = self.tab(0, "⌂ threads".into(), "");
-        let tabs =
-            self.tabs.iter().enumerate().flat_map(move |(index, tab)| {
-                let mark = if tab.asks { " !" } else { "" };
-                std::iter::once((Span::styled("│", Theme::muted()), TabHit::Nothing))
-                    .chain(self.tab(index + 1, shown(tab.title), mark))
-            });
+        let tabs = self.tabs.iter().enumerate().flat_map(move |(index, tab)| {
+            let mark = if tab.asks { " !" } else { "" };
+            std::iter::once((Span::raw(" "), TabHit::Nothing)).chain(self.tab(
+                index + 1,
+                shown(tab.title),
+                mark,
+            ))
+        });
         [
             (badge(), TabHit::Nothing),
             (Span::raw(" "), TabHit::Nothing),
@@ -282,7 +279,7 @@ impl<'a> TabBar<'a> {
         .chain(threads)
         .chain(tabs)
         .chain([
-            (Span::styled("│", Theme::muted()), TabHit::Nothing),
+            (Span::raw(" "), TabHit::Nothing),
             (Span::styled(" + ", Theme::title()), TabHit::New),
         ])
     }
@@ -602,11 +599,18 @@ mod tests {
         .render(area, &mut buffer);
         let row = rows(&buffer).remove(0);
         assert!(
-            row.starts_with(" mahi   ⌂ threads │ 7f3a │ 9a48 ! │ + "),
+            row.starts_with(" mahi   ⌂ threads   7f3a   9a48 !   + "),
             "{row}"
         );
         assert_eq!(buffer[(20, 0)].style().bg, Theme::selected().bg);
         assert_ne!(buffer[(8, 0)].style().bg, Theme::selected().bg);
+        for column in [6, 18, 59] {
+            assert_eq!(
+                buffer[(column, 0)].style().bg,
+                Some(ratatui_core::style::Color::Reset),
+                "{column}"
+            );
+        }
     }
 
     const HEADER: Header<'static> = Header {
@@ -699,7 +703,7 @@ mod tests {
         assert!(!row.contains("project"), "{row}");
         assert!(row.ends_with("remote none chosen (m) · davy "), "{row}");
         let (row, _) = top_row(top, 40);
-        assert_eq!(row.trim_end(), " mahi   ⌂ threads │ 7f3a │ +", "{row}");
+        assert_eq!(row.trim_end(), " mahi   ⌂ threads   7f3a   +", "{row}");
         for width in [0, 1, 5] {
             top_row(top, width);
         }
