@@ -53,6 +53,8 @@ use crate::{
     key_hints,
 };
 
+const NO_THREADS: &str = "no threads yet: press n to start one";
+const THREAD_KEYS: &str = "rilepahg";
 const MENU: [(&str, &str); 8] = [
     ("Threads", "t"),
     ("New thread", "n"),
@@ -284,6 +286,12 @@ impl Home {
             };
         }
         let selected = rows.get(self.selected);
+        if selected.is_none()
+            && matches!(input, PaletteInput::Text(key) if THREAD_KEYS.contains(key))
+        {
+            self.note = Some(NO_THREADS);
+            return None;
+        }
         match input {
             PaletteInput::Escape | PaletteInput::Text('q') => return Some(HomeAction::Quit),
             PaletteInput::Tab => {
@@ -352,7 +360,7 @@ impl Home {
             0 => {
                 self.focus = Focus::Threads;
                 if rows.is_empty() {
-                    self.note = Some("no threads yet: press n to start one");
+                    self.note = Some(NO_THREADS);
                 }
                 None
             }
@@ -371,7 +379,7 @@ impl Home {
 
     fn open_thread_menu(&mut self, selected: Option<&HomeRow>) {
         let Some(row) = selected else {
-            self.note = Some("no thread is selected");
+            self.note = Some(NO_THREADS);
             return;
         };
         let mut choices = Vec::with_capacity(9);
@@ -1158,6 +1166,19 @@ mod tests {
                 activity: &[],
             };
             home.render(&view, "", area, &mut buffer);
+        }
+    }
+
+    #[test]
+    fn a_thread_key_without_threads_says_how_to_start_one() {
+        let thread_keys = "rilepahg".chars().map(PaletteInput::Text);
+        for input in thread_keys.chain([PaletteInput::Enter]) {
+            let mut home = Home::default();
+            assert_eq!(home.key(input, &[]), None, "{input:?}");
+            assert!(
+                screen(&home, &[], "").contains("no threads yet: press n to start one"),
+                "{input:?}"
+            );
         }
     }
 
