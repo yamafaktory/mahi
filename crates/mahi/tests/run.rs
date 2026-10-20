@@ -6067,8 +6067,7 @@ exit 3
                 ("USER", OsStr::new("tester")),
                 ("MAHI_LIVE", OsStr::new("local")),
             ];
-            let running =
-                from_home.then(|| run_thread(fixture, &thread, &owner_config, &owner_env));
+            let running = from_home.then(|| run_thread(fixture, &thread, &owner_env));
             let owner = Driven::start(mahi_in_terminal(
                 &fixture.repo,
                 &["invite", &thread],
@@ -6150,12 +6149,7 @@ exit 3
 
         /// Resumes `thread` with an agent that waits, so its host serves the thread, and waits
         /// until the host published where it is reached.
-        fn run_thread(
-            fixture: &Fixture,
-            thread: &str,
-            config: &Path,
-            env: &[(&str, &OsStr)],
-        ) -> Driven {
+        fn run_thread(fixture: &Fixture, thread: &str, env: &[(&str, &OsStr)]) -> Driven {
             let mut running = Driven::start(mahi_in_terminal(
                 &fixture.repo,
                 &[
@@ -6171,7 +6165,7 @@ exit 3
             running.wait_for("Passphrase");
             running.type_line(PASSPHRASE);
             running.wait_for("agent-ready");
-            let live = config.join("mahi/live").join(thread);
+            let live = config_dir(&fixture.home).path().join("live").join(thread);
             let deadline = Instant::now() + Duration::from_secs(20);
             while !live.exists() {
                 assert!(Instant::now() < deadline, "{}", running.text());
