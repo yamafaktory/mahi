@@ -1397,6 +1397,27 @@ cat parser.rs
     }
 
     #[test]
+    fn the_pairing_code_a_teammate_types_on_the_home_screen_shows_as_typed() {
+        let fixture = fixture();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("MAHI_LIVE", "local"),
+            &[
+                ("Threads", b"c"),
+                ("Pairing code", b"412-merit-intention"),
+                ("412-merit-intention", b"\x1b"),
+                ("mahi join", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        let shown = output.as_bytes().chunks(16).any(|chunk| {
+            parser.process(chunk);
+            parser.screen().contents().contains("› 412-merit-intention")
+        });
+        assert!(shown, "{output}");
+    }
+
+    #[test]
     fn a_question_a_command_asks_at_once_stays_shown_while_it_waits() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);

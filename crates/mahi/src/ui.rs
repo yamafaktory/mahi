@@ -469,10 +469,19 @@ impl DialogPrompt {
     }
 
     pub(crate) fn secret(&mut self, question: &str) -> io::Result<SecretString> {
+        self.secret_shown_as(question, true)
+    }
+
+    /// Asks for a secret the user may see while typing it, such as a pairing code.
+    pub(crate) fn shown_secret(&mut self, question: &str) -> io::Result<SecretString> {
+        self.secret_shown_as(question, false)
+    }
+
+    fn secret_shown_as(&mut self, question: &str, masked: bool) -> io::Result<SecretString> {
         let dialog = Dialog::input(
             question.trim_end_matches([' ', ':']),
             self.take_said(),
-            true,
+            masked,
         );
         match self.ask(dialog)? {
             Answer::Text(text) => Ok(SecretString::from(text.to_string())),

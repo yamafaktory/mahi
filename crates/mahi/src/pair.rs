@@ -441,7 +441,7 @@ pub(crate) fn join_by_code(environment: &Environment) -> Result<Ticket, PairingE
     let card = id::id(environment)?;
     let mut prompt = TerminalPrompt::open().map_err(PairingError::Prompt)?;
     let typed = prompt
-        .secret("Pairing code: ")
+        .shown_secret("Pairing code: ")
         .map_err(PairingError::Prompt)?;
     let code: PairingCode = typed.expose_secret().parse()?;
     drop(typed);

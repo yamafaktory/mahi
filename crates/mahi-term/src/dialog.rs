@@ -490,10 +490,10 @@ impl Dialog {
                 .render(rest, buffer);
             }
             Kind::Input { text, masked } => {
-                let typed: String = if *masked {
-                    std::iter::repeat_n(MASK, text.chars().count()).collect()
+                let typed: Cow<'_, str> = if *masked {
+                    Cow::Owned(std::iter::repeat_n(MASK, text.chars().count()).collect())
                 } else {
-                    text.to_string()
+                    Cow::Borrowed(text.as_str())
                 };
                 Line::from(vec![
                     Span::styled("› ", Theme::title()),

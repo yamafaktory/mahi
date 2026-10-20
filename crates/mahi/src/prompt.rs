@@ -163,6 +163,17 @@ impl<P: Prompt + ?Sized> Prompt for &mut P {
     }
 }
 
+impl TerminalPrompt {
+    /// Asks for a secret the user may see while typing it, such as a pairing code: shown in a
+    /// dialog, which leaves nothing in the scrollback, and read without echo on lines.
+    pub(crate) fn shown_secret(&mut self, question: &str) -> io::Result<SecretString> {
+        match &mut self.on {
+            On::Lines { .. } => self.secret(question),
+            On::Dialogs(dialogs) => dialogs.shown_secret(question),
+        }
+    }
+}
+
 impl Prompt for TerminalPrompt {
     fn say(&mut self, line: &str) -> io::Result<()> {
         match &mut self.on {
