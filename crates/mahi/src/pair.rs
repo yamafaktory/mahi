@@ -97,6 +97,9 @@ const LOCK: &str = "pairing.lock";
 const MAX_RECORD_BYTES: u64 = 128;
 const TICKET_PREFIX: &str = "ticket ";
 const REFUSED: &[u8] = b"refused";
+const TELL_CODE: &str = "Tell this code to your teammate. In a clone of this project, they press \
+                         c on mahi's home screen, or run mahi join, and type it.";
+const WAITING_FOR_CODE: &str = "Waiting up to 10 minutes.";
 
 #[derive(Debug, Error)]
 pub(crate) enum PairingError {
@@ -184,12 +187,11 @@ pub(crate) fn invite_by_code(
     environment: &Environment,
 ) -> Result<String, PairingError> {
     invite::with_inviter(environment, |store, inviter| {
-        if crate::remote::sync_remote(store)
+        let remote = crate::remote::sync_remote(store)
             .map_err(|error| PairingError::Remote(PairRemoteError::Setup(error.into())))?
-            .is_none()
-        {
-            return Err(PairingError::NoRemote);
-        }
+            .ok_or(PairingError::NoRemote)?
+            .name;
+        crate::ui::show_notice(vec![format!("Getting a pairing code ready on {remote}…")]);
         let _lock = lock_pairing(store)?;
         clear_leftover(store, environment)?;
         let listener = PairListener::bind(inviter.relays)?;
@@ -207,7 +209,7 @@ pub(crate) fn invite_by_code(
                 drop(prompt);
                 owner_pairs(&listener, &code, deadline, (store, thread, inviter))
             });
-        crate::ui::show_working();
+        crate::ui::show_notice(vec![format!("Removing the pairing code from {remote}…")]);
         unpublish(store, environment, slot, commit);
         paired.map(|name| {
             format!("added {name} to thread {thread}; they join with the ticket mahi sent them\n")
@@ -216,13 +218,17 @@ pub(crate) fn invite_by_code(
 }
 
 fn show_code(prompt: &mut TerminalPrompt, code: &PairingCode) -> Result<(), PairingError> {
+    let code = zeroize::Zeroizing::new(code.to_string());
+    if crate::ui::is_showing() {
+        crate::ui::show_code("Invite a teammate", &code, &[TELL_CODE, WAITING_FOR_CODE]);
+        return Ok(());
+    }
     let say =
         |prompt: &mut TerminalPrompt, line: &str| prompt.say(line).map_err(PairingError::Prompt);
-    say(prompt, &format!("Pairing code: {code}"))?;
+    say(prompt, &format!("Pairing code: {}", code.as_str()))?;
     say(
         prompt,
-        "Tell it to your teammate, who runs mahi join (or presses c on mahi's home screen) in a \
-         clone of this project and types it. Waiting up to 10 minutes; Ctrl-C stops.",
+        &format!("{TELL_CODE} {WAITING_FOR_CODE} Ctrl-C stops."),
     )
 }
 

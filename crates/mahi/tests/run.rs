@@ -6008,7 +6008,7 @@ exit 3
                 &["invite", &thread],
                 &owner_env,
             ));
-            let shown = owner.wait_for("Tell it to your teammate");
+            let shown = owner.wait_for("Tell this code to your teammate");
             let code = shown
                 .split("Pairing code: ")
                 .nth(1)
@@ -6109,7 +6109,7 @@ exit 3
             );
             home.wait_for(&thread);
             home.terminal.write_all(b"i").unwrap();
-            home.wait_for("Pairing code:");
+            home.wait_for("Tell this code to your teammate");
             thread::sleep(Duration::from_secs(1));
             home.terminal.write_all(b"\x03").unwrap();
             home.wait_for(&format!("mahi invite {thread} failed"));
@@ -6135,7 +6135,7 @@ exit 3
             home.terminal.write_all(b"i").unwrap();
             home.wait_for("Pairing needs a remote to meet through.");
             home.terminal.write_all(b"1").unwrap();
-            home.wait_for("Pairing code:");
+            home.wait_for("Tell this code to your teammate");
             thread::sleep(Duration::from_secs(1));
             home.terminal.write_all(b"\x03").unwrap();
             home.wait_for(&format!("mahi invite {thread} failed"));
@@ -6160,23 +6160,45 @@ exit 3
             );
             home.wait_for(&thread);
             home.terminal.write_all(b"i").unwrap();
-            let before = home.wait_for("working…");
-            assert!(!before.contains("Pairing code:"), "{before}");
+            let before = home.wait_for("Getting a pairing code ready on up…");
+            assert!(!before.contains("Tell this code"), "{before}");
             let spun = home.wait_for("⠙");
-            assert!(!spun.contains("Pairing code:"), "{spun}");
-            home.wait_for("Pairing code:");
-            home.terminal.write_all(b"\x03").unwrap();
-            let screen = || {
+            assert!(!spun.contains("Tell this code"), "{spun}");
+            home.wait_for("Tell this code to your teammate");
+            let screen = |home: &Driven| {
                 let mut parser = vt100::Parser::new(24, 200, 0);
                 parser.process(home.text().as_bytes());
                 parser.screen().contents()
             };
+            let drawn = home.text().len();
+            thread::sleep(Duration::from_millis(500));
+            assert_eq!(home.text().len(), drawn, "{}", screen(&home));
+            let code_screen = screen(&home);
+            assert!(code_screen.contains("Invite a teammate"), "{code_screen}");
+            assert!(code_screen.contains("ctrl-c stop"), "{code_screen}");
+            let code_line = code_screen
+                .lines()
+                .find(|line| line.contains('🔑'))
+                .unwrap_or_default();
+            assert_eq!(
+                code_line
+                    .trim_matches(|c: char| c == '│' || c.is_whitespace() || c == '🔑')
+                    .split('-')
+                    .count(),
+                3,
+                "{code_screen}"
+            );
+            home.terminal.write_all(b"\x03").unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);
-            while !screen().contains("working…") {
+            while !screen(&home).contains("Removing the pairing code from up…") {
                 assert!(Instant::now() < deadline, "{}", home.text());
                 thread::sleep(Duration::from_millis(20));
             }
-            assert!(!screen().contains("Pairing code:"), "{}", screen());
+            assert!(
+                !screen(&home).contains("Invite a teammate"),
+                "{}",
+                screen(&home)
+            );
             home.wait_for(&format!("mahi invite {thread} failed"));
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());

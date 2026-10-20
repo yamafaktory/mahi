@@ -82,6 +82,7 @@ static SAVED: Mutex<Option<Termios>> = Mutex::new(None);
 static SAVED_STDERR: Mutex<Option<OwnedFd>> = Mutex::new(None);
 static NOTICE: Mutex<Notice> = Mutex::new(Notice {
     dialog: None,
+    spinning: false,
     asking: false,
     busy_since: None,
     spinner: None,
@@ -96,11 +97,12 @@ const CONTROL_DISABLED: u8 = 0;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("mahi's full-screen views know the disabled control value of Linux and macOS only");
 
-/// The notice a dialog shows while a command works, whether a question hides it, since
-/// when a command that has shown nothing yet works, and the spinner that turns in the
-/// notice's title.
+/// The notice a dialog shows while a command works, whether a spinner turns in its title,
+/// whether a question hides it, since when a command that has shown nothing yet works, and
+/// the thread that turns the spinner.
 struct Notice {
     dialog: Option<Dialog>,
+    spinning: bool,
     asking: bool,
     busy_since: Option<Instant>,
     spinner: Option<Spinner>,
@@ -129,8 +131,8 @@ impl Spinner {
 }
 
 /// Turns the spinner every `SPIN_EVERY` until `stopped` ends: shows that mahi is working once
-/// a busy command has shown nothing for `SPIN_AFTER`, and redraws the notice with the next
-/// frame in its title, through one terminal so only what changed is sent.
+/// a busy command has shown nothing for `SPIN_AFTER`, and redraws a spinning notice with the
+/// next frame in its title, through one terminal so only what changed is sent.
 fn spin(stopped: &mpsc::Receiver<()>) {
     let mut screen: Option<Terminal<AnsiBackend<io::Stdout>>> = None;
     let mut seen = DRAWN.load(Ordering::SeqCst);
@@ -154,6 +156,10 @@ fn spin(stopped: &mpsc::Receiver<()>) {
                 .is_some_and(|since| since.elapsed() >= SPIN_AFTER)
         {
             notice.dialog = Some(Dialog::notice("mahi", vec![WORKING.to_owned()]));
+            notice.spinning = true;
+        }
+        if !notice.spinning {
+            continue;
         }
         let Some(dialog) = notice.dialog.as_mut() else {
             continue;
@@ -229,14 +235,26 @@ pub(crate) fn show_notice(lines: Vec<String>) {
     if !is_showing() {
         return;
     }
+    let mut title = String::new();
+    spinner_title(0, &mut title);
+    keep_notice(Dialog::notice(&title, lines), true);
+}
+
+/// Shows `code` in a notice that stays still while mahi waits for the teammate who types it,
+/// above `paragraphs`, when a full-screen view owns the terminal.
+pub(crate) fn show_code(title: &str, code: &str, paragraphs: &[&str]) {
+    if is_showing() {
+        keep_notice(Dialog::code(title, code, paragraphs), false);
+    }
+}
+
+fn keep_notice(dialog: Dialog, spinning: bool) {
     if let Ok(mut notice) = NOTICE.lock() {
-        let mut title = String::new();
-        spinner_title(0, &mut title);
-        let dialog = Dialog::notice(&title, lines);
         if !notice.asking {
             let _ = show(&dialog);
         }
         notice.dialog = Some(dialog);
+        notice.spinning = spinning;
         if notice.spinner.is_none() {
             notice.spinner = Spinner::start();
         }
@@ -447,9 +465,9 @@ fn keys_make_signals_now() -> bool {
 }
 
 /// Asks questions in dialogs drawn over the full screen, reading keys raw from standard input.
-/// What it is told is drawn at once in a notice, which stays while a command works, such as a
-/// pairing code while it waits, and shows again above the next question; it never goes to
-/// standard error, so a code shown this way is not kept in the activity.
+/// What it is told is drawn at once in a notice, which stays while a command works and shows
+/// again above the next question; it never goes to standard error, so nothing said this way
+/// is kept in the activity.
 #[derive(Default)]
 pub(crate) struct DialogPrompt {
     said: Vec<String>,

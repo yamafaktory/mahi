@@ -52,6 +52,7 @@ use zeroize::Zeroizing;
 
 use crate::PaletteInput;
 
+const CODE_MARK: &str = "🔑  ";
 const MAX_INPUT_CHARS: usize = 1024;
 const MAX_WIDTH: u16 = 76;
 const TABLE_GAP: usize = 2;
@@ -122,6 +123,9 @@ enum Kind {
         last_offset: cell::Cell<usize>,
     },
     Notice,
+    Code {
+        code: Zeroizing<String>,
+    },
     Confirm {
         yes: bool,
     },
@@ -209,6 +213,25 @@ impl Dialog {
         Self::with(title, lines, Kind::Notice)
     }
 
+    /// Makes a notice that shows `code` on a line of its own, after a key and in the colour of
+    /// something to type, above `paragraphs` set apart by blank lines; Ctrl-C stops what it
+    /// waits for.
+    #[must_use]
+    pub fn code(title: &str, code: &str, paragraphs: &[&str]) -> Self {
+        let mut lines = Vec::with_capacity(paragraphs.len() * 2);
+        for paragraph in paragraphs {
+            lines.push(String::new());
+            lines.push((*paragraph).to_owned());
+        }
+        Self::with(
+            title,
+            lines,
+            Kind::Code {
+                code: Zeroizing::new(code.to_owned()),
+            },
+        )
+    }
+
     /// Puts `title` in place of the dialog's title, reusing its buffer, as a notice whose
     /// spinner turns does every frame.
     pub fn set_title(&mut self, title: &str) {
@@ -294,7 +317,7 @@ impl Dialog {
                 PaletteInput::Enter => Some(Answer::Ok),
                 _ => None,
             },
-            Kind::Notice => None,
+            Kind::Notice | Kind::Code { .. } => None,
             Kind::Confirm { yes } => match input {
                 PaletteInput::Text('y' | 'Y') => Some(Answer::Confirmed(true)),
                 PaletteInput::Text('n' | 'N') => Some(Answer::Confirmed(false)),
@@ -360,14 +383,29 @@ impl Dialog {
     pub fn render(&self, area: Rect, buffer: &mut Buffer) {
         let width = area.width.saturating_sub(4).min(self.wanted_width());
         let text_width = usize::from(width.saturating_sub(4)).max(1);
-        let text: Vec<Line<'_>> = self.lines.iter().map(|line| marked(line)).collect();
-        let text_rows: usize = self
-            .lines
-            .iter()
-            .map(|line| wrapped_rows(line, text_width, has_marks(line)))
-            .sum();
+        let mut text: Vec<Line<'_>> = Vec::with_capacity(self.lines.len() + 2);
+        if let Kind::Code { code } = &self.kind {
+            text.push(Line::default());
+            text.push(Line::from(vec![
+                Span::raw(CODE_MARK),
+                Span::styled(shown(code), Theme::code()),
+            ]));
+        }
+        text.extend(self.lines.iter().map(|line| marked(line)));
+        let code_rows = match &self.kind {
+            Kind::Code { code } => {
+                1 + wrapped_rows(&format!("{CODE_MARK}{}", shown(code)), text_width, false)
+            }
+            _ => 0,
+        };
+        let text_rows: usize = code_rows
+            + self
+                .lines
+                .iter()
+                .map(|line| wrapped_rows(line, text_width, has_marks(line)))
+                .sum::<usize>();
         let extra_rows = match &self.kind {
-            Kind::Message | Kind::Notice => 0,
+            Kind::Message | Kind::Notice | Kind::Code { .. } => 0,
             Kind::Confirm { .. } | Kind::Input { .. } => 2,
             Kind::Choose { items, .. } => items.len() + 1,
             Kind::Menu { items, .. } => items.len(),
@@ -454,7 +492,7 @@ impl Dialog {
     fn render_below(&self, area: Rect, buffer: &mut Buffer) {
         let [_, rest] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
         match &self.kind {
-            Kind::Message | Kind::Notice => {}
+            Kind::Message | Kind::Notice | Kind::Code { .. } => {}
             Kind::Table {
                 header,
                 rows,
@@ -534,6 +572,7 @@ impl Dialog {
             Kind::Table { .. } if cramped => &[("↑↓ jk", "scroll"), ("enter", "close")],
             Kind::Message | Kind::Table { .. } => &[("enter", "close")],
             Kind::Notice => &[],
+            Kind::Code { .. } => &[("ctrl-c", "stop")],
             Kind::Confirm { .. } => &[
                 ("y", "yes"),
                 ("n", "no"),
@@ -724,6 +763,86 @@ mod tests {
                     + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn a_code_shows_on_a_line_of_its_own_in_the_colour_of_something_to_type() {
+        let dialog = Dialog::code(
+            "Invite a teammate",
+            "884-neptune-outfielder",
+            &[
+                "Tell this code to your teammate.",
+                "Waiting up to 10 minutes.",
+            ],
+        );
+        let area = Rect::new(0, 0, 80, 16);
+        let mut buffer = Buffer::empty(area);
+        dialog.render(area, &mut buffer);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let at = rows
+            .iter()
+            .position(|row| row.contains("884-neptune-outfielder"))
+            .unwrap();
+        assert!(rows[at].contains("🔑"), "{rows:#?}");
+        assert!(
+            rows[at - 1].trim_matches([' ', '│']).is_empty(),
+            "{rows:#?}"
+        );
+        let told = rows
+            .iter()
+            .position(|row| row.contains("Tell this code"))
+            .unwrap();
+        let waits = rows
+            .iter()
+            .position(|row| row.contains("Waiting up to"))
+            .unwrap();
+        assert_eq!(told, at + 2, "{rows:#?}");
+        assert_eq!(waits, told + 2, "{rows:#?}");
+        assert!(
+            rows.iter().any(|row| row.contains("ctrl-c stop")),
+            "{rows:#?}"
+        );
+        let column = rows[at]
+            .find("884")
+            .map(|byte| rows[at][..byte].chars().count())
+            .unwrap();
+        let cell = &buffer[(
+            u16::try_from(column).unwrap() + 1,
+            u16::try_from(at).unwrap(),
+        )];
+        assert_eq!(cell.style().fg, Theme::code().fg);
+        assert!(!format!("{dialog:?}").contains("884"));
+    }
+
+    #[test]
+    fn a_code_that_wraps_on_a_narrow_terminal_leaves_room_for_every_paragraph() {
+        let dialog = Dialog::code(
+            "Invite a teammate",
+            "884-neptune-outfielder",
+            &[
+                "Tell this code to your teammate.",
+                "Waiting up to 10 minutes.",
+            ],
+        );
+        let area = Rect::new(0, 0, 30, 24);
+        let mut buffer = Buffer::empty(area);
+        dialog.render(area, &mut buffer);
+        let drawn: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(drawn.contains("minutes."), "{drawn}");
+        assert!(drawn.contains("ctrl-c stop"), "{drawn}");
     }
 
     #[test]
