@@ -181,7 +181,10 @@ pub(crate) fn home(environment: &Environment) -> i32 {
                 }
             }
             Ok(Chosen::Action(action)) => {
-                status = act(action, &mut store, environment);
+                status = match stop_thread_first(&action, &mut workspace) {
+                    Ok(()) => act(action, &mut store, environment),
+                    Err(told) => told,
+                };
                 workspace.show_threads();
                 ui::keys_make_signals(false);
                 workspace.set_screen(terminal::size(), true);
@@ -638,6 +641,49 @@ fn stop_to_quit(workspace: &Workspace) -> bool {
         )],
     ));
     matches!(confirmed, Ok(Answer::Confirmed(true)))
+}
+
+/// Before an action that ends or purges a thread whose agents run in the workspace's tabs,
+/// asks whether to stop them, and stops them as quitting does; returns what to tell the user
+/// when the action does not go on.
+fn stop_thread_first(action: &HomeAction, workspace: &mut Workspace) -> Result<(), String> {
+    let (thread, verb, done) = match action {
+        HomeAction::End(thread) => (thread, "end", "ended"),
+        HomeAction::Purge(thread) => (thread, "purge", "purged"),
+        _ => return Ok(()),
+    };
+    let Ok(thread) = thread.parse::<ThreadId>() else {
+        return Ok(());
+    };
+    let count = workspace.running_in(thread);
+    if count == 0 {
+        return Ok(());
+    }
+    let (running, them) = if count == 1 {
+        ("1 agent is".to_owned(), "it")
+    } else {
+        (format!("{count} agents are"), "them")
+    };
+    let confirmed = DialogPrompt::default().ask(Dialog::confirm(
+        "Confirm",
+        vec![format!(
+            "{running} running in this thread: stop {them} and {verb}? Each ends as a stop \
+             signal ends it, with its last snapshot unless it was already taking it."
+        )],
+    ));
+    if !matches!(confirmed, Ok(Answer::Confirmed(true))) {
+        return Err("the agents keep running".to_owned());
+    }
+    let busy = ui::Busy::start();
+    let left = workspace.stop_thread(thread, STOP_WITHIN);
+    drop(busy);
+    if left > 0 {
+        return Err(format!(
+            "{left} agent(s) did not stop within {} s; the thread was not {done}",
+            STOP_WITHIN.as_secs()
+        ));
+    }
+    Ok(())
 }
 
 /// Stops the agents the workspace still runs, once mahi has left its screen, saying so, and

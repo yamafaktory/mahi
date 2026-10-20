@@ -1442,6 +1442,32 @@ cat parser.rs
     }
 
     #[test]
+    fn purging_a_thread_whose_agent_runs_in_a_tab_stops_it_first_when_asked() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "purge-agents", "claude", agent);
+        script(&fixture, "purge-agents", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("agent-ready", b"\x000"),
+                ("Threads · 1", b"p"),
+                ("stop it and purge?", b"n"),
+                ("the agents keep running", b"p"),
+                ("stop it and purge?", b"y"),
+                ("Purge thread", b"y"),
+                ("purged thread", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(fixture.thread_worktrees().is_empty(), "{output}");
+        assert!(!output.contains("failed with exit code"), "{output}");
+    }
+
+    #[test]
     fn quitting_from_the_workspaces_palette_asks_on_a_screen_the_palette_left() {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
@@ -1501,8 +1527,8 @@ cat parser.rs
                 ("agent-ready", b"\x00"),
                 ("End this thread", &to_end),
                 ("Its history stays", b"y"),
-                ("failed with exit code", b"q"),
-                ("stop it and quit?", b"y"),
+                ("stop it and end?", b"y"),
+                (": done", b"q"),
             ],
         );
         assert_eq!(code, 0, "{output}");
@@ -1529,7 +1555,7 @@ cat parser.rs
             })
             .collect();
         let asked = format!("Endthread{thread}?");
-        let told = format!("mahiend{thread}failedwithexitcode");
+        let told = format!("mahiend{thread}:done");
         assert!(
             screens.iter().any(|screen| screen.contains(&asked)),
             "{output}"

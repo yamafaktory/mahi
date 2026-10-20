@@ -507,6 +507,7 @@ enum Ending {
     Running,
     Drawn,
     Failed,
+    Stopping,
     Closed,
 }
 
@@ -782,6 +783,7 @@ impl Workspace {
                     continue;
                 }
                 let ending = match (running.ending, code) {
+                    (Ending::Stopping, _) => Ending::Closed,
                     (Ending::Running, 0) => Ending::Drawn,
                     (Ending::Drawn, _) => {
                         told = Some(format!("{}: done", running.shown));
@@ -903,6 +905,65 @@ impl Workspace {
             .flat_map(|tab| tab.agents.iter())
             .filter(|running| running.ending == Ending::Running)
             .count()
+    }
+
+    /// Returns how many agents of `thread` run in the workspace's tabs.
+    pub(crate) fn running_in(&self, thread: ThreadId) -> usize {
+        self.thread_agents(thread)
+            .filter(|running| running.ending == Ending::Running)
+            .count()
+    }
+
+    /// Asks the agents of `thread` to end, as a stop signal does, and waits for them for at
+    /// most `within`, reading what every agent writes meanwhile; returns how many still run.
+    /// Their tabs close once they have ended, without telling it as a failure; one that still
+    /// runs at the end is counted as running again.
+    pub(crate) fn stop_thread(&mut self, thread: ThreadId, within: Duration) -> usize {
+        for running in self.thread_agents_mut(thread) {
+            if running.ending == Ending::Running {
+                running.ending = Ending::Stopping;
+                running.child.stop();
+            }
+        }
+        let deadline = Instant::now() + within;
+        let mut out = Vec::new();
+        loop {
+            self.take_output(&mut out);
+            out.clear();
+            let left = self
+                .thread_agents_mut(thread)
+                .map(|running| matches!(running.child.exited(), Ok(None)))
+                .filter(|&runs| runs)
+                .count();
+            if left == 0 {
+                return 0;
+            }
+            if Instant::now() >= deadline {
+                for running in self.thread_agents_mut(thread) {
+                    if running.ending == Ending::Stopping
+                        && matches!(running.child.exited(), Ok(None))
+                    {
+                        running.ending = Ending::Running;
+                    }
+                }
+                return left;
+            }
+            thread::sleep(STOP_POLL);
+        }
+    }
+
+    fn thread_agents(&self, thread: ThreadId) -> impl Iterator<Item = &Running> {
+        self.tabs
+            .iter()
+            .filter(move |tab| tab.thread == Some(thread))
+            .flat_map(|tab| tab.agents.iter())
+    }
+
+    fn thread_agents_mut(&mut self, thread: ThreadId) -> impl Iterator<Item = &mut Running> {
+        self.tabs
+            .iter_mut()
+            .filter(move |tab| tab.thread == Some(thread))
+            .flat_map(|tab| tab.agents.iter_mut())
     }
 
     /// Asks every agent's command to end, as a stop signal does, and waits for them
