@@ -61,6 +61,7 @@ use crate::{
         Environment,
         LiveMode,
     },
+    init,
     profile::Profile,
     prompt::{
         Prompt,
@@ -712,6 +713,16 @@ fn start_agent(
     let needs_key = !matches!(action, HomeAction::New) || environment.live != LiveMode::Off;
     let words = command_words(action, store, environment)?;
     let name = resumed.unwrap_or_else(|| words.last().cloned().unwrap_or_default());
+    if needs_key {
+        init::set_up_if_needed(environment, TerminalPrompt::open_interactive).map_err(|error| {
+            match error {
+                init::InitError::Prompt(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    String::new()
+                }
+                error => format!("mahi cannot be set up: {error}"),
+            }
+        })?;
+    }
     let key = match identity_file {
         Some(file) if needs_key => Some(unlocked::identity(
             file,

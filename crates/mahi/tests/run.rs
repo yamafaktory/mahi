@@ -1736,6 +1736,12 @@ cat parser.rs
 
     #[test]
     fn a_new_user_sets_mahi_up_and_starts_an_agent_without_leaving_the_home_screen() {
+        for live in ["off", "local"] {
+            new_user_sets_mahi_up_and_starts_an_agent(live);
+        }
+    }
+
+    fn new_user_sets_mahi_up_and_starts_an_agent(live: &str) {
         let fixture = fixture();
         let fresh = fixture.root.join("fresh-home");
         fs::create_dir(&fresh).unwrap();
@@ -1747,7 +1753,8 @@ cat parser.rs
             terminal_command(&fixture, &[])
                 .env("PATH", &path)
                 .env("HOME", &fresh)
-                .env("XDG_CONFIG_HOME", fresh.join(".config")),
+                .env("XDG_CONFIG_HOME", fresh.join(".config"))
+                .env("MAHI_LIVE", live),
             &[
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
@@ -1763,6 +1770,7 @@ cat parser.rs
             "{output}"
         );
         assert!(!output.contains("correct horse"), "{output}");
+        assert!(!output.contains("Passphrase for your mahi key"), "{output}");
         assert!(config_dir(&fresh).recipient_file().is_file());
         assert!(config_dir(&fresh).path().join("declined/claude").is_file());
     }

@@ -113,6 +113,14 @@ pub(crate) fn identity<E>(
     Ok(identity)
 }
 
+/// Keeps `identity`, the key setting mahi up just made or unlocked from `file`, as
+/// [`identity`] keeps one, so the action that set mahi up does not ask for its passphrase again.
+pub(crate) fn hold(file: &Path, identity: &LocalIdentity) {
+    if ui::is_showing() {
+        keep(file, identity, Instant::now());
+    }
+}
+
 /// Forgets the key the home screen kept unlocked, and the one a workspace handed over.
 pub(crate) fn forget() {
     *kept() = None;
@@ -222,6 +230,13 @@ mod tests {
     use age::secrecy::ExposeSecret;
 
     use super::*;
+
+    #[test]
+    fn a_key_held_while_no_home_screen_shows_is_not_kept() {
+        let file = Path::new("/config/held");
+        hold(file, &LocalIdentity::generate());
+        assert!(take_kept(file, Instant::now()).is_none());
+    }
 
     #[test]
     fn a_kept_key_is_given_back_for_its_file_until_it_goes_unused_too_long() {

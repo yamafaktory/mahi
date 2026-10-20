@@ -21,6 +21,7 @@ use crate::{
     environment::Environment,
     prompt::Prompt,
     session,
+    unlocked,
 };
 
 const MIN_PASSPHRASE_CHARS: usize = 8;
@@ -164,6 +165,7 @@ fn public_identity(
         identity.save(&identity_file, &passphrase)?;
         identity
     };
+    unlocked::hold(&identity_file, &identity);
     let public = PublicIdentity::from(&identity);
     public.save(&recipient_file)?;
     Ok(public)
