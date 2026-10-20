@@ -2081,6 +2081,70 @@ cat parser.rs
         assert!(worktree.exists());
     }
 
+    #[test]
+    fn an_arrow_typed_just_after_escape_closes_the_help_moves_the_selection() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\nexit 0\n";
+        let claude = script(&fixture, "help-agents", "claude", agent);
+        script(&fixture, "help-agents", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let mut mahi = terminal_command(&fixture, &[])
+            .env("PATH", &path)
+            .spawn()
+            .unwrap();
+        let mut terminal = mahi.writer().unwrap();
+        let mut reader = mahi.reader().unwrap();
+        let mut seen = Vec::new();
+        read_until(&mut reader, &mut seen, "Threads");
+        terminal.write_all(b"\t?").unwrap();
+        read_until(&mut reader, &mut seen, "enter close");
+        let output = Arc::new(Mutex::new(seen));
+        let collected = Arc::clone(&output);
+        thread::spawn(move || {
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                collected.lock().unwrap().extend_from_slice(&chunk[..read]);
+            }
+        });
+        let asked = |output: &Mutex<Vec<u8>>| {
+            let mut parser = vt100::Parser::new(24, 200, 0);
+            output.lock().unwrap().chunks(16).any(|chunk| {
+                parser.process(chunk);
+                parser
+                    .screen()
+                    .contents()
+                    .contains("Which agent should start the thread?")
+            })
+        };
+        for keys in [&b"\x1b"[..], b"\x1b[B", b"\r"] {
+            thread::sleep(Duration::from_millis(100));
+            terminal.write_all(keys).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !asked(&output) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            asked(&output),
+            "{}",
+            String::from_utf8_lossy(&output.lock().unwrap())
+        );
+        terminal.write_all(b"\x1b").unwrap();
+        thread::sleep(Duration::from_millis(800));
+        terminal.write_all(b"q").unwrap();
+        let status = loop {
+            if let Some(status) = mahi.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline + WAIT, "mahi kept running");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(exit_code(status), 0);
+    }
+
     /// Returns the screen, as text, of the agent's pane that showed `marker`, before the home
     /// screen came back.
     fn pane_at(output: &str, marker: &str) -> String {

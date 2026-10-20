@@ -45,7 +45,6 @@ use mahi_term::{
     HomeAction,
     HomeRow,
     HomeView,
-    PaletteInput,
     PaletteKeys,
     ThreadView,
     TopBar,
@@ -287,7 +286,7 @@ fn choose(
     let mut size = terminal::size();
     let mut terminal = Terminal::new(ui::backend(size.rows, size.cols))?;
     terminal.clear()?;
-    let mut keys = PaletteKeys::default();
+    let mut keys = ThreadListKeys::default();
     let mut rows = rows(place.store, place.own);
     let mut remote = remote::summary(place.store);
     home.fit(&rows);
@@ -296,7 +295,6 @@ fn choose(
     let mut read_at = Instant::now();
     let mut buffer = [0_u8; MAX_READ];
     let mut dirty = true;
-    let mut ignore_until = None;
     let mut passed = Vec::new();
     let mut for_threads = Vec::with_capacity(MAX_READ);
     loop {
@@ -364,13 +362,10 @@ fn choose(
                 dirty = true;
             }
         }
-        if for_threads.is_empty() || ignore_until.is_some_and(|until| Instant::now() < until) {
+        if for_threads.is_empty() {
             continue;
         }
-        let (chosen, escaped) = thread_list_keys(&mut keys, home, &rows, &for_threads);
-        if escaped {
-            ignore_until = Some(Instant::now() + AFTER_ESCAPE);
-        }
+        let chosen = keys.read(home, &rows, &mut for_threads, Instant::now());
         dirty = true;
         match chosen {
             Some(HomeAction::Quit) => return Ok(Chosen::Quit),
@@ -406,25 +401,41 @@ fn follow_children(
     Ok(changed)
 }
 
-/// Reads the thread list's keys from `typed`, and returns the action they choose, if any, and
-/// whether Escape was among them.
-fn thread_list_keys(
-    keys: &mut PaletteKeys,
-    home: &mut Home,
-    rows: &[HomeRow],
-    typed: &[u8],
-) -> (Option<HomeAction>, bool) {
-    let mut chosen = None;
-    let mut escaped = false;
-    keys.read(typed, |input| {
-        escaped |= input == PaletteInput::Escape;
-        if let Some(action) = home.key(input, rows) {
-            chosen = Some(action);
-            return false;
+/// The thread list's keys, and when the escape byte a read ended with alone may still be the
+/// start of a sequence whose rest comes in the next read.
+#[derive(Debug, Default)]
+struct ThreadListKeys {
+    keys: PaletteKeys,
+    escaped_until: Option<Instant>,
+}
+
+impl ThreadListKeys {
+    /// Reads the keys in `typed` at `now`, and returns the action they choose, if any. A read
+    /// that ends in an escape byte alone, outside a paste, gives the next read, when it comes
+    /// within half a second and starts with `[` or `O`, that byte back, so the rest of a paste
+    /// split after it is read as a paste.
+    fn read(
+        &mut self,
+        home: &mut Home,
+        rows: &[HomeRow],
+        typed: &mut Vec<u8>,
+        now: Instant,
+    ) -> Option<HomeAction> {
+        if self.escaped_until.take().is_some_and(|until| now < until)
+            && matches!(typed.first(), Some(b'[' | b'O'))
+        {
+            typed.insert(0, ESC);
         }
-        input != PaletteInput::Escape
-    });
-    (chosen, escaped)
+        let mut chosen = None;
+        self.keys.read(typed, |input| {
+            chosen = home.key(input, rows);
+            chosen.is_none()
+        });
+        if typed.last() == Some(&ESC) && !self.keys.is_pasting() {
+            self.escaped_until = Some(now + AFTER_ESCAPE);
+        }
+        chosen
+    }
 }
 
 /// Returns how long to wait for a key before looking again: briefly while agents run, whose
@@ -1294,6 +1305,106 @@ mod tests {
             ParticipantName::new(participant).unwrap(),
             AgentName::new(agent).unwrap(),
         )
+    }
+
+    fn home_rows() -> Vec<HomeRow> {
+        ["t1", "t2"]
+            .map(|thread| HomeRow {
+                thread: thread.to_owned(),
+                agents: "you.claude".to_owned(),
+                worktree: true,
+                owned: true,
+            })
+            .to_vec()
+    }
+
+    struct Typing {
+        keys: ThreadListKeys,
+        home: Home,
+        rows: Vec<HomeRow>,
+        now: Instant,
+    }
+
+    impl Typing {
+        fn with_help_open() -> Self {
+            let mut typing = Self {
+                keys: ThreadListKeys::default(),
+                home: Home::default(),
+                rows: home_rows(),
+                now: Instant::now(),
+            };
+            assert_eq!(typing.read(b"?"), None);
+            typing
+        }
+
+        fn read(&mut self, typed: &[u8]) -> Option<HomeAction> {
+            let mut typed = typed.to_vec();
+            self.keys
+                .read(&mut self.home, &self.rows, &mut typed, self.now)
+        }
+    }
+
+    #[test]
+    fn an_arrow_read_with_the_escape_that_closes_a_dialog_still_moves_the_selection() {
+        let mut typing = Typing::with_help_open();
+        assert_eq!(typing.read(b"\x1b\x1b[B"), None);
+        assert_eq!(typing.home.selected(), 1);
+        assert_eq!(typing.keys.escaped_until, None);
+    }
+
+    #[test]
+    fn a_key_read_after_the_escape_that_closes_a_dialog_is_not_dropped() {
+        let mut typing = Typing::with_help_open();
+        assert_eq!(typing.read(b"\x1b"), None);
+        assert!(typing.keys.escaped_until.is_some());
+        assert_eq!(typing.read(b"j"), None);
+        assert_eq!(typing.home.selected(), 1);
+    }
+
+    #[test]
+    fn the_rest_of_a_paste_split_after_its_escape_is_read_as_a_paste() {
+        for split in [
+            &[&b"[200~qey\r\x1b[201~"[..]][..],
+            &[b"[20", b"0~qey\r\x1b[201~"],
+        ] {
+            let mut typing = Typing::with_help_open();
+            assert_eq!(typing.read(b"\x1b"), None);
+            for rest in split {
+                assert_eq!(typing.read(rest), None, "{split:?}");
+            }
+            assert!(!typing.keys.keys.is_pasting(), "{split:?}");
+            assert_eq!(typing.home.selected(), 0, "{split:?}");
+            assert_eq!(typing.read(b"j"), None);
+            assert_eq!(typing.home.selected(), 1, "{split:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_next_read_within_half_a_second_gets_the_escape_byte_back() {
+        let mut late = Typing::with_help_open();
+        assert_eq!(late.read(b"\x1b"), None);
+        late.now += AFTER_ESCAPE;
+        assert_eq!(late.read(b"[200~"), None);
+        assert!(!late.keys.keys.is_pasting());
+        let mut after = Typing::with_help_open();
+        assert_eq!(after.read(b"\x1b"), None);
+        assert_eq!(after.read(b"j"), None);
+        assert_eq!(after.read(b"[200~"), None);
+        assert!(!after.keys.keys.is_pasting());
+        let mut next = Typing::with_help_open();
+        assert_eq!(next.read(b"\x1b"), None);
+        assert_eq!(next.read(b"[200~"), None);
+        assert!(next.keys.keys.is_pasting());
+    }
+
+    #[test]
+    fn only_a_read_that_ends_in_a_lone_escape_opens_the_window() {
+        let mut typing = Typing::with_help_open();
+        assert_eq!(typing.read(b"\x03"), None);
+        assert_eq!(typing.keys.escaped_until, None);
+        assert_eq!(typing.read(b"?"), None);
+        assert_eq!(typing.read(b"\x1b[27u"), None);
+        assert_eq!(typing.keys.escaped_until, None);
     }
 
     #[test]
