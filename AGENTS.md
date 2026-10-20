@@ -34,7 +34,8 @@ just test       # cargo nextest run; extra args pass through, e.g. just test -p 
 just build
 just run …      # run the mahi binary, e.g. just run threads
 just try …      # build mahi and run it in a scratch repo with its own config and data
-just try-reset  # remove try's scratch repo, config and data to start fresh
+just try-teammate … # the same as a second user, bob, with a key, config, data and clone of its own
+just try-reset  # remove the scratch repos, config and data of try and try-teammate
 just test-git   # the tests that run the git program (not part of just test)
 just test-wsl   # the tests that need WSL 2 (not part of just test; CI runs them on Windows)
 just release v  # check, bump every crate to version v, commit, tag v<v> and push (dry run without --execute)
@@ -52,6 +53,13 @@ just fuzz-shard <i> <n> [s] # run shard i of n of the fuzz targets (CI runs 6 in
 just fuzz-list [i] [n] # list the fuzz targets in shard i of n
 just mutants <crate> [args] # cargo-mutants on one crate, e.g. -f 'crates/mahi-ssh/src/proto/*'
 ```
+
+`just try` and `just try-teammate` give two users on one machine, each in a terminal of its own.
+Without a remote, the teammate clones the first user's scratch repository, and the two meet
+through cards and tickets. Pairing codes need a shared remote. Set `MAHI_TRY_REMOTE` to an SSH
+URL, such as `git@github.com:<you>/mahi-test.git`, before the first run of each recipe. The
+first user then pushes over SSH, and the teammate pushes over HTTPS with the token that
+`gh auth token` prints.
 
 CI (`.github/workflows/checks.yml`) runs `just fmt-check`, `just clippy`,
 `just test --profile ci` with `just test-git --profile ci`, `just deny` and `just shellcheck`

@@ -51,7 +51,7 @@ deny:
 
 # Check every shell script: the ones in scripts/ and the .deb's maintainer scripts
 shellcheck:
-    shellcheck scripts/*.sh packaging/deb/postinst packaging/deb/postrm packaging/deb/prerm
+    shellcheck -x scripts/*.sh packaging/deb/postinst packaging/deb/postrm packaging/deb/prerm
 
 build:
     cargo build --workspace --locked
@@ -59,14 +59,19 @@ build:
 run *args:
     cargo run --locked -p mahi -- {{args}}
 
-# Build mahi and run it in a scratch git repository with its own config and data, kept until try-reset
+# Build mahi and run it in a scratch git repository with its own config and data, kept until try-reset; MAHI_TRY_REMOTE names a shared git remote
 [positional-arguments]
 try *args:
     @scripts/try.sh "$@"
 
-# Remove the scratch repository, config and data that try uses
+# Run mahi as a second user, bob, with a key, config, data and clone of its own, to try mahi with two terminals
+[positional-arguments]
+try-teammate *args:
+    @scripts/try-teammate.sh "$@"
+
+# Remove the scratch repositories, config and data that try and try-teammate use
 try-reset:
-    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/mahi-try"
+    @scripts/try-reset.sh
 
 [positional-arguments]
 sweep max_gib="40":
