@@ -277,7 +277,9 @@ impl Store {
         writer.write_message(MessageKind::Flush)?;
         let (raw, mut reader) = writer.into_parts();
         let only_deletes = commands.iter().all(|(_, _, new)| new.is_null());
-        if !only_deletes {
+        if only_deletes {
+            drop(raw);
+        } else {
             let mut raw = BufWriter::with_capacity(PACK_BUFFER_BYTES, raw);
             self.write_pack(objects, &mut raw, interrupt)?;
             raw.flush()?;

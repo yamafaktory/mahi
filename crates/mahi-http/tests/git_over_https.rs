@@ -20,7 +20,10 @@ mod tests {
         sync::{
             Arc,
             atomic::AtomicBool,
+            mpsc,
         },
+        thread,
+        time::Duration,
     };
 
     use mahi_core::{
@@ -215,5 +218,41 @@ mod tests {
         );
         assert!(budget.exceeded());
         assert!(starved.fetched_refs(thread).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pairing_ref_is_pushed_and_deleted_over_https() {
+        let dir = tempfile::tempdir().unwrap();
+        let root: PathBuf = dir.path().to_path_buf();
+        let remote = root.join("remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]);
+        git(&remote, &["config", "http.receivepack", "true"]);
+        let projects = root.clone();
+        let backend = server(Arc::new(move |request: &Request| {
+            http_backend(&projects, request)
+        }));
+        let url =
+            HttpsRemote::parse(&format!("https://localhost:{}/remote.git", backend.port)).unwrap();
+        let owner = store_at(&root.join("owner"));
+        let commit = owner.write_pairing(b"node relay").unwrap();
+        let never = AtomicBool::new(false);
+        let transport = || connect(&url, &access(Some("secret"))).unwrap();
+        assert_eq!(
+            owner
+                .push_pairing(transport(), 412, commit, &never)
+                .unwrap(),
+            Pushed::Updated
+        );
+        let (sent, deleted) = mpsc::channel();
+        let deleting = transport();
+        thread::spawn(move || {
+            let _ = sent.send(owner.delete_pairing(deleting, 412, commit, &AtomicBool::new(false)));
+        });
+        let deleted = deleted
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the delete answers");
+        assert_eq!(deleted.unwrap(), Pushed::Updated);
+        assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
     }
 }
