@@ -1399,10 +1399,13 @@ cat parser.rs
     #[test]
     fn the_pairing_code_a_teammate_types_on_the_home_screen_shows_as_typed() {
         let fixture = fixture();
+        save_identity(&fixture);
+        let passphrase = format!("{PASSPHRASE}\r");
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("MAHI_LIVE", "local"),
             &[
                 ("Threads", b"c"),
+                ("Passphrase for your mahi key", passphrase.as_bytes()),
                 ("Pairing code", b"412-merit-intention"),
                 ("412-merit-intention", b"\x1b"),
                 ("mahi join", b"q"),
@@ -6027,9 +6030,10 @@ exit 3
             thread: String,
             owner: Driven,
             joiner: Driven,
+            _running: Option<Driven>,
         }
 
-        fn pair_until_asked(fixture: &Fixture) -> Pairing {
+        fn pair_until_asked(fixture: &Fixture, from_home: bool) -> Pairing {
             let (thread, _claude) = worked_thread(fixture);
             let (server, remote) = serve_remote(fixture);
             let bob = teammate(fixture, "bob");
@@ -6063,6 +6067,8 @@ exit 3
                 ("USER", OsStr::new("tester")),
                 ("MAHI_LIVE", OsStr::new("local")),
             ];
+            let running =
+                from_home.then(|| run_thread(fixture, &thread, &owner_config, &owner_env));
             let owner = Driven::start(mahi_in_terminal(
                 &fixture.repo,
                 &["invite", &thread],
@@ -6085,20 +6091,93 @@ exit 3
                 ("USER", OsStr::new("bob")),
                 ("MAHI_LIVE", OsStr::new("local")),
             ];
-            let mut joiner = Driven::start(mahi_in_terminal(&bob.repo, &["join"], &bob_env));
-            joiner.wait_for("Pairing code: ");
+            let mut joiner = if from_home {
+                let mut home = Driven::start(mahi_in_terminal(&bob.repo, &[], &bob_env));
+                home.wait_for("Threads");
+                home.terminal.write_all(b"c").unwrap();
+                home.wait_for("Passphrase for your mahi key");
+                home.type_line(PASSPHRASE);
+                home.wait_for("Pairing code");
+                home
+            } else {
+                let joiner = Driven::start(mahi_in_terminal(&bob.repo, &["join"], &bob_env));
+                joiner.wait_for("Pairing code: ");
+                joiner
+            };
             joiner.type_line(&code);
             joiner.wait_for("The code matched");
             let asked = owner.wait_for("[y/N]");
             assert!(asked.contains("Add bob (SHA256:"), "{asked}");
-            assert!(!joiner.text().contains(&code), "{}", joiner.text());
+            if !from_home {
+                assert!(!joiner.text().contains(&code), "{}", joiner.text());
+            }
             Pairing {
                 _server: server,
                 remote,
                 thread,
                 owner,
                 joiner,
+                _running: running,
             }
+        }
+
+        #[test]
+        fn a_teammate_who_joins_from_the_home_screen_lands_in_a_tab_on_the_thread() {
+            let fixture = fixture();
+            let mut pairing = pair_until_asked(&fixture, true);
+            pairing.owner.type_line("y");
+            pairing.owner.wait_for("Passphrase");
+            pairing.owner.type_line(PASSPHRASE);
+            assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
+
+            assert!(bob_listed(&fixture, &pairing.thread));
+            let short: String = pairing.thread.chars().take(8).collect();
+            pairing.joiner.wait_for(&format!("⌂ threads   {short}"));
+            pairing.joiner.wait_for("tester's");
+            let screen = {
+                let mut parser = vt100::Parser::new(24, 200, 0);
+                parser.process(pairing.joiner.text().as_bytes());
+                parser.screen().contents()
+            };
+            let top = screen.lines().next().unwrap_or_default();
+            assert!(top.contains(&format!("⌂ threads   {short}")), "{screen}");
+            assert!(!screen.contains("Threads ·"), "{screen}");
+            pairing.joiner.terminal.write_all(b"\x00").unwrap();
+            pairing.joiner.wait_for("Leave this tab");
+            pairing.joiner.terminal.write_all(b"q").unwrap();
+            assert_eq!(pairing.joiner.exit_code(), 0, "{}", pairing.joiner.text());
+        }
+
+        /// Resumes `thread` with an agent that waits, so its host serves the thread, and waits
+        /// until the host published where it is reached.
+        fn run_thread(
+            fixture: &Fixture,
+            thread: &str,
+            config: &Path,
+            env: &[(&str, &OsStr)],
+        ) -> Driven {
+            let mut running = Driven::start(mahi_in_terminal(
+                &fixture.repo,
+                &[
+                    "resume",
+                    thread,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "echo agent-ready; sleep 120",
+                ],
+                env,
+            ));
+            running.wait_for("Passphrase");
+            running.type_line(PASSPHRASE);
+            running.wait_for("agent-ready");
+            let live = config.join("mahi/live").join(thread);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !live.exists() {
+                assert!(Instant::now() < deadline, "{}", running.text());
+                thread::sleep(Duration::from_millis(50));
+            }
+            running
         }
 
         fn bob_listed(fixture: &Fixture, thread: &str) -> bool {
@@ -6113,7 +6192,7 @@ exit 3
         #[test]
         fn a_teammate_who_types_the_pairing_code_is_added_and_nothing_is_left_on_the_remote() {
             let fixture = fixture();
-            let mut pairing = pair_until_asked(&fixture);
+            let mut pairing = pair_until_asked(&fixture, false);
             pairing.owner.type_line("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
@@ -6138,7 +6217,7 @@ exit 3
         #[test]
         fn a_teammate_the_owner_does_not_add_is_told_and_nothing_is_left_on_the_remote() {
             let fixture = fixture();
-            let mut pairing = pair_until_asked(&fixture);
+            let mut pairing = pair_until_asked(&fixture, false);
             pairing.owner.type_line("n");
             assert_eq!(pairing.owner.exit_code(), 1, "{}", pairing.owner.text());
             assert!(pairing.owner.text().contains("you did not add bob"));

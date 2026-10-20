@@ -399,9 +399,16 @@ struct Tab {
     agents: Vec<Running>,
     selected: usize,
     watching: Option<AgentSlot>,
+    watch_only: bool,
 }
 
 impl Tab {
+    /// Returns whether the tab has nothing left to show: none of the user's agents, and it
+    /// does not only watch the thread's teammates.
+    fn is_done(&self) -> bool {
+        self.agents.is_empty() && !self.watch_only
+    }
+
     /// Returns the agents the list shows: the user's own, then the teammates' the workspace
     /// watches, from `teammates`.
     fn listed<'a>(&'a self, teammates: Option<&'a Teammates>) -> Vec<WorkspaceAgent<'a>> {
@@ -454,6 +461,9 @@ impl Tab {
 
     fn reselect(&mut self, teammates: Option<&Teammates>) {
         let Some(slot) = &self.watching else {
+            if self.agents.is_empty() {
+                self.select(0, teammates);
+            }
             return;
         };
         let place = teammates
@@ -546,6 +556,7 @@ enum Entry {
     AgentPalette,
     SendKey,
     Act(ThreadChoice),
+    Leave,
     Quit,
 }
 
@@ -699,6 +710,7 @@ impl Workspace {
             agents: Vec::new(),
             selected: 0,
             watching: None,
+            watch_only: false,
         });
         self.tabs.len() - 1
     }
@@ -824,40 +836,89 @@ impl Workspace {
                 tab.reselect(teammates_of(self.live.as_ref(), tab.thread));
             }
         }
-        if self.tabs.iter().any(|tab| tab.agents.is_empty()) {
-            let selected = self
-                .selected
-                .checked_sub(1)
-                .filter(|&index| {
-                    self.tabs
-                        .get(index)
-                        .is_some_and(|tab| !tab.agents.is_empty())
-                })
-                .map_or(0, |index| {
-                    1 + self
-                        .tabs
-                        .iter()
-                        .take(index)
-                        .filter(|tab| !tab.agents.is_empty())
-                        .count()
-                });
-            for tab in self.tabs.iter().filter(|tab| tab.agents.is_empty()) {
-                let still_open = |thread| {
-                    self.tabs
-                        .iter()
-                        .any(|other| !other.agents.is_empty() && other.thread == Some(thread))
-                };
-                if let (Some(thread), Some(live)) = (tab.thread, self.live.as_mut())
-                    && !still_open(thread)
-                {
-                    live.release(thread);
-                }
-            }
-            self.tabs.retain(|tab| !tab.agents.is_empty());
-            self.selected = selected;
-            self.palette = None;
-        }
+        changed |= self.close_done_tabs();
         (told.or_else(|| self.live_told.take()), changed)
+    }
+
+    /// Closes the tabs left with nothing to show, keeping the one shown when it stays, and
+    /// stops hosting the threads no tab is left open on; returns whether any closed.
+    fn close_done_tabs(&mut self) -> bool {
+        if !self.tabs.iter().any(Tab::is_done) {
+            return false;
+        }
+        let selected = self
+            .selected
+            .checked_sub(1)
+            .filter(|&index| self.tabs.get(index).is_some_and(|tab| !tab.is_done()))
+            .map_or(0, |index| {
+                1 + self
+                    .tabs
+                    .iter()
+                    .take(index)
+                    .filter(|tab| !tab.is_done())
+                    .count()
+            });
+        for tab in self.tabs.iter().filter(|tab| tab.is_done()) {
+            let still_open = |thread| {
+                self.tabs
+                    .iter()
+                    .any(|other| !other.is_done() && other.thread == Some(thread))
+            };
+            if let (Some(thread), Some(live)) = (tab.thread, self.live.as_mut())
+                && !still_open(thread)
+            {
+                live.release(thread);
+            }
+        }
+        self.tabs.retain(|tab| !tab.is_done());
+        self.selected = selected;
+        self.palette = None;
+        true
+    }
+
+    /// Opens a tab that watches the teammates' agents of `thread`, which the user joined, and
+    /// shows it; a tab already open on the thread is shown instead.
+    pub(crate) fn watch_thread(&mut self, thread: ThreadId) {
+        let open = self.tabs.iter().position(|tab| tab.thread == Some(thread));
+        let index = open.unwrap_or_else(|| {
+            let mut title = thread.to_string();
+            title.truncate(SHORT_THREAD);
+            self.add_tab(&title)
+        });
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.thread = Some(thread);
+            tab.watch_only = true;
+        }
+        self.selected = index + 1;
+        self.palette = None;
+        self.host(thread);
+    }
+
+    /// Closes the tabs that only watch the teammates of `thread`, before it ends or goes, so
+    /// the workspace no longer hosts it.
+    pub(crate) fn leave_thread(&mut self, thread: ThreadId) {
+        let mut left = false;
+        for tab in &mut self.tabs {
+            if tab.thread == Some(thread) && tab.agents.is_empty() {
+                tab.watch_only = false;
+                left = true;
+            }
+        }
+        if left {
+            self.close_done_tabs();
+        }
+    }
+
+    /// Closes the shown tab when it only watches teammates, and shows the thread list.
+    fn leave_tab(&mut self) {
+        let shown = self.selected.checked_sub(1);
+        if let Some(tab) = shown.and_then(|index| self.tabs.get_mut(index))
+            && tab.agents.is_empty()
+        {
+            tab.watch_only = false;
+            self.selected = 0;
+            self.close_done_tabs();
+        }
     }
 
     /// Writes into `out` what puts the user's terminal in the key modes of the agent shown
@@ -1340,6 +1401,9 @@ impl Workspace {
                 add(label.to_owned(), String::new(), Entry::Act(choice));
             }
         }
+        if shown.is_some_and(|tab| tab.watch_only && tab.agents.is_empty()) {
+            add("Leave this tab".to_owned(), String::new(), Entry::Leave);
+        }
         add("Quit mahi".to_owned(), "q".to_owned(), Entry::Quit);
         let title = shown.map_or("threads", |tab| tab.title.as_str());
         self.palette = Some(Palette {
@@ -1397,6 +1461,7 @@ impl Workspace {
                     self.chosen = self.shown_thread().map(|thread| Moved::Act(choice, thread));
                 }
                 Some(Entry::Quit) => self.chosen = Some(Moved::Quit),
+                Some(Entry::Leave) => self.leave_tab(),
                 Some(Entry::AgentPalette | Entry::SendKey) | None => {}
             }
         }
@@ -1822,6 +1887,7 @@ mod tests {
             agents,
             selected: 0,
             watching: None,
+            watch_only: false,
         }
     }
 
@@ -2073,6 +2139,42 @@ mod tests {
         workspace.selected = 0;
         let shown = drawn(&mut workspace);
         assert!(!shown.contains("(shown)"), "{shown}");
+    }
+
+    #[test]
+    fn a_tab_that_watches_a_joined_thread_stays_until_the_user_leaves_it() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        workspace.watch_thread(thread);
+        assert_eq!(workspace.selected, 1);
+        assert_eq!(workspace.tabs[0].title, "01234567");
+        let _ = workspace.take_ended();
+        assert_eq!(workspace.tabs.len(), 1);
+        workspace.watch_thread(thread);
+        assert_eq!(workspace.tabs.len(), 1);
+        let mut threads = Vec::new();
+        workspace.type_keys(b"\x00", &mut threads);
+        let entries = &workspace.palette.as_ref().unwrap().entries;
+        let leave = entries
+            .iter()
+            .position(|entry| *entry == Entry::Leave)
+            .unwrap();
+        let moves = b"\x1b[B".repeat(leave);
+        workspace.type_keys(&[moves, b"\r".to_vec()].concat(), &mut threads);
+        assert!(workspace.tabs.is_empty());
+        assert_eq!(workspace.selected, 0);
+        let agent = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("01234567", vec![agent]));
+        workspace.tabs[0].thread = Some(thread);
+        workspace.watch_thread(thread);
+        assert_eq!(workspace.tabs.len(), 1);
+        assert!(workspace.tabs[0].watch_only);
+        workspace.tabs[0].agents.clear();
+        workspace.leave_thread(thread);
+        assert!(workspace.tabs.is_empty());
     }
 
     #[test]

@@ -10,7 +10,10 @@ use std::{
         fd::AsFd as _,
         unix::net::UnixStream,
     },
-    path::Path,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::{
         Arc,
         Mutex,
@@ -484,19 +487,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
         .ticket
         .clone()
         .map_or_else(|| pair::join_by_code(environment).map_err(Box::new), Ok)?;
-    let cwd = env::current_dir()
-        .and_then(fs::canonicalize)
-        .map_err(JoinError::CurrentDirectory)?;
-    let config = ConfigDir::resolve(
-        environment.home.as_deref(),
-        environment.xdg_config_home.as_deref(),
-    )?;
-    let node_key = NodeKey::load(&config.node_key_file()).map_err(JoinError::NotInitialised)?;
-    let own = NodeId::from_bytes(node_key.public())
-        .map_err(|_| JoinError::NotInitialised(IdentityError::Malformed))?;
-    if ticket.invitee() != &own {
-        return Err(JoinError::NotForThisNode(own));
-    }
+    let (cwd, config, node_key, own) = invitee(ticket, environment)?;
     let signer = match command.agent() {
         Some(_) => {
             let signing =
@@ -509,9 +500,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
         None => None,
     };
     let store = Store::discover(&cwd)?;
-    let peers = Arc::new(JoinPeers(Mutex::new(HashSet::from([*ticket
-        .host()
-        .node()]))));
+    let peers = host_peers(ticket);
     let node = LiveNode::bind_live(
         node_key.secret(),
         relays,
@@ -574,6 +563,48 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     let watched = watch(&node, ticket, &meta, &node_key, &config, own);
     let _ = node.close();
     watched.map(|()| Outcome::Exited(0))
+}
+
+/// Accepts `ticket` in the repository around the current directory as `mahi join` does,
+/// recording the thread's `meta`, its owner and its host, without watching it or running an
+/// agent; returns the thread.
+pub(crate) fn record(ticket: &Ticket, environment: &Environment) -> Result<ThreadId, JoinError> {
+    let relays = relays_for(environment.live)?;
+    let (cwd, _, node_key, own) = invitee(ticket, environment)?;
+    let store = Store::discover(&cwd)?;
+    let node = LiveNode::bind_live(node_key.secret(), relays, host_peers(ticket))?;
+    let joined = joined_meta(&node, ticket, &store, own);
+    let _ = node.close();
+    joined.map(|_| ticket.thread())
+}
+
+/// Returns the current directory, the configuration, the node key and the node id of the
+/// user `ticket` must have been made for, or why it was not.
+fn invitee(
+    ticket: &Ticket,
+    environment: &Environment,
+) -> Result<(PathBuf, ConfigDir, NodeKey, NodeId), JoinError> {
+    let cwd = env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(JoinError::CurrentDirectory)?;
+    let config = ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )?;
+    let node_key = NodeKey::load(&config.node_key_file()).map_err(JoinError::NotInitialised)?;
+    let own = NodeId::from_bytes(node_key.public())
+        .map_err(|_| JoinError::NotInitialised(IdentityError::Malformed))?;
+    if ticket.invitee() != &own {
+        return Err(JoinError::NotForThisNode(own));
+    }
+    Ok((cwd, config, node_key, own))
+}
+
+/// Returns the peers a joining node admits at first: only the ticket's host.
+fn host_peers(ticket: &Ticket) -> Arc<JoinPeers> {
+    Arc::new(JoinPeers(Mutex::new(HashSet::from([*ticket
+        .host()
+        .node()]))))
 }
 
 /// Checks that this node's participant is listed with `signing_key`, when the user's agent will

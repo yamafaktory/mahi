@@ -27,6 +27,7 @@ use mahi_identity::{
     ConfigDir,
     CredentialName,
     CredentialNameError,
+    LocalIdentity,
     credential_names,
 };
 use mahi_sandbox::{
@@ -62,6 +63,8 @@ use crate::{
         LiveMode,
     },
     init,
+    join,
+    pair,
     profile::Profile,
     prompt::{
         Prompt,
@@ -153,6 +156,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
         .unwrap_or_default();
     let mut workspace = Workspace::new(palette_key, crate::run::notice(environment));
     workspace.host_with(workspace_live(environment, config.as_ref(), &store));
+    let identity_file = config.as_ref().map(ConfigDir::identity_file);
     let outcome = loop {
         let own = threads::own_key(environment);
         let place = Place {
@@ -169,7 +173,6 @@ pub(crate) fn home(environment: &Environment) -> i32 {
             Ok(Chosen::Quit | Chosen::InputEnded) => break Ok(()),
             Ok(Chosen::Stopped(signal)) => break Err(Ended::Stopped(signal)),
             Ok(Chosen::Action(action)) if runs_agent(&action) => {
-                let identity_file = config.as_ref().map(ConfigDir::identity_file);
                 if let Err(told) = open_agent(
                     action,
                     &mut store,
@@ -653,6 +656,55 @@ fn stop_to_quit(workspace: &Workspace) -> bool {
     matches!(confirmed, Ok(Answer::Confirmed(true)))
 }
 
+/// Unlocks the user's mahi key from `file`, asking for its passphrase in a dialog unless the
+/// home screen keeps it; returns what to tell the user when it is not unlocked.
+fn unlock_key(file: &Path) -> Result<LocalIdentity, String> {
+    unlocked::identity(
+        file,
+        || {
+            TerminalPrompt::open()
+                .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
+                .map_err(|error| match error.kind() {
+                    io::ErrorKind::Interrupted => String::new(),
+                    _ => format!("the passphrase cannot be asked: {error}"),
+                })
+        },
+        |error| format!("the mahi key cannot be unlocked: {error}"),
+    )
+}
+
+/// Pairs with the teammate whose code the user types, records the thread they add the user
+/// to, and opens it in a tab that watches its agents, with the mahi key unlocked to host it;
+/// returns what to tell the user when it does not.
+fn join_in_tab(
+    environment: &Environment,
+    workspace: &mut Workspace,
+    identity_file: Option<&Path>,
+) -> Result<(), String> {
+    const SHOWN: &str = "mahi join";
+    eprintln!("› {SHOWN}");
+    let busy = ui::Busy::start();
+    let joined = init::set_up_if_needed(environment, TerminalPrompt::open_interactive)
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+        .and_then(|()| match identity_file {
+            Some(file) => unlock_key(file).map(drop).map_err(Into::into),
+            None => Ok(()),
+        })
+        .and_then(|()| pair::join_by_code(environment).map_err(Into::into))
+        .and_then(|ticket| join::record(&ticket, environment).map_err(Into::into));
+    drop(busy);
+    ui::keys_make_signals(false);
+    let thread = match joined {
+        Ok(thread) => thread,
+        Err(error) => {
+            crate::report(&*error);
+            return Err(format!("{SHOWN} failed"));
+        }
+    };
+    workspace.watch_thread(thread);
+    Ok(())
+}
+
 /// Before an action that ends or purges a thread whose agents run in the workspace's tabs,
 /// asks whether to stop them, and stops them as quitting does; returns what to tell the user
 /// when the action does not go on.
@@ -665,6 +717,7 @@ fn stop_thread_first(action: &HomeAction, workspace: &mut Workspace) -> Result<(
     let Ok(thread) = thread.parse::<ThreadId>() else {
         return Ok(());
     };
+    workspace.leave_thread(thread);
     let count = workspace.running_in(thread);
     if count == 0 {
         return Ok(());
@@ -713,11 +766,16 @@ fn stop_agents(workspace: &mut Workspace) {
     }
 }
 
-/// Returns whether the action runs an agent, which the workspace runs in a thread's tab.
+/// Returns whether the action opens a thread's tab in the workspace: one that runs an agent,
+/// or a join, whose tab watches the owner's agents.
 fn runs_agent(action: &HomeAction) -> bool {
     matches!(
         action,
-        HomeAction::New | HomeAction::Resume(_) | HomeAction::AddAgent(_) | HomeAction::Handoff(_)
+        HomeAction::New
+            | HomeAction::Resume(_)
+            | HomeAction::AddAgent(_)
+            | HomeAction::Handoff(_)
+            | HomeAction::Join
     )
 }
 
@@ -741,7 +799,11 @@ fn open_agent(
     workspace: &mut Workspace,
     identity_file: Option<&Path>,
 ) -> Result<(), String> {
-    let started = start_agent(action, store, environment, workspace, identity_file);
+    let started = if action == HomeAction::Join {
+        join_in_tab(environment, workspace, identity_file)
+    } else {
+        start_agent(action, store, environment, workspace, identity_file)
+    };
     if started.as_ref().is_err_and(|told| !told.is_empty()) {
         workspace.show_threads();
     }
@@ -782,18 +844,7 @@ fn start_agent(
         })?;
     }
     let key = match identity_file {
-        Some(file) if needs_key => Some(unlocked::identity(
-            file,
-            || {
-                TerminalPrompt::open()
-                    .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
-                    .map_err(|error| match error.kind() {
-                        io::ErrorKind::Interrupted => String::new(),
-                        _ => format!("the passphrase cannot be asked: {error}"),
-                    })
-            },
-            |error| format!("the mahi key cannot be unlocked: {error}"),
-        )?),
+        Some(file) if needs_key => Some(unlock_key(file)?),
         Some(file) => unlocked::current(file),
         None => None,
     };
