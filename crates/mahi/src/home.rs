@@ -303,6 +303,7 @@ fn choose(
     let mut passed = Vec::new();
     let mut for_threads = Vec::with_capacity(MAX_READ);
     loop {
+        give_mouse(workspace, home, size);
         dirty |= follow_children(workspace, status, &mut passed)?;
         if read_at.elapsed() >= REREAD {
             let fresh = self::rows(place.store, place.own);
@@ -381,6 +382,15 @@ fn choose(
             }
             None => {}
         }
+    }
+}
+
+/// Leaves the mouse to the terminal while the home screen shows a dialog, and takes it back
+/// for the tabs after a dialog of an action left it, on a terminal of `size`.
+fn give_mouse(workspace: &mut Workspace, home: &Home, size: WindowSize) {
+    workspace.pause_mouse(home.has_dialog() && workspace.shows_threads());
+    if ui::mouse_was_left() {
+        workspace.set_screen(size, true);
     }
 }
 

@@ -87,7 +87,7 @@ use crate::{
 const READ_CHUNK: usize = 16 * 1024;
 const STOP_POLL: Duration = Duration::from_millis(20);
 const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h";
-const MOUSE_OFF: &[u8] = b"\x1b[?1002l\x1b[?1006l";
+pub(crate) const MOUSE_OFF: &[u8] = b"\x1b[?1002l\x1b[?1006l";
 const QUEUED_WRITES: usize = 64;
 const TERMINAL_OWN: [&str; 6] = [
     "KITTY_WINDOW_ID",
@@ -376,6 +376,7 @@ pub(crate) struct Workspace {
 #[derive(Debug, Default)]
 struct MouseState {
     on: bool,
+    paused: bool,
     dragging: bool,
     carried: Vec<u8>,
     joined: Vec<u8>,
@@ -864,7 +865,7 @@ impl Workspace {
     pub(crate) fn apply_shown(&mut self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.pending);
         self.pending.clear();
-        let wanted = self.has_tabs();
+        let wanted = self.has_tabs() && !self.mouse.paused;
         if wanted != self.mouse.on {
             out.extend_from_slice(if wanted { MOUSE_ON } else { MOUSE_OFF });
             self.mouse.on = wanted;
@@ -1001,7 +1002,17 @@ impl Workspace {
         self.screen = size;
         if reset {
             self.mouse.on = false;
+            self.mouse.dragging = false;
         }
+    }
+
+    /// Leaves the mouse to the terminal while `paused`, so a dialog's text can be selected,
+    /// and takes it back for the tabs once it is not.
+    pub(crate) fn pause_mouse(&mut self, paused: bool) {
+        if paused {
+            self.mouse.dragging = false;
+        }
+        self.mouse.paused = paused;
     }
 
     /// Gives every agent's terminal `size`.

@@ -90,6 +90,7 @@ static NOTICE: Mutex<Notice> = Mutex::new(Notice {
 static DRAWING: Mutex<()> = Mutex::new(());
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 static LEFT: AtomicBool = AtomicBool::new(false);
+static MOUSE_LEFT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 const CONTROL_DISABLED: u8 = 0xff;
 #[cfg(target_os = "linux")]
@@ -178,6 +179,7 @@ fn spin(stopped: &mpsc::Receiver<()>) {
             screen = None;
             seen = drawn;
         }
+        let _ = leave_mouse();
         if screen.is_none() {
             let size = terminal::size();
             screen = Terminal::new(backend(size.rows, size.cols)).ok();
@@ -713,10 +715,28 @@ fn show(dialog: &Dialog) -> io::Result<()> {
         return Ok(());
     }
     DRAWN.fetch_add(1, Ordering::SeqCst);
+    leave_mouse()?;
     let size = terminal::size();
     let mut screen = Terminal::new(backend(size.rows, size.cols))?;
     screen.clear()?;
     draw_over_backdrop(&mut screen, dialog)
+}
+
+/// Leaves the mouse to the terminal while a dialog shows, so its text can be selected, and
+/// remembers it for the full-screen view, which takes the mouse back.
+fn leave_mouse() -> io::Result<()> {
+    if !MOUSE_LEFT.swap(true, Ordering::SeqCst) {
+        let mut out = io::stdout().lock();
+        out.write_all(crate::workspace::MOUSE_OFF)?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// Returns whether a dialog left the mouse to the terminal since the last call, so the
+/// full-screen view takes it back.
+pub(crate) fn mouse_was_left() -> bool {
+    MOUSE_LEFT.swap(false, Ordering::SeqCst)
 }
 
 /// Draws `dialog` over the full-screen view's last frame, or over a line that says mahi works

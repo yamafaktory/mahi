@@ -1489,6 +1489,66 @@ cat parser.rs
     }
 
     #[test]
+    fn the_mouse_is_left_to_the_terminal_while_a_dialog_shows() {
+        const MOUSE_ON: &str = "\x1b[?1002h\x1b[?1006h";
+        const MOUSE_OFF: &str = "\x1b[?1002l\x1b[?1006l";
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "mouse-agents", "claude", agent);
+        script(&fixture, "mouse-agents", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("agent-ready", b"\x000"),
+                ("Threads · 1", b"?"),
+                ("what it does", b"\x001"),
+                ("Ctrl-Space palette", b"\x000"),
+                ("what it does", b"\r"),
+                ("Threads · 1", b"q"),
+                ("stop it and quit?", b"n"),
+                ("the agents keep running", b"q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        let mut ends = Vec::new();
+        let mut end = 0;
+        for chunk in output.as_bytes().chunks(16) {
+            parser.process(chunk);
+            end += chunk.len();
+            ends.push((end, parser.screen().contents()));
+        }
+        let mouse_when = |shows: &dyn Fn(&str) -> bool, after: usize| {
+            let (end, _) = ends
+                .iter()
+                .find(|(end, screen)| *end > after && shows(screen))
+                .unwrap();
+            let on = output.as_bytes()[..*end]
+                .windows(MOUSE_ON.len())
+                .rposition(|window| window == MOUSE_ON.as_bytes());
+            let off = output.as_bytes()[..*end]
+                .windows(MOUSE_OFF.len())
+                .rposition(|window| window == MOUSE_OFF.as_bytes());
+            (*end, on > off)
+        };
+        let (help, on) = mouse_when(&|screen| screen.contains("what it does"), 0);
+        assert!(!on, "{output:?}");
+        let (_, on) = mouse_when(
+            &|screen| screen.contains("Ctrl-Space palette") && !screen.contains("what it does"),
+            help,
+        );
+        assert!(on, "{output:?}");
+        let (asked, on) = mouse_when(&|screen| screen.contains("stop it and quit?"), help);
+        assert!(!on, "{output:?}");
+        let (_, on) = mouse_when(&|screen| screen.contains("the agents keep running"), asked);
+        assert!(on, "{output:?}");
+    }
+
+    #[test]
     fn quitting_from_the_workspaces_palette_asks_on_a_screen_the_palette_left() {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
