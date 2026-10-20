@@ -209,6 +209,13 @@ impl Dialog {
         Self::with(title, lines, Kind::Notice)
     }
 
+    /// Puts `title` in place of the dialog's title, reusing its buffer, as a notice whose
+    /// spinner turns does every frame.
+    pub fn set_title(&mut self, title: &str) {
+        self.title.clear();
+        self.title.push_str(title);
+    }
+
     /// Makes a yes or no question, `no` selected first.
     #[must_use]
     pub fn confirm(title: &str, lines: Vec<String>) -> Self {
@@ -717,6 +724,22 @@ mod tests {
                     + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn a_retitled_notice_draws_its_new_title() {
+        let mut notice = Dialog::notice("mahi ⠋", vec!["working…".to_owned()]);
+        notice.set_title("mahi ⠙");
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buffer = Buffer::empty(area);
+        notice.render(area, &mut buffer);
+        let drawn: String = buffer
+            .content
+            .iter()
+            .map(ratatui_core::buffer::Cell::symbol)
+            .collect();
+        assert!(drawn.contains("mahi ⠙"), "{drawn}");
+        assert!(!drawn.contains("⠋"), "{drawn}");
     }
 
     #[test]

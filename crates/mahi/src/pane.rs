@@ -157,6 +157,7 @@ impl Pane {
         palette_key: Option<&str>,
         replies: mpsc::SyncSender<Vec<u8>>,
     ) -> io::Result<Self> {
+        ui::clear_notice();
         let size = crate::terminal::size();
         let (rows, columns) = AgentFrame::agent_size(size.rows, size.cols);
         let mut terminal = Terminal::new(ui::backend(size.rows, size.cols))?;

@@ -284,6 +284,7 @@ fn choose(
 ) -> io::Result<Chosen> {
     let signals = TerminationSignals::listen().map_err(io::Error::other)?;
     ui::keys_make_signals(false);
+    ui::clear_notice();
     let mut size = terminal::size();
     let mut terminal = Terminal::new(ui::backend(size.rows, size.cols))?;
     terminal.clear()?;
@@ -499,6 +500,7 @@ fn draw(
     status: &str,
     workspace: &Workspace,
 ) -> io::Result<()> {
+    ui::clear_notice();
     let drawn = terminal.draw(|frame| {
         let (top, body) = TopBar::split(frame.area());
         if !workspace.has_tabs() {
@@ -812,6 +814,7 @@ fn run_words(words: &[String], environment: &Environment) -> String {
         return format!("{shown} is not a command mahi knows");
     };
     eprintln!("› {shown}");
+    let busy = ui::Busy::start();
     let code = match command {
         Command::Purge(purge) => match crate::purge_unless_declined(&purge, environment) {
             Some(code) => code,
@@ -819,6 +822,7 @@ fn run_words(words: &[String], environment: &Environment) -> String {
         },
         command => run_command(command, environment),
     };
+    drop(busy);
     match code {
         0 => format!("{shown}: done"),
         code => format!("{shown} failed with exit code {code}"),

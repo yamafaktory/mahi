@@ -16,9 +16,13 @@ use std::{
             AtomicU64,
             Ordering,
         },
+        mpsc,
     },
     thread,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use age::secrecy::SecretString;
@@ -66,18 +70,203 @@ const ESC: u8 = 0x1b;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 const LEAVE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l";
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPIN_EVERY: Duration = Duration::from_millis(100);
+const SPIN_AFTER: Duration = Duration::from_millis(150);
+const WORKING: &str = "working…";
 
 static SHOWING: AtomicBool = AtomicBool::new(false);
 static TRUE_COLOR: AtomicBool = AtomicBool::new(true);
 static BACKDROP: Mutex<Option<Buffer>> = Mutex::new(None);
 static SAVED: Mutex<Option<Termios>> = Mutex::new(None);
 static SAVED_STDERR: Mutex<Option<OwnedFd>> = Mutex::new(None);
+static NOTICE: Mutex<Notice> = Mutex::new(Notice {
+    dialog: None,
+    asking: false,
+    busy_since: None,
+    spinner: None,
+});
+static DRAWING: Mutex<()> = Mutex::new(());
+static DRAWN: AtomicU64 = AtomicU64::new(0);
+static LEFT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 const CONTROL_DISABLED: u8 = 0xff;
 #[cfg(target_os = "linux")]
 const CONTROL_DISABLED: u8 = 0;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("mahi's full-screen views know the disabled control value of Linux and macOS only");
+
+/// The notice a dialog shows while a command works, whether a question hides it, since
+/// when a command that has shown nothing yet works, and the spinner that turns in the
+/// notice's title.
+struct Notice {
+    dialog: Option<Dialog>,
+    asking: bool,
+    busy_since: Option<Instant>,
+    spinner: Option<Spinner>,
+}
+
+/// The thread that turns the spinner, and the sender whose drop stops it.
+struct Spinner {
+    done: mpsc::Sender<()>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl Spinner {
+    fn start() -> Option<Self> {
+        let (done, stopped) = mpsc::channel::<()>();
+        let thread = thread::Builder::new()
+            .name("spinner".to_owned())
+            .spawn(move || spin(&stopped))
+            .ok()?;
+        Some(Self { done, thread })
+    }
+
+    fn stop(self) {
+        drop(self.done);
+        let _ = self.thread.join();
+    }
+}
+
+/// Turns the spinner every `SPIN_EVERY` until `stopped` ends: shows that mahi is working once
+/// a busy command has shown nothing for `SPIN_AFTER`, and redraws the notice with the next
+/// frame in its title, through one terminal so only what changed is sent.
+fn spin(stopped: &mpsc::Receiver<()>) {
+    let mut screen: Option<Terminal<AnsiBackend<io::Stdout>>> = None;
+    let mut seen = DRAWN.load(Ordering::SeqCst);
+    let mut title = String::new();
+    for tick in 1.. {
+        if !matches!(
+            stopped.recv_timeout(SPIN_EVERY),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            return;
+        }
+        let Ok(mut notice) = NOTICE.lock() else {
+            return;
+        };
+        if notice.asking {
+            continue;
+        }
+        if notice.dialog.is_none()
+            && notice
+                .busy_since
+                .is_some_and(|since| since.elapsed() >= SPIN_AFTER)
+        {
+            notice.dialog = Some(Dialog::notice("mahi", vec![WORKING.to_owned()]));
+        }
+        let Some(dialog) = notice.dialog.as_mut() else {
+            continue;
+        };
+        title.clear();
+        spinner_title(tick, &mut title);
+        dialog.set_title(&title);
+        let Ok(_drawing) = DRAWING.lock() else {
+            return;
+        };
+        if !is_showing() || LEFT.load(Ordering::SeqCst) {
+            return;
+        }
+        let drawn = DRAWN.load(Ordering::SeqCst);
+        if drawn != seen {
+            screen = None;
+            seen = drawn;
+        }
+        if screen.is_none() {
+            let size = terminal::size();
+            screen = Terminal::new(backend(size.rows, size.cols)).ok();
+        }
+        if let Some(screen) = screen.as_mut() {
+            let _ = draw_over_backdrop(screen, dialog);
+        }
+    }
+}
+
+/// While it lives and a full-screen view owns the terminal, a command that shows nothing of
+/// its own for `SPIN_AFTER` gets a notice that says mahi is working, and every notice goes
+/// when the command ends.
+#[derive(Debug)]
+pub(crate) struct Busy {
+    started: bool,
+}
+
+impl Busy {
+    pub(crate) fn start() -> Self {
+        if !is_showing() {
+            return Self { started: false };
+        }
+        if let Ok(mut notice) = NOTICE.lock() {
+            notice.busy_since = Some(Instant::now());
+            if notice.spinner.is_none() {
+                notice.spinner = Spinner::start();
+            }
+        }
+        Self { started: true }
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        if self.started {
+            clear_notice();
+        }
+    }
+}
+
+fn spinner_title(tick: usize, title: &mut String) {
+    title.push_str("mahi ");
+    title.push_str(
+        SPINNER
+            .get(tick % SPINNER.len())
+            .copied()
+            .unwrap_or_default(),
+    );
+}
+
+/// Shows `lines` in a notice whose spinner turns until the next question or the next frame
+/// of the full-screen view, when one owns the terminal.
+pub(crate) fn show_notice(lines: Vec<String>) {
+    if !is_showing() {
+        return;
+    }
+    if let Ok(mut notice) = NOTICE.lock() {
+        let mut title = String::new();
+        spinner_title(0, &mut title);
+        let dialog = Dialog::notice(&title, lines);
+        if !notice.asking {
+            let _ = show(&dialog);
+        }
+        notice.dialog = Some(dialog);
+        if notice.spinner.is_none() {
+            notice.spinner = Spinner::start();
+        }
+    }
+}
+
+/// Shows that mahi is working, in place of what the notice said, when a full-screen view
+/// owns the terminal.
+pub(crate) fn show_working() {
+    show_notice(vec![WORKING.to_owned()]);
+}
+
+/// Takes the notice away, with a working notice still to come, and stops the spinner, before
+/// the full-screen view draws a frame or leaves the screen.
+pub(crate) fn clear_notice() {
+    let spinner = NOTICE.lock().ok().and_then(|mut notice| {
+        notice.dialog = None;
+        notice.busy_since = None;
+        notice.spinner.take()
+    });
+    if let Some(spinner) = spinner {
+        spinner.stop();
+    }
+}
+
+fn set_asking(asking: bool) {
+    if let Ok(mut notice) = NOTICE.lock() {
+        notice.asking = asking;
+    }
+}
 
 /// Keeps the full-screen view's last frame, which dialogs are drawn over.
 pub(crate) fn keep_backdrop(frame: &Buffer) {
@@ -161,6 +350,8 @@ fn listening_ended() {
 
 impl Drop for Showing {
     fn drop(&mut self) {
+        clear_notice();
+        let _drawing = DRAWING.lock();
         SHOWING.store(false, Ordering::SeqCst);
     }
 }
@@ -169,6 +360,8 @@ impl Drop for Showing {
 /// before the full-screen view, when mahi is about to die of a signal while the view owns it.
 pub(crate) fn before_dying() {
     crate::unlocked::forget();
+    let _drawing = DRAWING.lock();
+    LEFT.store(true, Ordering::SeqCst);
     if !is_showing() {
         return;
     }
@@ -272,7 +465,7 @@ impl std::fmt::Debug for DialogPrompt {
 impl DialogPrompt {
     pub(crate) fn say(&mut self, line: &str) {
         self.said.push(line.to_owned());
-        let _ = show(&Dialog::notice("mahi", self.said.clone()));
+        show_notice(self.said.clone());
     }
 
     pub(crate) fn secret(&mut self, question: &str) -> io::Result<SecretString> {
@@ -331,8 +524,10 @@ impl DialogPrompt {
         let signalling = keys_make_signals_now();
         keys_make_signals(false);
         let _ = rustix::termios::tcflush(io::stdin(), QueueSelector::IFlush);
+        set_asking(true);
         let answer = self.read_answer(&mut dialog);
-        let _ = show(&Dialog::notice("mahi", vec!["working…".to_owned()]));
+        set_asking(false);
+        show_working();
         keys_make_signals(signalling);
         answer
     }
@@ -484,20 +679,42 @@ fn clipboard_sequence(text: &str) -> Vec<u8> {
 
 /// Draws `dialog` over the full-screen view's last frame.
 fn show(dialog: &Dialog) -> io::Result<()> {
+    let Ok(_drawing) = DRAWING.lock() else {
+        return Ok(());
+    };
+    if !is_showing() {
+        return Ok(());
+    }
+    DRAWN.fetch_add(1, Ordering::SeqCst);
     let size = terminal::size();
     let mut screen = Terminal::new(backend(size.rows, size.cols))?;
     screen.clear()?;
+    draw_over_backdrop(&mut screen, dialog)
+}
+
+/// Draws `dialog` over the full-screen view's last frame, or over a line that says mahi works
+/// when the view kept none of this size.
+fn draw_over_backdrop(
+    screen: &mut Terminal<AnsiBackend<io::Stdout>>,
+    dialog: &Dialog,
+) -> io::Result<()> {
     screen.draw(|frame| {
         let area = frame.area();
-        let backdrop = BACKDROP.lock().ok().and_then(|kept| kept.clone());
-        match backdrop.filter(|kept| kept.area == area) {
-            Some(kept) => *frame.buffer_mut() = kept,
+        let kept = BACKDROP.lock();
+        match kept
+            .as_ref()
+            .ok()
+            .and_then(|kept| kept.as_ref())
+            .filter(|kept| kept.area == area)
+        {
+            Some(kept) => frame.buffer_mut().content.clone_from(&kept.content),
             None => Line::from(vec![
                 Span::styled(" mahi ", Theme::selected()),
                 Span::styled("  working", Style::new().fg(Theme::MUTED)),
             ])
             .render(area, frame.buffer_mut()),
         }
+        drop(kept);
         dialog.render(area, frame.buffer_mut());
     })?;
     Ok(())
@@ -608,6 +825,28 @@ fn collect(reader: OwnedFd, lines: &Mutex<Vec<String>>, generation: &AtomicU64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn title(tick: usize) -> String {
+        let mut title = String::new();
+        spinner_title(tick, &mut title);
+        title
+    }
+
+    #[test]
+    fn the_spinner_turns_through_its_frames_and_starts_again() {
+        assert_eq!(title(0), "mahi ⠋");
+        assert_eq!(title(1), "mahi ⠙");
+        assert_eq!(title(SPINNER.len()), title(0));
+        assert_ne!(title(3), title(4));
+    }
+
+    #[test]
+    fn nothing_spins_while_no_full_screen_view_shows() {
+        let busy = Busy::start();
+        assert!(!busy.started);
+        show_working();
+        assert!(NOTICE.lock().unwrap().spinner.is_none());
+    }
 
     #[test]
     fn only_a_terminal_that_says_so_draws_24_bit_colour() {

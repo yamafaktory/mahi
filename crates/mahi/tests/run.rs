@@ -1397,6 +1397,51 @@ cat parser.rs
     }
 
     #[test]
+    fn a_question_a_command_asks_at_once_stays_shown_while_it_waits() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let mut mahi = terminal_command(&fixture, &[]).spawn().unwrap();
+        let mut terminal = mahi.writer().unwrap();
+        let mut reader = mahi.reader().unwrap();
+        let mut seen = Vec::new();
+        read_until(&mut reader, &mut seen, &thread);
+        terminal.write_all(b"p").unwrap();
+        read_until(&mut reader, &mut seen, "Purge thread");
+        let output = Arc::new(Mutex::new(seen));
+        let collected = Arc::clone(&output);
+        thread::spawn(move || {
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                collected.lock().unwrap().extend_from_slice(&chunk[..read]);
+            }
+        });
+        thread::sleep(Duration::from_millis(600));
+        let screen = {
+            let mut parser = vt100::Parser::new(24, 200, 0);
+            parser.process(&output.lock().unwrap());
+            parser.screen().contents()
+        };
+        assert!(screen.contains("Purge thread"), "{screen}");
+        assert!(!screen.contains("working…"), "{screen}");
+        terminal.write_all(b"n").unwrap();
+        thread::sleep(Duration::from_millis(600));
+        terminal.write_all(b"q").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = mahi.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "mahi kept running");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(exit_code(status), 0);
+        assert!(!fixture.thread_worktrees().is_empty());
+    }
+
+    #[test]
     fn quitting_from_the_workspaces_palette_asks_on_a_screen_the_palette_left() {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
@@ -6046,6 +6091,45 @@ exit 3
             home.wait_for("Pairing code:");
             thread::sleep(Duration::from_secs(1));
             home.terminal.write_all(b"\x03").unwrap();
+            home.wait_for(&format!("mahi invite {thread} failed"));
+            home.terminal.write_all(b"q").unwrap();
+            assert_eq!(home.exit_code(), 0, "{}", home.text());
+            assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
+        }
+
+        #[test]
+        fn inviting_from_the_home_screen_spins_while_the_remote_answers() {
+            let fixture = fixture();
+            let (thread, _claude) = worked_thread(&fixture);
+            let (server, remote) = serve_remote(&fixture);
+            let forced = server.dir.path().join("forced.sh");
+            let script = fs::read_to_string(&forced).unwrap();
+            fs::write(&forced, script.replacen("\nexec ", "\nsleep 1\nexec ", 1)).unwrap();
+            let mut home = Driven::start(
+                terminal_command(&fixture, &[])
+                    .env("MAHI_LIVE", "local")
+                    .spawn()
+                    .unwrap(),
+            );
+            home.wait_for(&thread);
+            home.terminal.write_all(b"i").unwrap();
+            let before = home.wait_for("working…");
+            assert!(!before.contains("Pairing code:"), "{before}");
+            let spun = home.wait_for("⠙");
+            assert!(!spun.contains("Pairing code:"), "{spun}");
+            home.wait_for("Pairing code:");
+            home.terminal.write_all(b"\x03").unwrap();
+            let screen = || {
+                let mut parser = vt100::Parser::new(24, 200, 0);
+                parser.process(home.text().as_bytes());
+                parser.screen().contents()
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !screen().contains("working…") {
+                assert!(Instant::now() < deadline, "{}", home.text());
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!screen().contains("Pairing code:"), "{}", screen());
             home.wait_for(&format!("mahi invite {thread} failed"));
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());

@@ -207,6 +207,7 @@ pub(crate) fn invite_by_code(
                 drop(prompt);
                 owner_pairs(&listener, &code, deadline, (store, thread, inviter))
             });
+        crate::ui::show_working();
         unpublish(store, environment, slot, commit);
         paired.map(|name| {
             format!("added {name} to thread {thread}; they join with the ticket mahi sent them\n")
