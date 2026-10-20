@@ -406,6 +406,7 @@ fn follow_children(
     passed: &mut Vec<u8>,
 ) -> io::Result<bool> {
     let mut changed = workspace.take_output(passed);
+    changed |= workspace.forget_told();
     let (told, ended) = workspace.take_ended();
     if let Some(told) = told {
         *status = told;

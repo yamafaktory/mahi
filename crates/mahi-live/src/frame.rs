@@ -670,6 +670,7 @@ struct SenderState {
     epoch: [u8; EPOCH_BYTES],
     sequence: u64,
     anchored_with: [u8; CHALLENGE_BYTES],
+    stale: bool,
 }
 
 /// Checks and opens the frames one viewer or host receives, and keeps what replay protection
@@ -736,10 +737,24 @@ impl FrameReceiver {
     }
 
     /// Returns the run of `sender` this receiver follows, which a prompt for its agents
-    /// carries, or `None` before a screen of it anchored one.
+    /// carries, or `None` before a screen of it anchored one, and while frames of another run
+    /// of it come that no screen anchored yet, such as after its mahi restarted.
     #[must_use]
     pub fn run_of(&self, sender: &NodeId) -> Option<[u8; RUN_BYTES]> {
-        self.senders.get(sender).map(|state| state.epoch)
+        self.senders
+            .get(sender)
+            .filter(|state| !state.stale)
+            .map(|state| state.epoch)
+    }
+
+    /// Returns the node of `participant` and the run of it this receiver follows, which a
+    /// prompt for one of its agents goes to, or `None` before a screen of it anchored one.
+    #[must_use]
+    pub fn run_for(&self, participant: &ParticipantName) -> Option<(NodeId, [u8; RUN_BYTES])> {
+        self.participants
+            .iter()
+            .filter(|(_, name)| *name == participant)
+            .find_map(|(node, _)| self.run_of(node).map(|run| (*node, run)))
     }
 
     /// Replaces the participants, as a newer `meta` lists them; nodes no longer listed are
@@ -849,6 +864,7 @@ impl FrameReceiver {
             }
             if let Some(current) = self.senders.get_mut(&sender) {
                 current.sequence = plain.sequence;
+                current.stale = false;
             }
             return Ok(());
         }
@@ -864,11 +880,17 @@ impl FrameReceiver {
                         epoch: plain.epoch,
                         sequence: plain.sequence,
                         anchored_with: *challenge,
+                        stale: false,
                     },
                 );
                 Ok(())
             }
-            _ => Err(FrameError::Unanchored),
+            _ => {
+                if let Some(current) = self.senders.get_mut(&sender) {
+                    current.stale = true;
+                }
+                Err(FrameError::Unanchored)
+            }
         }
     }
 
@@ -1220,13 +1242,16 @@ mod tests {
         viewer.open(&old_screen).unwrap();
 
         let mut restarted = thread.sender(1);
+        assert_eq!(viewer.run_of(&node(1)), Some(old.run()));
         let fresh = restarted.seal(&output("alice", "new run")).unwrap();
         assert_eq!(viewer.open(&fresh), Err(FrameError::Unanchored));
+        assert_eq!(viewer.run_of(&node(1)), None);
         let request = viewer.request_screen().unwrap();
         assert_eq!(viewer.open(&old_screen), Err(FrameError::Replayed));
         viewer
             .open(&restarted.seal(&screen("alice", &request)).unwrap())
             .unwrap();
+        assert_eq!(viewer.run_of(&node(1)), Some(restarted.run()));
         let next = restarted.seal(&output("alice", "followed")).unwrap();
         assert_eq!(
             viewer.open(&next).unwrap().body,
@@ -1592,11 +1617,21 @@ mod tests {
         let mut viewer = thread.receiver();
         let mut alice = thread.sender(1);
         assert_eq!(viewer.run_of(&node(1)), None);
+        assert_eq!(
+            viewer.run_for(&ParticipantName::new("alice").unwrap()),
+            None
+        );
         let request = viewer.request_screen().unwrap();
         viewer
             .open(&alice.seal(&screen("alice", &request)).unwrap())
             .unwrap();
         assert_eq!(viewer.run_of(&node(1)), Some(alice.run()));
+        let named = |name: &str| ParticipantName::new(name).unwrap();
+        assert_eq!(
+            viewer.run_for(&named("alice")),
+            Some((node(1), alice.run()))
+        );
+        assert_eq!(viewer.run_for(&named("nobody")), None);
     }
 
     #[test]

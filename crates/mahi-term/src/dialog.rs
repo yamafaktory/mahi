@@ -132,6 +132,7 @@ enum Kind {
     Input {
         text: Zeroizing<String>,
         masked: bool,
+        max_bytes: Option<usize>,
     },
     Choose {
         items: Vec<String>,
@@ -254,6 +255,22 @@ impl Dialog {
             Kind::Input {
                 text: Zeroizing::new(String::with_capacity(MAX_INPUT_CHARS * 4)),
                 masked,
+                max_bytes: None,
+            },
+        )
+    }
+
+    /// Makes a prompt to write: a line that keeps the lines and tabs a paste brings, shown as
+    /// `⏎` and a space, up to `max_bytes` of text.
+    #[must_use]
+    pub fn prompt(title: &str, lines: Vec<String>, max_bytes: usize) -> Self {
+        Self::with(
+            title,
+            lines,
+            Kind::Input {
+                text: Zeroizing::new(String::with_capacity(max_bytes)),
+                masked: false,
+                max_bytes: Some(max_bytes),
             },
         )
     }
@@ -331,13 +348,27 @@ impl Dialog {
                 PaletteInput::Enter => Some(Answer::Confirmed(*yes)),
                 _ => None,
             },
-            Kind::Input { text, .. } => match input {
-                PaletteInput::Enter => Some(Answer::Text(std::mem::take(text))),
-                PaletteInput::Backspace => {
+            Kind::Input {
+                text, max_bytes, ..
+            } => match (input, *max_bytes) {
+                (PaletteInput::Enter, _) => Some(Answer::Text(std::mem::take(text))),
+                (PaletteInput::Backspace, _) => {
                     text.pop();
                     None
                 }
-                PaletteInput::Text(c) | PaletteInput::Pasted(c)
+                (PaletteInput::Pasted(c @ ('\n' | '\t')), Some(max))
+                    if text.len() + c.len_utf8() <= max =>
+                {
+                    text.push(c);
+                    None
+                }
+                (PaletteInput::Text(c) | PaletteInput::Pasted(c), Some(max))
+                    if !hidden(c) && text.len() + c.len_utf8() <= max =>
+                {
+                    text.push(c);
+                    None
+                }
+                (PaletteInput::Text(c) | PaletteInput::Pasted(c), None)
                     if !hidden(c) && text.chars().count() < MAX_INPUT_CHARS =>
                 {
                     text.push(c);
@@ -527,15 +558,18 @@ impl Dialog {
                 ])
                 .render(rest, buffer);
             }
-            Kind::Input { text, masked } => {
+            Kind::Input { text, masked, .. } => {
                 let typed: Cow<'_, str> = if *masked {
                     Cow::Owned(std::iter::repeat_n(MASK, text.chars().count()).collect())
+                } else if text.contains(['\n', '\t']) {
+                    Cow::Owned(text.replace('\n', "⏎ ").replace('\t', " "))
                 } else {
                     Cow::Borrowed(text.as_str())
                 };
+                let room = usize::from(rest.width).saturating_sub(3);
                 Line::from(vec![
                     Span::styled("› ", Theme::title()),
-                    Span::raw(typed),
+                    Span::raw(tail(&typed, room)),
                     Span::styled("▏", Style::new().fg(Theme::ACCENT)),
                 ])
                 .render(rest, buffer);
@@ -585,6 +619,21 @@ impl Dialog {
         };
         key_hints(pairs)
     }
+}
+
+/// Returns the end of `text` that fits in `room` columns, so the cursor after it shows.
+fn tail(text: &str, room: usize) -> &str {
+    let mut width = 0;
+    let start = text
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| {
+            width += unicode_width::UnicodeWidthChar::width(*c).unwrap_or(0);
+            width <= room
+        })
+        .last()
+        .map_or(text.len(), |(at, _)| at);
+    text.get(start..).unwrap_or_default()
 }
 
 /// Returns the spans that show `pairs` of keys and what they do, keys in the accent colour.
@@ -843,6 +892,46 @@ mod tests {
             .collect();
         assert!(drawn.contains("minutes."), "{drawn}");
         assert!(drawn.contains("ctrl-c stop"), "{drawn}");
+    }
+
+    #[test]
+    fn a_prompt_keeps_the_lines_of_a_paste_up_to_its_limit_and_shows_its_end() {
+        let mut prompt = Dialog::prompt("Prompt for alice.claude", Vec::new(), 12);
+        for c in "fix\nthat\tnow".chars() {
+            assert_eq!(prompt.key(PaletteInput::Pasted(c)), None);
+        }
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buffer = Buffer::empty(area);
+        prompt.render(area, &mut buffer);
+        let drawn: String = buffer
+            .content
+            .iter()
+            .map(ratatui_core::buffer::Cell::symbol)
+            .collect();
+        assert!(drawn.contains("fix⏎ that now"), "{drawn}");
+        assert_eq!(prompt.key(PaletteInput::Text('w')), None);
+        let Some(Answer::Text(text)) = prompt.key(PaletteInput::Enter) else {
+            panic!("the prompt was not taken");
+        };
+        assert_eq!(text.as_str(), "fix\nthat\tnow");
+        let mut line = Dialog::input("Name", Vec::new(), false);
+        assert_eq!(line.key(PaletteInput::Pasted('\n')), None);
+        let Some(Answer::Text(text)) = line.key(PaletteInput::Enter) else {
+            panic!("the line was not taken");
+        };
+        assert_eq!(text.as_str(), "");
+        let mut long = Dialog::prompt("Prompt", Vec::new(), 200);
+        for c in "a".repeat(100).chars().chain("END".chars()) {
+            long.key(PaletteInput::Text(c));
+        }
+        let mut buffer = Buffer::empty(area);
+        long.render(area, &mut buffer);
+        let drawn: String = buffer
+            .content
+            .iter()
+            .map(ratatui_core::buffer::Cell::symbol)
+            .collect();
+        assert!(drawn.contains("aaEND▏"), "{drawn}");
     }
 
     #[test]
