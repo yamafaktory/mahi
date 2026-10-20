@@ -1802,20 +1802,19 @@ cat parser.rs
     }
 
     #[test]
-    fn inviting_from_the_home_screen_without_a_remote_says_what_pairing_needs_and_comes_back() {
+    fn inviting_from_the_home_screen_without_a_remote_asks_for_one_first() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("MAHI_LIVE", "local"),
             &[
                 (&thread, b"i"),
-                (
-                    &format!("mahi invite {thread} failed with exit code 1"),
-                    b"q",
-                ),
+                ("Pairing needs a remote to meet through.", b"2"),
+                ("remote: off", b"q"),
             ],
         );
         assert_eq!(code, 0, "{output}");
+        assert!(!output.contains("mahi invite"), "{output}");
     }
 
     #[test]
@@ -5949,6 +5948,31 @@ exit 3
             assert_eq!(home.exit_code(), 0, "{}", home.text());
             assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
             assert!(!fixture.repo.join(".git/mahi/pairing").exists());
+        }
+
+        #[test]
+        fn inviting_from_the_home_screen_invites_once_the_remote_dialog_chooses_one() {
+            let fixture = fixture();
+            let (thread, _claude) = worked_thread(&fixture);
+            let (_server, remote) = serve_remote(&fixture);
+            assert!(fixture.mahi(&["remote", "--off"]).status.success());
+            let mut home = Driven::start(
+                terminal_command(&fixture, &[])
+                    .env("MAHI_LIVE", "local")
+                    .spawn()
+                    .unwrap(),
+            );
+            home.wait_for(&thread);
+            home.terminal.write_all(b"i").unwrap();
+            home.wait_for("Pairing needs a remote to meet through.");
+            home.terminal.write_all(b"1").unwrap();
+            home.wait_for("Pairing code:");
+            thread::sleep(Duration::from_secs(1));
+            home.terminal.write_all(b"\x03").unwrap();
+            home.wait_for(&format!("mahi invite {thread} failed"));
+            home.terminal.write_all(b"q").unwrap();
+            assert_eq!(home.exit_code(), 0, "{}", home.text());
+            assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
         }
 
         fn push_thread_refs(fixture: &Fixture, thread: &str, agent: &Path, remote: &Path) {

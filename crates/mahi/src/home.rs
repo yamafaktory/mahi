@@ -751,14 +751,14 @@ fn command_words(
         HomeAction::Resume(thread) => vec!["resume".to_owned(), thread],
         HomeAction::Land(thread) => vec!["land".to_owned(), thread],
         HomeAction::End(thread) => vec!["end".to_owned(), thread],
-        HomeAction::Invite(thread) => vec!["invite".to_owned(), thread],
+        HomeAction::Invite(thread) => invite_words(store, thread)?,
         HomeAction::Purge(thread) => vec!["purge".to_owned(), thread],
         HomeAction::AddAgent(thread) => agent_add_words(store, thread, environment)?,
         HomeAction::Handoff(thread) => handoff_words(store, thread, environment)?,
         HomeAction::Merge(thread) => merge_words(store, &thread, environment)?,
         HomeAction::Push(thread) => push_words(store, thread, environment)?,
         HomeAction::Join => vec!["join".to_owned()],
-        HomeAction::Remote => return Err(choose_remote(store)),
+        HomeAction::Remote => return Err(choose_remote(store, None)),
         HomeAction::Card => vec!["id".to_owned()],
         HomeAction::Credentials => credential_words(environment)?,
         HomeAction::Quit => return Err(String::new()),
@@ -1144,9 +1144,21 @@ enum RemoteChoice {
     Off,
 }
 
+/// Returns the words of `mahi invite` for `thread`, first asking in the Remote dialog for a
+/// remote to meet through when none is chosen, or what to tell the user when none is.
+fn invite_words(store: &mut Store, thread: String) -> Result<Vec<String>, String> {
+    if matches!(remote::sync_remote(store), Ok(None)) {
+        let told = choose_remote(store, Some("Pairing needs a remote to meet through."));
+        if !matches!(remote::sync_remote(store), Ok(Some(_))) {
+            return Err(told);
+        }
+    }
+    Ok(vec!["invite".to_owned(), thread])
+}
+
 /// Asks in a dialog which remote threads are pushed to, and whether it is private, or which
-/// git remote to add to the repository first.
-fn choose_remote(store: &mut Store) -> String {
+/// git remote to add to the repository first, telling first `why` it is asked.
+fn choose_remote(store: &mut Store, why: Option<&str>) -> String {
     let names = store.remote_names();
     let mut items = Vec::with_capacity(names.len() * 2 + 2);
     let mut choices = Vec::with_capacity(names.len() * 2 + 2);
@@ -1163,10 +1175,11 @@ fn choose_remote(store: &mut Store) -> String {
     choices.push(RemoteChoice::Add);
     items.push("Don't push threads".to_owned());
     choices.push(RemoteChoice::Off);
-    let mut lines = vec![
+    let mut lines: Vec<String> = why.map(str::to_owned).into_iter().collect();
+    lines.extend([
         format!("Threads are pushed to: {}", remote::summary(store)),
         "Teammates and your other machines pick threads up from there.".to_owned(),
-    ];
+    ]);
     if choices.len() == 2 {
         lines.push(
             "This repository has no git remote yet: add one, such as the GitHub repository \
