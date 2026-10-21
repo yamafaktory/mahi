@@ -36,7 +36,8 @@ const ARRIVAL_CHARS: usize = 80;
 #[derive(Debug, Default)]
 pub(crate) struct Prompts {
     state: Mutex<State>,
-    roles: Option<(Roles, ParticipantName)>,
+    roles: Option<Roles>,
+    own: Option<ParticipantName>,
 }
 
 #[derive(Debug, Default)]
@@ -58,13 +59,16 @@ pub(crate) struct Arrival {
     pub(crate) accepted: bool,
 }
 
-/// A prompt the host user accepted, waiting for the agent to be idle: its text, or, for a
-/// merge the agent asked for, the merge to make before telling the agent what came of it.
+/// A prompt the host user accepted, waiting for the agent to be idle: its text and its
+/// teammate, or, for a merge the agent asked for, the merge to make before telling the agent
+/// what came of it.
 #[derive(Debug)]
 pub(crate) struct Accepted {
     pub(crate) id: [u8; PROMPT_ID_BYTES],
     pub(crate) text: PromptText,
     pub(crate) merge: Option<MergeRequest>,
+    /// The teammate who sent it, when it is a prompt of someone other than the host user.
+    pub(crate) from: Option<ParticipantName>,
 }
 
 /// What the host user does with a waiting prompt.
@@ -102,7 +106,8 @@ impl Prompts {
     pub(crate) fn with_roles(roles: Roles, own: ParticipantName) -> Self {
         Self {
             state: Mutex::default(),
-            roles: Some((roles, own)),
+            roles: Some(roles),
+            own: Some(own),
         }
     }
 
@@ -119,8 +124,9 @@ impl Prompts {
         let role = self
             .roles
             .as_ref()
-            .filter(|(_, own)| *own != from)
-            .and_then(|(roles, _)| roles.role(&from));
+            .filter(|_| self.own.as_ref() != Some(&from))
+            .and_then(|roles| roles.role(&from));
+        let teammate = self.teammate(&from);
         let Ok(mut state) = self.state.lock() else {
             return PromptOutcome::Dropped;
         };
@@ -131,7 +137,7 @@ impl Prompts {
         let trusted = role == Some(TeammateRole::CanPrompt) || state.trusted.contains(&from);
         if !state.closed && trusted {
             let first_words: String = text.as_str().chars().take(ARRIVAL_CHARS).collect();
-            let outcome = state.accept(id, text, None);
+            let outcome = state.accept(id, text, (None, teammate));
             if outcome == PromptOutcome::Accepted {
                 state.arrived(&from, &first_words, true);
             }
@@ -208,6 +214,15 @@ impl Prompts {
         PromptOutcome::Queued
     }
 
+    /// Returns `from` when they are a teammate of the host user, once the host user is known,
+    /// so their accepted prompts name them.
+    fn teammate(&self, from: &ParticipantName) -> Option<ParticipantName> {
+        self.own
+            .as_ref()
+            .filter(|own| *own != from)
+            .map(|_| from.clone())
+    }
+
     /// Applies the host user's `decision` to the waiting prompt `id`, and returns whether it
     /// was still waiting.
     pub(crate) fn decide(&self, id: [u8; PROMPT_ID_BYTES], decision: Decision) -> bool {
@@ -220,14 +235,15 @@ impl Prompts {
         let Some(waiting) = state.waiting.remove(position) else {
             return false;
         };
+        let teammate = self.teammate(&waiting.from);
         let outcome = match decision {
             Decision::Reject => PromptOutcome::Rejected,
-            Decision::Accept => state.accept(waiting.id, waiting.text, waiting.merge),
-            Decision::AlwaysAccept if waiting.merge.is_some() => {
-                state.accept(waiting.id, waiting.text, waiting.merge)
+            Decision::Accept | Decision::AlwaysAccept if waiting.merge.is_some() => {
+                state.accept(waiting.id, waiting.text, (waiting.merge, None))
             }
+            Decision::Accept => state.accept(waiting.id, waiting.text, (None, teammate)),
             Decision::AlwaysAccept => {
-                let outcome = state.accept(waiting.id, waiting.text, waiting.merge);
+                let outcome = state.accept(waiting.id, waiting.text, (None, teammate.clone()));
                 let from = waiting.from;
                 while let Some(position) = state
                     .waiting
@@ -235,7 +251,7 @@ impl Prompts {
                     .position(|other| other.from == from && other.merge.is_none())
                 {
                     if let Some(other) = state.waiting.remove(position) {
-                        let outcome = state.accept(other.id, other.text, None);
+                        let outcome = state.accept(other.id, other.text, (None, teammate.clone()));
                         state.answer(other.id, outcome);
                     }
                 }
@@ -309,16 +325,22 @@ impl State {
         });
     }
 
+    /// Queues `text`, or `merge`, for the agent, naming `from`, the teammate who sent it.
     fn accept(
         &mut self,
         id: [u8; PROMPT_ID_BYTES],
         text: PromptText,
-        merge: Option<MergeRequest>,
+        (merge, from): (Option<MergeRequest>, Option<ParticipantName>),
     ) -> PromptOutcome {
         if self.accepted.len() >= MAX_ACCEPTED {
             return PromptOutcome::Dropped;
         }
-        self.accepted.push_back(Accepted { id, text, merge });
+        self.accepted.push_back(Accepted {
+            id,
+            text,
+            merge,
+            from,
+        });
         PromptOutcome::Accepted
     }
 
@@ -442,6 +464,44 @@ mod tests {
         assert_eq!(
             prompts.offer(name("bob"), [7; 16], text()),
             PromptOutcome::Dropped
+        );
+    }
+
+    #[test]
+    fn an_accepted_prompt_names_its_teammate_but_not_the_host_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let roles = Roles::of(dir.path(), mahi_core::ThreadId::random().unwrap());
+        roles.set(&name("bob"), TeammateRole::CanPrompt).unwrap();
+        let prompts = Prompts::with_roles(roles, name("alice"));
+        prompts.offer(name("bob"), [1; 16], text());
+        prompts.offer(name("alice"), [2; 16], text());
+        prompts.offer(name("carol"), [3; 16], text());
+        prompts.offer(name("carol"), [8; 16], text());
+        prompts.decide([2; 16], Decision::Accept);
+        prompts.decide([3; 16], Decision::AlwaysAccept);
+        prompts.offer(name("carol"), [9; 16], text());
+        prompts.offer_merge(name("alice"), [4; 16], (text(), request()));
+        prompts.decide([4; 16], Decision::Accept);
+        let senders: Vec<Option<String>> = std::iter::from_fn(|| prompts.next_accepted())
+            .map(|accepted| accepted.from.map(|from| from.to_string()))
+            .collect();
+        assert_eq!(
+            senders,
+            [
+                Some("bob".to_owned()),
+                None,
+                Some("carol".to_owned()),
+                Some("carol".to_owned()),
+                Some("carol".to_owned()),
+                None
+            ]
+        );
+        let unknown = Prompts::default();
+        unknown.offer(name("bob"), [5; 16], text());
+        unknown.decide([5; 16], Decision::Accept);
+        assert_eq!(
+            unknown.next_accepted().map(|accepted| accepted.from),
+            Some(None)
         );
     }
 

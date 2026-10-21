@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     io::{
         self,
         Write,
@@ -21,7 +22,10 @@ use mahi_agent::{
     hook::HookKind,
     payload::asks_user,
 };
-use mahi_core::is_invisible;
+use mahi_core::{
+    ParticipantName,
+    is_invisible,
+};
 use mahi_term::Report;
 
 use crate::{
@@ -286,7 +290,11 @@ pub(crate) fn give_accepted(
         typed.clear();
         match accepted.merge {
             Some(request) => encode(&merge(request), agent.bracketed_paste(), &mut typed),
-            None => encode(accepted.text.as_str(), agent.bracketed_paste(), &mut typed),
+            None => encode(
+                &tagged(accepted.text.as_str(), accepted.from.as_ref()),
+                agent.bracketed_paste(),
+                &mut typed,
+            ),
         }
         if type_in(&mut *input, &typed, pace.enter_after).is_err() {
             return;
@@ -328,6 +336,15 @@ fn type_in(input: &mut impl Write, typed: &[u8], enter_after: Duration) -> io::R
     input.flush()
 }
 
+/// Returns `text` as it is typed for the agent: after `[from <name>]` when a teammate sent it,
+/// so the agent tells them from its user.
+fn tagged<'a>(text: &'a str, from: Option<&ParticipantName>) -> Cow<'a, str> {
+    match from {
+        Some(from) => Cow::Owned(format!("[from {from}] {text}")),
+        None => Cow::Borrowed(text),
+    }
+}
+
 /// Writes `text` as the keys that type it into the agent: control characters other than
 /// newlines and tabs, and invisible ones, are left out, so nothing in it can end the paste or
 /// act as a key; without bracketed paste, newlines and tabs become spaces, so the prompt is
@@ -356,11 +373,21 @@ fn encode(text: &str, bracketed: bool, out: &mut Vec<u8>) {
 mod tests {
     use std::sync::Arc;
 
-    use mahi_core::ParticipantName;
     use mahi_live::PromptText;
 
     use super::*;
     use crate::prompts::Decision;
+
+    #[test]
+    fn a_teammates_prompt_is_typed_after_their_name_and_the_users_as_it_is() {
+        let bob = ParticipantName::new("bob").unwrap();
+        assert_eq!(tagged("say hello", Some(&bob)), "[from bob] say hello");
+        assert_eq!(tagged("say hello", None), "say hello");
+        assert_eq!(
+            encoded(&tagged("two\nlines", Some(&bob)), true),
+            b"\x1b[200~[from bob] two\rlines\x1b[201~"
+        );
+    }
 
     fn encoded(text: &str, bracketed: bool) -> Vec<u8> {
         let mut out = Vec::new();

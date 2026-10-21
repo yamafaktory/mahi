@@ -5210,7 +5210,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         host.type_keys(b"\0");
         host.wait_for_screen("run the tests");
         host.type_keys(b"\r");
-        host.wait_for("got:run the tests");
+        host.wait_for("got:[from bob] run the tests");
         wait_until("bob to learn it was accepted", || seen("accepted"));
         keys.write_all(b"\x1b").unwrap();
         thread::sleep(Duration::from_millis(300));
