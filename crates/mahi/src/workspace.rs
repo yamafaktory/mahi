@@ -363,7 +363,7 @@ pub(crate) struct Workspace {
     palette: Option<Palette>,
     composing: Option<Composing>,
     composed: bool,
-    prompt_told: Option<(String, Instant, ThreadId)>,
+    told: Option<Told>,
     chosen: Option<Moved>,
     list_shown: bool,
     redraw: Option<RedrawWait>,
@@ -501,6 +501,15 @@ fn told_of(prompted: Prompted, slot: &AgentSlot) -> Option<String> {
     }
 }
 
+/// What the last line of a thread's tab tells for a few seconds, after its label.
+#[derive(Debug)]
+struct Told {
+    label: &'static str,
+    text: String,
+    at: Instant,
+    thread: ThreadId,
+}
+
 /// Returns the teammates `live` watches in `thread`, when the workspace hosts it.
 fn teammates_of(live: Option<&WorkspaceLive>, thread: Option<ThreadId>) -> Option<&Teammates> {
     live?.teammates(thread?)
@@ -619,7 +628,7 @@ impl Workspace {
             palette: None,
             composing: None,
             composed: false,
-            prompt_told: None,
+            told: None,
             chosen: None,
             list_shown: true,
             redraw: None,
@@ -987,6 +996,17 @@ impl Workspace {
             running.child.show(out);
         }
         self.applied = shown;
+    }
+
+    /// Writes to `out` what takes the shown agent's key modes off the user's terminal, so
+    /// mahi's own dialogs read keys as the home screen does, and the next `apply_shown` puts
+    /// them back.
+    pub(crate) fn hide_shown(&mut self, out: &mut Vec<u8>) {
+        if let Some(old) = self.applied.take()
+            && let Some(running) = self.running_mut(old)
+        {
+            running.child.hide(out);
+        }
     }
 
     /// Says whether another agent can start, since the workspace runs at most 16 at once, or
@@ -1519,6 +1539,23 @@ impl Workspace {
             .and_then(|tab| tab.thread)
     }
 
+    /// Shows the open tab of `thread`, telling `told`, a label and its text, on its last line;
+    /// returns whether a tab of the thread is open.
+    pub(crate) fn show_thread(
+        &mut self,
+        thread: ThreadId,
+        (label, text): (&'static str, &str),
+    ) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.thread == Some(thread)) else {
+            return false;
+        };
+        self.selected = index + 1;
+        self.palette = None;
+        self.composing = None;
+        self.tell(label, Some(text.to_owned()), thread);
+        true
+    }
+
     /// Shows the thread list, where an action's outcome is told.
     pub(crate) fn show_threads(&mut self) {
         self.step(Step::To(0));
@@ -1585,10 +1622,16 @@ impl Workspace {
         }
     }
 
-    /// Tells `told`, if anything, on the last line of `thread`'s tab for a few seconds.
-    fn tell(&mut self, told: Option<String>, thread: ThreadId) {
-        if let Some(told) = told {
-            self.prompt_told = Some((told, Instant::now(), thread));
+    /// Tells `told`, if anything, after `label` on the last line of `thread`'s tab for a few
+    /// seconds.
+    fn tell(&mut self, label: &'static str, told: Option<String>, thread: ThreadId) {
+        if let Some(text) = told {
+            self.told = Some(Told {
+                label,
+                text,
+                at: Instant::now(),
+                thread,
+            });
         }
     }
 
@@ -1596,11 +1639,11 @@ impl Workspace {
     /// it did, so the screen is drawn again without it.
     pub(crate) fn forget_told(&mut self) -> bool {
         let old = self
-            .prompt_told
+            .told
             .as_ref()
-            .is_some_and(|(_, at, _)| at.elapsed() >= TOLD_FOR);
+            .is_some_and(|told| told.at.elapsed() >= TOLD_FOR);
         if old {
-            self.prompt_told = None;
+            self.told = None;
         }
         old
     }
@@ -1634,7 +1677,11 @@ impl Workspace {
                     Some(live) => live.prompt(composing.thread, &composing.slot, &text),
                     None => Prompted::NotHosted,
                 };
-                self.tell(told_of(prompted, &composing.slot), composing.thread);
+                self.tell(
+                    "prompt",
+                    told_of(prompted, &composing.slot),
+                    composing.thread,
+                );
                 if matches!(prompted, Prompted::Offline | Prompted::NotHosted) {
                     composing.dialog = Dialog::prompt(
                         &format!("Prompt for {}", composing.slot),
@@ -1733,10 +1780,10 @@ impl Workspace {
         ];
         let hints = [(self.palette_name.as_str(), "palette")];
         let told = self
-            .prompt_told
+            .told
             .as_ref()
-            .filter(|(_, at, thread)| at.elapsed() < TOLD_FOR && tab.thread == Some(*thread))
-            .map(|(told, _, _)| [("prompt", told.as_str())]);
+            .filter(|told| told.at.elapsed() < TOLD_FOR && tab.thread == Some(told.thread))
+            .map(|told| [(told.label, told.text.as_str())]);
         let cursor = ThreadView {
             agents: &agents,
             selected: tab.selected,
@@ -2318,10 +2365,7 @@ mod tests {
         workspace.type_keys(b"\x1b", &mut threads);
         assert!(workspace.composing.is_none());
         workspace.type_keys(b"again\rnext", &mut threads);
-        let told = workspace
-            .prompt_told
-            .as_ref()
-            .map(|(told, _, _)| told.as_str());
+        let told = workspace.told.as_ref().map(|told| told.text.as_str());
         assert_eq!(
             told,
             Some("the thread is not watched here; the prompt was not sent")
@@ -2361,11 +2405,11 @@ mod tests {
             "{drawn}"
         );
         assert!(!workspace.forget_told());
-        if let Some((_, at, _)) = workspace.prompt_told.as_mut() {
-            *at = Instant::now().checked_sub(TOLD_FOR).unwrap();
+        if let Some(told) = workspace.told.as_mut() {
+            told.at = Instant::now().checked_sub(TOLD_FOR).unwrap();
         }
         assert!(workspace.forget_told());
-        assert!(workspace.prompt_told.is_none());
+        assert!(workspace.told.is_none());
     }
 
     #[test]
@@ -2409,6 +2453,69 @@ mod tests {
         workspace.leave_thread(thread);
         assert!(workspace.tabs.is_empty());
         assert!(workspace.composing.is_none());
+    }
+
+    #[test]
+    fn showing_a_thread_selects_its_open_tab_and_tells_on_its_last_line() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let other: ThreadId = "fedcba9876543210fedcba9876543210".parse().unwrap();
+        assert!(!workspace.show_thread(thread, ("invite", "done")));
+        let agent = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("fedcba98", vec![agent]));
+        workspace.tabs[0].thread = Some(other);
+        let agent = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("01234567", vec![agent]));
+        workspace.tabs[1].thread = Some(thread);
+        assert!(workspace.shows_threads());
+        assert!(workspace.show_thread(thread, ("invite", "done")));
+        assert_eq!(workspace.selected, 2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
+        workspace.render(
+            Header {
+                repository: "r",
+                remote: "origin (private)",
+                remote_chosen: true,
+                remote_key: false,
+                identity: "me",
+            },
+            Rect::new(0, 0, 80, 1),
+            Rect::new(0, 1, 80, 19),
+            &mut buffer,
+        );
+        let drawn: String = buffer
+            .content()
+            .iter()
+            .map(ratatui_core::buffer::Cell::symbol)
+            .collect();
+        assert!(drawn.contains("invite done"), "{drawn}");
+        assert!(workspace.palette.is_none() && workspace.composing.is_none());
+    }
+
+    #[test]
+    fn hiding_the_shown_agent_puts_its_key_modes_back_on_the_next_apply() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let agent = running(&mut workspace, "sleep 5");
+        let id = agent.id;
+        workspace.tabs.push(tab("a", vec![agent]));
+        workspace.selected = 1;
+        let mut out = Vec::new();
+        workspace.apply_shown(&mut out);
+        assert_eq!(workspace.applied, Some(id));
+        out.clear();
+        workspace.hide_shown(&mut out);
+        assert_eq!(workspace.applied, None);
+        assert_eq!(out, b"\x1b[?2004h");
+        out.clear();
+        workspace.apply_shown(&mut out);
+        assert_eq!(workspace.applied, Some(id));
+        assert_eq!(out, b"\x1b[?2004l");
     }
 
     #[test]

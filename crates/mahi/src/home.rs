@@ -110,6 +110,7 @@ const MAX_READ: usize = 1024;
 const AFTER_ESCAPE: Duration = Duration::from_millis(500);
 const CHILD_WAIT: Duration = Duration::from_millis(15);
 const STOP_WITHIN: Duration = Duration::from_secs(30);
+const INVITED: (&str, &str) = ("invite", "done");
 
 /// Opens the home screen in the repository around the current directory and runs the actions
 /// chosen there until the user quits; returns the exit code. Everything happens on its
@@ -184,11 +185,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
                 }
             }
             Ok(Chosen::Action(action)) => {
-                status = match stop_thread_first(&action, &mut workspace) {
-                    Ok(()) => act(action, &mut store, environment),
-                    Err(told) => told,
-                };
-                workspace.show_threads();
+                status = act_and_show(action, &mut store, environment, &mut workspace);
                 ui::keys_make_signals(false);
                 workspace.set_screen(terminal::size(), true);
                 if let Err(error) = Screen::restore() {
@@ -604,13 +601,38 @@ fn rows(store: &Store, own: Option<&ParticipantKey>) -> Vec<HomeRow> {
     threads::home_rows(store, own).unwrap_or_default()
 }
 
-/// Runs the chosen action as its command does, without leaving the alternate screen, and
-/// returns what the home screen says about it.
-fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> String {
-    match command_words(action, store, environment) {
-        Ok(words) => run_words(&words, environment),
-        Err(told) => told,
+/// Runs the chosen action as `act` does, then shows the thread's tab when it invited a
+/// teammate to a thread open in one, and otherwise the thread list; returns what the home
+/// screen says about it.
+fn act_and_show(
+    action: HomeAction,
+    store: &mut Store,
+    environment: &Environment,
+    workspace: &mut Workspace,
+) -> String {
+    let invited = match &action {
+        HomeAction::Invite(thread) => thread.parse::<ThreadId>().ok(),
+        _ => None,
+    };
+    let mut hidden = Vec::new();
+    workspace.hide_shown(&mut hidden);
+    if let Err(error) = write_screen(&hidden) {
+        return format!("the terminal cannot be written: {error}");
     }
+    let done = stop_thread_first(&action, workspace).and_then(|()| act(action, store, environment));
+    let shown =
+        done.is_ok() && invited.is_some_and(|thread| workspace.show_thread(thread, INVITED));
+    if !shown {
+        workspace.show_threads();
+    }
+    done.unwrap_or_else(|told| told)
+}
+
+/// Runs the chosen action as its command does, without leaving the alternate screen, and
+/// returns what the home screen says about it, as an error when it ran no command or the
+/// command failed.
+fn act(action: HomeAction, store: &mut Store, environment: &Environment) -> Result<String, String> {
+    run_words(&command_words(action, store, environment)?, environment)
 }
 
 /// Returns what the workspace's palette chose with `moved`, once confirmed: quitting, or an
@@ -912,28 +934,29 @@ fn command_words(
 }
 
 /// Runs the mahi command `words` as it would run on its own, without leaving the alternate
-/// screen, and returns what the home screen says about it.
-fn run_words(words: &[String], environment: &Environment) -> String {
+/// screen, and returns what the home screen says about it, as an error when it did not
+/// succeed.
+fn run_words(words: &[String], environment: &Environment) -> Result<String, String> {
     let shown = format!("mahi {}", words.join(" "));
     let Ok(Cli {
         command: Some(command),
     }) = Cli::try_parse_from(std::iter::once("mahi").chain(words.iter().map(String::as_str)))
     else {
-        return format!("{shown} is not a command mahi knows");
+        return Err(format!("{shown} is not a command mahi knows"));
     };
     eprintln!("› {shown}");
     let busy = ui::Busy::start();
     let code = match command {
         Command::Purge(purge) => match crate::purge_unless_declined(&purge, environment) {
             Some(code) => code,
-            None => return format!("{shown}: nothing was purged"),
+            None => return Err(format!("{shown}: nothing was purged")),
         },
         command => run_command(command, environment),
     };
     drop(busy);
     match code {
-        0 => format!("{shown}: done"),
-        code => format!("{shown} failed with exit code {code}"),
+        0 => Ok(format!("{shown}: done")),
+        code => Err(format!("{shown} failed with exit code {code}")),
     }
 }
 
