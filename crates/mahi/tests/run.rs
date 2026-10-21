@@ -3451,6 +3451,9 @@ cat parser.rs
         assert!(output.contains("nothing was purged"), "{output}");
         assert!(worktree.is_dir());
         assert!(fixture.threads().len() > 1);
+        let roles = fixture.repo.join(".git/mahi/roles").join(&thread);
+        std::fs::create_dir_all(roles.parent().unwrap()).unwrap();
+        std::fs::write(&roles, "carol read-only\n").unwrap();
         let purged = fixture.mahi(&["purge", &thread, "--yes"]);
         let stderr = String::from_utf8_lossy(&purged.stderr);
         assert!(purged.status.success(), "{stderr}");
@@ -3463,6 +3466,7 @@ cat parser.rs
             assert!(stderr.contains(said), "{said}: {stderr}");
         }
         assert!(!worktree.exists());
+        assert!(!roles.exists());
         assert_eq!(fixture.threads(), [format!("refs/threads/{thread}/meta")]);
         let listed = fixture.mahi(&["threads"]);
         assert_eq!(
@@ -6242,10 +6246,12 @@ exit 3
             );
             home.wait_for(&thread);
             home.terminal.write_all(b"i").unwrap();
+            home.wait_for("What may they do with your agents?");
+            home.terminal.write_all(b"1").unwrap();
             home.wait_for("Tell this code to your teammate");
             thread::sleep(Duration::from_secs(1));
             home.terminal.write_all(b"\x03").unwrap();
-            home.wait_for(&format!("mahi invite {thread} failed"));
+            home.wait_for(&format!("mahi invite --read-only {thread} failed"));
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());
             assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
@@ -6268,10 +6274,12 @@ exit 3
             home.terminal.write_all(b"i").unwrap();
             home.wait_for("Pairing needs a remote to meet through.");
             home.terminal.write_all(b"1").unwrap();
+            home.wait_for("What may they do with your agents?");
+            home.terminal.write_all(b"1").unwrap();
             home.wait_for("Tell this code to your teammate");
             thread::sleep(Duration::from_secs(1));
             home.terminal.write_all(b"\x03").unwrap();
-            home.wait_for(&format!("mahi invite {thread} failed"));
+            home.wait_for(&format!("mahi invite --read-only {thread} failed"));
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());
             assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
@@ -6293,6 +6301,8 @@ exit 3
             );
             home.wait_for(&thread);
             home.terminal.write_all(b"i").unwrap();
+            home.wait_for("What may they do with your agents?");
+            home.terminal.write_all(b"1").unwrap();
             let before = home.wait_for("Getting a pairing code ready on up…");
             assert!(!before.contains("Tell this code"), "{before}");
             let spun = home.wait_for("⠙");
@@ -6332,7 +6342,7 @@ exit 3
                 "{}",
                 screen(&home)
             );
-            home.wait_for(&format!("mahi invite {thread} failed"));
+            home.wait_for(&format!("mahi invite --read-only {thread} failed"));
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());
             assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");

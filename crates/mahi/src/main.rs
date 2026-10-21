@@ -35,6 +35,7 @@ mod rebuilding;
 mod recorder;
 mod remote;
 mod report;
+mod roles;
 mod run;
 mod session;
 mod session_sync;
@@ -211,7 +212,7 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
         },
         Command::Join(command) => outcome_code(join::join(&command, environment)),
         Command::Invite(command) if command.card().is_none() => exit_code(
-            pair::invite_by_code(command.thread, environment).map(|done| {
+            pair::invite_by_code((command.thread, command.role()), environment).map(|done| {
                 eprint!("{done}");
                 0
             }),

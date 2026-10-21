@@ -111,6 +111,13 @@ const AFTER_ESCAPE: Duration = Duration::from_millis(500);
 const CHILD_WAIT: Duration = Duration::from_millis(15);
 const STOP_WITHIN: Duration = Duration::from_secs(30);
 const INVITED: (&str, &str) = ("invite", "done");
+const INVITE_ROLES: [(&str, &str); 2] = [
+    ("--read-only", "🔒 Read only: they watch your agents"),
+    (
+        "--can-prompt",
+        "✎ Can prompt: their prompts go straight to your agents",
+    ),
+];
 
 /// Opens the home screen in the repository around the current directory and runs the actions
 /// chosen there until the user quits; returns the exit code. Everything happens on its
@@ -1315,7 +1322,8 @@ enum RemoteChoice {
 }
 
 /// Returns the words of `mahi invite` for `thread`, first asking in the Remote dialog for a
-/// remote to meet through when none is chosen, or what to tell the user when none is.
+/// remote to meet through when none is chosen, then what the teammate may do with the user's
+/// agents, or what to tell the user when either is not answered.
 fn invite_words(store: &mut Store, thread: String) -> Result<Vec<String>, String> {
     if matches!(remote::sync_remote(store), Ok(None)) {
         let told = choose_remote(store, Some("Pairing needs a remote to meet through."));
@@ -1323,7 +1331,21 @@ fn invite_words(store: &mut Store, thread: String) -> Result<Vec<String>, String
             return Err(told);
         }
     }
-    Ok(vec!["invite".to_owned(), thread])
+    let dialog = Dialog::choose(
+        "Invite a teammate",
+        vec!["What may they do with your agents?".to_owned()],
+        INVITE_ROLES
+            .iter()
+            .map(|(_, item)| (*item).to_owned())
+            .collect(),
+    );
+    let Ok(Answer::Choice(index)) = DialogPrompt::default().ask(dialog) else {
+        return Err(String::new());
+    };
+    let (flag, _) = INVITE_ROLES
+        .get(index)
+        .ok_or_else(|| "no role was chosen".to_owned())?;
+    Ok(vec!["invite".to_owned(), (*flag).to_owned(), thread])
 }
 
 /// Asks in a dialog which remote threads are pushed to, and whether it is private, or which
@@ -1445,6 +1467,7 @@ mod tests {
     use mahi_core::AgentName;
 
     use super::*;
+    use crate::roles::TeammateRole;
 
     fn slot(participant: &str, agent: &str) -> AgentSlot {
         AgentSlot::new(
@@ -1551,6 +1574,36 @@ mod tests {
         assert_eq!(typing.read(b"?"), None);
         assert_eq!(typing.read(b"\x1b[27u"), None);
         assert_eq!(typing.keys.escaped_until, None);
+    }
+
+    #[test]
+    fn each_invite_choice_gives_the_role_its_words_name() {
+        let thread = "7f3a9c2e00010203040506070809abff";
+        let roles: Vec<(TeammateRole, &str)> = INVITE_ROLES
+            .iter()
+            .map(|(flag, item)| {
+                let Cli {
+                    command: Some(Command::Invite(invite)),
+                } = Cli::try_parse_from(["mahi", "invite", flag, thread]).unwrap()
+                else {
+                    panic!("not an invite");
+                };
+                (invite.role().unwrap(), *item)
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                (
+                    TeammateRole::ReadOnly,
+                    "🔒 Read only: they watch your agents"
+                ),
+                (
+                    TeammateRole::CanPrompt,
+                    "✎ Can prompt: their prompts go straight to your agents"
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -80,6 +80,7 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
+    roles::TeammateRole,
     sync::{
         self,
         PairRemoteError,
@@ -183,7 +184,7 @@ pub(crate) enum PairingError {
 /// on the chosen remote, shows the code, and adds the teammate who proves they know it, then
 /// removes what it published. Returns what to print.
 pub(crate) fn invite_by_code(
-    thread: ThreadId,
+    (thread, role): (ThreadId, Option<TeammateRole>),
     environment: &Environment,
 ) -> Result<String, PairingError> {
     invite::with_inviter(environment, |store, inviter| {
@@ -207,7 +208,7 @@ pub(crate) fn invite_by_code(
                 let mut prompt = TerminalPrompt::open().map_err(PairingError::Prompt)?;
                 show_code(&mut prompt, &code)?;
                 drop(prompt);
-                owner_pairs(&listener, &code, deadline, (store, thread, inviter))
+                owner_pairs(&listener, &code, deadline, (store, (thread, role), inviter))
             });
         crate::ui::show_notice(vec![format!("Removing the pairing code from {remote}…")]);
         unpublish(store, environment, slot, commit);
@@ -345,7 +346,7 @@ fn owner_pairs(
     listener: &PairListener,
     code: &PairingCode,
     deadline: Instant,
-    (store, thread, inviter): (&Store, ThreadId, &Inviter<'_>),
+    (store, (thread, role), inviter): (&Store, (ThreadId, Option<TeammateRole>), &Inviter<'_>),
 ) -> Result<String, PairingError> {
     let mut link = accept_until_stopped(listener, deadline)?;
     let stop = StopOnSignal::start();
@@ -385,7 +386,9 @@ fn owner_pairs(
     if !link.is_open() {
         return Err(PairingError::JoinerLeft(name));
     }
-    let added = invite::invite_to(store, thread, card, inviter, &mut || TerminalPrompt::open());
+    let added = invite::invite_to(store, (thread, role), card, inviter, &mut || {
+        TerminalPrompt::open()
+    });
     let ticket = match added {
         Ok(ticket) => ticket,
         Err(error) => {

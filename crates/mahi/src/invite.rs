@@ -58,6 +58,10 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
+    roles::{
+        Roles,
+        TeammateRole,
+    },
     thread_lock::{
         LockError,
         ThreadLock,
@@ -135,9 +139,13 @@ pub(crate) fn invite(
     };
     let card: ParticipantCard = card.parse()?;
     with_inviter(environment, |store, inviter| {
-        let ticket = invite_to(store, command.thread, card, inviter, &mut || {
-            TerminalPrompt::open()
-        })?;
+        let ticket = invite_to(
+            store,
+            (command.thread, command.role()),
+            card,
+            inviter,
+            &mut || TerminalPrompt::open(),
+        )?;
         Ok(format!("{ticket}\n"))
     })
 }
@@ -186,10 +194,12 @@ pub(crate) fn relays_for(live: LiveMode) -> Result<Relays, InviteError> {
 }
 
 /// Adds `card`'s participant to `thread` unless they are already in it, exactly as the card
-/// says, and returns their ticket. The passphrase is asked only when they must be added.
+/// says, gives them `role` when there is one, and returns their ticket. The passphrase is
+/// asked only when they must be added. A role that cannot be kept is told, and their prompts
+/// then wait for the user as before.
 pub(crate) fn invite_to<P: Prompt>(
     store: &Store,
-    thread: ThreadId,
+    (thread, role): (ThreadId, Option<TeammateRole>),
     card: ParticipantCard,
     inviter: &Inviter<'_>,
     open_prompt: &mut dyn FnMut() -> io::Result<P>,
@@ -221,11 +231,17 @@ pub(crate) fn invite_to<P: Prompt>(
     if address.node() != &own {
         return Err(InviteError::NodeMismatch);
     }
+    let name = new.name().clone();
     let meta = if current.participants().any(|listed| listed == new) {
         current
     } else {
         add(store, thread, &current, card, inviter, open_prompt)?
     };
+    if let Some(role) = role
+        && let Err(error) = Roles::of(store.common_dir(), thread).set(&name, role)
+    {
+        eprintln!("mahi: {name}'s role was not kept, so their prompts wait for you: {error}");
+    }
     Ok(Ticket::new(
         thread,
         address,
@@ -407,7 +423,7 @@ mod tests {
         let card = bob();
         let ticket = invite_to(
             &store,
-            owner.thread,
+            (owner.thread, None),
             card.clone(),
             &inviter(&owner, &owner.key),
             &mut script(&[PASSPHRASE]),
@@ -430,15 +446,28 @@ mod tests {
                 .any(|listed| listed == card.participant())
         );
 
+        let roles = Roles::of(store.common_dir(), owner.thread);
+        let bob = card.participant().name().clone();
+        assert_eq!(roles.role(&bob), None);
         let again = invite_to(
             &store,
-            owner.thread,
-            card,
+            (owner.thread, Some(TeammateRole::ReadOnly)),
+            card.clone(),
             &inviter(&owner, &owner.key),
             &mut script(&[]),
         )
         .unwrap();
         assert_eq!(again.min_generation(), 1);
+        assert_eq!(roles.role(&bob), Some(TeammateRole::ReadOnly));
+        invite_to(
+            &store,
+            (owner.thread, None),
+            card,
+            &inviter(&owner, &owner.key),
+            &mut script(&[]),
+        )
+        .unwrap();
+        assert_eq!(roles.role(&bob), Some(TeammateRole::ReadOnly));
     }
 
     #[test]
@@ -449,7 +478,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                owner.thread,
+                (owner.thread, None),
                 bob(),
                 &inviter(&owner, &stranger),
                 &mut script(&[]),
@@ -459,7 +488,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                owner.thread,
+                (owner.thread, None),
                 bob(),
                 &inviter(&owner, &owner.key),
                 &mut script(&["wrong passphrase"]),
@@ -504,7 +533,7 @@ mod tests {
             assert!(matches!(
                 invite_to(
                     &store,
-                    owner.thread,
+                    (owner.thread, None),
                     card,
                     &inviter(&owner, &owner.key),
                     &mut script(&[]),
@@ -536,7 +565,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                missing,
+                (missing, None),
                 bob(),
                 &inviter(&owner, &owner.key),
                 &mut script(&[]),
@@ -554,7 +583,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                owner.thread,
+                (owner.thread, None),
                 bob(),
                 &inviter(&owner, &owner.key),
                 &mut script(&[PASSPHRASE]),
@@ -584,7 +613,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                owner.thread,
+                (owner.thread, None),
                 bob(),
                 &inviter(&owner, &owner.key),
                 &mut script(&[]),
@@ -594,7 +623,7 @@ mod tests {
         crate::live::publish_address(&owner.config, owner.thread, &published).unwrap();
         let ticket = invite_to(
             &store,
-            owner.thread,
+            (owner.thread, None),
             bob(),
             &inviter(&owner, &owner.key),
             &mut script(&[PASSPHRASE]),

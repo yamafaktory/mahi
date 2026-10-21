@@ -31,6 +31,7 @@ use crate::{
     },
     profile::Profile,
     remote::RemoteName,
+    roles::TeammateRole,
 };
 
 const EXIT_CODES: &str = "\
@@ -151,12 +152,30 @@ pub(crate) struct InviteCommand {
     /// Without one, mahi shows a pairing code for the teammate to type instead.
     #[arg(num_args = 0.., value_name = "CARD")]
     card: Vec<String>,
+    /// The teammate's prompts reach your agents without your accepting each one.
+    #[arg(long, conflicts_with = "read_only")]
+    can_prompt: bool,
+    /// The teammate only watches your agents; mahi refuses their prompts. Without this or
+    /// --can-prompt, each of their prompts waits for you to accept it.
+    #[arg(long)]
+    read_only: bool,
 }
 
 impl InviteCommand {
     /// Returns the card, its words joined by spaces, or `None` when none was given.
     pub(crate) fn card(&self) -> Option<String> {
         (!self.card.is_empty()).then(|| self.card.join(" "))
+    }
+
+    /// Returns the role the teammate gets, or `None` when the invite gives none.
+    pub(crate) fn role(&self) -> Option<TeammateRole> {
+        if self.can_prompt {
+            Some(TeammateRole::CanPrompt)
+        } else if self.read_only {
+            Some(TeammateRole::ReadOnly)
+        } else {
+            None
+        }
     }
 }
 
@@ -557,6 +576,17 @@ mod tests {
             panic!("not an invite");
         };
         assert_eq!(by_code.card(), None);
+        assert_eq!(by_code.role(), None);
+        for (flag, role) in [
+            ("--can-prompt", TeammateRole::CanPrompt),
+            ("--read-only", TeammateRole::ReadOnly),
+        ] {
+            let Command::Invite(invite) = parse(&["invite", flag, thread]).unwrap().command else {
+                panic!("not an invite");
+            };
+            assert_eq!(invite.role(), Some(role));
+        }
+        assert!(parse(&["invite", "--can-prompt", "--read-only", thread]).is_err());
         let Command::Join(by_code) = parse(&["join"]).unwrap().command else {
             panic!("not a join");
         };

@@ -15,7 +15,13 @@ use mahi_live::{
 };
 use mahi_term::Report;
 
-use crate::merge::MergeRequest;
+use crate::{
+    merge::MergeRequest,
+    roles::{
+        Roles,
+        TeammateRole,
+    },
+};
 
 const MAX_WAITING: usize = 32;
 const MAX_WAITING_FROM_ONE: usize = 8;
@@ -30,6 +36,7 @@ const ARRIVAL_CHARS: usize = 80;
 #[derive(Debug, Default)]
 pub(crate) struct Prompts {
     state: Mutex<State>,
+    roles: Option<(Roles, ParticipantName)>,
 }
 
 #[derive(Debug, Default)]
@@ -89,19 +96,40 @@ pub(crate) struct Answer {
 }
 
 impl Prompts {
-    /// Takes a prompt `from` a teammate: it waits, unless too many do, in all or from that
-    /// teammate, or the run is ending, or is accepted at once when the host user always
-    /// accepts that teammate; either way its sender is answered.
+    /// Returns no prompts yet, for the host of `own`'s agent, whose teammates have the roles
+    /// in `roles`, read again with each prompt, so a role given while the agent runs counts at
+    /// once; `own` has no role, so their own prompts are asked about as before.
+    pub(crate) fn with_roles(roles: Roles, own: ParticipantName) -> Self {
+        Self {
+            state: Mutex::default(),
+            roles: Some((roles, own)),
+        }
+    }
+
+    /// Takes a prompt `from` a teammate: it is refused when their role is read only, and
+    /// accepted at once when it lets them prompt or the host user always accepts them;
+    /// otherwise it waits, unless too many do, in all or from that teammate, or the run is
+    /// ending. Either way its sender is answered.
     pub(crate) fn offer(
         &self,
         from: ParticipantName,
         id: [u8; PROMPT_ID_BYTES],
         text: PromptText,
     ) -> PromptOutcome {
+        let role = self
+            .roles
+            .as_ref()
+            .filter(|(_, own)| *own != from)
+            .and_then(|(roles, _)| roles.role(&from));
         let Ok(mut state) = self.state.lock() else {
             return PromptOutcome::Dropped;
         };
-        if !state.closed && state.trusted.contains(&from) {
+        if role == Some(TeammateRole::ReadOnly) {
+            state.answer(id, PromptOutcome::Rejected);
+            return PromptOutcome::Rejected;
+        }
+        let trusted = role == Some(TeammateRole::CanPrompt) || state.trusted.contains(&from);
+        if !state.closed && trusted {
             let first_words: String = text.as_str().chars().take(ARRIVAL_CHARS).collect();
             let outcome = state.accept(id, text, None);
             if outcome == PromptOutcome::Accepted {
@@ -362,6 +390,59 @@ mod tests {
             })
             .collect();
         assert_eq!(counts, [1, 2, 3, 4, 5, 2, 1, 0]);
+    }
+
+    #[test]
+    fn a_teammates_role_decides_whether_their_prompt_goes_waits_or_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let roles = Roles::of(dir.path(), mahi_core::ThreadId::random().unwrap());
+        let prompts = Prompts::with_roles(roles.clone(), name("alice"));
+        roles.set(&name("bob"), TeammateRole::CanPrompt).unwrap();
+        roles.set(&name("carol"), TeammateRole::ReadOnly).unwrap();
+        roles.set(&name("alice"), TeammateRole::ReadOnly).unwrap();
+        assert_eq!(
+            prompts.offer(name("bob"), [1; 16], text()),
+            PromptOutcome::Accepted
+        );
+        assert_eq!(
+            prompts.offer(name("carol"), [2; 16], text()),
+            PromptOutcome::Rejected
+        );
+        assert_eq!(
+            prompts.offer(name("dave"), [3; 16], text()),
+            PromptOutcome::Queued
+        );
+        assert_eq!(waiting(&prompts), 1);
+        assert_eq!(
+            prompts.next_accepted().map(|accepted| accepted.id),
+            Some([1; 16])
+        );
+        let mut arrivals = Vec::new();
+        prompts.take_arrivals(&mut arrivals);
+        assert_eq!(
+            arrivals
+                .iter()
+                .map(|arrival| (arrival.from.as_str(), arrival.accepted))
+                .collect::<Vec<_>>(),
+            [("bob", true), ("dave", false)]
+        );
+        prompts.decide([3; 16], Decision::AlwaysAccept);
+        roles.set(&name("dave"), TeammateRole::ReadOnly).unwrap();
+        assert_eq!(
+            prompts.offer(name("dave"), [4; 16], text()),
+            PromptOutcome::Rejected
+        );
+        assert_eq!(
+            prompts.offer(name("alice"), [5; 16], text()),
+            PromptOutcome::Queued
+        );
+        prompts.offer_merge(name("bob"), [6; 16], (text(), request()));
+        assert_eq!(waiting(&prompts), 2);
+        prompts.close();
+        assert_eq!(
+            prompts.offer(name("bob"), [7; 16], text()),
+            PromptOutcome::Dropped
+        );
     }
 
     #[test]

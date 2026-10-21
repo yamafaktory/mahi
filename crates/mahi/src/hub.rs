@@ -61,6 +61,7 @@ use crate::{
         Answer,
         Prompts,
     },
+    roles::Roles,
 };
 
 const PAUSE: Duration = Duration::from_millis(200);
@@ -593,7 +594,10 @@ impl Link {
             socket,
         };
         let tap = OutputTap::new(size);
-        let prompts = Arc::new(Prompts::default());
+        let prompts = Arc::new(Prompts::with_roles(
+            Roles::of(git_dir, joining.keys.thread()),
+            joining.slot.participant().clone(),
+        ));
         let claims = Arc::new(Claims::default());
         let role = joining.settle(&tap, (&prompts, &claims))?;
         match &role {
