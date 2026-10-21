@@ -2,6 +2,7 @@ use std::{
     collections::{
         BTreeSet,
         HashMap,
+        HashSet,
     },
     fmt::Write as _,
     io,
@@ -9,9 +10,19 @@ use std::{
         Path,
         PathBuf,
     },
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
+        mpsc,
+    },
     thread,
-    time::Instant,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use mahi_core::{
@@ -66,6 +77,10 @@ use crate::{
     },
     mcp,
     session,
+    sync::{
+        self as remote_sync,
+        Reach,
+    },
     teammates::Teammates,
     thread_lock::{
         LiveLock,
@@ -74,6 +89,10 @@ use crate::{
     threads,
     unlocked,
 };
+
+/// How often the workspace checks whether the owner purged a thread it only watches, while
+/// none of its teammates' agents is online.
+const PURGE_CHECK_EVERY: Duration = Duration::from_secs(10);
 
 /// What came of a prompt the user wrote to a teammate's agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +145,8 @@ pub(crate) struct WorkspaceLive {
     git_dir: PathBuf,
     shared: Option<SharedNode>,
     hosted: HashMap<ThreadId, Hosted>,
+    reach: Reach,
+    purge_checks: PurgeChecks,
 }
 
 /// A thread the workspace hosts: its host, the socket its agents reach it on, and the
@@ -137,6 +158,7 @@ struct Hosted {
     teammates: Teammates,
     key: ThreadKey,
     base: ObjectId,
+    owner: ParticipantKey,
 }
 
 impl WorkspaceLive {
@@ -160,6 +182,8 @@ impl WorkspaceLive {
             git_dir: git_dir.to_path_buf(),
             shared: None,
             hosted: HashMap::new(),
+            reach: Reach::gather(environment),
+            purge_checks: PurgeChecks::default(),
         })
     }
 
@@ -212,7 +236,7 @@ impl WorkspaceLive {
             config: self.config.clone(),
             runtime: self.runtime.clone(),
             node_key,
-            owner,
+            owner: owner.clone(),
             relays: self.relays,
             bootstrap: live::bootstrap(&store, thread),
         };
@@ -237,6 +261,7 @@ impl WorkspaceLive {
                         teammates,
                         key,
                         base: meta.base(),
+                        owner,
                     },
                 );
                 Ok(())
@@ -325,15 +350,152 @@ impl WorkspaceLive {
         }
     }
 
+    /// Checks at `now`, off this thread and at most every [`PURGE_CHECK_EVERY`], whether the
+    /// owner purged each thread of `watched` the workspace hosts while none of its teammates'
+    /// agents is online, by fetching its `meta` alone; returns the threads found purged since
+    /// the last call. A check that fails says nothing, and the next one tries again.
+    pub(crate) fn take_purged(
+        &mut self,
+        now: Instant,
+        watched: impl IntoIterator<Item = ThreadId>,
+    ) -> Vec<ThreadId> {
+        for thread in watched {
+            let Some(hosted) = self.hosted.get(&thread) else {
+                continue;
+            };
+            if hosted.teammates.agents().any(|(_, online)| online)
+                || !self.purge_checks.due(now, thread)
+            {
+                continue;
+            }
+            let (git_dir, reach, owner) = (
+                self.git_dir.clone(),
+                self.reach.clone(),
+                hosted.owner.clone(),
+            );
+            self.purge_checks.start(now, thread, move |interrupt| {
+                Store::open(&git_dir).is_ok_and(|store| {
+                    remote_sync::fetch_purged(&store, &reach, (thread, &owner), interrupt)
+                        .unwrap_or(false)
+                })
+            });
+        }
+        self.purge_checks.take_found()
+    }
+
     /// Stops hosting `thread`, once none of its tabs is open, and closes the node once it
     /// hosts no thread, so it no longer publishes where it is.
     pub(crate) fn release(&mut self, thread: ThreadId) {
         if let Some(hosted) = self.hosted.remove(&thread) {
             stop(hosted);
         }
+        self.purge_checks.forget(thread);
         if self.hosted.is_empty() {
             self.shared = None;
         }
+    }
+}
+
+/// The checks the workspace runs, each on a thread of its own, of whether a thread's owner
+/// purged it.
+#[derive(Debug)]
+struct PurgeChecks {
+    sender: mpsc::Sender<(ThreadId, bool)>,
+    receiver: mpsc::Receiver<(ThreadId, bool)>,
+    running: HashSet<ThreadId>,
+    started: HashMap<ThreadId, Instant>,
+    interrupt: Arc<AtomicBool>,
+}
+
+impl Default for PurgeChecks {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender,
+            receiver,
+            running: HashSet::new(),
+            started: HashMap::new(),
+            interrupt: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl PurgeChecks {
+    /// Starts `check` on a thread of its own for `thread` at `now`, unless one still runs for
+    /// it or the last one started less than [`PURGE_CHECK_EVERY`] ago; `check` stops soon
+    /// once the flag it gets is set, and returns whether the thread was purged.
+    fn start(
+        &mut self,
+        now: Instant,
+        thread: ThreadId,
+        check: impl FnOnce(&Arc<AtomicBool>) -> bool + Send + 'static,
+    ) {
+        if !self.due(now, thread) {
+            return;
+        }
+        let (sender, interrupt) = (self.sender.clone(), Arc::clone(&self.interrupt));
+        let spawned = thread::Builder::new()
+            .name("mahi-purge-check".to_owned())
+            .spawn(move || {
+                let mut told = CheckEnded {
+                    sender,
+                    thread,
+                    purged: false,
+                };
+                told.purged = check(&interrupt);
+            });
+        if spawned.is_ok() {
+            self.running.insert(thread);
+        }
+        self.started.insert(thread, now);
+    }
+
+    /// Says whether a check of `thread` may start at `now`: none runs for it, and the last
+    /// one started at least [`PURGE_CHECK_EVERY`] ago.
+    fn due(&self, now: Instant, thread: ThreadId) -> bool {
+        let recent = self
+            .started
+            .get(&thread)
+            .is_some_and(|at| now.saturating_duration_since(*at) < PURGE_CHECK_EVERY);
+        !recent && !self.running.contains(&thread)
+    }
+
+    /// Forgets when `thread` was last checked, once the workspace no longer hosts it; a check
+    /// still running for it ends on its own.
+    fn forget(&mut self, thread: ThreadId) {
+        self.started.remove(&thread);
+    }
+
+    /// Returns the threads the checks that ended since the last call found purged.
+    fn take_found(&mut self) -> Vec<ThreadId> {
+        let mut found = Vec::new();
+        while let Ok((thread, purged)) = self.receiver.try_recv() {
+            self.running.remove(&thread);
+            if purged {
+                found.push(thread);
+            }
+        }
+        found
+    }
+}
+
+/// Sends what a check of `thread` found once it ends, even when it panics, so the thread is
+/// checked again.
+struct CheckEnded {
+    sender: mpsc::Sender<(ThreadId, bool)>,
+    thread: ThreadId,
+    purged: bool,
+}
+
+impl Drop for CheckEnded {
+    fn drop(&mut self) {
+        let _ = self.sender.send((self.thread, self.purged));
+    }
+}
+
+impl Drop for PurgeChecks {
+    fn drop(&mut self) {
+        self.interrupt.store(true, Ordering::SeqCst);
     }
 }
 
@@ -498,6 +660,59 @@ pub(crate) mod tests {
             owner_key,
             thread: started.thread,
         }
+    }
+
+    fn found_once_ended(checks: &mut PurgeChecks) -> Vec<ThreadId> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut found = Vec::new();
+        while !checks.running.is_empty() && Instant::now() < deadline {
+            found.extend(checks.take_found());
+            thread::sleep(Duration::from_millis(5));
+        }
+        found
+    }
+
+    #[test]
+    fn a_purge_check_runs_again_only_once_the_last_ended_and_its_interval_passed() {
+        let mut checks = PurgeChecks::default();
+        let thread = ThreadId::random().unwrap();
+        let start = Instant::now();
+        let (release, held) = mpsc::channel::<()>();
+        checks.start(start, thread, move |_| held.recv().is_ok());
+        checks.start(start + PURGE_CHECK_EVERY * 2, thread, |_| true);
+        release.send(()).unwrap();
+        assert_eq!(found_once_ended(&mut checks), [thread]);
+        checks.start(start + PURGE_CHECK_EVERY / 2, thread, |_| true);
+        assert!(checks.running.is_empty());
+        checks.start(start + PURGE_CHECK_EVERY, thread, |_| false);
+        assert!(checks.running.contains(&thread));
+        assert!(found_once_ended(&mut checks).is_empty());
+        assert!(checks.running.is_empty());
+    }
+
+    #[test]
+    fn a_purge_check_that_panics_is_counted_as_ended() {
+        let mut checks = PurgeChecks::default();
+        let thread = ThreadId::random().unwrap();
+        checks.start(Instant::now(), thread, |_| panic!("the check failed"));
+        assert!(found_once_ended(&mut checks).is_empty());
+        assert!(checks.running.is_empty());
+    }
+
+    #[test]
+    fn dropping_the_purge_checks_tells_a_running_check_to_stop() {
+        let mut checks = PurgeChecks::default();
+        let thread = ThreadId::random().unwrap();
+        let (told, stopped) = mpsc::channel();
+        checks.start(Instant::now(), thread, move |interrupt| {
+            while !interrupt.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            told.send(()).unwrap();
+            false
+        });
+        drop(checks);
+        assert!(stopped.recv_timeout(Duration::from_secs(10)).is_ok());
     }
 
     #[test]

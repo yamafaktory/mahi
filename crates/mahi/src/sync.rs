@@ -65,6 +65,7 @@ use mahi_thread::{
     ParticipantKey,
     ThreadError,
     accept_fetched,
+    accept_fetched_meta,
 };
 use thiserror::Error;
 
@@ -84,6 +85,9 @@ use crate::{
 
 const MAX_CAUSE_CHARS: usize = 300;
 const BRANCH_CHECK_BYTES: u64 = 64 << 20;
+/// The most bytes read to fetch a thread's `meta` alone: the ref listing and one document
+/// of at most `MAX_META_BYTES`.
+const META_CHECK_BYTES: u64 = 4 << 20;
 const HTTPS_CREDENTIAL: &str = "https-";
 const SYSTEM_KNOWN_HOSTS: [&str; 2] = ["/etc/ssh/ssh_known_hosts", "/etc/ssh/ssh_known_hosts2"];
 
@@ -213,15 +217,69 @@ impl SyncSetup {
     }
 }
 
+/// What reaching a remote needs from the environment, gathered once, so a check that runs
+/// off the workspace's thread reaches it without the environment; the token of an HTTPS remote
+/// is read only when it is reached.
+#[derive(Debug, Clone)]
+pub(crate) struct Reach {
+    ssh: Result<SshAccess, &'static str>,
+    proxy: Result<Option<ProxySetting>, String>,
+    config: Result<ConfigDir, String>,
+}
+
+impl Reach {
+    /// Gathers what reaching a remote needs from `environment`.
+    pub(crate) fn gather(environment: &Environment) -> Self {
+        Self {
+            ssh: SshAccess::gather(environment),
+            proxy: ProxySetting::from_values(
+                environment.https_proxy.as_deref(),
+                environment.no_proxy.as_deref(),
+            )
+            .map_err(|error| error.to_string()),
+            config: ConfigDir::resolve(
+                environment.home.as_deref(),
+                environment.xdg_config_home.as_deref(),
+            )
+            .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// Returns what reaching `remote` needs, or says what is missing.
+    fn access(&self, remote: &RemoteUrl) -> Result<Access, String> {
+        match remote {
+            RemoteUrl::Ssh(_) => self.ssh.clone().map(Access::Ssh).map_err(str::to_owned),
+            RemoteUrl::Https(url) => self.https(url).map(Access::Https),
+        }
+    }
+
+    /// Returns what reaching the HTTPS remote `url` needs: the proxy from `HTTPS_PROXY` and
+    /// `NO_PROXY`, and the token stored for its host, if any (see [`https_credential`]).
+    fn https(&self, url: &HttpsRemote) -> Result<HttpsAccess, String> {
+        let proxy = self.proxy.clone()?;
+        let token = match https_credential(url) {
+            Some(name) => {
+                let config = self.config.as_ref().map_err(Clone::clone)?;
+                Credential::load(config, &name)
+                    .map_err(|error| format!("cannot read the credential {name}: {error}"))?
+                    .map(|credential| {
+                        Token::new(String::from_utf8_lossy(credential.expose()).into_owned())
+                    })
+            }
+            None => None,
+        };
+        Ok(HttpsAccess {
+            proxy,
+            roots: Roots::WebPki,
+            token,
+        })
+    }
+}
+
 impl Access {
     /// Gathers what reaching `remote` needs, or says what is missing.
     fn gather(environment: &Environment, remote: &RemoteUrl) -> Result<Self, String> {
-        match remote {
-            RemoteUrl::Ssh(_) => SshAccess::gather(environment)
-                .map(Self::Ssh)
-                .map_err(str::to_owned),
-            RemoteUrl::Https(url) => https_access(environment, url).map(Self::Https),
-        }
+        Reach::gather(environment).access(remote)
     }
 
     fn connect(
@@ -240,36 +298,6 @@ impl Access {
             _ => Err(ConnectError::Mismatch),
         }
     }
-}
-
-/// Gathers what reaching the HTTPS remote `url` needs: the proxy from `HTTPS_PROXY` and
-/// `NO_PROXY`, and the token stored for its host, if any (see [`https_credential`]).
-fn https_access(environment: &Environment, url: &HttpsRemote) -> Result<HttpsAccess, String> {
-    let proxy = ProxySetting::from_values(
-        environment.https_proxy.as_deref(),
-        environment.no_proxy.as_deref(),
-    )
-    .map_err(|error| error.to_string())?;
-    let token = match https_credential(url) {
-        Some(name) => {
-            let config = ConfigDir::resolve(
-                environment.home.as_deref(),
-                environment.xdg_config_home.as_deref(),
-            )
-            .map_err(|error| error.to_string())?;
-            Credential::load(&config, &name)
-                .map_err(|error| format!("cannot read the credential {name}: {error}"))?
-                .map(|credential| {
-                    Token::new(String::from_utf8_lossy(credential.expose()).into_owned())
-                })
-        }
-        None => None,
-    };
-    Ok(HttpsAccess {
-        proxy,
-        roots: Roots::WebPki,
-        token,
-    })
 }
 
 /// Returns the name of the credential that holds the token for an HTTPS remote's host and
@@ -578,6 +606,59 @@ pub(crate) fn fetch_from(
         return Err(FetchError::OverLimit(fetch_limit));
     }
     fetched
+}
+
+/// Fetches only `thread`'s `meta` from where this clone fetches threads, reached through
+/// `reach` with at most [`META_CHECK_BYTES`] read, accepts it trusting `owner`, and returns
+/// whether it is now the tombstone of the owner's purge, without telling the user anything. A
+/// clone with no remote to fetch from, and a remote without the thread, give `false`.
+///
+/// # Errors
+///
+/// Returns [`PurgeCheckError`] if the remote cannot be used or reached, the fetch fails, or
+/// the fetched `meta` is refused.
+pub(crate) fn fetch_purged(
+    store: &Store,
+    reach: &Reach,
+    (thread, owner): (ThreadId, &ParticipantKey),
+    interrupt: &Arc<AtomicBool>,
+) -> Result<bool, PurgeCheckError> {
+    let Some((_, url, _)) = fetch_source(store).map_err(SetupError::from)? else {
+        return Ok(false);
+    };
+    let access = reach.access(&url).map_err(SetupError::Access)?;
+    let transport = access
+        .connect(&url, interrupt, ReadBudget::new(META_CHECK_BYTES))
+        .map_err(FetchError::from)?;
+    Ok(meta_purged(store, transport, (thread, owner), interrupt)?)
+}
+
+/// Fetches only `thread`'s `meta` through `transport` and accepts it alone trusting `owner`,
+/// leaving the fetched refs waiting as they are; returns whether the local `meta` is then the
+/// tombstone of the owner's purge, `false` when the remote does not have the thread.
+fn meta_purged<T: Transport>(
+    store: &Store,
+    transport: T,
+    (thread, owner): (ThreadId, &ParticipantKey),
+    interrupt: &AtomicBool,
+) -> Result<bool, FetchError> {
+    let fetched = store.fetch_meta(transport, thread, interrupt);
+    if interrupt.load(Ordering::SeqCst) {
+        return Err(StoreError::Interrupted.into());
+    }
+    let Some(commit) = fetched? else {
+        return Ok(false);
+    };
+    Ok(accept_fetched_meta(store, thread, commit, owner)?)
+}
+
+/// Telling whether a thread was purged failed.
+#[derive(Debug, Error)]
+pub(crate) enum PurgeCheckError {
+    #[error(transparent)]
+    Setup(#[from] SetupError),
+    #[error(transparent)]
+    Fetch(#[from] FetchError),
 }
 
 fn fetch_and_accept<T: Transport>(
@@ -1022,13 +1103,19 @@ mod tests {
             ..Environment::default()
         };
         let url = HttpsRemote::parse("https://git.example.com/r.git").unwrap();
-        assert!(https_access(&environment, &url).unwrap().token.is_none());
+        assert!(
+            Reach::gather(&environment)
+                .https(&url)
+                .unwrap()
+                .token
+                .is_none()
+        );
         let config = ConfigDir::resolve(Some(home.path()), None).unwrap();
         mahi_identity::Credential::new(zeroize::Zeroizing::new(b"tok".to_vec()))
             .unwrap()
             .save(&config, &"https-git-example-com".parse().unwrap())
             .unwrap();
-        let access = https_access(&environment, &url).unwrap();
+        let access = Reach::gather(&environment).https(&url).unwrap();
         assert!(access.token.is_some());
         assert_eq!(
             access.proxy.unwrap().for_host("git.example.com"),
@@ -1036,7 +1123,8 @@ mod tests {
         );
         let lookalike = HttpsRemote::parse("https://git-example.com/r.git").unwrap();
         assert!(
-            https_access(&environment, &lookalike)
+            Reach::gather(&environment)
+                .https(&lookalike)
                 .unwrap()
                 .token
                 .is_none()
@@ -1045,7 +1133,7 @@ mod tests {
             https_proxy: Some("socks5://proxy.corp:1080".to_owned()),
             ..Environment::default()
         };
-        assert!(https_access(&socks, &url).is_err());
+        assert!(Reach::gather(&socks).https(&url).is_err());
     }
 
     #[test]
@@ -1269,6 +1357,54 @@ mod git_tests {
             git(&remote, &["rev-parse", &meta.to_string()]),
             second.to_string()
         );
+    }
+
+    #[test]
+    fn a_meta_check_tells_the_owners_purge_and_leaves_the_fetched_refs_waiting() {
+        let (_owner_dir, owner_store) = crate::session::tests::repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let owner = ParticipantKey::from_public_key(signer.public_key()).unwrap();
+        let started = crate::session::tests::start_with(&owner_store, &signer).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare"]);
+        let connect = || {
+            file::connect(remote.as_os_str().as_encoded_bytes(), Protocol::V1, false)
+                .unwrap_or_else(|never| match never {})
+        };
+        let (_clone_dir, clone) = crate::session::tests::repository_on_main();
+        let never = AtomicBool::new(false);
+        let check = |owner: &ParticipantKey| {
+            meta_purged(&clone, connect(), (started.thread, owner), &never)
+        };
+        assert!(!check(&owner).unwrap());
+        let meta = ThreadRef::new(started.thread, RefKind::Meta);
+        owner_store
+            .push_refs(
+                connect(),
+                &[meta.clone(), started.snapshots.clone()],
+                &never,
+            )
+            .unwrap();
+        clone
+            .fetch_thread(connect(), started.thread, &never)
+            .unwrap();
+        let waiting = clone.fetched_refs(started.thread).unwrap();
+        assert!(!check(&owner).unwrap());
+        assert_eq!(clone.head(&meta).unwrap(), owner_store.head(&meta).unwrap());
+
+        let stranger = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let stranger = ParticipantKey::from_public_key(stranger.public_key()).unwrap();
+        mahi_thread::tombstone_thread(&owner_store, started.thread, &signer).unwrap();
+        owner_store
+            .push_refs(connect(), std::slice::from_ref(&meta), &never)
+            .unwrap();
+        assert!(check(&stranger).is_err());
+        assert!(check(&owner).unwrap());
+        assert_eq!(clone.head(&meta).unwrap(), owner_store.head(&meta).unwrap());
+        assert_eq!(clone.head(&started.snapshots).unwrap(), None);
+        assert_eq!(clone.fetched_refs(started.thread).unwrap(), waiting);
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub use fetched::{
     Accepted,
     Refusal,
     accept_fetched,
+    accept_fetched_meta,
 };
 pub use handoff::{
     BRIEFED_PROMPTS,

@@ -59,20 +59,8 @@ impl Store {
         interrupt: &AtomicBool,
     ) -> Result<(), StoreError> {
         self.clear_fetched(thread)?;
-        let url = transport.to_url().into_owned();
         let spec = format!("+{THREADS_PREFIX}{thread}/*:{FETCHED_PREFIX}{thread}/*");
-        let remote = self
-            .repo
-            .remote_at(url.as_bstr())
-            .map_err(gix::Error::from_error)?
-            .with_fetch_tags(Tags::None)
-            .with_refspecs([spec.as_str()], Direction::Fetch)
-            .map_err(gix::Error::from_error)?;
-        let prepared = remote
-            .to_connection_with_transport(transport)
-            .with_credentials(|_| Ok(None))
-            .prepare_fetch(gix::progress::Discard, ref_map::Options::default())
-            .map_err(gix::Error::from_error)?;
+        let prepared = self.prepare_fetch(transport, &spec)?;
         if prepared.ref_map().mappings.is_empty() {
             return Ok(());
         }
@@ -80,6 +68,56 @@ impl Store {
             .receive(gix::progress::Discard, interrupt)
             .map_err(gix::Error::from_error)?;
         Ok(())
+    }
+
+    /// Fetches only `thread`'s `meta` from the remote `transport` reaches, and returns the
+    /// commit it points to there, or `None` when the remote does not have it. No ref is
+    /// written, so the refs [`Store::fetch_thread`] fetched keep waiting; the commit stays
+    /// unreferenced until it is accepted, or until git's garbage collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Git`] if the fetch fails or is interrupted.
+    pub fn fetch_meta<T: Transport>(
+        &self,
+        transport: T,
+        thread: ThreadId,
+        interrupt: &AtomicBool,
+    ) -> Result<Option<ObjectId>, StoreError> {
+        let meta = ThreadRef::new(thread, RefKind::Meta).to_string();
+        let prepared = self.prepare_fetch(transport, &meta)?;
+        let Some(commit) = prepared
+            .ref_map()
+            .mappings
+            .iter()
+            .find_map(|mapping| mapping.remote.as_id().map(ToOwned::to_owned))
+        else {
+            return Ok(None);
+        };
+        prepared
+            .receive(gix::progress::Discard, interrupt)
+            .map_err(gix::Error::from_error)?;
+        Ok(Some(commit))
+    }
+
+    fn prepare_fetch<T: Transport>(
+        &self,
+        transport: T,
+        spec: &str,
+    ) -> Result<gix::remote::fetch::Prepare<'_, '_, T>, StoreError> {
+        let url = transport.to_url().into_owned();
+        let remote = self
+            .repo
+            .remote_at(url.as_bstr())
+            .map_err(gix::Error::from_error)?
+            .with_fetch_tags(Tags::None)
+            .with_refspecs([spec], Direction::Fetch)
+            .map_err(gix::Error::from_error)?;
+        Ok(remote
+            .to_connection_with_transport(transport)
+            .with_credentials(|_| Ok(None))
+            .prepare_fetch(gix::progress::Discard, ref_map::Options::default())
+            .map_err(gix::Error::from_error)?)
     }
 
     /// Lists `thread`'s fetched refs, in name order, as the thread refs they mirror, with the

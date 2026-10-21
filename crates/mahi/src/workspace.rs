@@ -833,7 +833,7 @@ impl Workspace {
     pub(crate) fn take_ended(&mut self) -> (Option<String>, bool) {
         self.host_again();
         let mut told = None;
-        let mut changed = false;
+        let mut changed = self.leave_purged();
         for tab in &mut self.tabs {
             for running in &mut tab.agents {
                 let Some(code) = running.child.exited().unwrap_or(Some(1)) else {
@@ -942,6 +942,36 @@ impl Workspace {
         self.palette = None;
         self.composing = None;
         self.host(thread);
+    }
+
+    /// Closes the tabs that only watch threads their owners purged, as the live layer's
+    /// checks find them, telling it; returns whether one closed.
+    fn leave_purged(&mut self) -> bool {
+        let Some(live) = self.live.as_mut() else {
+            return false;
+        };
+        let watched = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.watch_only && tab.agents.is_empty())
+            .filter_map(|tab| tab.thread);
+        let purged = live.take_purged(Instant::now(), watched);
+        self.leave_purged_threads(&purged)
+    }
+
+    /// Closes the tabs that only watch the threads of `purged`, which their owners purged,
+    /// telling the last one; returns whether one closed.
+    fn leave_purged_threads(&mut self, purged: &[ThreadId]) -> bool {
+        let mut left = false;
+        for &thread in purged {
+            let before = self.tabs.len();
+            self.leave_thread(thread);
+            if self.tabs.len() != before {
+                self.live_told = Some(format!("thread {thread} was purged by its owner"));
+                left = true;
+            }
+        }
+        left
     }
 
     /// Closes the tabs that only watch the teammates of `thread`, before it ends or goes, so
@@ -2493,6 +2523,32 @@ mod tests {
             .collect();
         assert!(drawn.contains("invite done"), "{drawn}");
         assert!(workspace.palette.is_none() && workspace.composing.is_none());
+    }
+
+    #[test]
+    fn a_purged_thread_closes_only_its_watching_tab_and_says_its_owner_purged_it() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let watched: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let running_in: ThreadId = "fedcba9876543210fedcba9876543210".parse().unwrap();
+        workspace.watch_thread(watched);
+        let agent = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("fedcba98", vec![agent]));
+        workspace.tabs[1].thread = Some(running_in);
+        workspace.selected = 1;
+        assert!(!workspace.leave_purged_threads(&[running_in]));
+        assert_eq!(workspace.tabs.len(), 2);
+        assert!(workspace.live_told.is_none());
+        assert!(workspace.leave_purged_threads(&[watched]));
+        assert_eq!(workspace.tabs.len(), 1);
+        assert_eq!(workspace.tabs[0].thread, Some(running_in));
+        assert!(workspace.shows_threads());
+        assert_eq!(
+            workspace.live_told.as_deref(),
+            Some("thread 0123456789abcdef0123456789abcdef was purged by its owner")
+        );
     }
 
     #[test]

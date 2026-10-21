@@ -143,6 +143,25 @@ pub fn accept_fetched(
     Ok(accepted)
 }
 
+/// Accepts `commit`, a `meta` fetched for `thread` alone, as [`accept_fetched`] accepts the
+/// fetched `meta`, without reading or touching the fetched refs; returns whether the local
+/// `meta` is then the tombstone `trusted_owner` signed when they purged the thread.
+///
+/// # Errors
+///
+/// Returns [`ThreadError::FetchedMetaRefused`] if the document is not the thread's or not
+/// signed by `trusted_owner`, [`ThreadError::Pin`] if the pin refuses it, or
+/// [`ThreadError::Store`] if it or the local `meta` cannot be read, or `meta` cannot be moved.
+pub fn accept_fetched_meta(
+    store: &Store,
+    thread: ThreadId,
+    commit: ObjectId,
+    trusted_owner: &ParticipantKey,
+) -> Result<bool, ThreadError> {
+    let (_, current) = accept_meta(store, thread, commit, trusted_owner)?;
+    Ok(matches!(current, MetaDocument::Purged(_)))
+}
+
 fn accept_meta(
     store: &Store,
     thread: ThreadId,
@@ -407,6 +426,42 @@ mod tests {
         assert!(newer.purged && newer.updated.is_empty());
         assert_eq!(setup.store.head(&meta).unwrap(), Some(ended));
         assert_eq!(setup.store.head(&alice).unwrap(), None);
+    }
+
+    #[test]
+    fn accepting_a_fetched_meta_alone_tells_a_purge_and_leaves_the_waiting_refs() {
+        let setup = setup();
+        let (key, first) = created(&setup);
+        let alice = snapshots(&setup, "alice", "claude");
+        let waiting = commit(&setup, None, "f", b"work");
+        stage(&setup, &alice, waiting);
+        assert!(!accept_fetched_meta(&setup.store, setup.thread, first, &setup.owner_key).unwrap());
+
+        let live = load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
+        let tombstone = Tombstone::sign(&live, &setup.owner).unwrap();
+        let impostor = Setup {
+            thread: setup.thread,
+            ..crate::thread::tests::setup()
+        };
+        let forged = draft(&impostor, 1, "taken")
+            .sign(&key, &impostor.owner)
+            .unwrap();
+        let forged = commit(&setup, Some(first), META_ENTRY, &forged);
+        assert!(matches!(
+            accept_fetched_meta(&setup.store, setup.thread, forged, &setup.owner_key),
+            Err(ThreadError::FetchedMetaRefused { .. })
+        ));
+        let meta = ThreadRef::new(setup.thread, RefKind::Meta);
+        assert_eq!(setup.store.head(&meta).unwrap(), Some(first));
+
+        let ended = commit(&setup, Some(first), META_ENTRY, &tombstone);
+        assert!(accept_fetched_meta(&setup.store, setup.thread, ended, &setup.owner_key).unwrap());
+        assert_eq!(setup.store.head(&meta).unwrap(), Some(ended));
+        assert_eq!(setup.store.head(&alice).unwrap(), None);
+        assert_eq!(
+            setup.store.fetched_refs(setup.thread).unwrap(),
+            [(alice, waiting)]
+        );
     }
 
     #[test]
