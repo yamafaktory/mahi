@@ -308,7 +308,9 @@ impl Prompts {
     /// Calls `visit` with each waiting prompt, oldest first.
     pub(crate) fn each_waiting(&self, mut visit: impl FnMut(&Waiting)) {
         if let Ok(state) = self.state.lock() {
-            state.waiting.iter().for_each(&mut visit);
+            for waiting in &state.waiting {
+                visit(waiting);
+            }
         }
     }
 }

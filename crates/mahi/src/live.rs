@@ -20,7 +20,6 @@ use std::{
         Arc,
         Mutex,
         MutexGuard,
-        PoisonError,
         atomic::{
             AtomicBool,
             AtomicUsize,
@@ -121,6 +120,8 @@ pub(crate) enum HostError {
     Frame(#[from] FrameError),
     #[error("another of your mahis hosts this thread's live layer")]
     AnotherHost,
+    #[error("a thread panicked while it changed the threads this node hosts")]
+    HostedPoisoned,
     #[error("the agent is already served by this host")]
     SlotTaken,
     #[error("an agent of another participant cannot be served by this host")]
@@ -910,9 +911,7 @@ impl LiveHost {
             }
             None => (None, None, None),
         };
-        if !shared.threads.add(thread, Arc::clone(&peers)) {
-            return Err(HostError::AnotherHost);
-        }
+        shared.threads.add(thread, Arc::clone(&peers))?;
         let (queue, tapped) = mpsc::sync_channel(TAP_QUEUE);
         let dropped = Arc::new(AtomicBool::new(false));
         let wanted = Arc::new(Mutex::new(VecDeque::with_capacity(PENDING_SCREENS)));
@@ -1080,31 +1079,34 @@ pub(crate) struct HostedThreads {
 }
 
 impl HostedThreads {
-    fn threads(&self) -> MutexGuard<'_, HashMap<ThreadId, Arc<HostPeers>>> {
-        self.threads.lock().unwrap_or_else(PoisonError::into_inner)
+    fn threads(&self) -> Option<MutexGuard<'_, HashMap<ThreadId, Arc<HostPeers>>>> {
+        self.threads.lock().ok()
     }
 
-    fn add(&self, thread: ThreadId, peers: Arc<HostPeers>) -> bool {
-        let mut threads = self.threads();
+    fn add(&self, thread: ThreadId, peers: Arc<HostPeers>) -> Result<(), HostError> {
+        let mut threads = self.threads().ok_or(HostError::HostedPoisoned)?;
         if threads.contains_key(&thread) {
-            return false;
+            return Err(HostError::AnotherHost);
         }
         threads.insert(thread, peers);
-        true
+        Ok(())
     }
 
     fn remove(&self, thread: ThreadId) {
-        self.threads().remove(&thread);
+        if let Some(mut threads) = self.threads() {
+            threads.remove(&thread);
+        }
     }
 
     fn of(&self, thread: ThreadId) -> Option<Arc<HostPeers>> {
-        self.threads().get(&thread).cloned()
+        self.threads()?.get(&thread).cloned()
     }
 }
 
 impl Peers for HostedThreads {
     fn admits(&self, node: &NodeId) -> bool {
-        self.threads().values().any(|peers| peers.admits(node))
+        self.threads()
+            .is_some_and(|threads| threads.values().any(|peers| peers.admits(node)))
     }
 
     fn meta_for(&self, thread: ThreadId, node: &NodeId) -> Option<Vec<u8>> {
@@ -1891,9 +1893,16 @@ mod tests {
     fn one_node_admits_every_hosted_threads_participants_and_serves_each_only_its_own_meta() {
         let (first, second) = (hosted(), hosted());
         let threads = HostedThreads::default();
-        assert!(threads.add(first.thread, Arc::new(peers(&first, REREAD_EVERY))));
-        assert!(!threads.add(first.thread, Arc::new(peers(&first, REREAD_EVERY))));
-        assert!(threads.add(second.thread, Arc::new(peers(&second, REREAD_EVERY))));
+        threads
+            .add(first.thread, Arc::new(peers(&first, REREAD_EVERY)))
+            .unwrap();
+        assert!(matches!(
+            threads.add(first.thread, Arc::new(peers(&first, REREAD_EVERY))),
+            Err(HostError::AnotherHost)
+        ));
+        threads
+            .add(second.thread, Arc::new(peers(&second, REREAD_EVERY)))
+            .unwrap();
         assert!(threads.admits(&first.owner_node));
         assert!(threads.admits(&second.owner_node));
         assert!(!threads.admits(bob().node()));
@@ -1905,6 +1914,30 @@ mod tests {
         assert!(!threads.admits(&first.owner_node));
         assert!(threads.meta_for(first.thread, &first.owner_node).is_none());
         assert!(threads.admits(&second.owner_node));
+    }
+
+    #[test]
+    fn poisoned_hosted_threads_admit_no_one_and_host_nothing_more() {
+        let (first, second) = (hosted(), hosted());
+        let threads = HostedThreads::default();
+        threads
+            .add(first.thread, Arc::new(peers(&first, REREAD_EVERY)))
+            .unwrap();
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = threads.threads.lock();
+                    panic!("poison the lock");
+                })
+                .join();
+        });
+        assert!(!threads.admits(&first.owner_node));
+        assert!(threads.meta_for(first.thread, &first.owner_node).is_none());
+        assert!(matches!(
+            threads.add(second.thread, Arc::new(peers(&second, REREAD_EVERY))),
+            Err(HostError::HostedPoisoned)
+        ));
+        threads.remove(first.thread);
     }
 
     #[test]

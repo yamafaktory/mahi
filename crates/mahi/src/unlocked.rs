@@ -11,7 +11,6 @@ use std::{
     sync::{
         Mutex,
         MutexGuard,
-        PoisonError,
     },
     time::{
         Duration,
@@ -97,7 +96,11 @@ pub(crate) fn identity<E>(
     ask: impl FnOnce() -> Result<SecretString, E>,
     unlock_error: impl FnOnce(IdentityError) -> E,
 ) -> Result<LocalIdentity, E> {
-    if let Some(given) = given().as_ref().filter(|given| given.file == file) {
+    if let Some(given) = given()
+        .as_deref()
+        .and_then(Option::as_ref)
+        .filter(|given| given.file == file)
+    {
         return Ok(given.identity.clone());
     }
     let showing = ui::is_showing();
@@ -121,10 +124,18 @@ pub(crate) fn hold(file: &Path, identity: &LocalIdentity) {
     }
 }
 
-/// Forgets the key the home screen kept unlocked, and the one a workspace handed over.
+/// Forgets the key the home screen kept unlocked, and the one a workspace handed over, even
+/// when a thread panicked while it held one.
 pub(crate) fn forget() {
-    *kept() = None;
-    *given() = None;
+    wipe(&KEPT);
+    wipe(&GIVEN);
+}
+
+fn wipe<T>(lock: &Mutex<Option<T>>) {
+    lock.clear_poison();
+    if let Ok(mut held) = lock.lock() {
+        *held = None;
+    }
 }
 
 /// Returns the key the home screen keeps unlocked for `file`, if it keeps one, counting this
@@ -169,20 +180,26 @@ fn give(identity: LocalIdentity, file: &Path) {
     let Some(no_cores) = NoCores::start() else {
         return;
     };
-    *given() = Some(Given {
-        file: file.to_path_buf(),
-        identity,
-        _no_cores: no_cores,
-    });
+    if let Some(mut given) = given() {
+        *given = Some(Given {
+            file: file.to_path_buf(),
+            identity,
+            _no_cores: no_cores,
+        });
+    }
 }
 
-fn given() -> MutexGuard<'static, Option<Given>> {
-    GIVEN.lock().unwrap_or_else(PoisonError::into_inner)
+fn given() -> Option<MutexGuard<'static, Option<Given>>> {
+    GIVEN.lock().ok()
 }
 
-/// Forgets the kept key if no action has used it for 15 minutes before `now`.
+/// Forgets the kept key if no action has used it for 15 minutes before `now`, or if a thread
+/// panicked while it held the key.
 pub(crate) fn forget_unused(now: Instant) {
-    let mut kept = kept();
+    let Some(mut kept) = kept() else {
+        wipe(&KEPT);
+        return;
+    };
     if kept.as_ref().is_some_and(|kept| !kept.is_fresh(now)) {
         *kept = None;
     }
@@ -194,12 +211,12 @@ impl Kept {
     }
 }
 
-fn kept() -> MutexGuard<'static, Option<Kept>> {
-    KEPT.lock().unwrap_or_else(PoisonError::into_inner)
+fn kept() -> Option<MutexGuard<'static, Option<Kept>>> {
+    KEPT.lock().ok()
 }
 
 fn take_kept(file: &Path, now: Instant) -> Option<LocalIdentity> {
-    let mut kept = kept();
+    let mut kept = kept()?;
     let fresh = kept
         .as_ref()
         .is_some_and(|kept| kept.file == file && kept.is_fresh(now));
@@ -213,7 +230,9 @@ fn take_kept(file: &Path, now: Instant) -> Option<LocalIdentity> {
 }
 
 fn keep(file: &Path, identity: &LocalIdentity, now: Instant) {
-    let mut kept = kept();
+    let Some(mut kept) = kept() else {
+        return;
+    };
     let Some(no_cores) = kept.take().map(|old| old.no_cores).or_else(NoCores::start) else {
         return;
     };
@@ -268,9 +287,9 @@ mod tests {
         let start = Instant::now();
         keep(file, &identity, start);
         forget_unused(start + KEEP_FOR / 2);
-        assert!(kept().is_some());
+        assert!(kept().unwrap().is_some());
         forget_unused(start + KEEP_FOR);
-        assert!(kept().is_none());
+        assert!(kept().unwrap().is_none());
     }
 
     #[test]
@@ -325,7 +344,7 @@ mod tests {
         );
         assert_eq!(getrlimit(Resource::Core).current, Some(0));
         forget();
-        assert!(given().is_none());
+        assert!(given().unwrap().is_none());
     }
 
     #[test]
@@ -351,7 +370,7 @@ mod tests {
             std::os::fd::IntoRawFd::into_raw_fd(reader),
             Path::new("/config/identity"),
         );
-        assert!(given().is_none());
+        assert!(given().unwrap().is_none());
     }
 
     #[test]
@@ -367,7 +386,7 @@ mod tests {
             Path::new("/config/identity"),
         );
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(given().is_none());
+        assert!(given().unwrap().is_none());
         drop(writer);
     }
 
@@ -376,6 +395,67 @@ mod tests {
         let identity = LocalIdentity::generate();
         keep(Path::new("/config/identity"), &identity, Instant::now());
         ui::before_dying();
-        assert!(kept().is_none());
+        assert!(kept().unwrap().is_none());
+    }
+
+    fn poison<T: Send>(lock: &'static Mutex<T>) {
+        let _ = std::thread::spawn(move || {
+            let _guard = lock.lock();
+            panic!("poison the lock");
+        })
+        .join();
+    }
+
+    #[test]
+    fn a_poisoned_kept_key_is_neither_given_back_nor_replaced() {
+        let identity = LocalIdentity::generate();
+        let file = Path::new("/config/identity");
+        let now = Instant::now();
+        keep(file, &identity, now);
+        poison(&KEPT);
+        assert!(take_kept(file, now).is_none());
+        keep(file, &LocalIdentity::generate(), now);
+        assert!(take_kept(file, now).is_none());
+    }
+
+    #[test]
+    fn a_poisoned_handed_over_key_is_not_used() {
+        let identity = LocalIdentity::generate();
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        let mut writer = std::fs::File::from(writer);
+        std::io::Write::write_all(&mut writer, identity.to_secret().expose_secret().as_bytes())
+            .unwrap();
+        drop(writer);
+        let file = Path::new("/config/identity");
+        receive(std::os::fd::IntoRawFd::into_raw_fd(reader), file);
+        poison(&GIVEN);
+        assert!(
+            super::identity(file, || Err(IdentityError::WrongPassphrase), |error| error).is_err()
+        );
+    }
+
+    #[test]
+    fn a_poisoned_kept_key_is_wiped_by_the_idle_check() {
+        keep(
+            Path::new("/config/identity"),
+            &LocalIdentity::generate(),
+            Instant::now(),
+        );
+        poison(&KEPT);
+        forget_unused(Instant::now());
+        assert!(KEPT.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn forgetting_wipes_a_poisoned_key() {
+        let file = Path::new("/config/identity");
+        keep(file, &LocalIdentity::generate(), Instant::now());
+        give(LocalIdentity::generate(), file);
+        assert!(GIVEN.lock().unwrap().is_some());
+        poison(&KEPT);
+        poison(&GIVEN);
+        forget();
+        assert!(KEPT.lock().unwrap().is_none());
+        assert!(GIVEN.lock().unwrap().is_none());
     }
 }
