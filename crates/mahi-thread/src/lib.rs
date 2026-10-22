@@ -51,6 +51,7 @@ pub use meta::{
     MetaError,
     Participant,
     PrivateMeta,
+    Role,
     Tombstone,
     VerifiedMeta,
 };

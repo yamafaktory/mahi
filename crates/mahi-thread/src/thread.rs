@@ -377,6 +377,7 @@ pub(crate) mod tests {
     use crate::{
         Participant,
         PrivateMeta,
+        Role,
     };
 
     pub(crate) struct Setup {
@@ -418,7 +419,8 @@ pub(crate) mod tests {
                     setup.mahi.to_public(),
                     crate::node::tests::random_node(),
                 )
-                .unwrap(),
+                .unwrap()
+                .with_role(Role::Collaborator),
             ],
             PrivateMeta::new(title, "main").unwrap(),
         )
@@ -702,7 +704,8 @@ pub(crate) mod tests {
                     age::x25519::Identity::generate().to_public(),
                     crate::node::tests::random_node(),
                 )
-                .unwrap(),
+                .unwrap()
+                .with_role(Role::Collaborator),
             ],
             PrivateMeta::new("t", "main").unwrap(),
         )
@@ -792,7 +795,8 @@ pub(crate) mod tests {
             mahi.to_public(),
             crate::node::tests::random_node(),
         )
-        .unwrap();
+        .unwrap()
+        .with_role(Role::Collaborator);
         (participant, mahi)
     }
 
@@ -1019,7 +1023,8 @@ pub(crate) mod tests {
                     setup.mahi.to_public(),
                     crate::node::tests::random_node(),
                 )
-                .unwrap(),
+                .unwrap()
+                .with_role(Role::Collaborator),
             ],
             PrivateMeta::new("t", "main").unwrap(),
         )

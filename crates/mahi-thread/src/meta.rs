@@ -46,7 +46,7 @@ pub const MAX_META_BYTES: usize = 256 * 1024;
 /// The most participants a thread can have.
 pub const MAX_PARTICIPANTS: usize = 256;
 
-const VERSION: u16 = 2;
+const VERSION: u16 = 4;
 const TOMBSTONE_VERSION: u16 = 3;
 const NAMESPACE: &str = "mahi-meta";
 const HASH: HashAlg = HashAlg::Sha512;
@@ -57,13 +57,23 @@ const MAX_PRIVATE_BYTES: usize = 4096;
 const LOW_ORDER_PROBE: [u8; 32] = [0x5a; 32];
 
 /// A person in a thread: their name, the SSH key they sign with, the mahi key that the thread
-/// key is wrapped to, and the node key of their machine on the live layer.
+/// key is wrapped to, the node key of their machine on the live layer, and their role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Participant {
     name: ParticipantName,
     key: ParticipantKey,
     recipient: x25519::Recipient,
     node: NodeId,
+    role: Role,
+}
+
+/// What a participant does in a thread, which the owner chooses and signs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    /// Runs an agent of their own in the thread, whose work the other collaborators take.
+    Collaborator,
+    /// Only watches.
+    Watcher,
 }
 
 /// The encrypted part of a thread's meta document.
@@ -151,6 +161,9 @@ pub enum InvalidMeta {
     /// The owner is not a participant.
     #[error("the owner is not a participant")]
     OwnerNotListed,
+    /// The owner is listed as a watcher.
+    #[error("the owner is not a collaborator")]
+    OwnerNotCollaborator,
     /// The owner is listed with a key other than the trusted one.
     #[error("the owner's key is not the trusted owner key")]
     OwnerKeyUntrusted,
@@ -267,6 +280,7 @@ struct WireParticipant<'a> {
     key: &'a str,
     recipient: &'a str,
     node: [u8; 32],
+    role: Role,
     wrapped: &'a [u8],
 }
 
@@ -285,7 +299,8 @@ struct WirePrivate<'a> {
 
 impl Participant {
     /// Creates a participant who signs with `key`, receives the thread key at `recipient` and
-    /// speaks on the live layer as `node`.
+    /// speaks on the live layer as `node`, as a watcher until [`Participant::with_role`] says
+    /// otherwise.
     ///
     /// # Errors
     ///
@@ -305,7 +320,29 @@ impl Participant {
             key,
             recipient,
             node,
+            role: Role::Watcher,
         })
+    }
+
+    /// Returns the participant with the role `role`.
+    #[must_use]
+    pub fn with_role(self, role: Role) -> Self {
+        Self { role, ..self }
+    }
+
+    /// Returns the participant's role.
+    #[must_use]
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// Returns whether `other` is the same person: the same name and keys, whatever the role.
+    #[must_use]
+    pub fn is_same_person(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.key == other.key
+            && self.recipient == other.recipient
+            && self.node == other.node
     }
 
     /// Returns the participant's name.
@@ -474,6 +511,7 @@ impl MetaDraft {
                         key: participant.key.to_openssh(),
                         recipient,
                         node: *participant.node.as_bytes(),
+                        role: participant.role,
                         wrapped,
                     },
                 )
@@ -734,7 +772,8 @@ impl VerifiedMeta {
                     .parse()
                     .map_err(|_| InvalidMeta::ParticipantRecipient)?,
                 NodeId::from_bytes(wire.node).map_err(|_| InvalidMeta::ParticipantNode)?,
-            )?;
+            )?
+            .with_role(wire.role);
             participants.push((participant, wire.wrapped.to_vec()));
         }
         validate_participants(&owner, participants.iter().map(|(p, _)| p))?;
@@ -898,7 +937,12 @@ fn validate_participants<'a>(
         if !nodes.insert(participant.node) {
             return Err(InvalidMeta::DuplicateNode);
         }
-        has_owner |= &participant.name == owner;
+        if &participant.name == owner {
+            if participant.role != Role::Collaborator {
+                return Err(InvalidMeta::OwnerNotCollaborator);
+            }
+            has_owner = true;
+        }
     }
     if !has_owner {
         return Err(InvalidMeta::OwnerNotListed);
@@ -981,7 +1025,7 @@ mod tests {
     }
 
     fn draft(owner: &Person, others: &[&Person]) -> MetaDraft {
-        let mut participants = vec![owner.participant()];
+        let mut participants = vec![owner.participant().with_role(Role::Collaborator)];
         participants.extend(others.iter().map(|p| p.participant()));
         MetaDraft::new(
             ThreadId::random().unwrap(),
@@ -1118,13 +1162,44 @@ mod tests {
         assert_eq!(meta.owner(), &alice.name);
         assert_eq!(
             meta.participants().cloned().collect::<Vec<_>>(),
-            [alice.participant(), bob.participant()]
+            [
+                alice.participant().with_role(Role::Collaborator),
+                bob.participant()
+            ]
         );
 
         let key = meta.thread_key(&bob.name, bob.identity()).unwrap();
         let private = meta.private(&key).unwrap();
         assert_eq!(private.title(), "Fix the parser");
         assert_eq!(private.landing_branch(), "feature/parser");
+    }
+
+    #[test]
+    fn roles_are_signed_and_read_back_and_a_new_participant_only_watches() {
+        let (alice, bob, carol) = (
+            Person::new("alice"),
+            Person::new("bob"),
+            Person::new("carol"),
+        );
+        assert_eq!(bob.participant().role(), Role::Watcher);
+        let mut draft = draft(&alice, &[&bob]);
+        draft
+            .participants
+            .push(carol.participant().with_role(Role::Collaborator));
+        let encoded = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
+        let meta = VerifiedMeta::decode(&encoded, draft.thread, &alice.key()).unwrap();
+        let roles: Vec<(&str, Role)> = meta
+            .participants()
+            .map(|participant| (participant.name().as_str(), participant.role()))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                ("alice", Role::Collaborator),
+                ("bob", Role::Watcher),
+                ("carol", Role::Collaborator)
+            ]
+        );
     }
 
     #[test]
@@ -1288,7 +1363,7 @@ mod tests {
         let alice = Person::new("alice");
         let draft = draft(&alice, &[]);
         let encoded = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
-        for version in [VERSION - 1, TOMBSTONE_VERSION + 1] {
+        for version in [1, 2, VERSION + 1] {
             let other =
                 signed_envelope(&alice.private, &body_of(&encoded), HASH, NAMESPACE, version);
             assert!(matches!(
@@ -1321,6 +1396,7 @@ mod tests {
             key: key.to_openssh(),
             recipient: &mahi,
             node: *alice.node.as_bytes(),
+            role: Role::Collaborator,
             wrapped: b"",
         };
         let fresh = || WireBody {
@@ -1353,6 +1429,15 @@ mod tests {
         let mut body = fresh();
         body.owner = "Alice";
         assert!(matches!(decode(&body), Err(MetaError::Name(_))));
+        let mut body = fresh();
+        body.participants = vec![WireParticipant {
+            role: Role::Watcher,
+            ..good
+        }];
+        assert!(matches!(
+            decode(&body),
+            Err(MetaError::Invalid(InvalidMeta::OwnerNotCollaborator))
+        ));
         let mut body = fresh();
         body.participants = vec![good, good];
         assert!(matches!(
@@ -1509,6 +1594,7 @@ mod tests {
     fn drafts_check_their_participants() {
         let (alice, bob) = (Person::new("alice"), Person::new("bob"));
         let private = PrivateMeta::new("t", "main").unwrap();
+        let owner = alice.participant().with_role(Role::Collaborator);
         let make = |participants: Vec<Participant>| {
             MetaDraft::new(
                 ThreadId::random().unwrap(),
@@ -1530,7 +1616,7 @@ mod tests {
             Err(InvalidMeta::OwnerNotListed)
         );
         assert_eq!(
-            make(vec![alice.participant(), alice.participant()]),
+            make(vec![owner.clone(), owner.clone()]),
             Err(InvalidMeta::DuplicateName)
         );
         let same_key = Participant::new(
@@ -1555,18 +1641,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            make(vec![alice.participant(), same_key]),
+            make(vec![owner.clone(), same_key]),
             Err(InvalidMeta::DuplicateKey)
         );
         assert_eq!(
-            make(vec![alice.participant(), same_recipient]),
+            make(vec![owner.clone(), same_recipient]),
             Err(InvalidMeta::DuplicateRecipient)
         );
         assert_eq!(
-            make(vec![alice.participant(), same_node]),
+            make(vec![owner.clone(), same_node]),
             Err(InvalidMeta::DuplicateNode)
         );
-        assert_eq!(make(vec![alice.participant(), bob.participant()]), Ok(()));
+        assert_eq!(make(vec![owner.clone(), bob.participant()]), Ok(()));
+        assert_eq!(
+            make(vec![alice.participant(), bob.participant()]),
+            Err(InvalidMeta::OwnerNotCollaborator)
+        );
     }
 
     fn recipient_from_bytes(bytes: [u8; 32]) -> x25519::Recipient {
@@ -1637,6 +1727,7 @@ mod tests {
                 key: key.to_openssh(),
                 recipient: &weak,
                 node: *alice.node.as_bytes(),
+                role: Role::Collaborator,
                 wrapped: b"",
             }],
             private: b"",
@@ -1665,7 +1756,7 @@ mod tests {
                 0,
                 base(),
                 alice.name.clone(),
-                vec![alice.participant(), copy],
+                vec![alice.participant().with_role(Role::Collaborator), copy],
                 PrivateMeta::new("t", "main").unwrap(),
             ),
             Err(MetaError::Invalid(InvalidMeta::DuplicateRecipient))

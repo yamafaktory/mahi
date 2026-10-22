@@ -33,6 +33,7 @@ use crate::{
     Participant,
     ParticipantKey,
     PrivateMeta,
+    Role,
     accept_fetched,
     create_thread,
     thread::META_ENTRY,
@@ -63,7 +64,8 @@ fn person(seed: u8, name: &str) -> (PrivateKey, Participant) {
         recipient,
         node,
     )
-    .expect("a valid participant");
+    .expect("a valid participant")
+    .with_role(Role::Collaborator);
     (key, participant)
 }
 

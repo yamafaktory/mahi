@@ -214,7 +214,7 @@ pub(crate) fn invite_to<P: Prompt>(
     let invitee_node = *card.participant().node();
     let new = card.participant();
     if let Some(clash) = current.participants().find(|listed| {
-        *listed != new
+        !listed.is_same_person(new)
             && (listed.name() == new.name()
                 || listed.key() == new.key()
                 || listed.recipient().to_string() == new.recipient().to_string()
@@ -232,7 +232,10 @@ pub(crate) fn invite_to<P: Prompt>(
         return Err(InviteError::NodeMismatch);
     }
     let name = new.name().clone();
-    let meta = if current.participants().any(|listed| listed == new) {
+    let meta = if current
+        .participants()
+        .any(|listed| listed.is_same_person(new))
+    {
         current
     } else {
         add(store, thread, &current, card, inviter, open_prompt)?
@@ -315,7 +318,10 @@ mod tests {
         PublicIdentity,
     };
     use mahi_store::GlobalPatterns;
-    use mahi_thread::Participant;
+    use mahi_thread::{
+        Participant,
+        Role,
+    };
     use ssh_key::{
         Algorithm,
         PrivateKey,
@@ -468,6 +474,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(roles.role(&bob), Some(TeammateRole::ReadOnly));
+    }
+
+    #[test]
+    fn a_card_listed_with_another_role_gets_its_ticket_again() {
+        let (_repo, store) = repository_on_main();
+        let owner = owner_of_a_thread(&store);
+        let key = ParticipantKey::from_public_key(owner.key.public_key()).unwrap();
+        let listed = load_meta(&store, owner.thread, &key, 0)
+            .unwrap()
+            .participants()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(listed.role(), Role::Collaborator);
+        let ticket = invite_to(
+            &store,
+            (owner.thread, None),
+            ParticipantCard::new(listed.with_role(Role::Watcher)),
+            &inviter(&owner, &owner.key),
+            &mut script(&[]),
+        )
+        .unwrap();
+        assert_eq!(ticket.min_generation(), 0);
     }
 
     #[test]

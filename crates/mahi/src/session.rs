@@ -54,6 +54,7 @@ use mahi_thread::{
     Participant,
     ParticipantKey,
     PrivateMeta,
+    Role,
     SshSigner,
     ThreadError,
     TranscriptError,
@@ -190,7 +191,8 @@ pub(crate) fn start(
         ParticipantKey::from_public_key(signer.public_key())?,
         public.recipient().clone(),
         node,
-    )?;
+    )?
+    .with_role(Role::Collaborator);
     let slot = AgentSlot::new(participant.clone(), agent.clone());
     let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
     let title = format!("{} on {branch}", agent.as_str());
