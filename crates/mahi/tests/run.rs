@@ -3722,8 +3722,8 @@ echo stray > "$CODEX_HOME/history.jsonl"
             stdout.contains("args=[--permission-mode bypassPermissions --mcp-config "),
             "{stdout}"
         );
-        let config = fixture.home.join(".config/mahi/config.toml");
-        fs::write(&config, "agent-approvals = \"ask\"\n").unwrap();
+        let settings = config_dir(&fixture.home).settings_file();
+        fs::write(&settings, "agent-approvals = \"ask\"\n").unwrap();
         let asked = fixture
             .command(&["run", claude.to_str().unwrap()])
             .output()
