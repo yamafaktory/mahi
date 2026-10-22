@@ -4406,6 +4406,9 @@ echo stray > "$CODEX_HOME/history.jsonl"
             "echo x > {outside} 2>/dev/null; echo outside=$?; \
              echo x >> {readme} 2>/dev/null; echo checkout=$?; \
              echo x > {hook} 2>/dev/null; echo git=$?; \
+             echo x > {object} 2>/dev/null; echo objects=$?; \
+             echo x > {branch} 2>/dev/null; echo refs=$?; \
+             echo x >> {packed} 2>/dev/null; echo packed=$?; \
              admin=$(sed 's/^gitdir: //' .git); \
              echo x >> \"$admin/HEAD\" 2>/dev/null; echo admin=$?; \
              echo x >> .git 2>/dev/null; echo link=$?; \
@@ -4413,11 +4416,16 @@ echo stray > "$CODEX_HOME/history.jsonl"
             outside = outside.display(),
             readme = fixture.repo.join("README").display(),
             hook = fixture.repo.join(".git/hooks/pre-commit").display(),
+            object = fixture.repo.join(".git/objects/agent").display(),
+            branch = fixture.repo.join(".git/refs/heads/agent").display(),
+            packed = fixture.repo.join(".git/packed-refs").display(),
         );
         let output = fixture.mahi(&["run", "sh", "-c", &script]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(output.status.code(), Some(0), "{stdout}");
-        for place in ["outside", "checkout", "git", "admin", "link", "unlink"] {
+        for place in [
+            "outside", "checkout", "git", "objects", "refs", "packed", "admin", "link", "unlink",
+        ] {
             assert!(stdout.contains(&format!("{place}=")), "{stdout}");
             assert!(!stdout.contains(&format!("{place}=0")), "{place}: {stdout}");
         }
@@ -4427,6 +4435,8 @@ echo stray > "$CODEX_HOME/history.jsonl"
             "hello from the repository\n"
         );
         assert!(!fixture.repo.join(".git/hooks/pre-commit").exists());
+        assert!(!fixture.repo.join(".git/objects/agent").exists());
+        assert!(!fixture.repo.join(".git/refs/heads/agent").exists());
         let worktree = worktree_of(&String::from_utf8_lossy(&output.stderr));
         let admin = fixture
             .repo
