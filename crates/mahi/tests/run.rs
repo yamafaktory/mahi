@@ -582,6 +582,9 @@ printf 'fix it' | "$MAHI_BIN" hook prompt
 "$MAHI_BIN" hook tool < /dev/null
 "$MAHI_BIN" hook turn-end < /dev/null
 { echo kept > "$CLAUDE_CONFIG_DIR/written" && echo state=writable; } 2>/dev/null || echo state=none
+{ echo '{}' > "$CLAUDE_CONFIG_DIR/settings.json" && echo settings=writable; } 2>/dev/null || echo settings=locked
+{ rm -f "$CLAUDE_CONFIG_DIR/settings.json" && echo settings=removed; } 2>/dev/null || echo settings=kept
+{ echo '{}' > "$CLAUDE_CONFIG_DIR/new.json" && mv -f "$CLAUDE_CONFIG_DIR/new.json" "$CLAUDE_CONFIG_DIR/settings.json" && echo settings=replaced; } 2>/dev/null || echo settings=stays
 "#;
 
     fn fake_claude(fixture: &Fixture) -> PathBuf {
@@ -747,7 +750,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         );
         assert!(
             stdout.contains(&format!(
-                "args=--mcp-config {}",
+                "args=--permission-mode bypassPermissions --mcp-config {}",
                 state.join("mcp.json").display()
             )),
             "{stdout}"
@@ -766,6 +769,9 @@ content = '{{"bin": "{mahi_bin}"}}'
             "proxy=http://",
             "hooks=ok",
             "state=writable",
+            "settings=locked",
+            "settings=kept",
+            "settings=stays",
         ] {
             assert!(stdout.contains(expected), "{expected}: {stdout}");
         }
@@ -3687,6 +3693,48 @@ echo stray > "$CODEX_HOME/history.jsonl"
     }
 
     #[test]
+    fn claude_keeps_asking_when_the_user_chose_so_or_set_its_permission_mode() {
+        let fixture = fixture();
+        let claude = script(&fixture, "asking", "claude", "#!/bin/sh\necho args=[$*]\n");
+        let chosen = fixture
+            .command(&["run", claude.to_str().unwrap(), "--permission-mode", "plan"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&chosen.stdout);
+        assert_eq!(chosen.status.code(), Some(0), "{stdout}");
+        assert!(
+            stdout.contains("args=[--permission-mode plan --mcp-config "),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("bypassPermissions"), "{stdout}");
+        let prompted = fixture
+            .command(&[
+                "run",
+                claude.to_str().unwrap(),
+                "--",
+                "--permission-mode plan",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&prompted.stdout);
+        assert_eq!(prompted.status.code(), Some(0), "{stdout}");
+        assert!(
+            stdout.contains("args=[--permission-mode bypassPermissions --mcp-config "),
+            "{stdout}"
+        );
+        let config = fixture.home.join(".config/mahi/config.toml");
+        fs::write(&config, "agent-approvals = \"ask\"\n").unwrap();
+        let asked = fixture
+            .command(&["run", claude.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&asked.stdout);
+        assert_eq!(asked.status.code(), Some(0), "{stdout}");
+        assert!(stdout.contains("args=[--mcp-config "), "{stdout}");
+        assert!(!stdout.contains("bypassPermissions"), "{stdout}");
+    }
+
+    #[test]
     fn resuming_claude_with_no_conversation_to_continue_starts_a_new_one() {
         let fixture = fixture();
         save_identity(&fixture);
@@ -3717,7 +3765,10 @@ echo stray > "$CODEX_HOME/history.jsonl"
         .env("MAHI_LIVE", "off");
         let (code, output) = in_terminal_with(command, Some(PASSPHRASE));
         assert_eq!(code, 0, "{output}");
-        assert!(output.contains("args=[--mcp-config "), "{output}");
+        assert!(
+            output.contains("args=[--permission-mode bypassPermissions --mcp-config "),
+            "{output}"
+        );
         assert!(!output.contains("--continue"), "{output}");
         assert!(
             output.contains("has no conversation here to continue"),

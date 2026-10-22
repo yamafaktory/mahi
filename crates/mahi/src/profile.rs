@@ -1,5 +1,8 @@
 use std::{
-    ffi::OsStr,
+    ffi::{
+        OsStr,
+        OsString,
+    },
     fs::{
         self,
         File,
@@ -67,10 +70,13 @@ use rustix::{
 };
 use thiserror::Error;
 
-use crate::environment::{
-    EnvName,
-    EnvNameError,
-    PASSED_ON,
+use crate::{
+    environment::{
+        EnvName,
+        EnvNameError,
+        PASSED_ON,
+    },
+    settings::AgentApprovals,
 };
 
 const CODEX_LOG_DEPTH: usize = 3;
@@ -124,6 +130,15 @@ pub(crate) struct Profile {
     pub(crate) takes_prompt: bool,
     pub(crate) tools: Tools,
     install: Install,
+    approvals: Option<Approvals>,
+}
+
+/// How mahi starts an agent in its own mode that asks no permission: the arguments it adds,
+/// and how it tells that the user's own arguments chose a mode already.
+#[derive(Debug)]
+struct Approvals {
+    args: &'static [&'static str],
+    chosen: fn(&[OsString]) -> bool,
 }
 
 /// The file in the agent's state directory that tells it where `mahi mcp` is.
@@ -166,6 +181,7 @@ fn claude_code_profile() -> Profile {
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
             ("DISABLE_AUTOUPDATER", "1"),
             ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
+            ("IS_SANDBOX", "1"),
         ]
         .iter()
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -185,6 +201,10 @@ fn claude_code_profile() -> Profile {
         takes_prompt: true,
         tools: Tools::McpFlag("--mcp-config"),
         install: Install::ClaudeCode,
+        approvals: Some(Approvals {
+            args: &["--permission-mode", "bypassPermissions"],
+            chosen: claude_code_chose_approvals,
+        }),
     }
 }
 
@@ -239,6 +259,10 @@ fn codex_profile() -> Profile {
                 .collect(),
         ),
         install: Install::Codex,
+        approvals: Some(Approvals {
+            args: &["-c", "approval_policy=\"never\""],
+            chosen: codex_chose_approvals,
+        }),
     }
 }
 
@@ -383,6 +407,7 @@ fn read_profile(path: &Path) -> Result<Profile, LoadError> {
             Tools::Args(user.tool_args)
         },
         install: Install::Files(user.files),
+        approvals: None,
     })
 }
 
@@ -454,6 +479,34 @@ impl Profile {
         let mut left = MOST_SESSION_ENTRIES;
         let mut path = String::new();
         holds_log(&state.join(dir), (&mut path, depth), is_log, &mut left).unwrap_or(true)
+    }
+
+    /// Returns the files in the agent's state directory that hold mahi's hooks, which the
+    /// sandbox shows read-only, so the agent cannot take the hooks out during its run.
+    pub(crate) fn hook_files(&self) -> &'static [&'static str] {
+        match self.install {
+            Install::ClaudeCode => &[CLAUDE_CODE_SETTINGS_FILE],
+            Install::Codex => &[CODEX_HOOKS_FILE],
+            Install::Files(_) => &[],
+        }
+    }
+
+    /// Returns the arguments that start the agent in its own mode that asks no permission,
+    /// none when `approvals` keeps the agent's own choice, when its profile has no such mode,
+    /// or when the user's own `arguments` already choose one.
+    pub(crate) fn approval_args(
+        &self,
+        approvals: AgentApprovals,
+        arguments: &[OsString],
+    ) -> &'static [&'static str] {
+        match approvals {
+            AgentApprovals::Ask => &[],
+            AgentApprovals::Never => self
+                .approvals
+                .as_ref()
+                .filter(|skip| !(skip.chosen)(arguments))
+                .map_or(&[], |skip| skip.args),
+        }
     }
 
     /// Returns how one line of the agent's session log reads, when mahi has a reader for it.
@@ -728,8 +781,53 @@ fn install_files(
     Ok(())
 }
 
+fn claude_code_chose_approvals(arguments: &[OsString]) -> bool {
+    arguments
+        .iter()
+        .filter_map(|argument| argument.to_str())
+        .any(|argument| {
+            argument == "--permission-mode"
+                || argument.starts_with("--permission-mode=")
+                || argument == "--dangerously-skip-permissions"
+        })
+}
+
+fn codex_chose_approvals(arguments: &[OsString]) -> bool {
+    let sets_policy = |value: &str| value.trim_start().starts_with("approval_policy");
+    let mut arguments = arguments
+        .iter()
+        .map(|argument| argument.to_str().unwrap_or(""));
+    while let Some(argument) = arguments.next() {
+        let chose = match argument {
+            "--ask-for-approval"
+            | "-a"
+            | "--approve-for-me"
+            | "--yolo"
+            | "--dangerously-bypass-approvals-and-sandbox" => true,
+            "-c" | "--config" => arguments.next().is_some_and(sets_policy),
+            _ => {
+                argument.starts_with("--ask-for-approval=")
+                    || (argument.starts_with("-a") && !argument.starts_with("--"))
+                    || argument.strip_prefix("--config=").is_some_and(sets_policy)
+                    || (!argument.starts_with("--")
+                        && argument
+                            .strip_prefix("-c")
+                            .map(|value| value.strip_prefix('=').unwrap_or(value))
+                            .is_some_and(sets_policy))
+            }
+        };
+        if chose {
+            return true;
+        }
+    }
+    false
+}
+
+const CLAUDE_CODE_SETTINGS_FILE: &str = "settings.json";
+
 const CLAUDE_CODE_SETTINGS: &str = r#"{
   "permissions": { "allow": ["mcp__mahi"] },
+  "skipDangerousModePermissionPrompt": true,
   "hooks": {
     "UserPromptSubmit": [
       { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook prompt" }] }
@@ -770,7 +868,11 @@ fn install_claude_code(
     worktree: &Path,
     tools: Option<(&str, &str)>,
 ) -> io::Result<()> {
-    replace(state, "settings.json", CLAUDE_CODE_SETTINGS.as_bytes())?;
+    replace(
+        state,
+        CLAUDE_CODE_SETTINGS_FILE,
+        CLAUDE_CODE_SETTINGS.as_bytes(),
+    )?;
     if let Some((mahi, socket)) = tools {
         let config = serde_json::json!({
             "mcpServers": {
@@ -984,6 +1086,99 @@ mod tests {
         .unwrap()
     }
 
+    fn approval_args(
+        profile: &Profile,
+        approvals: AgentApprovals,
+        arguments: &[&str],
+    ) -> Vec<&'static str> {
+        let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+        profile.approval_args(approvals, &arguments).to_vec()
+    }
+
+    #[test]
+    fn claude_code_asks_no_permission_unless_the_user_chose_a_mode() {
+        let claude = claude_code_profile();
+        assert_eq!(
+            approval_args(
+                &claude,
+                AgentApprovals::Never,
+                &["--model", "opus", "--allow-dangerously-skip-permissions"]
+            ),
+            ["--permission-mode", "bypassPermissions"]
+        );
+        for chosen in [
+            &["--permission-mode", "plan"][..],
+            &["--permission-mode=acceptEdits"],
+            &["--dangerously-skip-permissions"],
+        ] {
+            assert!(
+                approval_args(&claude, AgentApprovals::Never, chosen).is_empty(),
+                "{chosen:?}"
+            );
+        }
+        assert!(approval_args(&claude, AgentApprovals::Ask, &[]).is_empty());
+    }
+
+    #[test]
+    fn codex_asks_no_permission_unless_the_user_chose_a_policy() {
+        let codex = codex_profile();
+        assert_eq!(
+            approval_args(
+                &codex,
+                AgentApprovals::Never,
+                &[
+                    "-c",
+                    "model=\"o3\"",
+                    "-m",
+                    "o3",
+                    "-capproval",
+                    "--config=model=o3"
+                ]
+            ),
+            ["-c", "approval_policy=\"never\""]
+        );
+        for chosen in [
+            &["--ask-for-approval", "on-request"][..],
+            &["--ask-for-approval=untrusted"],
+            &["-a", "never"],
+            &["-auntrusted"],
+            &["--approve-for-me"],
+            &["--yolo"],
+            &["-c=approval_policy=never"],
+            &["--dangerously-bypass-approvals-and-sandbox"],
+            &["-c", "approval_policy=\"on-request\""],
+            &["--config", " approval_policy = \"untrusted\""],
+            &["--config=approval_policy=\"never\""],
+            &["-capproval_policy=\"never\""],
+        ] {
+            assert!(
+                approval_args(&codex, AgentApprovals::Never, chosen).is_empty(),
+                "{chosen:?}"
+            );
+        }
+        assert!(approval_args(&codex, AgentApprovals::Ask, &[]).is_empty());
+    }
+
+    #[test]
+    fn claude_code_is_told_it_runs_in_a_sandbox_so_root_may_skip_permissions() {
+        assert!(
+            claude_code_profile()
+                .env
+                .contains(&("IS_SANDBOX".to_owned(), "1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_files_holding_mahis_hooks_are_named_for_each_built_in_profile() {
+        assert_eq!(claude_code_profile().hook_files(), ["settings.json"]);
+        assert_eq!(codex_profile().hook_files(), ["hooks.json"]);
+    }
+
+    #[test]
+    fn claude_code_is_told_its_no_approval_mode_was_accepted() {
+        let settings: serde_json::Value = serde_json::from_str(CLAUDE_CODE_SETTINGS).unwrap();
+        assert_eq!(settings["skipDangerousModePermissionPrompt"], true);
+    }
     #[test]
     fn a_state_directory_is_created_private_and_a_planted_link_or_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();

@@ -35,6 +35,18 @@ pub(crate) struct Settings {
     pub(crate) palette_key: PaletteKey,
     pub(crate) fetch_limit: u64,
     pub(crate) push_limit: u64,
+    pub(crate) agent_approvals: AgentApprovals,
+}
+
+/// Whether mahi starts an agent in its own mode that asks no permission, inside the sandbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AgentApprovals {
+    /// The agent never asks: its profile's no-approval arguments are added.
+    #[default]
+    Never,
+    /// The agent keeps its own choice.
+    Ask,
 }
 
 impl Default for Settings {
@@ -43,6 +55,7 @@ impl Default for Settings {
             palette_key: PaletteKey::default(),
             fetch_limit: DEFAULT_TRANSFER_LIMIT,
             push_limit: DEFAULT_TRANSFER_LIMIT,
+            agent_approvals: AgentApprovals::default(),
         }
     }
 }
@@ -53,6 +66,7 @@ struct SettingsFile {
     palette_key: Option<String>,
     fetch_limit: Option<Size>,
     push_limit: Option<Size>,
+    agent_approvals: Option<AgentApprovals>,
 }
 
 #[derive(Deserialize)]
@@ -116,6 +130,7 @@ impl Settings {
             palette_key,
             fetch_limit: limit(file.fetch_limit, "fetch-limit")?,
             push_limit: limit(file.push_limit, "push-limit")?,
+            agent_approvals: file.agent_approvals.unwrap_or_default(),
         })
     }
 }
@@ -160,6 +175,27 @@ mod tests {
             Settings::read(&path).unwrap().palette_key,
             PaletteKey::CTRL_SPACE
         );
+    }
+
+    #[test]
+    fn agents_ask_no_permission_unless_agent_approvals_is_ask() {
+        let (_dir, path) = written("");
+        assert_eq!(
+            Settings::read(&path).unwrap().agent_approvals,
+            AgentApprovals::Never
+        );
+        for (text, approvals) in [
+            ("agent-approvals = \"ask\"\n", AgentApprovals::Ask),
+            ("agent-approvals = \"never\"\n", AgentApprovals::Never),
+        ] {
+            let (_dir, path) = written(text);
+            assert_eq!(Settings::read(&path).unwrap().agent_approvals, approvals);
+        }
+        let (_dir, path) = written("agent-approvals = \"sometimes\"\n");
+        assert!(matches!(
+            Settings::read(&path),
+            Err(SettingsError::Invalid(..))
+        ));
     }
 
     #[test]

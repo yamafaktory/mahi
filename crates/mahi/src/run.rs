@@ -259,6 +259,7 @@ use crate::{
         SessionSource,
     },
     settings::{
+        AgentApprovals,
         Settings,
         SettingsError,
     },
@@ -533,7 +534,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
         },
         credentials,
     )?;
-    prepared.palette_key = settings.palette_key;
+    prepared.apply(&settings);
     prepared.set_thread(live, own_key(&signing)?);
     if let Err(error) =
         remote::offer_origin(&prepared.store, &config, TerminalPrompt::open_interactive)
@@ -646,7 +647,7 @@ pub(crate) fn resume(
         },
         credentials,
     )?;
-    prepared.palette_key = settings.palette_key;
+    prepared.apply(&settings);
     prepared.join_thread(environment, &config, owner.clone(), bootstrap)?;
     prepared.sync = SyncSetup::gather(&prepared.store, environment, owns_meta);
     let commits = match listed_and_fetched(
@@ -804,7 +805,7 @@ fn start_new_agent(
         },
         credentials,
     )?;
-    prepared.palette_key = settings.palette_key;
+    prepared.apply(&settings);
     prepared.join_thread(environment, &config, owner.clone(), bootstrap)?;
     prepared.sync = SyncSetup::gather(&prepared.store, environment, owner == own);
     let commits = match listed_and_fetched(
@@ -1061,7 +1062,7 @@ pub(crate) fn join_run(
         },
         credentials,
     )?;
-    prepared.palette_key = settings.palette_key;
+    prepared.apply(&settings);
     prepared.join_thread(
         environment,
         &config,
@@ -1314,9 +1315,16 @@ struct Prepared {
     sync: Option<SyncSetup>,
     handoff: Option<PathBuf>,
     palette_key: PaletteKey,
+    approvals: AgentApprovals,
 }
 
 impl Prepared {
+    /// Takes from `settings` the palette's key and whether the agent asks for permissions.
+    fn apply(&mut self, settings: &Settings) {
+        self.palette_key = settings.palette_key;
+        self.approvals = settings.agent_approvals;
+    }
+
     /// Sets the thread's live layer, if any, and the owner of its `meta`, which the agent's
     /// tools read.
     fn set_thread(&mut self, live: Option<LiveSetup>, owner: ParticipantKey) {
@@ -1414,6 +1422,7 @@ impl Prepared {
             sync: None,
             handoff: None,
             palette_key: PaletteKey::default(),
+            approvals: AgentApprovals::default(),
         })
     }
 
@@ -1508,6 +1517,7 @@ impl Prepared {
             profile: self.profile,
             state: state.clone(),
             credentials: &self.credentials,
+            approvals: self.approvals,
         };
         let (sandbox, network) = (self.sandbox, self.network);
         let (config, _running) = mark_running(environment, &started)
@@ -1524,15 +1534,9 @@ impl Prepared {
                 return Err(error);
             }
         };
-        let pusher = self.sync.map(|setup| {
-            let refs = setup.refs(started.thread, &started.slot);
-            let name = setup.name.clone();
-            let limit = setup.push_limit;
-            let pusher = Pusher::start(self.git_dir.clone(), (refs, limit), move |flag| {
-                setup.connect(flag)
-            });
-            (pusher, name)
-        });
+        let pusher = self
+            .sync
+            .map(|setup| start_pusher(setup, &self.git_dir, &started));
         let activity = Arc::new(Activity::default());
         let key = started.key.take().map(Arc::new);
         let (recorder, turns) = start_background(
@@ -1659,6 +1663,18 @@ fn serve_tools(
 
 /// Opens the door `mahi merge` reaches `started`'s running agent at; a failure is reported,
 /// and the agent runs without it.
+/// Starts pushing the refs of `started`'s agent to the remote `setup` names, and returns the
+/// pusher with the remote's name.
+fn start_pusher(setup: SyncSetup, git_dir: &Path, started: &Started) -> (Pusher, RemoteName) {
+    let refs = setup.refs(started.thread, &started.slot);
+    let name = setup.name.clone();
+    let limit = setup.push_limit;
+    let pusher = Pusher::start(git_dir.to_path_buf(), (refs, limit), move |flag| {
+        setup.connect(flag)
+    });
+    (pusher, name)
+}
+
 fn open_door(environment: &Environment, started: &Started) -> Option<MergeDoor> {
     merge_door::door_path(
         &environment.runtime_dir(),
@@ -2281,6 +2297,7 @@ struct Launch<'a> {
     first_prompt: fn(&str) -> String,
     credentials: &'a [Handed],
     profile: Option<&'static Profile>,
+    approvals: AgentApprovals,
     state: Option<PathBuf>,
     arguments: &'a [OsString],
     environment: &'a Environment,
@@ -2310,7 +2327,8 @@ impl Launch<'_> {
         resuming && !profile.resume_args.is_empty() && !profile.has_session(state, self.worktree)
     }
 
-    /// Adds the agent's arguments: the user's, then those its profile always adds, then, when
+    /// Adds the agent's arguments: the user's, then those its profile always adds, then those
+    /// that start it asking no permission unless the user chose otherwise, then, when
     /// mahi serves the agent its tools, what its profile adds for them (a flag and the file in
     /// its state directory `state` that tells it where `mahi mcp` is, or the profile's tool
     /// arguments), then the user's after `--` and the first prompt of a handoff, after those
@@ -2330,6 +2348,11 @@ impl Launch<'_> {
         }
         for argument in self.profile.iter().flat_map(|profile| &profile.args) {
             pty = pty.arg(argument);
+        }
+        if let Some(profile) = self.profile {
+            for argument in profile.approval_args(self.approvals, before) {
+                pty = pty.arg(argument);
+            }
         }
         if let (Some(profile), Some(tools)) = (self.profile, self.tools_config()) {
             match &profile.tools {
@@ -2401,6 +2424,16 @@ impl Launch<'_> {
             Ok(count) => eprintln!("mahi: restored the agent's session ({count} files)"),
             Err(error) => crate::report_with("the agent's session was not restored", &error),
         }
+    }
+
+    /// Shows the agent its state directory `state`, writable but for the files that hold
+    /// mahi's hooks.
+    fn bind_state(&self, sandbox: &mut Sandbox, state: &Path) -> Result<(), RunError> {
+        sandbox.bind(state, Access::ReadWrite)?;
+        for name in self.profile.iter().flat_map(|profile| profile.hook_files()) {
+            sandbox.bind(&state.join(name), Access::ReadOnly)?;
+        }
+        Ok(())
     }
 
     fn prepare_state(&self) -> Result<Option<PathBuf>, RunError> {
@@ -2510,7 +2543,7 @@ impl Launch<'_> {
         let state = self.prepare_state()?;
         if let Some(state) = &state {
             self.restore_session(state);
-            sandbox.bind(state, Access::ReadWrite)?;
+            self.bind_state(&mut sandbox, state)?;
         }
         if let Some(network) = &network {
             sandbox.open_loopback_port(network.port())?;
@@ -3372,7 +3405,7 @@ impl DraftWriter {
             },
             credentials,
         )?;
-        prepared.palette_key = settings.palette_key;
+        prepared.apply(&settings);
         Ok(Self { prepared })
     }
 
@@ -3416,6 +3449,7 @@ impl DraftWriter {
             profile: prepared.profile,
             state: prepared.profile.map(|_| state),
             credentials: &prepared.credentials,
+            approvals: prepared.approvals,
         };
         let sandbox = mem::take(&mut prepared.sandbox);
         let (child, raw, proxy) = launch.spawn(sandbox, prepared.network.take())?;
