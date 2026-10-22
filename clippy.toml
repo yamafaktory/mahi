@@ -2,3 +2,9 @@ allow-dbg-in-tests = true
 allow-panic-in-tests = true
 allow-unwrap-in-tests = true
 doc-valid-idents = ["AppArmor", ".."]
+disallowed-methods = [
+    { path = "std::panic::catch_unwind", reason = "mahi never catches a panic" },
+    { path = "std::sync::PoisonError::into_inner", reason = "never read the data inside a poisoned mutex" },
+    { path = "std::sync::PoisonError::get_ref", reason = "never read the data inside a poisoned mutex" },
+    { path = "std::sync::PoisonError::get_mut", reason = "never read the data inside a poisoned mutex" },
+]

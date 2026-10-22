@@ -113,7 +113,9 @@ The workspace lint table is the rule. A summary:
 ## Rust style
 
 Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) and the
-[Rust Style Guide](https://doc.rust-lang.org/style-guide/). Specifically:
+[Rust Style Guide](https://doc.rust-lang.org/style-guide/). Some rules below come from
+[Google's Rust style guide](https://google.github.io/styleguide/rustguide.html). Do not follow
+the rest of that guide: where it disagrees with this file, this file wins. Specifically:
 
 - **Names.** `UpperCamelCase` for types and traits, `snake_case` for functions and modules,
   `SCREAMING_SNAKE_CASE` for constants. Conversions use `as_`, `to_` and `into_` with their
@@ -148,6 +150,24 @@ Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) an
 - **Dependencies.** Prefer well-maintained crates that DESIGN.md already names (`gix`,
   `rustix`, `vt100`, `iroh`, `age`, `ratatui`, `spake2`, …), and `clap` (derive) for the
   command line. Ask before you add a large dependency that the design does not name.
+- **Flags.** Use an enum, not a `bool`, for an argument whose meaning is not clear at the
+  call site.
+- **Matches.** When each variant of a mahi enum needs its own decision, list the variants
+  instead of `_`, so a new variant breaks the build. Use `if let` when only one variant matters.
+- **Shared ownership.** Avoid `Rc` and `Arc`. Use them only to share a value between threads or
+  tasks, or when single ownership is clearly too complex.
+- **Poisoned mutexes.** Never read the data inside a poisoned mutex. Treat a poisoned lock as
+  a failure. `clippy.toml` disallows `PoisonError::into_inner`, `get_ref` and `get_mut`.
+- **Panics.** Do not catch a panic. `clippy.toml` disallows `std::panic::catch_unwind`.
+- **`#[must_use]`.** Mark a function `#[must_use]` when ignoring its result is a misuse. Mark
+  an error type and a lazy value `#[must_use]` too.
+- **Constructor and trait names.** When a type has an infallible `new`, name its fallible
+  constructor `try_new`. Name an extension trait `FooExt`.
+- **Lifetimes and generics.** Give a lifetime on a type a descriptive name, such as `'buf`.
+  Give a generic parameter a short name that hints at its bound.
+- **Iterators.** Assign an iterator chain to a variable before a `for` loop, not in its
+  header. Do not use `for_each`.
+- **Formatting.** Use `#[rustfmt::skip]` only for generated code or deliberate alignment.
 
 ## Performance and security
 
