@@ -4,7 +4,6 @@ use std::{
         Condvar,
         Mutex,
         MutexGuard,
-        PoisonError,
     },
     time::{
         Duration,
@@ -95,7 +94,8 @@ pub enum Trigger {
     Poked,
     /// The interval elapsed.
     Timer,
-    /// The scheduler was closed, or every [`Poker`] was dropped; stop snapshotting.
+    /// The scheduler was closed, every [`Poker`] was dropped, or a thread panicked while it held
+    /// the scheduler's lock. Stop snapshotting.
     Closed,
 }
 
@@ -112,24 +112,26 @@ struct Shared {
 }
 
 impl Shared {
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> Option<MutexGuard<'_, State>> {
+        self.state.lock().ok()
     }
 
     fn wait_until<'a>(
         &self,
         state: MutexGuard<'a, State>,
         until: Instant,
-    ) -> MutexGuard<'a, State> {
+    ) -> Option<MutexGuard<'a, State>> {
         let left = until.saturating_duration_since(Instant::now());
         self.wake
             .wait_timeout(state, left)
-            .unwrap_or_else(PoisonError::into_inner)
-            .0
+            .ok()
+            .map(|(state, _)| state)
     }
 
     fn close(&self) {
-        self.lock().closed = true;
+        if let Some(mut state) = self.lock() {
+            state.closed = true;
+        }
         self.wake.notify_all();
     }
 }
@@ -192,26 +194,26 @@ impl Scheduler {
     /// `spawn_blocking`.
     #[must_use]
     pub fn wait(&mut self) -> Trigger {
-        let trigger = self.wait_inner();
+        let trigger = self.wait_inner().unwrap_or(Trigger::Closed);
         self.last = Some(Instant::now());
         trigger
     }
 
-    fn wait_inner(&self) -> Trigger {
+    fn wait_inner(&self) -> Option<Trigger> {
         let now = Instant::now();
         let timer = now.checked_add(self.interval).unwrap_or(now + LONGEST);
-        let mut state = self.shared.lock();
+        let mut state = self.shared.lock()?;
         loop {
             if state.closed {
-                return Trigger::Closed;
+                return Some(Trigger::Closed);
             }
             if state.poked {
                 break;
             }
             if Instant::now() >= timer {
-                return Trigger::Timer;
+                return Some(Trigger::Timer);
             }
-            state = self.shared.wait_until(state, timer);
+            state = self.shared.wait_until(state, timer)?;
         }
 
         let earliest = self
@@ -225,16 +227,16 @@ impl Scheduler {
                 .min(latest);
             loop {
                 if state.closed {
-                    return Trigger::Closed;
+                    return Some(Trigger::Closed);
                 }
                 if state.poked || Instant::now() >= quiet {
                     break;
                 }
-                state = self.shared.wait_until(state, quiet);
+                state = self.shared.wait_until(state, quiet)?;
             }
             if !state.poked || Instant::now() >= latest {
                 state.poked = false;
-                return Trigger::Poked;
+                return Some(Trigger::Poked);
             }
         }
     }
@@ -261,7 +263,9 @@ impl Poker {
     /// Reports that the worktree may have changed.
     pub fn poke(&self) {
         let shared = &self.handles.0;
-        shared.lock().poked = true;
+        if let Some(mut state) = shared.lock() {
+            state.poked = true;
+        }
         shared.wake.notify_all();
     }
 
@@ -480,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn a_poisoned_lock_does_not_stop_the_scheduler() {
+    fn a_poisoned_lock_closes_the_scheduler() {
         let (mut scheduler, poker) = Scheduler::new(slow_timer());
         let shared = Arc::clone(&poker.handles.0);
         let _ = thread::spawn(move || {
@@ -489,6 +493,7 @@ mod tests {
         })
         .join();
         poker.poke();
-        assert_eq!(scheduler.wait(), Trigger::Poked);
+        assert_eq!(scheduler.wait(), Trigger::Closed);
+        assert_eq!(scheduler.wait(), Trigger::Closed);
     }
 }
