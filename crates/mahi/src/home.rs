@@ -50,7 +50,10 @@ use mahi_term::{
     ThreadView,
     TopBar,
 };
-use mahi_thread::ParticipantKey;
+use mahi_thread::{
+    ParticipantKey,
+    Role,
+};
 use ratatui_core::terminal::Terminal;
 
 use crate::{
@@ -709,7 +712,8 @@ fn unlock_key(file: &Path) -> Result<LocalIdentity, String> {
 
 /// Pairs with the teammate whose code the user types, records the thread they add the user
 /// to, and opens it in a tab that watches its agents, with the mahi key unlocked to host it;
-/// returns what to tell the user when it does not.
+/// when the owner made the user a collaborator, then starts the agent they pick there, as
+/// `mahi join` with an agent does. Returns what to tell the user when it does not.
 fn join_in_tab(
     environment: &Environment,
     workspace: &mut Workspace,
@@ -725,18 +729,49 @@ fn join_in_tab(
             None => Ok(()),
         })
         .and_then(|()| pair::join_by_code(environment).map_err(Into::into))
-        .and_then(|ticket| join::record(&ticket, environment).map_err(Into::into));
+        .and_then(|ticket| {
+            join::record(&ticket, environment)
+                .map(|joined| (ticket, joined))
+                .map_err(Into::into)
+        });
     drop(busy);
     ui::keys_make_signals(false);
-    let thread = match joined {
-        Ok(thread) => thread,
+    let (ticket, (thread, role)) = match joined {
+        Ok(joined) => joined,
         Err(error) => {
             crate::report(&*error);
             return Err(format!("{SHOWN} failed"));
         }
     };
     workspace.watch_thread(thread);
-    Ok(())
+    match role {
+        Role::Watcher => Ok(()),
+        Role::Collaborator => {
+            let agent = agent_to_run(
+                environment,
+                ("Join a thread", "Which agent should work in this thread?"),
+                &[],
+            )
+            .map_err(|told| match told.split_once("; run mahi run") {
+                Some((none, _)) => none.to_owned(),
+                None => told,
+            })?;
+            let words = vec![
+                "join".to_owned(),
+                ticket.to_string(),
+                "--".to_owned(),
+                agent.clone(),
+            ];
+            let shown = format!("mahi join -- {agent}");
+            let key = identity_file.and_then(unlocked::current);
+            workspace.open(
+                environment,
+                (&short(&thread.to_string()), &agent, &shown),
+                (&words, false),
+                key.as_ref(),
+            )
+        }
+    }
 }
 
 /// Before an action that ends or purges a thread whose agents run in the workspace's tabs,
@@ -1469,7 +1504,6 @@ fn add_remote(store: &mut Store) -> Result<Added, remote::RemoteError> {
 #[cfg(test)]
 mod tests {
     use mahi_core::AgentName;
-    use mahi_thread::Role;
 
     use super::*;
 

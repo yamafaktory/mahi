@@ -42,6 +42,7 @@ use mahi_core::{
 };
 use mahi_crypto::ThreadKey;
 use mahi_identity::{
+    AgentSigner,
     ConfigDir,
     ConfigError,
     IdentityError,
@@ -78,7 +79,9 @@ use mahi_thread::{
     MetaError,
     NodeId,
     OwnerError,
+    Participant,
     ParticipantKey,
+    Role,
     ThreadError,
     VerifiedMeta,
     load_meta,
@@ -501,6 +504,19 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
         None => None,
     };
     let store = Store::discover(&cwd)?;
+    let signer = match signer {
+        Some(signer) if crate::report::connected() => {
+            let meta = recorded_meta(ticket, &store, own)?;
+            return join_with_agent(
+                command,
+                environment,
+                (ticket, &store, &config, own),
+                signer,
+                meta,
+            );
+        }
+        signer => signer,
+    };
     let peers = host_peers(ticket);
     let node = LiveNode::bind_live(
         node_key.secret(),
@@ -517,46 +533,13 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     };
     if let Some(signer) = signer {
         let _ = node.close();
-        let agent = command
-            .agent()
-            .map(|(program, _)| session::agent_from(Path::new(program)))
-            .ok_or(JoinError::OptionsNeedAgent)?;
-        let lock = AgentLock::acquire(&config, ticket.thread(), &agent).map_err(JoinError::Busy)?;
-        let me = meta
-            .participants()
-            .find(|listed| listed.node() == &own)
-            .map(|listed| listed.name().clone());
-        let meta = match me {
-            Some(me) => {
-                let stopped = sync::fetch_until_stopped(
-                    &store,
-                    environment,
-                    ticket.thread(),
-                    ticket.owner(),
-                    Some(&me),
-                );
-                if let Some(signal) = stopped {
-                    return Ok(Outcome::Stopped(signal));
-                }
-                load_meta(&store, ticket.thread(), ticket.owner(), meta.generation())
-                    .map_err(JoinError::Pin)?
-            }
-            None => meta,
-        };
-        let commits = CommitKey::new(signer).map_err(JoinError::SigningKey)?;
-        let (participant, key) = unlock(&meta, own, Some(commits.key()), &config)?;
-        let joined = Joined {
-            thread: ticket.thread(),
-            base: meta.base(),
-            key,
-            participant,
-            owner: ticket.owner().clone(),
-            host: ticket.host().clone(),
-            lock,
-            commits,
-        };
-        return run::join_run(command, environment, joined)
-            .map_err(|error| JoinError::Run(Box::new(error)));
+        return join_with_agent(
+            command,
+            environment,
+            (ticket, &store, &config, own),
+            signer,
+            meta,
+        );
     }
     if let Ok(mut admitted) = peers.0.lock() {
         admitted.extend(meta.participants().map(|participant| *participant.node()));
@@ -566,17 +549,100 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     watched.map(|()| Outcome::Exited(0))
 }
 
+/// Runs `command`'s agent in the thread `ticket` invites to, whose `meta` the user is listed
+/// in, as `mahi join <ticket> -- <agent>` does.
+fn join_with_agent(
+    command: &JoinCommand,
+    environment: &Environment,
+    (ticket, store, config, own): (&Ticket, &Store, &ConfigDir, NodeId),
+    signer: AgentSigner,
+    meta: VerifiedMeta,
+) -> Result<Outcome, JoinError> {
+    let agent = command
+        .agent()
+        .map(|(program, _)| session::agent_from(Path::new(program)))
+        .ok_or(JoinError::OptionsNeedAgent)?;
+    let lock = AgentLock::acquire(config, ticket.thread(), &agent).map_err(JoinError::Busy)?;
+    let me = meta
+        .participants()
+        .find(|listed| listed.node() == &own)
+        .map(|listed| listed.name().clone());
+    let meta = match me {
+        Some(me) => {
+            let stopped = sync::fetch_until_stopped(
+                store,
+                environment,
+                ticket.thread(),
+                ticket.owner(),
+                Some(&me),
+            );
+            if let Some(signal) = stopped {
+                return Ok(Outcome::Stopped(signal));
+            }
+            load_meta(store, ticket.thread(), ticket.owner(), meta.generation())
+                .map_err(JoinError::Pin)?
+        }
+        None => meta,
+    };
+    let commits = CommitKey::new(signer).map_err(JoinError::SigningKey)?;
+    let (participant, key) = unlock(&meta, own, Some(commits.key()), config)?;
+    let joined = Joined {
+        thread: ticket.thread(),
+        base: meta.base(),
+        key,
+        participant,
+        owner: ticket.owner().clone(),
+        host: ticket.host().clone(),
+        lock,
+        commits,
+    };
+    run::join_run(command, environment, joined).map_err(|error| JoinError::Run(Box::new(error)))
+}
+
+/// Returns the `meta` that joining with `ticket` recorded here, at the ticket's generation
+/// or later, when it still lists both the user's node `own` and the ticket's host; a
+/// workspace's child reads it instead of binding the user's node key, which the workspace
+/// holds.
+fn recorded_meta(ticket: &Ticket, store: &Store, own: NodeId) -> Result<VerifiedMeta, JoinError> {
+    if remembered_owner(store, ticket.thread())
+        .map_err(JoinError::Owner)?
+        .as_ref()
+        != Some(ticket.owner())
+    {
+        return Err(JoinError::NotListed);
+    }
+    let meta = load_meta(
+        store,
+        ticket.thread(),
+        ticket.owner(),
+        ticket.min_generation(),
+    )
+    .map_err(JoinError::Pin)?;
+    let listed = |node: &NodeId| meta.participants().any(|listed| listed.node() == node);
+    if !listed(&own) || !listed(ticket.host().node()) {
+        return Err(JoinError::NotListed);
+    }
+    Ok(meta)
+}
+
 /// Accepts `ticket` in the repository around the current directory as `mahi join` does,
 /// recording the thread's `meta`, its owner and its host, without watching it or running an
-/// agent; returns the thread.
-pub(crate) fn record(ticket: &Ticket, environment: &Environment) -> Result<ThreadId, JoinError> {
+/// agent; returns the thread and the role the owner gave the user in it.
+pub(crate) fn record(
+    ticket: &Ticket,
+    environment: &Environment,
+) -> Result<(ThreadId, Role), JoinError> {
     let relays = relays_for(environment.live)?;
     let (cwd, _, node_key, own) = invitee(ticket, environment)?;
     let store = Store::discover(&cwd)?;
     let node = LiveNode::bind_live(node_key.secret(), relays, host_peers(ticket))?;
     let joined = joined_meta(&node, ticket, &store, own);
     let _ = node.close();
-    joined.map(|_| ticket.thread())
+    let role = joined?
+        .participants()
+        .find(|listed| listed.node() == &own)
+        .map_or(Role::Watcher, Participant::role);
+    Ok((ticket.thread(), role))
 }
 
 /// Returns the current directory, the configuration, the node key and the node id of the
@@ -1215,5 +1281,48 @@ mod tests {
         let owner = mahi_thread::ParticipantKey::from_public_key(key.public_key()).unwrap();
         mahi_thread::remember_owner(&store, started.thread, &owner).unwrap();
         check_joinable(&store, started.thread).unwrap();
+    }
+
+    #[test]
+    fn a_workspace_child_reads_the_recorded_meta_only_for_its_owner_generation_and_nodes() {
+        use mahi_live::HostAddress;
+        use mahi_thread::Role;
+
+        use crate::workspace_live::tests::{
+            add_bob,
+            setup,
+        };
+
+        let setup = setup();
+        let bob = add_bob(&setup, Role::Collaborator);
+        let owner = setup.owner();
+        let meta = load_meta(&setup.store, setup.thread, &owner, 0).unwrap();
+        let alice = *meta.participants().next().unwrap().node();
+        let host = HostAddress::new(alice, None, Vec::new()).unwrap();
+        let ticket = |generation, invitee| {
+            Ticket::new(
+                setup.thread,
+                host.clone(),
+                owner.clone(),
+                generation,
+                invitee,
+            )
+        };
+        assert!(matches!(
+            recorded_meta(&ticket(1, *bob.node()), &setup.store, *bob.node()),
+            Err(JoinError::NotListed)
+        ));
+        remember_owner(&setup.store, setup.thread, &owner).unwrap();
+        let read = recorded_meta(&ticket(1, *bob.node()), &setup.store, *bob.node()).unwrap();
+        assert_eq!(read.generation(), 1);
+        assert!(matches!(
+            recorded_meta(&ticket(2, *bob.node()), &setup.store, *bob.node()),
+            Err(JoinError::Pin(_))
+        ));
+        let stranger = NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap();
+        assert!(matches!(
+            recorded_meta(&ticket(1, stranger), &setup.store, stranger),
+            Err(JoinError::NotListed)
+        ));
     }
 }

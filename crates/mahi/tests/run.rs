@@ -6095,6 +6095,12 @@ exit 3
         }
 
         fn pair_until_asked(fixture: &Fixture, from_home: bool) -> Pairing {
+            pair_as(fixture, from_home, ("--collaborator", "/usr/bin:/bin:/usr"))
+        }
+
+        /// Pairs bob as `role` with the thread's owner, bob's mahi running with `path` as its
+        /// `PATH`, until the owner is asked whether to add bob.
+        fn pair_as(fixture: &Fixture, from_home: bool, (role, path): (&str, &str)) -> Pairing {
             let (thread, _claude) = worked_thread(fixture);
             let (server, remote) = serve_remote(fixture);
             let bob = teammate(fixture, "bob");
@@ -6131,7 +6137,7 @@ exit 3
             let running = from_home.then(|| run_thread(fixture, &thread, &owner_env));
             let owner = Driven::start(mahi_in_terminal(
                 &fixture.repo,
-                &["invite", "--collaborator", &thread],
+                &["invite", role, &thread],
                 &owner_env,
             ));
             let shown = owner.wait_for("Tell this code to your teammate");
@@ -6144,7 +6150,7 @@ exit 3
             assert!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]).contains("refs/mahi/pair/"));
             let bob_config = bob.home.join(".config");
             let bob_env: [(&str, &OsStr); 6] = [
-                ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+                ("PATH", OsStr::new(path)),
                 ("HOME", bob.home.as_os_str()),
                 ("XDG_CONFIG_HOME", bob_config.as_os_str()),
                 ("SSH_AUTH_SOCK", bob.socket.as_os_str()),
@@ -6184,7 +6190,7 @@ exit 3
         #[test]
         fn a_teammate_who_joins_from_the_home_screen_lands_in_a_tab_on_the_thread() {
             let fixture = fixture();
-            let mut pairing = pair_until_asked(&fixture, true);
+            let mut pairing = pair_as(&fixture, true, ("--watcher", "/usr/bin:/bin:/usr"));
             pairing.owner.type_line("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
@@ -6205,6 +6211,42 @@ exit 3
             pairing.joiner.terminal.write_all(b"\x00").unwrap();
             pairing.joiner.wait_for("Leave this tab");
             pairing.joiner.terminal.write_all(b"q").unwrap();
+            assert_eq!(pairing.joiner.exit_code(), 0, "{}", pairing.joiner.text());
+        }
+
+        #[test]
+        fn a_collaborator_who_joins_from_the_home_screen_gets_their_agent_in_the_threads_tab() {
+            let fixture = fixture();
+            let codex = script(
+                &fixture,
+                "bob-tools",
+                "codex",
+                "#!/bin/sh\necho bob-agent-ready\nexec /bin/sleep 60\n",
+            );
+            let tools = codex.parent().unwrap().to_str().unwrap().to_owned();
+            let mut pairing = pair_as(&fixture, true, ("--collaborator", &tools));
+            pairing.owner.type_line("y");
+            pairing.owner.wait_for("Passphrase");
+            pairing.owner.type_line(PASSPHRASE);
+            assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
+
+            let short: String = pairing.thread.chars().take(8).collect();
+            pairing.joiner.wait_for("bob-agent-ready");
+            let screen = {
+                let mut parser = vt100::Parser::new(24, 200, 0);
+                parser.process(pairing.joiner.text().as_bytes());
+                parser.screen().contents()
+            };
+            let top = screen.lines().next().unwrap_or_default();
+            assert!(top.contains(&format!("⌂ threads   {short}")), "{screen}");
+            assert_eq!(top.matches(&short).count(), 1, "{screen}");
+            pairing.joiner.terminal.write_all(b"\x00").unwrap();
+            pairing.joiner.wait_for("Quit mahi");
+            pairing.joiner.terminal.write_all(b"q").unwrap();
+            pairing
+                .joiner
+                .wait_for("1 agent is running: stop it and quit?");
+            pairing.joiner.terminal.write_all(b"y").unwrap();
             assert_eq!(pairing.joiner.exit_code(), 0, "{}", pairing.joiner.text());
         }
 
