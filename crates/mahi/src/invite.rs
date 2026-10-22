@@ -37,8 +37,10 @@ use mahi_thread::{
     KeyError,
     MetaError,
     NodeId,
+    Participant,
     ParticipantCard,
     ParticipantKey,
+    Role,
     SshSigner,
     ThreadError,
     VerifiedMeta,
@@ -58,10 +60,6 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
-    roles::{
-        Roles,
-        TeammateRole,
-    },
     thread_lock::{
         LockError,
         ThreadLock,
@@ -78,6 +76,8 @@ pub(crate) enum InviteError {
     Config(#[from] ConfigError),
     #[error("mahi is not set up; run mahi init first")]
     NotInitialised(#[source] IdentityError),
+    #[error("{0} owns the thread, so they stay a collaborator")]
+    OwnerStays(ParticipantName),
     #[error("SSH_AUTH_SOCK is not set; start ssh-agent and add your signing key (ssh-add)")]
     NoSshAgent,
     #[error("cannot sign with the SSH key")]
@@ -193,13 +193,11 @@ pub(crate) fn relays_for(live: LiveMode) -> Result<Relays, InviteError> {
     }
 }
 
-/// Adds `card`'s participant to `thread` unless they are already in it, exactly as the card
-/// says, gives them `role` when there is one, and returns their ticket. The passphrase is
-/// asked only when they must be added. A role that cannot be kept is told, and their prompts
-/// then wait for the user as before.
+/// Adds `card`'s participant to `thread` with `role`, or gives them `role` when they are in it
+/// already, and returns their ticket. The passphrase is asked only when `meta` must change.
 pub(crate) fn invite_to<P: Prompt>(
     store: &Store,
-    (thread, role): (ThreadId, Option<TeammateRole>),
+    (thread, role): (ThreadId, Role),
     card: ParticipantCard,
     inviter: &Inviter<'_>,
     open_prompt: &mut dyn FnMut() -> io::Result<P>,
@@ -211,16 +209,19 @@ pub(crate) fn invite_to<P: Prompt>(
         ) => InviteError::NotOwner(thread, Box::new(error)),
         other => InviteError::Thread(thread, Box::new(other)),
     })?;
-    let invitee_node = *card.participant().node();
-    let new = card.participant();
+    let new = card.into_participant().with_role(role);
+    let invitee_node = *new.node();
     if let Some(clash) = current.participants().find(|listed| {
-        !listed.is_same_person(new)
+        !listed.is_same_person(&new)
             && (listed.name() == new.name()
                 || listed.key() == new.key()
                 || listed.recipient().to_string() == new.recipient().to_string()
                 || listed.node() == new.node())
     }) {
         return Err(InviteError::Clash(clash.name().clone()));
+    }
+    if new.name() == current.owner() && role != Role::Collaborator {
+        return Err(InviteError::OwnerStays(new.name().clone()));
     }
     let address = host_address(thread, inviter)?;
     if inviter.relays == Relays::Public && address.relay().is_none() {
@@ -231,20 +232,11 @@ pub(crate) fn invite_to<P: Prompt>(
     if address.node() != &own {
         return Err(InviteError::NodeMismatch);
     }
-    let name = new.name().clone();
-    let meta = if current
-        .participants()
-        .any(|listed| listed.is_same_person(new))
-    {
+    let meta = if current.participants().any(|listed| *listed == new) {
         current
     } else {
-        add(store, thread, &current, card, inviter, open_prompt)?
+        add(store, thread, &current, new, inviter, open_prompt)?
     };
-    if let Some(role) = role
-        && let Err(error) = Roles::of(store.common_dir(), thread).set(&name, role)
-    {
-        eprintln!("mahi: {name}'s role was not kept, so their prompts wait for you: {error}");
-    }
     Ok(Ticket::new(
         thread,
         address,
@@ -277,7 +269,7 @@ fn add<P: Prompt>(
     store: &Store,
     thread: ThreadId,
     current: &VerifiedMeta,
-    card: ParticipantCard,
+    participant: Participant,
     inviter: &Inviter<'_>,
     open_prompt: &mut dyn FnMut() -> io::Result<P>,
 ) -> Result<VerifiedMeta, InviteError> {
@@ -294,14 +286,8 @@ fn add<P: Prompt>(
         .thread_key(current.owner(), identity.as_age())
         .map_err(|error| InviteError::Thread(thread, Box::new(error.into())))?;
     drop(identity);
-    add_participant(
-        store,
-        thread,
-        &thread_key,
-        inviter.signer,
-        card.into_participant(),
-    )
-    .map_err(|error| InviteError::Add(thread, Box::new(error)))
+    add_participant(store, thread, &thread_key, inviter.signer, participant)
+        .map_err(|error| InviteError::Add(thread, Box::new(error)))
 }
 
 #[cfg(test)]
@@ -318,10 +304,6 @@ mod tests {
         PublicIdentity,
     };
     use mahi_store::GlobalPatterns;
-    use mahi_thread::{
-        Participant,
-        Role,
-    };
     use ssh_key::{
         Algorithm,
         PrivateKey,
@@ -429,7 +411,7 @@ mod tests {
         let card = bob();
         let ticket = invite_to(
             &store,
-            (owner.thread, None),
+            (owner.thread, Role::Watcher),
             card.clone(),
             &inviter(&owner, &owner.key),
             &mut script(&[PASSPHRASE]),
@@ -446,38 +428,40 @@ mod tests {
             ticket.owner(),
             &ParticipantKey::from_public_key(owner.key.public_key()).unwrap()
         );
-        let meta = load_meta(&store, owner.thread, ticket.owner(), 1).unwrap();
-        assert!(
-            meta.participants()
-                .any(|listed| listed == card.participant())
-        );
+        let role_of_bob = |generation| {
+            load_meta(&store, owner.thread, ticket.owner(), generation)
+                .unwrap()
+                .participants()
+                .find(|listed| listed.is_same_person(card.participant()))
+                .map(Participant::role)
+        };
+        assert_eq!(role_of_bob(1), Some(Role::Watcher));
 
-        let roles = Roles::of(store.common_dir(), owner.thread);
-        let bob = card.participant().name().clone();
-        assert_eq!(roles.role(&bob), None);
         let again = invite_to(
             &store,
-            (owner.thread, Some(TeammateRole::ReadOnly)),
+            (owner.thread, Role::Watcher),
             card.clone(),
             &inviter(&owner, &owner.key),
             &mut script(&[]),
         )
         .unwrap();
         assert_eq!(again.min_generation(), 1);
-        assert_eq!(roles.role(&bob), Some(TeammateRole::ReadOnly));
-        invite_to(
+        let promoted = invite_to(
             &store,
-            (owner.thread, None),
-            card,
+            (owner.thread, Role::Collaborator),
+            card.clone(),
             &inviter(&owner, &owner.key),
-            &mut script(&[]),
+            &mut script(&[PASSPHRASE]),
         )
         .unwrap();
-        assert_eq!(roles.role(&bob), Some(TeammateRole::ReadOnly));
+        assert_eq!(promoted.min_generation(), 2);
+        assert_eq!(role_of_bob(2), Some(Role::Collaborator));
+        let meta = load_meta(&store, owner.thread, ticket.owner(), 2).unwrap();
+        assert_eq!(meta.participants().count(), 2);
     }
 
     #[test]
-    fn a_card_listed_with_another_role_gets_its_ticket_again() {
+    fn the_owners_own_card_gets_its_ticket_again_but_cannot_make_them_a_watcher() {
         let (_repo, store) = repository_on_main();
         let owner = owner_of_a_thread(&store);
         let key = ParticipantKey::from_public_key(owner.key.public_key()).unwrap();
@@ -487,16 +471,32 @@ mod tests {
             .next()
             .unwrap()
             .clone();
-        assert_eq!(listed.role(), Role::Collaborator);
+        let card = || ParticipantCard::new(listed.clone().with_role(Role::Watcher));
         let ticket = invite_to(
             &store,
-            (owner.thread, None),
-            ParticipantCard::new(listed.with_role(Role::Watcher)),
+            (owner.thread, Role::Collaborator),
+            card(),
             &inviter(&owner, &owner.key),
             &mut script(&[]),
         )
         .unwrap();
         assert_eq!(ticket.min_generation(), 0);
+        assert!(matches!(
+            invite_to(
+                &store,
+                (owner.thread, Role::Watcher),
+                card(),
+                &inviter(&owner, &owner.key),
+                &mut script(&[]),
+            ),
+            Err(InviteError::OwnerStays(name)) if name.as_str() == "alice"
+        ));
+        assert_eq!(
+            load_meta(&store, owner.thread, &key, 0)
+                .unwrap()
+                .generation(),
+            0
+        );
     }
 
     #[test]
@@ -507,7 +507,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                (owner.thread, None),
+                (owner.thread, Role::Watcher),
                 bob(),
                 &inviter(&owner, &stranger),
                 &mut script(&[]),
@@ -517,7 +517,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                (owner.thread, None),
+                (owner.thread, Role::Watcher),
                 bob(),
                 &inviter(&owner, &owner.key),
                 &mut script(&["wrong passphrase"]),
@@ -562,7 +562,7 @@ mod tests {
             assert!(matches!(
                 invite_to(
                     &store,
-                    (owner.thread, None),
+                    (owner.thread, Role::Watcher),
                     card,
                     &inviter(&owner, &owner.key),
                     &mut script(&[]),
@@ -594,7 +594,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                (missing, None),
+                (missing, Role::Watcher),
                 bob(),
                 &inviter(&owner, &owner.key),
                 &mut script(&[]),
@@ -612,7 +612,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                (owner.thread, None),
+                (owner.thread, Role::Watcher),
                 bob(),
                 &inviter(&owner, &owner.key),
                 &mut script(&[PASSPHRASE]),
@@ -642,7 +642,7 @@ mod tests {
         assert!(matches!(
             invite_to(
                 &store,
-                (owner.thread, None),
+                (owner.thread, Role::Watcher),
                 bob(),
                 &inviter(&owner, &owner.key),
                 &mut script(&[]),
@@ -652,7 +652,7 @@ mod tests {
         crate::live::publish_address(&owner.config, owner.thread, &published).unwrap();
         let ticket = invite_to(
             &store,
-            (owner.thread, None),
+            (owner.thread, Role::Watcher),
             bob(),
             &inviter(&owner, &owner.key),
             &mut script(&[PASSPHRASE]),

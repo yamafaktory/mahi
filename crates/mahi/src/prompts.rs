@@ -17,10 +17,7 @@ use mahi_term::Report;
 
 use crate::{
     merge::MergeRequest,
-    roles::{
-        Roles,
-        TeammateRole,
-    },
+    roles::Watchers,
 };
 
 const MAX_WAITING: usize = 32;
@@ -36,7 +33,7 @@ const ARRIVAL_CHARS: usize = 80;
 #[derive(Debug, Default)]
 pub(crate) struct Prompts {
     state: Mutex<State>,
-    roles: Option<Roles>,
+    watchers: Option<Box<dyn Watchers>>,
     own: Option<ParticipantName>,
 }
 
@@ -100,41 +97,40 @@ pub(crate) struct Answer {
 }
 
 impl Prompts {
-    /// Returns no prompts yet, for the host of `own`'s agent, whose teammates have the roles
-    /// in `roles`, read again with each prompt, so a role given while the agent runs counts at
-    /// once; `own` has no role, so their own prompts are asked about as before.
-    pub(crate) fn with_roles(roles: Roles, own: ParticipantName) -> Self {
+    /// Returns no prompts yet, for the host of `own`'s agent, whose teammates who only watch
+    /// `watchers` tells, asked again with each prompt, so a role changed while the agent runs
+    /// counts at once; `own`'s own prompts are asked about as before.
+    pub(crate) fn with_watchers(watchers: Box<dyn Watchers>, own: ParticipantName) -> Self {
         Self {
             state: Mutex::default(),
-            roles: Some(roles),
+            watchers: Some(watchers),
             own: Some(own),
         }
     }
 
-    /// Takes a prompt `from` a teammate: it is refused when their role is read only, and
-    /// accepted at once when it lets them prompt or the host user always accepts them;
-    /// otherwise it waits, unless too many do, in all or from that teammate, or the run is
-    /// ending. Either way its sender is answered.
+    /// Takes a prompt `from` a teammate: it is refused when they only watch, and accepted at
+    /// once when the host user always accepts them; otherwise it waits, unless too many do, in
+    /// all or from that teammate, or the run is ending. Either way its sender is answered.
     pub(crate) fn offer(
         &self,
         from: ParticipantName,
         id: [u8; PROMPT_ID_BYTES],
         text: PromptText,
     ) -> PromptOutcome {
-        let role = self
-            .roles
+        let watches = self
+            .watchers
             .as_ref()
             .filter(|_| self.own.as_ref() != Some(&from))
-            .and_then(|roles| roles.role(&from));
+            .is_some_and(|watchers| watchers.is_watcher(&from));
         let teammate = self.teammate(&from);
         let Ok(mut state) = self.state.lock() else {
             return PromptOutcome::Dropped;
         };
-        if role == Some(TeammateRole::ReadOnly) {
+        if watches {
             state.answer(id, PromptOutcome::Rejected);
             return PromptOutcome::Rejected;
         }
-        let trusted = role == Some(TeammateRole::CanPrompt) || state.trusted.contains(&from);
+        let trusted = state.trusted.contains(&from);
         if !state.closed && trusted {
             let first_words: String = text.as_str().chars().take(ARRIVAL_CHARS).collect();
             let outcome = state.accept(id, text, (None, teammate));
@@ -416,17 +412,26 @@ mod tests {
         assert_eq!(counts, [1, 2, 3, 4, 5, 2, 1, 0]);
     }
 
+    #[derive(Debug, Default)]
+    struct Listed(std::sync::Arc<Mutex<HashSet<ParticipantName>>>);
+
+    impl Watchers for Listed {
+        fn is_watcher(&self, participant: &ParticipantName) -> bool {
+            self.0.lock().unwrap().contains(participant)
+        }
+    }
+
     #[test]
-    fn a_teammates_role_decides_whether_their_prompt_goes_waits_or_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let roles = Roles::of(dir.path(), mahi_core::ThreadId::random().unwrap());
-        let prompts = Prompts::with_roles(roles.clone(), name("alice"));
-        roles.set(&name("bob"), TeammateRole::CanPrompt).unwrap();
-        roles.set(&name("carol"), TeammateRole::ReadOnly).unwrap();
-        roles.set(&name("alice"), TeammateRole::ReadOnly).unwrap();
+    fn a_watchers_prompt_is_refused_and_anyone_elses_waits_for_the_host_user() {
+        let watching =
+            std::sync::Arc::new(Mutex::new(HashSet::from([name("carol"), name("alice")])));
+        let prompts = Prompts::with_watchers(
+            Box::new(Listed(std::sync::Arc::clone(&watching))),
+            name("alice"),
+        );
         assert_eq!(
             prompts.offer(name("bob"), [1; 16], text()),
-            PromptOutcome::Accepted
+            PromptOutcome::Queued
         );
         assert_eq!(
             prompts.offer(name("carol"), [2; 16], text()),
@@ -436,11 +441,7 @@ mod tests {
             prompts.offer(name("dave"), [3; 16], text()),
             PromptOutcome::Queued
         );
-        assert_eq!(waiting(&prompts), 1);
-        assert_eq!(
-            prompts.next_accepted().map(|accepted| accepted.id),
-            Some([1; 16])
-        );
+        assert_eq!(waiting(&prompts), 2);
         let mut arrivals = Vec::new();
         prompts.take_arrivals(&mut arrivals);
         assert_eq!(
@@ -448,10 +449,10 @@ mod tests {
                 .iter()
                 .map(|arrival| (arrival.from.as_str(), arrival.accepted))
                 .collect::<Vec<_>>(),
-            [("bob", true), ("dave", false)]
+            [("bob", false), ("dave", false)]
         );
         prompts.decide([3; 16], Decision::AlwaysAccept);
-        roles.set(&name("dave"), TeammateRole::ReadOnly).unwrap();
+        watching.lock().unwrap().insert(name("dave"));
         assert_eq!(
             prompts.offer(name("dave"), [4; 16], text()),
             PromptOutcome::Rejected
@@ -461,7 +462,7 @@ mod tests {
             PromptOutcome::Queued
         );
         prompts.offer_merge(name("bob"), [6; 16], (text(), request()));
-        assert_eq!(waiting(&prompts), 2);
+        assert_eq!(waiting(&prompts), 3);
         prompts.close();
         assert_eq!(
             prompts.offer(name("bob"), [7; 16], text()),
@@ -471,11 +472,9 @@ mod tests {
 
     #[test]
     fn an_accepted_prompt_names_its_teammate_but_not_the_host_user() {
-        let dir = tempfile::tempdir().unwrap();
-        let roles = Roles::of(dir.path(), mahi_core::ThreadId::random().unwrap());
-        roles.set(&name("bob"), TeammateRole::CanPrompt).unwrap();
-        let prompts = Prompts::with_roles(roles, name("alice"));
+        let prompts = Prompts::with_watchers(Box::new(Listed::default()), name("alice"));
         prompts.offer(name("bob"), [1; 16], text());
+        prompts.decide([1; 16], Decision::Accept);
         prompts.offer(name("alice"), [2; 16], text());
         prompts.offer(name("carol"), [3; 16], text());
         prompts.offer(name("carol"), [8; 16], text());

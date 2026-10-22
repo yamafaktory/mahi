@@ -113,11 +113,11 @@ const CHILD_WAIT: Duration = Duration::from_millis(15);
 const STOP_WITHIN: Duration = Duration::from_secs(30);
 const INVITED: (&str, &str) = ("invite", "done");
 const INVITE_ROLES: [(&str, &str); 2] = [
-    ("--read-only", "🔒 Read only: they watch your agents"),
     (
-        "--can-prompt",
-        "✎ Can prompt: their prompts go straight to your agents",
+        "--collaborator",
+        "✎ Collaborator: they run their own agent, kept in sync with yours",
     ),
+    ("--watcher", "🔒 Watcher: they watch your agents"),
 ];
 
 /// Opens the home screen in the repository around the current directory and runs the actions
@@ -1469,9 +1469,9 @@ fn add_remote(store: &mut Store) -> Result<Added, remote::RemoteError> {
 #[cfg(test)]
 mod tests {
     use mahi_core::AgentName;
+    use mahi_thread::Role;
 
     use super::*;
-    use crate::roles::TeammateRole;
 
     fn slot(participant: &str, agent: &str) -> AgentSlot {
         AgentSlot::new(
@@ -1597,7 +1597,7 @@ mod tests {
     #[test]
     fn each_invite_choice_gives_the_role_its_words_name() {
         let thread = "7f3a9c2e00010203040506070809abff";
-        let roles: Vec<(TeammateRole, &str)> = INVITE_ROLES
+        let roles: Vec<(Role, &str)> = INVITE_ROLES
             .iter()
             .map(|(flag, item)| {
                 let Cli {
@@ -1606,20 +1606,17 @@ mod tests {
                 else {
                     panic!("not an invite");
                 };
-                (invite.role().unwrap(), *item)
+                (invite.role(), *item)
             })
             .collect();
         assert_eq!(
             roles,
             [
                 (
-                    TeammateRole::ReadOnly,
-                    "🔒 Read only: they watch your agents"
+                    Role::Collaborator,
+                    "✎ Collaborator: they run their own agent, kept in sync with yours"
                 ),
-                (
-                    TeammateRole::CanPrompt,
-                    "✎ Can prompt: their prompts go straight to your agents"
-                ),
+                (Role::Watcher, "🔒 Watcher: they watch your agents"),
             ]
         );
     }

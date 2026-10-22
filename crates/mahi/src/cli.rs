@@ -23,6 +23,7 @@ use mahi_identity::{
 };
 use mahi_live::Ticket;
 use mahi_proxy::HostName;
+use mahi_thread::Role;
 
 use crate::{
     environment::{
@@ -31,7 +32,6 @@ use crate::{
     },
     profile::Profile,
     remote::RemoteName,
-    roles::TeammateRole,
 };
 
 const EXIT_CODES: &str = "\
@@ -145,6 +145,7 @@ pub(crate) struct RemoteCommand {
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
+#[command(group(ArgGroup::new("role").required(true).args(["collaborator", "watcher"])))]
 pub(crate) struct InviteCommand {
     /// The thread to invite to, as `mahi threads` lists it.
     pub(crate) thread: ThreadId,
@@ -152,13 +153,12 @@ pub(crate) struct InviteCommand {
     /// Without one, mahi shows a pairing code for the teammate to type instead.
     #[arg(num_args = 0.., value_name = "CARD")]
     card: Vec<String>,
-    /// The teammate's prompts reach your agents without your accepting each one.
-    #[arg(long, conflicts_with = "read_only")]
-    can_prompt: bool,
-    /// The teammate only watches your agents; mahi refuses their prompts. Without this or
-    /// --can-prompt, each of their prompts waits for you to accept it.
+    /// The teammate runs their own agent in the thread, kept in sync with yours.
     #[arg(long)]
-    read_only: bool,
+    collaborator: bool,
+    /// The teammate only watches your agents.
+    #[arg(long)]
+    watcher: bool,
 }
 
 impl InviteCommand {
@@ -167,14 +167,12 @@ impl InviteCommand {
         (!self.card.is_empty()).then(|| self.card.join(" "))
     }
 
-    /// Returns the role the teammate gets, or `None` when the invite gives none.
-    pub(crate) fn role(&self) -> Option<TeammateRole> {
-        if self.can_prompt {
-            Some(TeammateRole::CanPrompt)
-        } else if self.read_only {
-            Some(TeammateRole::ReadOnly)
+    /// Returns the role the teammate gets.
+    pub(crate) fn role(&self) -> Role {
+        if self.collaborator {
+            Role::Collaborator
         } else {
-            None
+            Role::Watcher
         }
     }
 }
@@ -563,8 +561,8 @@ mod tests {
         let card = "mahi-participant bob age1x 00 ssh-ed25519 AAAA bob@laptop";
         let words: Vec<&str> = card.split(' ').collect();
         for arguments in [
-            vec!["invite", thread, card],
-            [vec!["invite", thread], words.clone()].concat(),
+            vec!["invite", "--collaborator", thread, card],
+            [vec!["invite", "--collaborator", thread], words.clone()].concat(),
         ] {
             let Command::Invite(invite) = parse(&arguments).unwrap().command else {
                 panic!("not an invite");
@@ -572,21 +570,22 @@ mod tests {
             assert_eq!(invite.thread.to_string(), thread);
             assert_eq!(invite.card().as_deref(), Some(card));
         }
-        let Command::Invite(by_code) = parse(&["invite", thread]).unwrap().command else {
+        let Command::Invite(by_code) = parse(&["invite", "--watcher", thread]).unwrap().command
+        else {
             panic!("not an invite");
         };
         assert_eq!(by_code.card(), None);
-        assert_eq!(by_code.role(), None);
         for (flag, role) in [
-            ("--can-prompt", TeammateRole::CanPrompt),
-            ("--read-only", TeammateRole::ReadOnly),
+            ("--collaborator", Role::Collaborator),
+            ("--watcher", Role::Watcher),
         ] {
             let Command::Invite(invite) = parse(&["invite", flag, thread]).unwrap().command else {
                 panic!("not an invite");
             };
-            assert_eq!(invite.role(), Some(role));
+            assert_eq!(invite.role(), role);
         }
-        assert!(parse(&["invite", "--can-prompt", "--read-only", thread]).is_err());
+        assert!(parse(&["invite", thread]).is_err());
+        assert!(parse(&["invite", "--collaborator", "--watcher", thread]).is_err());
         let Command::Join(by_code) = parse(&["join"]).unwrap().command else {
             panic!("not a join");
         };

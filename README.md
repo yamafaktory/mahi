@@ -92,12 +92,13 @@ picks the SSH key in ssh-agent that signs your threads (asking which when there 
 agent signs in with that mahi does not have yet (Claude Code's token), and, once per clone,
 whether to push threads to `origin` and whether `origin` is private or public.
 
-To work with a teammate, the thread's owner runs `mahi invite <thread>` (or presses `i` on the
-home screen), which shows a short pairing code such as `412-merit-intention`; the teammate runs
+To work with a teammate, the thread's owner runs `mahi invite --collaborator <thread>`, or
+presses `i` on the home screen; `--watcher` invites a teammate who only watches. mahi shows a
+short pairing code such as `412-merit-intention`; the teammate runs
 `mahi join` (or presses `c`) in a clone of the project and types it, and once the owner says
 yes, the teammate watches the thread live. Pairing meets through the remote `mahi remote`
 chose. Cards and tickets still work without it: `mahi id` prints the card a thread's owner
-needs, `mahi invite <thread> <card>` turns it into a ticket, and `mahi join <ticket>` uses it.
+needs, `mahi invite --collaborator <thread> <card>` turns it into a ticket, and `mahi join <ticket>` uses it.
 `mahi handoff`, `mahi agent` and `mahi merge`
 move work between agents.
 
@@ -190,7 +191,7 @@ are recorded, and give it `mahi mcp`, so it gets the thread's tools. A profile f
 | `mahi purge <thread>` | Deletes a thread here and on its remote |
 | `mahi remote [name]` | Shows or chooses the remote threads are pushed to |
 | `mahi id` | Prints your participant card |
-| `mahi invite <thread> <card>` | Invites a teammate and prints the ticket they join with |
+| `mahi invite --collaborator\|--watcher <thread> [card]` | Invites a teammate and prints the ticket they join with, or a pairing code without a card |
 | `mahi join <ticket>` | Watches a thread live from a ticket |
 | `mahi credential add\|list\|remove` | Keeps the tokens agents sign in with |
 | `mahi apparmor` | Prints the AppArmor profile Ubuntu needs for the sandbox |

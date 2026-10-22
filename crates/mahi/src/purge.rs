@@ -56,7 +56,6 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
-    roles::Roles,
     run::until_stopped,
     session,
     sync::{
@@ -206,9 +205,6 @@ pub(crate) fn purge(
     }
     if let Err(error) = BranchRecord::remove(&store, thread) {
         let _ = writeln!(report, "cannot forget the pushed branch's record: {error}");
-    }
-    if let Err(error) = Roles::of(store.common_dir(), thread).remove() {
-        let _ = writeln!(report, "cannot forget the teammates' roles: {error}");
     }
     lock.remove().map_err(PurgeError::Remove)?;
     let _ = writeln!(report, "purged thread {thread}");

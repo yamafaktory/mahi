@@ -80,7 +80,6 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
-    roles::TeammateRole,
     sync::{
         self,
         PairRemoteError,
@@ -184,7 +183,7 @@ pub(crate) enum PairingError {
 /// on the chosen remote, shows the code, and adds the teammate who proves they know it, then
 /// removes what it published. Returns what to print.
 pub(crate) fn invite_by_code(
-    (thread, role): (ThreadId, Option<TeammateRole>),
+    (thread, role): (ThreadId, mahi_thread::Role),
     environment: &Environment,
 ) -> Result<String, PairingError> {
     invite::with_inviter(environment, |store, inviter| {
@@ -346,7 +345,7 @@ fn owner_pairs(
     listener: &PairListener,
     code: &PairingCode,
     deadline: Instant,
-    (store, (thread, role), inviter): (&Store, (ThreadId, Option<TeammateRole>), &Inviter<'_>),
+    (store, (thread, role), inviter): (&Store, (ThreadId, mahi_thread::Role), &Inviter<'_>),
 ) -> Result<String, PairingError> {
     let mut link = accept_until_stopped(listener, deadline)?;
     let stop = StopOnSignal::start();

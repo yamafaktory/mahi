@@ -578,6 +578,7 @@ pub(crate) mod tests {
     use mahi_store::GlobalPatterns;
     use mahi_thread::{
         Participant,
+        Role,
         add_participant,
     };
     use ssh_key::{
@@ -605,6 +606,12 @@ pub(crate) mod tests {
         identity: LocalIdentity,
         owner_key: PrivateKey,
         pub(crate) thread: ThreadId,
+    }
+
+    impl Setup {
+        pub(crate) fn owner(&self) -> ParticipantKey {
+            ParticipantKey::from_public_key(self.owner_key.public_key()).unwrap()
+        }
     }
 
     pub(crate) fn hosting(setup: &Setup) -> WorkspaceLive {
@@ -749,7 +756,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn add_bob(setup: &Setup) {
+    pub(crate) fn add_bob(setup: &Setup, role: Role) -> Participant {
         let bob = Participant::new(
             "bob".parse().unwrap(),
             ParticipantKey::from_public_key(
@@ -761,9 +768,14 @@ pub(crate) mod tests {
             age::x25519::Identity::generate().to_public(),
             NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
         )
-        .unwrap();
-        let owner = ParticipantKey::from_public_key(setup.owner_key.public_key()).unwrap();
-        let thread_key = load_meta(&setup.store, setup.thread, &owner, 0)
+        .unwrap()
+        .with_role(role);
+        sign_participant(setup, bob.clone());
+        bob
+    }
+
+    pub(crate) fn sign_participant(setup: &Setup, participant: Participant) {
+        let thread_key = load_meta(&setup.store, setup.thread, &setup.owner(), 0)
             .unwrap()
             .thread_key(&"alice".parse().unwrap(), setup.identity.as_age())
             .unwrap();
@@ -772,7 +784,7 @@ pub(crate) mod tests {
             setup.thread,
             &thread_key,
             &setup.owner_key,
-            bob,
+            participant,
         )
         .unwrap();
     }
@@ -780,7 +792,7 @@ pub(crate) mod tests {
     #[test]
     fn an_offline_teammates_agent_shows_its_turns_and_changes_as_the_tools_read_them() {
         let setup = setup();
-        add_bob(&setup);
+        add_bob(&setup, Role::Collaborator);
         let bob: AgentSlot = "bob.codex".parse().unwrap();
         let snapshots = mahi_core::ThreadRef::new(setup.thread, RefKind::Snapshots(bob.clone()));
         let tree = setup.store.write_tree(&[]).unwrap();
@@ -820,7 +832,7 @@ pub(crate) mod tests {
     fn a_hosted_threads_teammates_agents_from_its_refs_are_listed_offline() {
         let setup = setup();
         let tree = setup.store.write_tree(&[]).unwrap();
-        add_bob(&setup);
+        add_bob(&setup, Role::Collaborator);
         for slot in ["bob.codex", "mallory.claude"] {
             let slot: AgentSlot = slot.parse().unwrap();
             let agent = mahi_core::ThreadRef::new(setup.thread, RefKind::Transcript(slot));

@@ -55,13 +55,14 @@ use crate::{
         LiveHost,
         LiveSetup,
         Offer,
+        REREAD_EVERY,
         hub_socket,
     },
     prompts::{
         Answer,
         Prompts,
     },
-    roles::Roles,
+    roles::MetaRoles,
 };
 
 const PAUSE: Duration = Duration::from_millis(200);
@@ -594,8 +595,13 @@ impl Link {
             socket,
         };
         let tap = OutputTap::new(size);
-        let prompts = Arc::new(Prompts::with_roles(
-            Roles::of(git_dir, joining.keys.thread()),
+        let prompts = Arc::new(Prompts::with_watchers(
+            Box::new(MetaRoles::of(
+                git_dir,
+                joining.keys.thread(),
+                joining.setup.owner.clone(),
+                REREAD_EVERY,
+            )),
             joining.slot.participant().clone(),
         ));
         let claims = Arc::new(Claims::default());

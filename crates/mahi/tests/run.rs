@@ -3457,9 +3457,6 @@ cat parser.rs
         assert!(output.contains("nothing was purged"), "{output}");
         assert!(worktree.is_dir());
         assert!(fixture.threads().len() > 1);
-        let roles = fixture.repo.join(".git/mahi/roles").join(&thread);
-        std::fs::create_dir_all(roles.parent().unwrap()).unwrap();
-        std::fs::write(&roles, "carol read-only\n").unwrap();
         let purged = fixture.mahi(&["purge", &thread, "--yes"]);
         let stderr = String::from_utf8_lossy(&purged.stderr);
         assert!(purged.status.success(), "{stderr}");
@@ -3472,7 +3469,6 @@ cat parser.rs
             assert!(stderr.contains(said), "{said}: {stderr}");
         }
         assert!(!worktree.exists());
-        assert!(!roles.exists());
         assert_eq!(fixture.threads(), [format!("refs/threads/{thread}/meta")]);
         let listed = fixture.mahi(&["threads"]);
         assert_eq!(
@@ -5311,7 +5307,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         let thread_text = thread.to_string();
         let mut invite = mahi_in_terminal(
             &fixture.repo,
-            &["invite", &thread_text, card.trim()],
+            &["invite", "--collaborator", &thread_text, card.trim()],
             &owner_env,
         );
         let (invited, invite_end) = collect(&invite);
@@ -6135,7 +6131,7 @@ exit 3
             let running = from_home.then(|| run_thread(fixture, &thread, &owner_env));
             let owner = Driven::start(mahi_in_terminal(
                 &fixture.repo,
-                &["invite", &thread],
+                &["invite", "--collaborator", &thread],
                 &owner_env,
             ));
             let shown = owner.wait_for("Tell this code to your teammate");

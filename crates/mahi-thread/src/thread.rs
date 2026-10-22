@@ -13,6 +13,7 @@ use mahi_store::{
 use thiserror::Error;
 
 use crate::{
+    InvalidMeta,
     MAX_META_BYTES,
     MetaDocument,
     MetaDraft,
@@ -240,9 +241,10 @@ pub fn record_meta(
     Ok(verified)
 }
 
-/// Adds `participant` to `thread`, which `owner_key` owns: signs the next generation of its
-/// meta document, with the thread key also wrapped to the new participant, commits it on top of
-/// the current `meta` commit, and pins it.
+/// Adds `participant` to `thread`, which `owner_key` owns, or replaces their entry when the
+/// same person is listed already, such as to change their role: signs the next generation of
+/// its meta document, with the thread key also wrapped to the new participant, commits it on
+/// top of the current `meta` commit, and pins it.
 ///
 /// Returns the new document.
 ///
@@ -272,7 +274,16 @@ pub fn add_participant(
         .checked_add(1)
         .ok_or(ThreadError::NoNextGeneration(thread))?;
     let mut participants: Vec<Participant> = current.participants().cloned().collect();
-    participants.push(participant);
+    match participants
+        .iter_mut()
+        .find(|listed| listed.is_same_person(&participant))
+    {
+        Some(listed) if *listed == participant => {
+            return Err(MetaError::from(InvalidMeta::DuplicateName).into());
+        }
+        Some(listed) => *listed = participant,
+        None => participants.push(participant),
+    }
     let draft = MetaDraft::new(
         thread,
         generation,
@@ -866,11 +877,29 @@ pub(crate) mod tests {
         let head = setup.store.head(&meta_ref).unwrap();
 
         assert!(matches!(
-            add_participant(&setup.store, setup.thread, &thread_key, &setup.owner, bob),
+            add_participant(
+                &setup.store,
+                setup.thread,
+                &thread_key,
+                &setup.owner,
+                bob.clone()
+            ),
             Err(ThreadError::Meta(MetaError::Invalid(
                 crate::InvalidMeta::DuplicateName
             )))
         ));
+        assert_eq!(setup.store.head(&meta_ref).unwrap(), head);
+        let watching = add_participant(
+            &setup.store,
+            setup.thread,
+            &thread_key,
+            &setup.owner,
+            bob.clone().with_role(Role::Watcher),
+        )
+        .unwrap();
+        let roles: Vec<Role> = watching.participants().map(Participant::role).collect();
+        assert_eq!(roles, [Role::Collaborator, Role::Watcher]);
+        let head = setup.store.head(&meta_ref).unwrap();
         let (carol, _) = person("carol");
         assert!(matches!(
             add_participant(
