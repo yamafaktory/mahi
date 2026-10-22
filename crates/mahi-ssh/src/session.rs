@@ -9,7 +9,6 @@ use std::{
         Arc,
         Mutex,
         OnceLock,
-        PoisonError,
         atomic::AtomicBool,
     },
     time::Duration,
@@ -192,6 +191,16 @@ fn protocol(error: impl std::fmt::Display) -> SshError {
     SshError::Protocol(error.to_string())
 }
 
+fn ended(failure: &Mutex<Option<String>>) -> SshError {
+    let failure = failure.lock().ok();
+    protocol(
+        failure
+            .as_deref()
+            .and_then(Option::as_deref)
+            .unwrap_or("the connection has ended"),
+    )
+}
+
 impl std::fmt::Debug for SshSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("SshSession").finish_non_exhaustive()
@@ -299,11 +308,6 @@ impl SshSession {
         let _ = self.budget.set(budget);
     }
 
-    fn ended(&self) -> SshError {
-        let failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
-        protocol(failure.as_deref().unwrap_or("the connection has ended"))
-    }
-
     /// Sets how long [`SshSession::exec`] waits for the host to start a command; 20 s unless
     /// set.
     pub fn set_exec_timeout(&mut self, timeout: Duration) {
@@ -334,8 +338,8 @@ impl SshSession {
             self.commands
                 .send(request)
                 .await
-                .map_err(|_| self.ended())?;
-            started.await.map_err(|_| self.ended())?
+                .map_err(|_| ended(&self.failure))?;
+            started.await.map_err(|_| ended(&self.failure))?
         });
         let started = until_interrupted(self.interrupt.as_deref(), starting)
             .await
@@ -359,8 +363,8 @@ impl SshSession {
         self.commands
             .send(Command::Disconnect { ack })
             .await
-            .map_err(|_| self.ended())?;
-        done.await.map_err(|_| self.ended())
+            .map_err(|_| ended(&self.failure))?;
+        done.await.map_err(|_| ended(&self.failure))
     }
 }
 
@@ -495,7 +499,9 @@ struct Slot {
 
 impl Slot {
     fn record(&self, update: impl FnOnce(&mut Ending)) {
-        update(&mut self.ending.lock().unwrap_or_else(PoisonError::into_inner));
+        if let Ok(mut ending) = self.ending.lock() {
+            update(&mut ending);
+        }
     }
 }
 
@@ -582,7 +588,9 @@ impl Driver {
                 break failure;
             }
         };
-        *self.failure.lock().unwrap_or_else(PoisonError::into_inner) = Some(failure);
+        if let Ok(mut slot) = self.failure.lock() {
+            *slot = Some(failure);
+        }
     }
 
     async fn disconnect(&mut self) {
@@ -1815,5 +1823,45 @@ mod tests {
             offered_algorithms(&[]),
             Some(HostKeyAlgorithm::ALL.to_vec())
         );
+    }
+
+    fn poisoned<T: Send>(value: T) -> Mutex<T> {
+        let lock = Mutex::new(value);
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = lock.lock();
+                    panic!("poison the lock");
+                })
+                .join();
+        });
+        lock
+    }
+
+    #[test]
+    fn a_poisoned_failure_is_not_read() {
+        let failure = poisoned(Some("boom".to_owned()));
+        assert!(matches!(
+            ended(&failure),
+            SshError::Protocol(why) if why == "the connection has ended"
+        ));
+    }
+
+    #[test]
+    fn nothing_is_recorded_into_a_poisoned_ending() {
+        let slot = Slot {
+            command: String::new(),
+            env: Vec::new(),
+            start: None,
+            early: Vec::new(),
+            output: None,
+            receiver: None,
+            ending: Arc::new(poisoned(Ending::default())),
+            input: VecDeque::new(),
+            eof: None,
+        };
+        let mut recorded = false;
+        slot.record(|_| recorded = true);
+        assert!(!recorded);
     }
 }

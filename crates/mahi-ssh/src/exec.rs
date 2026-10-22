@@ -9,7 +9,6 @@ use std::{
     sync::{
         Arc,
         Mutex,
-        PoisonError,
         atomic::{
             AtomicBool,
             Ordering,
@@ -187,7 +186,7 @@ impl Read for ExecOutput {
                     self.release(chunk.len());
                     self.chunk = chunk;
                 }
-                None => return self.end().map(|()| 0),
+                None => return outcome(&self.ending).map(|()| 0),
             }
         }
         let count = self.chunk.len().min(buffer.len());
@@ -208,23 +207,25 @@ impl ExecOutput {
             .runtime
             .block_on(commands.send(Command::Consumed { id, count }));
     }
+}
 
-    fn end(&self) -> io::Result<()> {
-        let ending = self.ending.lock().unwrap_or_else(PoisonError::into_inner);
-        let said = printable(&ending.errors);
-        let failure = if let Some(signal) = &ending.signal {
-            RemoteFailure::Signal(signal.clone())
-        } else if !ending.closed {
-            RemoteFailure::Cut
-        } else {
-            match (ending.status, said.is_empty()) {
-                (Some(0), _) | (None, true) => return Ok(()),
-                (Some(status), true) => RemoteFailure::Status(status),
-                (_, false) => RemoteFailure::Said(said),
-            }
-        };
-        Err(io::Error::other(failure))
-    }
+fn outcome(ending: &Mutex<Ending>) -> io::Result<()> {
+    let ending = ending.lock().map_err(|_| {
+        io::Error::other("a thread panicked while it recorded how the remote command ended")
+    })?;
+    let said = printable(&ending.errors);
+    let failure = if let Some(signal) = &ending.signal {
+        RemoteFailure::Signal(signal.clone())
+    } else if !ending.closed {
+        RemoteFailure::Cut
+    } else {
+        match (ending.status, said.is_empty()) {
+            (Some(0), _) | (None, true) => return Ok(()),
+            (Some(status), true) => RemoteFailure::Status(status),
+            (_, false) => RemoteFailure::Said(said),
+        }
+    };
+    Err(io::Error::other(failure))
 }
 
 impl Write for ExecInput {
@@ -327,6 +328,37 @@ mod tests {
         assert_eq!(
             printable("a\u{2028}b\u{e0041}c\u{3164}d\u{115f}e".as_bytes()),
             "a?b?c?d?e"
+        );
+    }
+
+    fn poisoned<T: Send>(value: T) -> Mutex<T> {
+        let lock = Mutex::new(value);
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = lock.lock();
+                    panic!("poison the lock");
+                })
+                .join();
+        });
+        lock
+    }
+
+    #[test]
+    fn a_poisoned_ending_is_a_failure_even_after_a_clean_exit() {
+        let ending = poisoned(Ending {
+            closed: true,
+            status: Some(0),
+            ..Ending::default()
+        });
+        let error = outcome(&ending).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            error
+                .into_inner()
+                .unwrap()
+                .downcast::<RemoteFailure>()
+                .is_err()
         );
     }
 }
