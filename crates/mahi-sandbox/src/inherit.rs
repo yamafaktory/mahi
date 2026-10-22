@@ -6,10 +6,7 @@ use std::{
         OwnedFd,
         RawFd,
     },
-    sync::{
-        Mutex,
-        PoisonError,
-    },
+    sync::Mutex,
 };
 
 use rustix::{
@@ -28,15 +25,14 @@ static TAKEN: Mutex<[RawFd; crate::MAX_PASSED]> = Mutex::new([-1; crate::MAX_PAS
 /// # Errors
 ///
 /// Returns an error if `fd` is a standard stream's, if it was taken before or the most were,
-/// or if it is not open or not a pipe; then the descriptor is left as it is, but a number
-/// refused for not being open or a pipe still counts among those taken.
+/// if it is not open or not a pipe, or if a thread panicked while it took another number; then
+/// the descriptor is left as it is, but a number refused for not being open or a pipe still
+/// counts among those taken.
 pub fn inherited_pipe(fd: RawFd) -> io::Result<File> {
     if fd <= 2 {
         return Err(io::ErrorKind::InvalidInput.into());
     }
-    if !take_number(fd) {
-        return Err(io::ErrorKind::AlreadyExists.into());
-    }
+    take_number(fd)?;
     let pipe = is_pipe(fd)?;
     if !pipe {
         return Err(io::ErrorKind::InvalidInput.into());
@@ -46,16 +42,18 @@ pub fn inherited_pipe(fd: RawFd) -> io::Result<File> {
     Ok(File::from(owned))
 }
 
-fn take_number(fd: RawFd) -> bool {
-    let mut taken = TAKEN.lock().unwrap_or_else(PoisonError::into_inner);
+fn take_number(fd: RawFd) -> io::Result<()> {
+    let mut taken = TAKEN
+        .lock()
+        .map_err(|_| io::Error::other("a thread panicked while it took a descriptor"))?;
     if taken.contains(&fd) {
-        return false;
+        return Err(io::ErrorKind::AlreadyExists.into());
     }
     let Some(free) = taken.iter_mut().find(|number| **number == -1) else {
-        return false;
+        return Err(io::ErrorKind::AlreadyExists.into());
     };
     *free = fd;
-    true
+    Ok(())
 }
 
 #[expect(
@@ -140,5 +138,18 @@ mod tests {
             inherited_pipe(past.into_raw_fd()).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
+    }
+
+    #[test]
+    fn a_poisoned_table_refuses_every_pipe() {
+        let _ = std::thread::spawn(|| {
+            let _guard = TAKEN.lock();
+            panic!("poison the table");
+        })
+        .join();
+        let (reader, _writer) = rustix::pipe::pipe().unwrap();
+        let fd = reader.into_raw_fd();
+        assert_eq!(inherited_pipe(fd).unwrap_err().kind(), io::ErrorKind::Other);
+        drop(own(fd));
     }
 }
