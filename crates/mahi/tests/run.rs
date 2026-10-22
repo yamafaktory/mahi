@@ -6308,7 +6308,7 @@ exit 3
             home.wait_for("Tell this code to your teammate");
             thread::sleep(Duration::from_secs(1));
             home.terminal.write_all(b"\x03").unwrap();
-            home.wait_for(&format!("mahi invite --read-only {thread} failed"));
+            home.wait_for(&format!("mahi invite --collaborator {thread} failed"));
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());
             assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
@@ -6336,7 +6336,7 @@ exit 3
             home.wait_for("Tell this code to your teammate");
             thread::sleep(Duration::from_secs(1));
             home.terminal.write_all(b"\x03").unwrap();
-            home.wait_for(&format!("mahi invite --read-only {thread} failed"));
+            home.wait_for(&format!("mahi invite --collaborator {thread} failed"));
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());
             assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
@@ -6399,7 +6399,7 @@ exit 3
                 "{}",
                 screen(&home)
             );
-            home.wait_for(&format!("mahi invite --read-only {thread} failed"));
+            home.wait_for(&format!("mahi invite --collaborator {thread} failed"));
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());
             assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
