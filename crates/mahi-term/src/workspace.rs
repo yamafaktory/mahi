@@ -323,6 +323,9 @@ pub struct ThreadView<'a> {
     pub list: ListPlace,
     /// The keys that reach mahi, and what they do.
     pub hints: &'a [(&'a str, &'a str)],
+    /// The spinner's frame and what the pane waits for, drawn in its middle while it has no
+    /// screen.
+    pub waiting: Option<(&'a str, &'a str)>,
 }
 
 impl<'a> ThreadView<'a> {
@@ -366,6 +369,15 @@ impl<'a> ThreadView<'a> {
         block.render(pane, buffer);
         if let Some(screen) = screen {
             draw_screen(screen, inner, buffer, false);
+        } else if let Some((frame, text)) = self.waiting {
+            let middle = Rect {
+                y: inner.y.saturating_add(inner.height / 2),
+                height: inner.height.min(1),
+                ..inner
+            };
+            Line::from(vec![Span::raw(frame), Span::raw(" "), Span::raw(text)])
+                .centered()
+                .render(middle, buffer);
         }
         if let Some(list) = list {
             Clear.render(list, buffer);
@@ -721,6 +733,7 @@ mod tests {
             prompts: 2,
             list: ListPlace::Beside,
             hints: &[("ctrl-space", "workspace")],
+            waiting: None,
         }
         .render(Some(parser.screen()), area, &mut buffer);
         let rows = rows(&buffer);
@@ -780,6 +793,7 @@ mod tests {
             prompts: 0,
             list: ListPlace::Beside,
             hints: &[],
+            waiting: None,
         };
         let area = Rect::new(0, 0, 100, 10);
         let mut buffer = Buffer::empty(area);
@@ -807,6 +821,33 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_without_a_screen_shows_what_it_waits_for_in_its_middle() {
+        let area = Rect::new(0, 0, 80, 12);
+        let view = ThreadView {
+            agents: &[],
+            selected: 0,
+            prompts: 0,
+            list: ListPlace::Hidden,
+            hints: &[],
+            waiting: Some(("⠋", "waiting for the thread's host")),
+        };
+        let mut buffer = Buffer::empty(area);
+        view.render(None, area, &mut buffer);
+        let drawn = rows(&buffer);
+        let text = "⠋ waiting for the thread's host";
+        let at = drawn.iter().position(|row| row.contains(text));
+        assert_eq!(at, Some(5), "{drawn:#?}");
+        let middle: Vec<char> = drawn[5].chars().collect();
+        let left = middle.iter().position(|&cell| cell == '⠋').unwrap();
+        let right = middle.len() - left - text.chars().count();
+        assert!(left.abs_diff(right) <= 1, "{middle:?}");
+        let parser = vt100::Parser::new(9, 78, 0);
+        let mut buffer = Buffer::empty(area);
+        view.render(Some(parser.screen()), area, &mut buffer);
+        assert!(!rows(&buffer).iter().any(|row| row.contains("waiting")));
+    }
+
+    #[test]
     fn a_teammates_agent_is_named_read_only_and_the_list_over_the_pane_hides_the_cursor() {
         let mut parser = vt100::Parser::new(5, 78, 0);
         parser.process("\x1b[1;70Hx".as_bytes());
@@ -818,6 +859,7 @@ mod tests {
             prompts: 0,
             list: ListPlace::Over,
             hints: &[],
+            waiting: None,
         }
         .render(Some(parser.screen()), area, &mut buffer);
         let rows = rows(&buffer);
@@ -831,6 +873,7 @@ mod tests {
             prompts: 0,
             list: ListPlace::Hidden,
             hints: &[],
+            waiting: None,
         }
         .render(Some(parser.screen()), area, &mut buffer);
         assert_eq!(cursor, Some(Position::new(71, 1)));
@@ -875,6 +918,7 @@ mod tests {
                 prompts: 0,
                 list,
                 hints: &[],
+                waiting: None,
             }
             .render(Some(parser.screen()), body, &mut buffer);
             let bottom = rows + 1;
@@ -916,6 +960,7 @@ mod tests {
             prompts: 0,
             list: ListPlace::Beside,
             hints: &[],
+            waiting: None,
         };
         let area = Rect::new(0, 1, 100, 12);
         let at = |view: &ThreadView<'_>, x, y| view.list_at(area, Position::new(x, y));
@@ -950,6 +995,7 @@ mod tests {
             prompts: 0,
             list: ListPlace::Beside,
             hints: &[],
+            waiting: None,
         };
         let area = Rect::new(0, 1, 100, 12);
         assert_eq!(
@@ -984,6 +1030,7 @@ mod tests {
                     prompts: 1,
                     list,
                     hints: &[("q", "quit")],
+                    waiting: None,
                 }
                 .render(Some(parser.screen()), area, &mut buffer);
             }

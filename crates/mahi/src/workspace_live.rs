@@ -607,6 +607,14 @@ pub(crate) mod tests {
         pub(crate) thread: ThreadId,
     }
 
+    pub(crate) fn hosting(setup: &Setup) -> WorkspaceLive {
+        let mut live =
+            WorkspaceLive::new(&setup.environment, &setup.config, setup.store.common_dir())
+                .unwrap();
+        live.host_unlocked(setup.thread, &setup.identity).unwrap();
+        live
+    }
+
     pub(crate) fn setup() -> Setup {
         let (repo, store) = repository_on_main();
         let dirs = TempDir::new().unwrap();

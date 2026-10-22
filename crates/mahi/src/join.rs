@@ -151,6 +151,7 @@ const RESET: &[u8] =
 pub(crate) const STUCK_SCREEN: Duration = Duration::from_secs(3);
 const DRAIN: usize = 256;
 pub(crate) const HOST_SILENCE: Duration = Duration::from_secs(30);
+pub(crate) const WAITING_FOR_HOST: &str = "waiting for the thread's host";
 const KEY_QUEUE: usize = 64;
 const TYPING_PAUSE: Duration = Duration::from_millis(10);
 
@@ -652,7 +653,7 @@ fn joined_meta(
             Err(error) if Instant::now() >= deadline => return Err(JoinError::NoMeta(error)),
             Err(_) => {
                 if !told {
-                    eprintln!("mahi: waiting for the thread's host");
+                    eprintln!("mahi: {WAITING_FOR_HOST}");
                     told = true;
                 }
                 thread::sleep(RETRY_PAUSE);

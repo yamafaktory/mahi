@@ -81,7 +81,12 @@ use crate::{
         KEY_FD,
         REPORT_FD,
     },
+    join::WAITING_FOR_HOST,
     teammates::Teammates,
+    ui::{
+        SPIN_EVERY,
+        SPINNER,
+    },
     workspace_live::{
         Prompted,
         WorkspaceLive,
@@ -379,6 +384,15 @@ pub(crate) struct Workspace {
     live_told: Option<String>,
     live_failed: HashSet<ThreadId>,
     live_tried: Instant,
+    spin: Option<Spin>,
+}
+
+/// The spinner a tab that watches a joined thread turns until it lists an agent: its frame,
+/// and when it last turned.
+#[derive(Debug, Clone, Copy)]
+struct Spin {
+    frame: usize,
+    turned: Instant,
 }
 
 /// What the workspace keeps of the mouse between reads.
@@ -644,6 +658,7 @@ impl Workspace {
             live_told: None,
             live_failed: HashSet::new(),
             live_tried: Instant::now(),
+            spin: None,
         }
     }
 
@@ -942,6 +957,50 @@ impl Workspace {
         self.palette = None;
         self.composing = None;
         self.host(thread);
+    }
+
+    /// Turns the spinner of the shown tab at `now` while it only watches a thread and lists
+    /// no agent yet; returns whether what it shows changed.
+    pub(crate) fn spin(&mut self, now: Instant) -> bool {
+        if !self.waits_for_host() {
+            return self.spin.take().is_some();
+        }
+        match &mut self.spin {
+            None => {
+                self.spin = Some(Spin {
+                    frame: 0,
+                    turned: now,
+                });
+                true
+            }
+            Some(spin) if now.saturating_duration_since(spin.turned) >= SPIN_EVERY => {
+                spin.frame = (spin.frame + 1) % SPINNER.len();
+                spin.turned = now;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Returns the spinner's frame and what the shown tab waits for, while it waits for the
+    /// thread's host.
+    pub(crate) fn waiting(&self) -> Option<(&'static str, &'static str)> {
+        let spin = self.spin.filter(|_| self.waits_for_host())?;
+        Some((SPINNER.get(spin.frame)?, WAITING_FOR_HOST))
+    }
+
+    fn waits_for_host(&self) -> bool {
+        let Some(tab) = self
+            .selected
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get(index))
+        else {
+            return false;
+        };
+        let Some(teammates) = teammates_of(self.live.as_ref(), tab.thread) else {
+            return false;
+        };
+        tab.watch_only && tab.agents.is_empty() && teammates.agents().len() == 0
     }
 
     /// Closes the tabs that only watch threads their owners purged, as the live layer's
@@ -1333,6 +1392,7 @@ impl Workspace {
             prompts: 0,
             list,
             hints: &[],
+            waiting: None,
         }
         .list_at(body, position);
         drop(agents);
@@ -1375,6 +1435,7 @@ impl Workspace {
             prompts: 0,
             list,
             hints: &[],
+            waiting: None,
         }
         .pane_point(body, position, clamp);
         let (Some(point), Some(running)) = (point, tab.agents.get_mut(tab.selected)) else {
@@ -1828,6 +1889,7 @@ impl Workspace {
                 Some(told) => told,
                 None => &hints,
             },
+            waiting: self.waiting(),
         }
         .render(screen, body, buffer);
         cursor.filter(|_| shown.is_some())
@@ -2440,6 +2502,50 @@ mod tests {
         }
         assert!(workspace.forget_told());
         assert!(workspace.told.is_none());
+    }
+
+    #[test]
+    fn a_tab_that_watches_a_hosted_thread_spins_until_it_lists_an_agent() {
+        let setup = crate::workspace_live::tests::setup();
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        workspace.host_with(Some(crate::workspace_live::tests::hosting(&setup)));
+        let now = Instant::now();
+        assert!(!workspace.spin(now));
+        workspace.watch_thread(setup.thread);
+        assert!(workspace.spin(now));
+        assert_eq!(
+            workspace.waiting(),
+            Some(("⠋", "waiting for the thread's host"))
+        );
+        assert!(!workspace.spin(now + SPIN_EVERY / 2));
+        assert!(workspace.spin(now + SPIN_EVERY));
+        assert_eq!(workspace.waiting().map(|(frame, _)| frame), Some("⠙"));
+        let agent = running(&mut workspace, "sleep 5");
+        workspace.tabs[0].agents.push(agent);
+        assert!(workspace.spin(now + SPIN_EVERY * 2));
+        assert_eq!(workspace.waiting(), None);
+        assert!(!workspace.spin(now + SPIN_EVERY * 3));
+    }
+
+    #[test]
+    fn a_tab_that_watches_a_thread_the_workspace_cannot_host_does_not_spin() {
+        let setup = crate::workspace_live::tests::setup();
+        for live in [
+            None,
+            WorkspaceLive::new(&setup.environment, &setup.config, setup.store.common_dir()),
+        ] {
+            let mut workspace = Workspace::new(
+                PaletteKey::default(),
+                Notice::for_terminal(TerminalHints::default()),
+            );
+            workspace.host_with(live);
+            workspace.watch_thread(setup.thread);
+            assert!(!workspace.spin(Instant::now()));
+            assert_eq!(workspace.waiting(), None);
+        }
     }
 
     #[test]

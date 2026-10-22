@@ -88,6 +88,7 @@ use crate::{
         self,
         Captured,
         DialogPrompt,
+        SPIN_EVERY,
         Showing,
     },
     unlocked,
@@ -411,6 +412,7 @@ fn follow_children(
 ) -> io::Result<bool> {
     let mut changed = workspace.take_output(passed);
     changed |= workspace.forget_told();
+    changed |= workspace.spin(Instant::now());
     let (told, ended) = workspace.take_ended();
     if let Some(told) = told {
         *status = told;
@@ -466,6 +468,8 @@ impl ThreadListKeys {
 fn key_wait(workspace: &Workspace) -> Duration {
     if workspace.is_running() {
         CHILD_WAIT
+    } else if workspace.waiting().is_some() {
+        SPIN_EVERY
     } else {
         KEY_WAIT
     }
@@ -1474,6 +1478,20 @@ mod tests {
             ParticipantName::new(participant).unwrap(),
             AgentName::new(agent).unwrap(),
         )
+    }
+
+    #[test]
+    fn the_home_screen_wakes_for_each_turn_of_a_waiting_tabs_spinner() {
+        let mut workspace = Workspace::new(
+            mahi_term::PaletteKey::default(),
+            mahi_term::Notice::for_terminal(mahi_term::TerminalHints::default()),
+        );
+        let setup = crate::workspace_live::tests::setup();
+        workspace.host_with(Some(crate::workspace_live::tests::hosting(&setup)));
+        assert_eq!(key_wait(&workspace), KEY_WAIT);
+        workspace.watch_thread(setup.thread);
+        workspace.spin(Instant::now());
+        assert_eq!(key_wait(&workspace), SPIN_EVERY);
     }
 
     fn home_rows() -> Vec<HomeRow> {
