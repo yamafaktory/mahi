@@ -32,6 +32,7 @@ pub(crate) struct Teammates {
     agents: Vec<Teammate>,
     lost: bool,
     asked_at: Option<Instant>,
+    started: Option<Instant>,
 }
 
 /// A teammate's agent the workspace watches.
@@ -61,6 +62,12 @@ enum Presence {
     Online(Instant),
     /// Not heard from for [`HOST_SILENCE`], since this time, or never.
     Offline(Option<Instant>),
+}
+
+impl Teammate {
+    fn was_heard(&self) -> bool {
+        !matches!(self.presence, Presence::Offline(None))
+    }
 }
 
 impl Presence {
@@ -96,6 +103,7 @@ impl Teammates {
             agents: Vec::new(),
             lost: false,
             asked_at: None,
+            started: None,
         }
     }
 
@@ -192,15 +200,25 @@ impl Teammates {
 
     /// Says whether to ask for the agents' screens at `now`, at most once every
     /// [`ASK_EVERY`]: frames were dropped, an agent online has no screen and none on its way,
-    /// or one waited too long for its missing parts. When it says so, the screens are taken as asked for.
+    /// one waited too long for its missing parts, or no agent was heard yet within
+    /// [`HOST_SILENCE`] of the first call, then at most once every [`STUCK_SCREEN`], so a slow
+    /// answer still meets the challenge it echoes. When it says so, the screens are taken as
+    /// asked for.
     pub(crate) fn take_wants_screen(&mut self, now: Instant) -> bool {
+        let started = *self.started.get_or_insert(now);
         if self
             .asked_at
             .is_some_and(|at| now.saturating_duration_since(at) < ASK_EVERY)
         {
             return false;
         }
+        let unheard = !self.agents.iter().any(Teammate::was_heard)
+            && now.saturating_duration_since(started) < HOST_SILENCE
+            && self
+                .asked_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= STUCK_SCREEN);
         let wanted = self.lost
+            || unheard
             || self.agents.iter().any(|teammate| {
                 teammate.presence.is_online()
                     && match &teammate.rebuilding {
@@ -465,7 +483,7 @@ mod tests {
         let mut teammates = Teammates::new("alice".parse().unwrap());
         let mut clock = Clock::new();
         let now = Instant::now();
-        assert!(!clock.asks(&mut teammates));
+        assert!(clock.asks(&mut teammates));
         assert!(teammates.apply(&bob(), output("bob.claude", b"lost"), now));
         assert!(teammates.screen(&slot("bob.claude")).is_none());
         assert!(clock.asks(&mut teammates));
@@ -493,11 +511,30 @@ mod tests {
     }
 
     #[test]
+    fn a_new_watcher_asks_until_it_hears_an_agent_for_at_most_the_host_silence() {
+        let start = Instant::now();
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        assert!(teammates.take_wants_screen(start));
+        assert!(!teammates.take_wants_screen(start + ASK_EVERY));
+        assert!(teammates.take_wants_screen(start + STUCK_SCREEN));
+        teammates.add_offline([&slot("bob.claude")]);
+        let later = start + STUCK_SCREEN * 2;
+        assert!(teammates.take_wants_screen(later));
+        assert!(teammates.apply(&bob(), screen("bob.claude", (2, 20), b"hi"), later));
+        assert!(!teammates.take_wants_screen(start + STUCK_SCREEN * 3));
+        let mut unanswered = Teammates::new("alice".parse().unwrap());
+        assert!(unanswered.take_wants_screen(start));
+        assert!(!unanswered.take_wants_screen(start + HOST_SILENCE));
+    }
+
+    #[test]
     fn the_users_own_agents_are_not_watched_and_a_lost_frame_asks_again_once() {
         let mut teammates = Teammates::new(bob());
         let mut clock = Clock::new();
         assert!(!teammates.apply(&bob(), screen("bob.claude", (2, 20), b"me"), Instant::now()));
         assert_eq!(teammates.agents().count(), 0);
+        assert!(clock.asks(&mut teammates));
+        clock.0 += HOST_SILENCE;
         teammates.lose();
         assert!(clock.asks(&mut teammates));
         assert!(!clock.asks(&mut teammates));
@@ -682,6 +719,8 @@ mod tests {
             ]
         );
         let mut clock = Clock::new();
+        assert!(clock.asks(&mut teammates));
+        clock.0 += HOST_SILENCE;
         assert!(!clock.asks(&mut teammates));
         let now = Instant::now();
         assert!(teammates.apply(
