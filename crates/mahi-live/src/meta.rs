@@ -32,6 +32,8 @@ use tokio::sync::Semaphore;
 use crate::{
     HostAddress,
     LiveError,
+    SnapshotsAnswer,
+    SnapshotsRequest,
 };
 
 /// The ALPN of the protocol a host serves `meta` on.
@@ -61,6 +63,24 @@ pub trait Peers: Send + Sync + fmt::Debug + 'static {
     /// participants, or `None` to refuse, as a node that does not host always does. It may
     /// block, as it reads the repository.
     fn meta_for(&self, thread: ThreadId, node: &NodeId) -> Option<Vec<u8>>;
+
+    /// Says whether this node would serve `node` the snapshots `request` asks for: `node` is a
+    /// collaborator of the thread it names, as the host's current `meta` lists it, and the
+    /// agent is one the host serves. It is called for every request, before its turn is
+    /// taken, so it only looks at what is already in memory. A node that does not host
+    /// serves none, as by default.
+    fn serves_snapshots(&self, node: &NodeId, request: &SnapshotsRequest) -> bool {
+        let _ = (node, request);
+        false
+    }
+
+    /// Returns, for the node `node`, which [`Peers::serves_snapshots`] admitted, the answer to
+    /// `request`, bounded to the host's own limits, or `None` to refuse. It may block, as it
+    /// reads the repository.
+    fn snapshots_for(&self, node: &NodeId, request: &SnapshotsRequest) -> Option<SnapshotsAnswer> {
+        let _ = (node, request);
+        None
+    }
 }
 
 #[derive(Debug)]

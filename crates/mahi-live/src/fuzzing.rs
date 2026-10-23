@@ -6,6 +6,8 @@ use std::str::FromStr;
 
 use crate::{
     HostAddress,
+    SnapshotsAnswer,
+    SnapshotsRequest,
     Ticket,
     frame,
 };
@@ -29,6 +31,20 @@ pub fn ticket(data: &[u8]) {
         assert!(text.len() <= 1023);
         assert_eq!(Ticket::from_str(&text).ok(), Some(ticket));
     }
+}
+
+/// Decodes `data` as a request for snapshots and as a host's answer to one, and checks that a
+/// decoded request encodes and decodes again to the same.
+///
+/// # Panics
+///
+/// Panics if a decoded request does not survive encoding, the bug looked for.
+pub fn snapshots(data: &[u8]) {
+    if let Ok(request) = SnapshotsRequest::from_bytes(data) {
+        let bytes = request.to_bytes().expect("a decoded request encodes");
+        assert_eq!(SnapshotsRequest::from_bytes(&bytes).ok(), Some(request));
+    }
+    let _ = SnapshotsAnswer::from_bytes(data.to_vec());
 }
 
 /// Decodes `data` as a live frame's plaintext and its body.

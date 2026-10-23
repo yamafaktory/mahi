@@ -10,6 +10,7 @@ mod local;
 mod lookup;
 mod meta;
 mod pair;
+mod snapshots;
 #[cfg(test)]
 mod testing;
 mod ticket;
@@ -81,6 +82,12 @@ pub use pair::{
     STEP_WAIT,
     parse_place,
     place_bytes,
+};
+pub use snapshots::{
+    MAX_SNAPSHOTS_REQUEST_BYTES,
+    SNAPSHOTS_ALPN,
+    SnapshotsAnswer,
+    SnapshotsRequest,
 };
 pub use ticket::{
     AddressError,

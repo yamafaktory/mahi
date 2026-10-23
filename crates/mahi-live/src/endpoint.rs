@@ -63,6 +63,13 @@ use crate::{
         META_ALPN,
         MetaHandler,
     },
+    snapshots::{
+        self,
+        SNAPSHOTS_ALPN,
+        SnapshotsAnswer,
+        SnapshotsHandler,
+        SnapshotsRequest,
+    },
     ticket::is_plain_relay,
 };
 
@@ -71,6 +78,7 @@ const FIRST_STABLE_PORT: u16 = 49_152;
 const STABLE_PORTS: u16 = 16_384;
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
 const FETCH_WAIT: Duration = Duration::from_secs(20);
+const SNAPSHOTS_WAIT: Duration = Duration::from_secs(90);
 const REACHED_WAIT: Duration = Duration::from_secs(1);
 
 /// Which relays an endpoint uses to reach peers it cannot reach directly.
@@ -136,9 +144,13 @@ pub enum LiveError {
         "the host refused: this node is not a participant of the thread, or the host does not have it"
     )]
     Refused,
-    /// The host sent more than a `meta` document can hold.
-    #[error("the host sent a meta document that is too large")]
+    /// The host sent more than the caller reads: a `meta` document's limit, or the
+    /// caller's for snapshots.
+    #[error("the host sent more than mahi reads")]
     TooLarge,
+    /// The host's answer, or a request, is not in the expected format.
+    #[error("the host's answer is malformed")]
+    Malformed,
     /// The host did not answer in time.
     #[error("the host did not answer in time")]
     TimedOut,
@@ -253,6 +265,7 @@ impl LiveNode {
                         .spawn(endpoint.clone());
                     let router = Router::builder(endpoint)
                         .accept(META_ALPN, MetaHandler::new(Arc::clone(&peers)))
+                        .accept(SNAPSHOTS_ALPN, SnapshotsHandler::new(Arc::clone(&peers)))
                         .accept(
                             iroh_gossip::ALPN,
                             GossipGate {
@@ -371,6 +384,36 @@ impl LiveNode {
         self.runtime()?
             .block_on(async {
                 tokio::time::timeout(FETCH_WAIT, meta::fetch(&self.endpoint, host, thread)).await
+            })
+            .map_err(|_| LiveError::TimedOut)?
+    }
+
+    /// Asks the host at `host` for the turn-end snapshots `request` names, reading at most
+    /// `max_bytes` of its answer, within a minute and a half.
+    ///
+    /// The answer is returned unchecked: the caller takes the pack in as a history and checks
+    /// who signed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiveError::Refused`] if the host refuses, [`LiveError::Unavailable`] if it is
+    /// busy or asked too soon, [`LiveError::TimedOut`] if it does not answer in time,
+    /// [`LiveError::TooLarge`] if it sends more than `max_bytes`, [`LiveError::Malformed`] if
+    /// its answer is not one, or another [`LiveError`] if it cannot be reached.
+    pub fn fetch_snapshots(
+        &self,
+        host: &HostAddress,
+        request: &SnapshotsRequest,
+        max_bytes: usize,
+    ) -> Result<SnapshotsAnswer, LiveError> {
+        outside_runtime()?;
+        self.runtime()?
+            .block_on(async {
+                tokio::time::timeout(
+                    SNAPSHOTS_WAIT,
+                    snapshots::fetch(&self.endpoint, host, request, max_bytes),
+                )
+                .await
             })
             .map_err(|_| LiveError::TimedOut)?
     }
