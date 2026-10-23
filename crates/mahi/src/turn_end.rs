@@ -116,6 +116,15 @@ impl LatestTurnEnds {
     }
 }
 
+/// Returns the newest turn-end snapshot of `slot` at or before `head`, walking back at most
+/// 4,096 snapshots, or `None` when there is none within them or one cannot be read.
+pub(crate) fn latest(store: &Store, slot: &AgentSlot, head: ObjectId) -> Option<ObjectId> {
+    match latest_ended(store, &slot.to_string(), head, None) {
+        Walked::Found(commit) => Some(commit),
+        Walked::Nothing | Walked::Failed => None,
+    }
+}
+
 /// What a walk back through an agent's snapshots found: a turn end, none new (it met the
 /// snapshot seen before, the first snapshot or its limit), or a snapshot it could not read.
 enum Walked {
@@ -282,5 +291,29 @@ mod tests {
             .unwrap();
         assert_eq!(latest.refresh(&store, &slots), []);
         assert_eq!(latest.known(), []);
+    }
+
+    #[test]
+    fn the_latest_turn_end_is_the_newest_naming_the_slot_at_or_before_the_head() {
+        let (_dir, store) = repository_on_main();
+        let thread = ThreadId::random().unwrap();
+        let alice = slot("alice.claude");
+        let snapshots = ThreadRef::new(thread, RefKind::Snapshots(alice.clone()));
+        let tree = store.write_tree(&[]).unwrap();
+        let plain = store
+            .append(&snapshots, None, tree, SNAPSHOT_MESSAGE)
+            .unwrap();
+        assert_eq!(latest(&store, &alice, plain), None);
+        let ended = store
+            .append(&snapshots, Some(plain), tree, &message(&alice))
+            .unwrap();
+        let others = store
+            .append(&snapshots, Some(ended), tree, &message(&slot("bob.claude")))
+            .unwrap();
+        let after = store
+            .append(&snapshots, Some(others), tree, SNAPSHOT_MESSAGE)
+            .unwrap();
+        assert_eq!(latest(&store, &alice, after), Some(ended));
+        assert_eq!(latest(&store, &alice, ended), Some(ended));
     }
 }

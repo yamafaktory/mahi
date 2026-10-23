@@ -1,6 +1,7 @@
 use std::{
     collections::{
         HashMap,
+        HashSet,
         VecDeque,
     },
     fs::{
@@ -45,7 +46,9 @@ use std::{
 use mahi_core::{
     AgentSlot,
     ParticipantName,
+    RefKind,
     ThreadId,
+    ThreadRef,
 };
 use mahi_identity::{
     ConfigDir,
@@ -69,16 +72,21 @@ use mahi_live::{
     PromptText,
     Received,
     Relays,
+    SnapshotsAnswer,
+    SnapshotsRequest,
     prompt_id,
 };
 use mahi_sandbox::WindowSize;
 use mahi_store::{
+    HistoryLimits,
+    ObjectId,
     Store,
     StoreError,
 };
 use mahi_thread::{
     NodeId,
     ParticipantKey,
+    Role,
     ThreadError,
     load_meta_document,
 };
@@ -96,13 +104,23 @@ use crate::{
         Answer,
         Prompts,
     },
+    settings::Settings,
     teammates::Teammates,
     thread_lock::{
         LiveLock,
         LockError,
     },
-    turn_end::LatestTurnEnds,
+    turn_end::{
+        self,
+        LatestTurnEnds,
+    },
 };
+
+/// The most snapshots a host sends in one answer.
+const MAX_SERVED_COMMITS: usize = 4096;
+/// The most bytes a host builds for one answer, whatever its `fetch-limit`, since it holds the
+/// answer in memory.
+const MAX_SERVED_BYTES: u64 = 256 << 20;
 
 /// How often a host rereads its `meta` at most, whoever asks.
 pub(crate) const REREAD_EVERY: Duration = Duration::from_secs(5);
@@ -912,7 +930,9 @@ impl LiveHost {
             }
             None => (None, None, None),
         };
-        shared.threads.add(thread, Arc::clone(&peers))?;
+        shared
+            .threads
+            .add(thread, Hosting::new(&peers, &registry, &setup.config))?;
         let (queue, tapped) = mpsc::sync_channel(TAP_QUEUE);
         let dropped = Arc::new(AtomicBool::new(false));
         let wanted = Arc::new(Mutex::new(VecDeque::with_capacity(PENDING_SCREENS)));
@@ -1077,20 +1097,74 @@ impl SharedNode {
 /// and serves each thread's `meta` only to that thread's participants.
 #[derive(Debug, Default)]
 pub(crate) struct HostedThreads {
-    threads: Mutex<HashMap<ThreadId, Arc<HostPeers>>>,
+    threads: Mutex<HashMap<ThreadId, Hosting>>,
+}
+
+/// What a node hosts of one thread: its participants and `meta`, the agents it serves, and
+/// the most bytes it sends of their snapshots in one answer.
+#[derive(Debug, Clone)]
+struct Hosting {
+    peers: Arc<HostPeers>,
+    registry: Arc<Mutex<Registry>>,
+    fetch_limit: u64,
+}
+
+impl Hosting {
+    fn new(peers: &Arc<HostPeers>, registry: &Arc<Mutex<Registry>>, config: &ConfigDir) -> Self {
+        Self {
+            peers: Arc::clone(peers),
+            registry: Arc::clone(registry),
+            fetch_limit: Settings::load(config)
+                .map_or(Settings::default().fetch_limit, |settings| {
+                    settings.fetch_limit
+                }),
+        }
+    }
+
+    fn serves(&self, slot: &AgentSlot) -> bool {
+        self.registry.lock().is_ok_and(|registry| {
+            registry
+                .agents
+                .iter()
+                .any(|hosted| &hosted.slot == slot && !hosted.is_leaving())
+        })
+    }
+
+    fn snapshots(&self, request: &SnapshotsRequest) -> Option<SnapshotsAnswer> {
+        let store = Store::open(&self.peers.git_dir).ok()?;
+        let snapshots = ThreadRef::new(request.thread, RefKind::Snapshots(request.slot.clone()));
+        let head = store.head(&snapshots).ok()??;
+        let tip = turn_end::latest(&store, &request.slot, head)?;
+        let since = match request.since {
+            Some(since) => Some(ObjectId::try_from(since.as_slice()).ok()?),
+            None => None,
+        };
+        let mut pack = Vec::new();
+        let limits = HistoryLimits {
+            commits: MAX_SERVED_COMMITS,
+            bytes: self.fetch_limit.min(MAX_SERVED_BYTES),
+        };
+        store
+            .write_history_pack(since, tip, limits, &mut pack, &AtomicBool::new(false))
+            .ok()?;
+        Some(SnapshotsAnswer {
+            tip: tip.as_bytes().try_into().ok()?,
+            pack,
+        })
+    }
 }
 
 impl HostedThreads {
-    fn threads(&self) -> Option<MutexGuard<'_, HashMap<ThreadId, Arc<HostPeers>>>> {
+    fn threads(&self) -> Option<MutexGuard<'_, HashMap<ThreadId, Hosting>>> {
         self.threads.lock().ok()
     }
 
-    fn add(&self, thread: ThreadId, peers: Arc<HostPeers>) -> Result<(), HostError> {
+    fn add(&self, thread: ThreadId, hosting: Hosting) -> Result<(), HostError> {
         let mut threads = self.threads().ok_or(HostError::HostedPoisoned)?;
         if threads.contains_key(&thread) {
             return Err(HostError::AnotherHost);
         }
-        threads.insert(thread, peers);
+        threads.insert(thread, hosting);
         Ok(())
     }
 
@@ -1100,7 +1174,7 @@ impl HostedThreads {
         }
     }
 
-    fn of(&self, thread: ThreadId) -> Option<Arc<HostPeers>> {
+    fn of(&self, thread: ThreadId) -> Option<Hosting> {
         self.threads()?.get(&thread).cloned()
     }
 }
@@ -1108,11 +1182,24 @@ impl HostedThreads {
 impl Peers for HostedThreads {
     fn admits(&self, node: &NodeId) -> bool {
         self.threads()
-            .is_some_and(|threads| threads.values().any(|peers| peers.admits(node)))
+            .is_some_and(|threads| threads.values().any(|hosting| hosting.peers.admits(node)))
     }
 
     fn meta_for(&self, thread: ThreadId, node: &NodeId) -> Option<Vec<u8>> {
-        self.of(thread)?.meta_for(thread, node)
+        self.of(thread)?.peers.meta_for(thread, node)
+    }
+
+    fn serves_snapshots(&self, node: &NodeId, request: &SnapshotsRequest) -> bool {
+        self.of(request.thread).is_some_and(|hosting| {
+            hosting.peers.is_collaborator(node) && hosting.serves(&request.slot)
+        })
+    }
+
+    fn snapshots_for(&self, node: &NodeId, request: &SnapshotsRequest) -> Option<SnapshotsAnswer> {
+        let hosting = self.of(request.thread)?;
+        hosting.peers.reread_if_due();
+        (hosting.peers.is_collaborator(node) && hosting.serves(&request.slot))
+            .then(|| hosting.snapshots(request))?
     }
 }
 
@@ -1693,6 +1780,7 @@ pub(crate) struct HostPeers {
 #[derive(Debug)]
 struct Cache {
     participants: HashMap<NodeId, ParticipantName>,
+    collaborators: HashSet<NodeId>,
     document: Vec<u8>,
     read_at: Instant,
 }
@@ -1729,6 +1817,13 @@ impl HostPeers {
             .unwrap_or_default()
     }
 
+    /// Says whether `node` is a collaborator's, as the host's `meta` lists it now.
+    fn is_collaborator(&self, node: &NodeId) -> bool {
+        self.cache
+            .lock()
+            .is_ok_and(|cache| cache.collaborators.contains(node))
+    }
+
     fn reread_if_due(&self) {
         let due = self.cache.lock().is_ok_and(|mut cache| {
             let due = cache.read_at.elapsed() >= self.reread_every;
@@ -1740,10 +1835,12 @@ impl HostPeers {
         if !due {
             return;
         }
-        if let Ok(fresh) = read(&self.git_dir, self.thread, &self.owner)
-            && let Ok(mut cache) = self.cache.lock()
-        {
-            *cache = fresh;
+        let fresh = read(&self.git_dir, self.thread, &self.owner);
+        if let Ok(mut cache) = self.cache.lock() {
+            match fresh {
+                Ok(fresh) => *cache = fresh,
+                Err(_) => cache.collaborators.clear(),
+            }
         }
     }
 }
@@ -1777,6 +1874,11 @@ fn read(git_dir: &Path, thread: ThreadId, owner: &ParticipantKey) -> Result<Cach
         participants: meta
             .participants()
             .map(|participant| (*participant.node(), participant.name().clone()))
+            .collect(),
+        collaborators: meta
+            .participants()
+            .filter(|participant| participant.role() == Role::Collaborator)
+            .map(|participant| *participant.node())
             .collect(),
         document,
         read_at: Instant::now(),
@@ -1818,17 +1920,17 @@ pub(crate) fn screen_parts(
 mod tests {
     use std::sync::atomic::AtomicBool;
 
-    use mahi_core::{
-        AgentName,
-        RefKind,
-        ThreadRef,
-    };
+    use mahi_core::AgentName;
     use mahi_identity::{
         LocalIdentity,
         NodeKey,
         PublicIdentity,
     };
-    use mahi_store::GlobalPatterns;
+    use mahi_store::{
+        EntryKind,
+        GlobalPatterns,
+        TakeLimits,
+    };
     use mahi_thread::{
         Participant,
         VerifiedMeta,
@@ -1909,6 +2011,14 @@ mod tests {
         .unwrap()
     }
 
+    fn bare(hosted: &Hosted) -> Hosting {
+        Hosting {
+            peers: Arc::new(peers(hosted, REREAD_EVERY)),
+            registry: Arc::default(),
+            fetch_limit: 1 << 20,
+        }
+    }
+
     fn peers(hosted: &Hosted, reread_every: Duration) -> HostPeers {
         HostPeers::new(
             hosted.store.common_dir().to_path_buf(),
@@ -1945,16 +2055,12 @@ mod tests {
     fn one_node_admits_every_hosted_threads_participants_and_serves_each_only_its_own_meta() {
         let (first, second) = (hosted(), hosted());
         let threads = HostedThreads::default();
-        threads
-            .add(first.thread, Arc::new(peers(&first, REREAD_EVERY)))
-            .unwrap();
+        threads.add(first.thread, bare(&first)).unwrap();
         assert!(matches!(
-            threads.add(first.thread, Arc::new(peers(&first, REREAD_EVERY))),
+            threads.add(first.thread, bare(&first)),
             Err(HostError::AnotherHost)
         ));
-        threads
-            .add(second.thread, Arc::new(peers(&second, REREAD_EVERY)))
-            .unwrap();
+        threads.add(second.thread, bare(&second)).unwrap();
         assert!(threads.admits(&first.owner_node));
         assert!(threads.admits(&second.owner_node));
         assert!(!threads.admits(bob().node()));
@@ -1972,9 +2078,7 @@ mod tests {
     fn poisoned_hosted_threads_admit_no_one_and_host_nothing_more() {
         let (first, second) = (hosted(), hosted());
         let threads = HostedThreads::default();
-        threads
-            .add(first.thread, Arc::new(peers(&first, REREAD_EVERY)))
-            .unwrap();
+        threads.add(first.thread, bare(&first)).unwrap();
         std::thread::scope(|scope| {
             let _ = scope
                 .spawn(|| {
@@ -1986,7 +2090,7 @@ mod tests {
         assert!(!threads.admits(&first.owner_node));
         assert!(threads.meta_for(first.thread, &first.owner_node).is_none());
         assert!(matches!(
-            threads.add(second.thread, Arc::new(peers(&second, REREAD_EVERY))),
+            threads.add(second.thread, bare(&second)),
             Err(HostError::HostedPoisoned)
         ));
         threads.remove(first.thread);
@@ -2326,6 +2430,263 @@ mod tests {
         let announced = announced.unwrap();
         assert_eq!(announced.slot, slot);
         assert_eq!(announced.commit.as_slice(), ended.unwrap().as_bytes());
+        bob_host.stop();
+    }
+
+    fn list(hosted: &Hosted, name: &str, node: &NodeKey, role: Role) -> Participant {
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let participant = Participant::new(
+            ParticipantName::new(name).unwrap(),
+            ParticipantKey::from_public_key(key.public_key()).unwrap(),
+            age::x25519::Identity::generate().to_public(),
+            NodeId::from_bytes(node.public()).unwrap(),
+        )
+        .unwrap();
+        relist(hosted, &participant, role);
+        participant
+    }
+
+    fn relist(hosted: &Hosted, participant: &Participant, role: Role) {
+        add_participant(
+            &hosted.store,
+            hosted.thread,
+            &hosted.thread_key,
+            &hosted.owner_key,
+            participant.clone().with_role(role),
+        )
+        .unwrap();
+    }
+
+    fn agent(name: &str) -> AgentSlot {
+        AgentSlot::new(
+            ParticipantName::new(name).unwrap(),
+            AgentName::new("claude").unwrap(),
+        )
+    }
+
+    fn serving(hosted: &Hosted, slots: &[&AgentSlot]) -> HostedThreads {
+        let hosting = Hosting {
+            peers: Arc::new(peers(hosted, Duration::ZERO)),
+            registry: Arc::default(),
+            fetch_limit: 1 << 20,
+        };
+        for slot in slots {
+            hosting
+                .registry
+                .lock()
+                .unwrap()
+                .add(
+                    (*slot).clone(),
+                    WindowSize { rows: 4, cols: 40 },
+                    Inbox::Local(Arc::new(Prompts::default())),
+                )
+                .unwrap();
+        }
+        let threads = HostedThreads::default();
+        threads.add(hosted.thread, hosting).unwrap();
+        threads
+    }
+
+    #[test]
+    fn a_host_serves_only_a_current_collaborator_the_agents_it_serves() {
+        let hosted = hosted();
+        let bob_node = NodeKey::generate().unwrap();
+        let bob = list(&hosted, "bob", &bob_node, Role::Collaborator);
+        let bob_id = NodeId::from_bytes(bob_node.public()).unwrap();
+        let (served, other) = (agent("frank"), agent("dave"));
+        let ended = ended_snapshots(&hosted, &served);
+        ended_snapshots(&hosted, &other);
+        let threads = serving(&hosted, &[&served]);
+        let ask = |slot: &AgentSlot| SnapshotsRequest {
+            thread: hosted.thread,
+            slot: slot.clone(),
+            since: None,
+        };
+
+        assert!(threads.serves_snapshots(&bob_id, &ask(&served)));
+        let answer = threads.snapshots_for(&bob_id, &ask(&served)).unwrap();
+        assert_eq!(answer.tip.as_slice(), ended.as_bytes());
+        assert!(!threads.serves_snapshots(&bob_id, &ask(&other)));
+        assert!(threads.snapshots_for(&bob_id, &ask(&other)).is_none());
+
+        relist(&hosted, &bob, Role::Watcher);
+        assert!(threads.snapshots_for(&bob_id, &ask(&served)).is_none());
+        assert!(!threads.serves_snapshots(&bob_id, &ask(&served)));
+    }
+
+    #[test]
+    fn a_host_that_cannot_read_meta_again_serves_no_one() {
+        let hosted = hosted();
+        let bob_node = NodeKey::generate().unwrap();
+        list(&hosted, "bob", &bob_node, Role::Collaborator);
+        let bob_id = NodeId::from_bytes(bob_node.public()).unwrap();
+        let served = agent("frank");
+        ended_snapshots(&hosted, &served);
+        let threads = serving(&hosted, &[&served]);
+        let ask = SnapshotsRequest {
+            thread: hosted.thread,
+            slot: served,
+            since: None,
+        };
+        assert!(threads.snapshots_for(&bob_id, &ask).is_some());
+
+        gix::open(hosted.store.common_dir())
+            .unwrap()
+            .find_reference(
+                ThreadRef::new(hosted.thread, RefKind::Meta)
+                    .to_string()
+                    .as_str(),
+            )
+            .unwrap()
+            .delete()
+            .unwrap();
+        assert!(threads.snapshots_for(&bob_id, &ask).is_none());
+        assert!(!threads.serves_snapshots(&bob_id, &ask));
+    }
+
+    #[test]
+    fn a_host_answers_with_what_follows_the_askers_commit_and_needs_a_turn_end() {
+        let hosted = hosted();
+        let bob_node = NodeKey::generate().unwrap();
+        list(&hosted, "bob", &bob_node, Role::Collaborator);
+        let bob_id = NodeId::from_bytes(bob_node.public()).unwrap();
+        let (served, unfinished) = (agent("frank"), agent("dave"));
+        let ended = ended_snapshots(&hosted, &served);
+        let tree = hosted.store.write_tree(&[]).unwrap();
+        hosted
+            .store
+            .append(
+                &ThreadRef::new(hosted.thread, RefKind::Snapshots(unfinished.clone())),
+                None,
+                tree,
+                session::SNAPSHOT_MESSAGE,
+            )
+            .unwrap();
+        let threads = serving(&hosted, &[&served, &unfinished]);
+        let ask = |slot: &AgentSlot, since: Option<ObjectId>| SnapshotsRequest {
+            thread: hosted.thread,
+            slot: slot.clone(),
+            since: since.map(|since| since.as_bytes().try_into().unwrap()),
+        };
+
+        let same = threads
+            .snapshots_for(&bob_id, &ask(&served, Some(ended)))
+            .unwrap();
+        assert_eq!(same.tip.as_slice(), ended.as_bytes());
+        assert!(same.pack.is_empty());
+        let unrelated = hosted.store.write_tree(&[]).unwrap();
+        let elsewhere = hosted
+            .store
+            .append(
+                &ThreadRef::new(hosted.thread, RefKind::Snapshots(agent("erin"))),
+                None,
+                unrelated,
+                "snapshot",
+            )
+            .unwrap();
+        assert!(
+            threads
+                .snapshots_for(&bob_id, &ask(&served, Some(elsewhere)))
+                .is_none()
+        );
+        assert!(
+            threads
+                .snapshots_for(&bob_id, &ask(&unfinished, None))
+                .is_none()
+        );
+    }
+
+    fn ended_snapshots(hosted: &Hosted, slot: &AgentSlot) -> ObjectId {
+        let snapshots = ThreadRef::new(hosted.thread, RefKind::Snapshots(slot.clone()));
+        let readme = hosted.store.write_blob(b"bob's work").unwrap();
+        let tree = hosted
+            .store
+            .write_tree(&[("README", EntryKind::Blob, readme)])
+            .unwrap();
+        let ended = hosted
+            .store
+            .append(&snapshots, None, tree, &turn_end::message(slot))
+            .unwrap();
+        hosted
+            .store
+            .append(&snapshots, Some(ended), tree, session::SNAPSHOT_MESSAGE)
+            .unwrap();
+        ended
+    }
+
+    fn ask_as(
+        key: &NodeKey,
+        host: &HostAddress,
+        (thread, slot): (ThreadId, &AgentSlot),
+    ) -> Result<SnapshotsAnswer, LiveError> {
+        let node = LiveNode::bind(key.secret(), Relays::Disabled).unwrap();
+        let answer = node.fetch_snapshots(
+            host,
+            &SnapshotsRequest {
+                thread,
+                slot: slot.clone(),
+                since: None,
+            },
+            1 << 20,
+        );
+        node.close().unwrap();
+        answer
+    }
+
+    #[test]
+    fn a_host_serves_its_agents_turn_end_snapshots_to_collaborators_only() {
+        let hosted = hosted();
+        let (bob_node, carol_node) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+        list(&hosted, "bob", &bob_node, Role::Collaborator);
+        list(&hosted, "carol", &carol_node, Role::Watcher);
+        let bob_dir = TempDir::new().unwrap();
+        let bob_key_file = bob_dir.path().join("node.key");
+        bob_node.save(&bob_key_file).unwrap();
+        let slot = AgentSlot::new(
+            ParticipantName::new("bob").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+        let ended = ended_snapshots(&hosted, &slot);
+        let own = OwnAgent {
+            slot: slot.clone(),
+            size: WindowSize { rows: 4, cols: 40 },
+            drawn: b"bob's agent",
+            prompts: Arc::new(Prompts::default()),
+        };
+        let (bob_shared, bob_host) = host_on(
+            &hosted,
+            &bob_dir,
+            &bob_key_file,
+            (Vec::new(), HostRole::Agent(own)),
+        );
+        let address = bob_shared.node.address(Duration::from_secs(1)).unwrap();
+        let alice = NodeKey::load(&hosted.node_keys.path().join("node.key")).unwrap();
+        let alices = AgentSlot::new(
+            ParticipantName::new("alice").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+
+        let watcher = ask_as(&carol_node, &address, (hosted.thread, &slot));
+        assert!(matches!(watcher, Err(LiveError::Refused)), "{watcher:?}");
+        let not_served = ask_as(&alice, &address, (hosted.thread, &alices));
+        assert!(
+            matches!(not_served, Err(LiveError::Refused)),
+            "{not_served:?}"
+        );
+        let answer = ask_as(&alice, &address, (hosted.thread, &slot)).unwrap();
+        assert_eq!(answer.tip.as_slice(), ended.as_bytes());
+        let (_elsewhere, clone) = repository_on_main();
+        let limits = TakeLimits {
+            commits: 16,
+            object_bytes: 1 << 20,
+        };
+        clone
+            .take_history_pack(&answer.pack, None, ended, limits, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(
+            clone.read_entry(ended, "README", 64).unwrap().as_deref(),
+            Some(b"bob's work".as_slice())
+        );
         bob_host.stop();
     }
 
