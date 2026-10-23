@@ -1908,13 +1908,13 @@ fn start_background(
             commits: started.commits.clone(),
             session,
         };
-        let poker = recorder.as_ref().map(Recorder::poker);
+        let events = recorder.as_ref().map(Recorder::events);
         let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
         let closing = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&closing);
         thread::spawn(move || hook::serve(&hooks, &flag, &messages, &activity));
         let worker = thread::spawn(move || {
-            turns::record(&transcript, &inputs, poker.as_ref(), pushes.as_ref())
+            turns::record(&transcript, &inputs, events.as_ref(), pushes.as_ref())
         });
         (closing, worker)
     });

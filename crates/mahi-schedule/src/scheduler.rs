@@ -1,4 +1,5 @@
 use std::{
+    mem,
     sync::{
         Arc,
         Condvar,
@@ -102,6 +103,7 @@ pub enum Trigger {
 #[derive(Debug, Default)]
 struct State {
     poked: bool,
+    urgent: bool,
     closed: bool,
 }
 
@@ -151,14 +153,15 @@ impl Drop for Handles {
 /// and otherwise on a timer that runs at the schedule's minimum interval while the worktree
 /// keeps changing and doubles up to its maximum while it does not. The timer is the safety net
 /// that catches changes no hook reported. However often it is poked, snapshots are never
-/// closer together than the minimum interval, and the scheduler holds two flags, so its
-/// memory never grows.
+/// closer together than the minimum interval, except that one urgent poke in each minimum
+/// interval is taken at once, and the scheduler holds three flags, so its memory never grows.
 #[derive(Debug)]
 pub struct Scheduler {
     shared: Arc<Shared>,
     schedule: Schedule,
     interval: Duration,
     last: Option<Instant>,
+    last_urgent: Option<Instant>,
 }
 
 /// A handle that reports changes to a [`Scheduler`] from any thread.
@@ -182,6 +185,7 @@ impl Scheduler {
             schedule,
             interval: schedule.min_interval,
             last: None,
+            last_urgent: None,
         };
         (scheduler, poker)
     }
@@ -194,26 +198,34 @@ impl Scheduler {
     /// `spawn_blocking`.
     #[must_use]
     pub fn wait(&mut self) -> Trigger {
-        let trigger = self.wait_inner().unwrap_or(Trigger::Closed);
-        self.last = Some(Instant::now());
+        let (trigger, urgent) = self.wait_inner().unwrap_or((Trigger::Closed, false));
+        let now = Instant::now();
+        self.last = Some(now);
+        if urgent {
+            self.last_urgent = Some(now);
+        }
         trigger
     }
 
-    fn wait_inner(&self) -> Option<Trigger> {
+    fn wait_inner(&self) -> Option<(Trigger, bool)> {
         let now = Instant::now();
         let timer = now.checked_add(self.interval).unwrap_or(now + LONGEST);
         let mut state = self.shared.lock()?;
         loop {
             if state.closed {
-                return Some(Trigger::Closed);
+                return Some((Trigger::Closed, false));
             }
             if state.poked {
                 break;
             }
             if Instant::now() >= timer {
-                return Some(Trigger::Timer);
+                return Some((Trigger::Timer, false));
             }
             state = self.shared.wait_until(state, timer)?;
+        }
+        if self.takes_urgent(&mut state) {
+            state.poked = false;
+            return Some((Trigger::Poked, true));
         }
 
         let earliest = self
@@ -227,18 +239,30 @@ impl Scheduler {
                 .min(latest);
             loop {
                 if state.closed {
-                    return Some(Trigger::Closed);
+                    return Some((Trigger::Closed, false));
                 }
                 if state.poked || Instant::now() >= quiet {
                     break;
                 }
                 state = self.shared.wait_until(state, quiet)?;
             }
+            if state.poked && self.takes_urgent(&mut state) {
+                state.poked = false;
+                return Some((Trigger::Poked, true));
+            }
             if !state.poked || Instant::now() >= latest {
                 state.poked = false;
-                return Some(Trigger::Poked);
+                state.urgent = false;
+                return Some((Trigger::Poked, false));
             }
         }
+    }
+
+    fn takes_urgent(&self, state: &mut State) -> bool {
+        mem::take(&mut state.urgent)
+            && self
+                .last_urgent
+                .is_none_or(|at| at.elapsed() >= self.schedule.min_interval)
     }
 
     /// Records whether the snapshot just taken found a change, which sets the next interval.
@@ -265,6 +289,18 @@ impl Poker {
         let shared = &self.handles.0;
         if let Some(mut state) = shared.lock() {
             state.poked = true;
+        }
+        shared.wake.notify_all();
+    }
+
+    /// Reports a change to record at once, such as the end of an agent's turn: the next
+    /// [`Scheduler::wait`] returns without the settle time or the minimum interval, unless the
+    /// previous urgent poke it took was less than a minimum interval ago.
+    pub fn poke_now(&self) {
+        let shared = &self.handles.0;
+        if let Some(mut state) = shared.lock() {
+            state.poked = true;
+            state.urgent = true;
         }
         shared.wake.notify_all();
     }
@@ -343,6 +379,48 @@ mod tests {
         assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
         drop(handle.join().unwrap());
+    }
+
+    #[test]
+    fn an_urgent_poke_skips_the_minimum_interval_once_per_interval() {
+        let (mut scheduler, poker) = Scheduler::new(schedule(2000, 60_000, 1000));
+        poker.poke();
+        assert_eq!(scheduler.wait(), Trigger::Poked);
+        poker.poke_now();
+        let started = Instant::now();
+        assert_eq!(scheduler.wait(), Trigger::Poked);
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "{:?}",
+            started.elapsed()
+        );
+        poker.poke_now();
+        let started = Instant::now();
+        assert_eq!(scheduler.wait(), Trigger::Poked);
+        assert!(
+            started.elapsed() >= Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_urgent_poke_during_settling_ends_it() {
+        let (mut scheduler, poker) = Scheduler::new(schedule(2000, 60_000, 1000));
+        let poking = poker.clone();
+        let started = Instant::now();
+        poker.poke();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            poking.poke_now();
+        });
+        assert_eq!(scheduler.wait(), Trigger::Poked);
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "{:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
     }
 
     #[test]

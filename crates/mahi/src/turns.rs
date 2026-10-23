@@ -17,7 +17,6 @@ use mahi_core::{
     ThreadId,
 };
 use mahi_crypto::ThreadKey;
-use mahi_schedule::Poker;
 use mahi_store::{
     Store,
     StoreError,
@@ -39,6 +38,7 @@ use crate::{
         HookKind,
         HookMessage,
     },
+    recorder::AgentEvents,
     session::CommitKey,
     session_sync::{
         self,
@@ -81,11 +81,12 @@ pub(crate) enum TurnError {
 }
 
 /// Collects hook messages into turns until [`Delivery::End`], seals each turn when its
-/// `turn-end` arrives, and pokes `poker` whenever the worktree may have changed.
+/// `turn-end` arrives, and tells `events` whenever the worktree may have changed and when
+/// a turn ends.
 pub(crate) fn record(
     transcript: &Transcript,
     inputs: &Receiver<Delivery>,
-    poker: Option<&Poker>,
+    events: Option<&AgentEvents>,
     pushes: Option<&PushPoker>,
 ) -> Summary {
     let store = match Store::open(&transcript.git_dir) {
@@ -103,7 +104,7 @@ pub(crate) fn record(
             .session
             .as_ref()
             .map(|source| scope.spawn(move || record_sessions(transcript, source, &woken, pushes)));
-        let mut summary = record_turns(&store, transcript, inputs, poker, pushes, &wake);
+        let mut summary = record_turns(&store, transcript, inputs, events, pushes, &wake);
         drop(wake);
         if let Some(sessions) = sessions {
             match sessions.join() {
@@ -156,7 +157,7 @@ fn record_turns(
     store: &Store,
     transcript: &Transcript,
     inputs: &Receiver<Delivery>,
-    poker: Option<&Poker>,
+    events: Option<&AgentEvents>,
     pushes: Option<&PushPoker>,
     sessions: &SyncSender<()>,
 ) -> Summary {
@@ -169,12 +170,14 @@ fn record_turns(
                 break;
             }
         };
-        if let Some(poker) = poker
-            && matches!(message.kind, HookKind::Tool | HookKind::TurnEnd)
-        {
-            poker.poke();
-        }
         let ends = message.kind == HookKind::TurnEnd;
+        if let Some(events) = events {
+            match message.kind {
+                HookKind::Tool => events.changed(),
+                HookKind::TurnEnd => events.turn_ended(),
+                HookKind::Prompt | HookKind::Asks => {}
+            }
+        }
         turns.push(&message);
         if ends && turns.seal_or_note(store, transcript) {
             let _ = sessions.try_send(());
@@ -264,13 +267,13 @@ impl Turns {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
-
-    use mahi_schedule::{
-        Schedule,
-        Scheduler,
-        Trigger,
+    use std::{
+        sync::mpsc,
+        time::Duration,
     };
+
+    use mahi_schedule::Schedule;
+    use mahi_store::GlobalPatterns;
     use mahi_thread::{
         read_tip,
         read_turns,
@@ -282,9 +285,15 @@ mod tests {
     };
 
     use super::*;
-    use crate::session::tests::{
-        repository_on_main,
-        start_with,
+    use crate::{
+        recorder::{
+            Recorder,
+            Target,
+        },
+        session::tests::{
+            repository_on_main,
+            start_with,
+        },
     };
 
     fn hook(kind: HookKind, payload: &[u8]) -> Delivery {
@@ -382,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_and_turn_ends_poke_the_snapshot_scheduler() {
+    fn a_turn_end_hook_ends_the_snapshots_with_a_turn_end_snapshot() {
         let (_dir, store) = repository_on_main();
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let mut started = start_with(&store, &signer).unwrap();
@@ -395,24 +404,102 @@ mod tests {
             commits: started.commits.clone(),
             session: None,
         };
-        let (mut scheduler, poker) = Scheduler::new(
+        let recorder = Recorder::start(
+            Target {
+                git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
+                snapshots: started.snapshots.clone(),
+                globals: GlobalPatterns::default(),
+                commits: started.commits.clone(),
+            },
+            started.first_snapshot.take().unwrap(),
             Schedule::new(
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(3600),
-                std::time::Duration::from_millis(1),
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+                Duration::from_millis(5),
             )
             .unwrap(),
         );
-        assert_eq!(scheduler.wait(), Trigger::Timer);
+        std::fs::write(started.worktree.join("done"), "done").unwrap();
         let (sender, inputs) = mpsc::channel();
         sender.send(hook(HookKind::Tool, b"")).unwrap();
+        sender.send(hook(HookKind::TurnEnd, b"")).unwrap();
         sender.send(Delivery::End { dropped: 0 }).unwrap();
+        let events = recorder.events();
         assert!(
-            record(&transcript, &inputs, Some(&poker), None)
+            record(&transcript, &inputs, Some(&events), None)
                 .error
                 .is_none()
         );
-        assert_eq!(scheduler.wait(), Trigger::Poked);
+        recorder.finish().unwrap();
+
+        let ended = store.head(&started.snapshots).unwrap().unwrap();
+        assert_eq!(
+            store.commit_message(ended).unwrap(),
+            format!("snapshot\n\nMahi-Turn-End: {}\n", started.slot)
+        );
+        let repo = gix::open(store.common_dir()).unwrap();
+        let tree = repo.find_commit(ended).unwrap().tree().unwrap();
+        assert!(tree.find_entry("done").is_some());
+    }
+
+    #[test]
+    fn a_tool_hook_asks_for_a_plain_snapshot() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut started = start_with(&store, &signer).unwrap();
+        let transcript = Transcript {
+            git_dir: store.common_dir().to_path_buf(),
+            key: Arc::new(started.key.take().unwrap()),
+            thread: started.thread,
+            slot: started.slot.clone(),
+            tip: None,
+            commits: started.commits.clone(),
+            session: None,
+        };
+        let zero = store.head(&started.snapshots).unwrap();
+        let recorder = Recorder::start(
+            Target {
+                git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
+                snapshots: started.snapshots.clone(),
+                globals: GlobalPatterns::default(),
+                commits: started.commits.clone(),
+            },
+            started.first_snapshot.take().unwrap(),
+            Schedule::new(
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_millis(5),
+            )
+            .unwrap(),
+        );
+        std::fs::write(started.worktree.join("edited"), "edited").unwrap();
+        let (sender, inputs) = mpsc::channel();
+        sender.send(hook(HookKind::Tool, b"")).unwrap();
+        sender.send(Delivery::End { dropped: 0 }).unwrap();
+        let events = recorder.events();
+        assert!(
+            record(&transcript, &inputs, Some(&events), None)
+                .error
+                .is_none()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while store.head(&started.snapshots).unwrap() == zero {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tool hook asked for no snapshot"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let taken = store.head(&started.snapshots).unwrap().unwrap();
+        assert_eq!(
+            store.commit_message(taken).unwrap(),
+            crate::session::SNAPSHOT_MESSAGE
+        );
+        recorder.finish().unwrap();
     }
 
     #[test]

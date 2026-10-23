@@ -2,7 +2,10 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::AtomicBool,
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
         mpsc::{
             self,
             Receiver,
@@ -27,6 +30,7 @@ use mahi_schedule::{
 };
 use mahi_store::{
     GlobalPatterns,
+    ObjectId,
     Store,
     StoreError,
 };
@@ -48,6 +52,7 @@ use crate::{
 };
 
 const FINAL_ATTEMPTS: usize = 3;
+const TURN_END_TRAILER: &str = "Mahi-Turn-End: ";
 
 /// Snapshots an agent's worktree on its own thread while the agent runs.
 #[derive(Debug)]
@@ -55,6 +60,7 @@ pub(crate) struct Recorder {
     poker: Poker,
     worker: JoinHandle<Result<usize, RecordError>>,
     abandon: Arc<AtomicBool>,
+    turn_ended: Arc<AtomicBool>,
     merges: Sender<MergeJob>,
 }
 
@@ -71,6 +77,28 @@ struct MergeJob {
 pub(crate) struct Merger {
     poker: Poker,
     merges: Sender<MergeJob>,
+}
+
+/// Tells the recorder what the agent did: a change that asks for a snapshot soon, or the end
+/// of a turn, which a turn-end snapshot records.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentEvents {
+    poker: Poker,
+    turn_ended: Arc<AtomicBool>,
+}
+
+impl AgentEvents {
+    /// Asks for a snapshot soon, as when the agent used a tool.
+    pub(crate) fn changed(&self) {
+        self.poker.poke();
+    }
+
+    /// Asks for a turn-end snapshot at once, taken before any merge and even when the
+    /// worktree did not change.
+    pub(crate) fn turn_ended(&self) {
+        self.turn_ended.store(true, Ordering::SeqCst);
+        self.poker.poke_now();
+    }
 }
 
 impl Merger {
@@ -104,25 +132,61 @@ pub(crate) enum RecordError {
     Stopped,
 }
 
+/// Which snapshot to take: a plain one, committed only when the worktree changed, or the one
+/// that ends a turn, committed unless the last commit already ends a turn with the same tree.
+#[derive(Debug, Clone, Copy)]
+enum SnapshotKind<'msg> {
+    Plain,
+    TurnEnd {
+        message: &'msg str,
+        last_ended: Option<ObjectId>,
+    },
+}
+
+/// The signals the recorder's thread reads: when to snapshot, the merges asked for, whether
+/// a turn ended, and whether to give up.
+struct Signals<'sig> {
+    scheduler: Scheduler,
+    merges: &'sig Receiver<MergeJob>,
+    turn_ended: &'sig AtomicBool,
+    abandon: &'sig AtomicBool,
+}
+
 impl Recorder {
     /// Starts snapshotting `target` on `schedule`, after `first`, the snapshot already taken.
     pub(crate) fn start(target: Target, first: Recorded, schedule: Schedule) -> Self {
         let (scheduler, poker) = Scheduler::new(schedule);
         let abandon = Arc::new(AtomicBool::new(false));
-        let stop = Arc::clone(&abandon);
+        let turn_ended = Arc::new(AtomicBool::new(false));
+        let (stop, ended) = (Arc::clone(&abandon), Arc::clone(&turn_ended));
         let (merges, jobs) = mpsc::channel();
-        let worker = thread::spawn(move || record(&target, first, (scheduler, &jobs), &stop));
+        let worker = thread::spawn(move || {
+            record(
+                &target,
+                first,
+                Signals {
+                    scheduler,
+                    merges: &jobs,
+                    turn_ended: &ended,
+                    abandon: &stop,
+                },
+            )
+        });
         Self {
             poker,
             worker,
             abandon,
+            turn_ended,
             merges,
         }
     }
 
-    /// Returns a handle that asks for a snapshot soon, as when the agent used a tool.
-    pub(crate) fn poker(&self) -> Poker {
-        self.poker.clone()
+    /// Returns a handle that tells the recorder what the agent did.
+    pub(crate) fn events(&self) -> AgentEvents {
+        AgentEvents {
+            poker: self.poker.clone(),
+            turn_ended: Arc::clone(&self.turn_ended),
+        }
     }
 
     /// Returns a handle that has the recorder merge another agent's work into the worktree.
@@ -149,15 +213,35 @@ impl Recorder {
 fn record(
     target: &Target,
     mut last: Recorded,
-    (mut scheduler, jobs): (Scheduler, &Receiver<MergeJob>),
-    abandon: &AtomicBool,
+    mut signals: Signals<'_>,
 ) -> Result<usize, RecordError> {
     let store = Store::open(&target.git_dir)?;
+    let abandon = signals.abandon;
     let mut first_error = None;
     let mut skipped = 0;
+    let turn_end = format!("{SNAPSHOT_MESSAGE}\n\n{TURN_END_TRAILER}{}\n", target.slot);
+    let mut last_ended = None;
     loop {
-        let trigger = scheduler.wait();
-        while let Ok(job) = jobs.try_recv() {
+        let trigger = signals.scheduler.wait();
+        let closing = trigger == Trigger::Closed;
+        let mut changed = false;
+        if signals.turn_ended.swap(false, Ordering::SeqCst) {
+            let kind = SnapshotKind::TurnEnd {
+                message: &turn_end,
+                last_ended,
+            };
+            let outcome = snapshot(&store, target, &mut last, kind, FINAL_ATTEMPTS, abandon);
+            if let Ok((_, left_out)) = &outcome {
+                skipped = *left_out;
+                last_ended = Some(last.commit);
+            }
+            let (ended_changed, error) = settle(outcome.map(|(changed, _)| changed), closing);
+            changed |= ended_changed;
+            if let Some(error) = error {
+                first_error.get_or_insert(error);
+            }
+        }
+        while let Ok(job) = signals.merges.try_recv() {
             let _ = job.done.send(merge_between(
                 &store,
                 target,
@@ -166,14 +250,20 @@ fn record(
                 abandon,
             ));
         }
-        let closing = trigger == Trigger::Closed;
         let attempts = if closing { FINAL_ATTEMPTS } else { 1 };
-        let outcome = snapshot(&store, target, &mut last, attempts, abandon);
+        let outcome = snapshot(
+            &store,
+            target,
+            &mut last,
+            SnapshotKind::Plain,
+            attempts,
+            abandon,
+        );
         if let Ok((_, left_out)) = &outcome {
             skipped = *left_out;
         }
-        let (changed, error) = settle(outcome.map(|(changed, _)| changed), closing);
-        scheduler.record(changed);
+        let (plain_changed, error) = settle(outcome.map(|(changed, _)| changed), closing);
+        signals.scheduler.record(changed || plain_changed);
         if let Some(error) = error {
             first_error.get_or_insert(error);
         }
@@ -223,6 +313,7 @@ fn snapshot(
     store: &Store,
     target: &Target,
     last: &mut Recorded,
+    kind: SnapshotKind<'_>,
     attempts: usize,
     abandon: &AtomicBool,
 ) -> Result<(bool, usize), StoreError> {
@@ -235,18 +326,24 @@ fn snapshot(
         }
     };
     let skipped = taken.skipped.len();
-    if taken.tree == last.tree {
-        return Ok((false, skipped));
-    }
+    let changed = taken.tree != last.tree;
+    let message = match kind {
+        SnapshotKind::Plain if !changed => return Ok((false, skipped)),
+        SnapshotKind::TurnEnd { last_ended, .. } if !changed && last_ended == Some(last.commit) => {
+            return Ok((false, skipped));
+        }
+        SnapshotKind::Plain => SNAPSHOT_MESSAGE,
+        SnapshotKind::TurnEnd { message, .. } => message,
+    };
     last.commit = store.append_signed(
         &target.snapshots,
         Some(last.commit),
         taken.tree,
-        SNAPSHOT_MESSAGE,
+        message,
         target.commits.signer(),
     )?;
     last.tree = taken.tree;
-    Ok((true, skipped))
+    Ok((changed, skipped))
 }
 
 #[cfg(test)]
@@ -359,6 +456,162 @@ mod tests {
             assert!(signed_by(&store, commit, &key).unwrap(), "{commit}");
             next = store.parent(commit).unwrap();
         }
+    }
+
+    #[test]
+    fn a_turn_end_is_a_signed_snapshot_with_its_trailer_even_when_nothing_changed() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut started = start_with(&store, &signer).unwrap();
+        let zero = store.head(&started.snapshots).unwrap().unwrap();
+        let recorder = Recorder::start(
+            Target {
+                git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
+                snapshots: started.snapshots.clone(),
+                globals: GlobalPatterns::default(),
+                commits: CommitKey::new(signer.clone()).unwrap(),
+            },
+            started.first_snapshot.take().unwrap(),
+            fast(),
+        );
+        recorder.events().turn_ended();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while store.head(&started.snapshots).unwrap() == Some(zero) {
+            assert!(Instant::now() < deadline, "the turn end was never recorded");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        recorder.finish().unwrap();
+
+        let ended = store.head(&started.snapshots).unwrap().unwrap();
+        assert_eq!(store.parent(ended).unwrap(), Some(zero));
+        assert_eq!(
+            store.commit_message(ended).unwrap(),
+            format!("snapshot\n\nMahi-Turn-End: {}\n", started.slot)
+        );
+        let trees = snapshot_trees(&store, &started.snapshots);
+        assert_eq!(trees[0], trees[1]);
+        let key = ParticipantKey::from_public_key(signer.public_key()).unwrap();
+        assert!(signed_by(&store, ended, &key).unwrap());
+    }
+
+    fn wait_for_new_head(store: &Store, snapshots: &ThreadRef, old: Option<ObjectId>) -> ObjectId {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let head = store.head(snapshots).unwrap();
+            if head != old {
+                return head.unwrap();
+            }
+            assert!(Instant::now() < deadline, "no new snapshot");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_turn_end_marks_only_its_own_snapshot_and_is_not_repeated_without_a_change() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut started = start_with(&store, &signer).unwrap();
+        let zero = store.head(&started.snapshots).unwrap();
+        let recorder = Recorder::start(
+            Target {
+                git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
+                snapshots: started.snapshots.clone(),
+                globals: GlobalPatterns::default(),
+                commits: CommitKey::new(signer.clone()).unwrap(),
+            },
+            started.first_snapshot.take().unwrap(),
+            fast(),
+        );
+        let events = recorder.events();
+        events.turn_ended();
+        let ended = wait_for_new_head(&store, &started.snapshots, zero);
+        fs::write(started.worktree.join("next"), "next turn").unwrap();
+        events.changed();
+        let plain = wait_for_new_head(&store, &started.snapshots, Some(ended));
+        assert_eq!(store.commit_message(plain).unwrap(), SNAPSHOT_MESSAGE);
+        events.turn_ended();
+        let ended_again = wait_for_new_head(&store, &started.snapshots, Some(plain));
+        events.turn_ended();
+        recorder.finish().unwrap();
+
+        assert_eq!(store.head(&started.snapshots).unwrap(), Some(ended_again));
+        assert_eq!(store.parent(ended_again).unwrap(), Some(plain));
+        assert_eq!(
+            store.commit_message(ended_again).unwrap(),
+            format!("snapshot\n\nMahi-Turn-End: {}\n", started.slot)
+        );
+    }
+
+    #[test]
+    fn a_turn_end_is_recorded_before_a_merge_asked_for_with_it() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut started = start_with(&store, &signer).unwrap();
+        let readme = store.write_blob(b"hello\n").unwrap();
+        let notes = store.write_blob(b"from bob\n").unwrap();
+        let theirs = store
+            .write_tree(&[
+                ("README", mahi_store::EntryKind::Blob, readme),
+                ("notes.txt", mahi_store::EntryKind::Blob, notes),
+            ])
+            .unwrap();
+        let bob: mahi_core::AgentSlot = "bob.codex".parse().unwrap();
+        let commit = store
+            .append(
+                &ThreadRef::new(started.thread, mahi_core::RefKind::Snapshots(bob.clone())),
+                None,
+                theirs,
+                SNAPSHOT_MESSAGE,
+            )
+            .unwrap();
+        let recorder = Recorder::start(
+            Target {
+                git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
+                snapshots: started.snapshots.clone(),
+                globals: GlobalPatterns::default(),
+                commits: CommitKey::new(signer.clone()).unwrap(),
+            },
+            started.first_snapshot.take().unwrap(),
+            Schedule::new(
+                Duration::from_secs(2),
+                Duration::from_secs(60),
+                Duration::from_millis(5),
+            )
+            .unwrap(),
+        );
+        fs::write(started.worktree.join("mine"), "my turn").unwrap();
+        recorder.events().turn_ended();
+        let MergeDone::Merged {
+            commit: merge_commit,
+            ..
+        } = recorder
+            .merger()
+            .merge(MergeRequest {
+                from: bob,
+                commit,
+                thread_base: store.head_commit().unwrap(),
+            })
+            .unwrap()
+        else {
+            panic!("nothing was merged");
+        };
+        recorder.finish().unwrap();
+
+        let ended = store.parent(merge_commit).unwrap().unwrap();
+        assert_eq!(
+            store.commit_message(ended).unwrap(),
+            format!("snapshot\n\nMahi-Turn-End: {}\n", started.slot)
+        );
+        let repo = gix::open(store.common_dir()).unwrap();
+        let tree = repo.find_commit(ended).unwrap().tree().unwrap();
+        assert!(tree.find_entry("mine").is_some());
+        assert!(tree.find_entry("notes.txt").is_none());
     }
 
     #[test]
