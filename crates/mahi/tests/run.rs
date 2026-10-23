@@ -6174,6 +6174,8 @@ exit 3
             joiner.wait_for("The code matched");
             let asked = owner.wait_for("[y/N]");
             assert!(asked.contains("Add bob (SHA256:"), "{asked}");
+            let named = format!("to thread {thread} as a {}? [y/N]", &role[2..]);
+            assert!(asked.contains(&named), "{asked}");
             if !from_home {
                 assert!(!joiner.text().contains(&code), "{}", joiner.text());
             }

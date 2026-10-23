@@ -364,8 +364,9 @@ fn owner_pairs(
     }
     let name = card.participant().name().to_string();
     let question = format!(
-        "Add {name} ({}) to thread {thread}? [y/N] ",
-        card.participant().key().fingerprint()
+        "Add {name} ({}) to thread {thread} as a {}? [y/N] ",
+        card.participant().key().fingerprint(),
+        role_name(role)
     );
     drop(stop);
     let answer = TerminalPrompt::open()
@@ -411,6 +412,13 @@ fn owner_pairs(
         });
     }
     Ok(name)
+}
+
+fn role_name(role: mahi_thread::Role) -> &'static str {
+    match role {
+        mahi_thread::Role::Collaborator => "collaborator",
+        mahi_thread::Role::Watcher => "watcher",
+    }
 }
 
 fn accept_until_stopped(
