@@ -1,4 +1,5 @@
 use mahi_core::{
+    AgentSlot,
     ParticipantName,
     RefKind,
     ThreadId,
@@ -17,7 +18,9 @@ use crate::{
     MetaDocument,
     ParticipantKey,
     PinError,
+    Role,
     ThreadError,
+    VerifiedMeta,
     commits::signed_by,
     pins::Pins,
     thread::META_ENTRY,
@@ -32,6 +35,34 @@ pub enum Refusal {
     /// A commit it adds is not signed by the key `meta` lists for the ref's participant.
     #[error("commit {0} is not signed by the participant's key")]
     NotSigned(ObjectId),
+}
+
+/// Why fetched snapshots were refused.
+#[derive(Debug, Error)]
+pub enum SnapshotsRefusal {
+    /// They are the local participant's own, which no one else writes.
+    #[error("the snapshots are the user's own")]
+    Own,
+    /// Their participant is not listed in `meta`.
+    #[error("{0} is not a participant of the thread")]
+    NotListed(ParticipantName),
+    /// Their participant only watches the thread, so runs no agent whose work is taken.
+    #[error("{0} watches the thread and runs no agent in it")]
+    Watcher(ParticipantName),
+    /// Their history failed the checks a fetched agent ref gets.
+    #[error(transparent)]
+    Refused(#[from] Refusal),
+}
+
+/// What [`accept_snapshots`] did to the agent's snapshots ref.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotsAccepted {
+    /// The ref moved forward to the fetched commit.
+    Moved,
+    /// The ref is already at or past the fetched commit.
+    Kept,
+    /// The ref and the fetched commit went apart; the ref stays.
+    Diverged,
 }
 
 /// What accepting a thread's fetched refs changed.
@@ -219,6 +250,52 @@ fn read_document(
     Ok(MetaDocument::decode(&encoded, thread, trusted_owner)?)
 }
 
+/// Moves the snapshots ref of `slot` in `meta`'s thread forward to `tip`, a commit fetched from
+/// the agent's host, on behalf of the participant `local`: only when `meta` lists the slot's
+/// participant as a collaborator other than `local`, and when every commit the ref gains is
+/// signed by the key `meta` lists for them. A ref already at or past `tip` stays, and so does
+/// one whose history went apart from it. The history walks go through at most
+/// [`MAX_HISTORY_WALK`] commits.
+///
+/// `meta` must be the newest the user accepted, read again for each answer, so that a
+/// collaborator made a watcher is refused from then on. Nothing in a snapshot names its
+/// thread: the caller takes the answer only from the node of the slot's participant, and only
+/// for a turn-end snapshot of that slot.
+///
+/// # Errors
+///
+/// Returns [`SnapshotsRefusal::Own`] for `local`'s own slot, [`SnapshotsRefusal::NotListed`]
+/// or [`SnapshotsRefusal::Watcher`] if `meta` does not list the participant as a collaborator,
+/// or [`SnapshotsRefusal::Refused`] with [`Refusal::NotSigned`] if a commit the ref would gain
+/// is not theirs, or with [`Refusal::Store`] if the history cannot be read or the ref moved.
+pub fn accept_snapshots(
+    store: &Store,
+    meta: &VerifiedMeta,
+    slot: &AgentSlot,
+    tip: ObjectId,
+    local: &ParticipantName,
+) -> Result<SnapshotsAccepted, SnapshotsRefusal> {
+    let owner = slot.participant();
+    if owner == local {
+        return Err(SnapshotsRefusal::Own);
+    }
+    let writer = meta
+        .participants()
+        .find(|listed| listed.name() == owner)
+        .ok_or_else(|| SnapshotsRefusal::NotListed(owner.clone()))?;
+    match writer.role() {
+        Role::Collaborator => {}
+        Role::Watcher => return Err(SnapshotsRefusal::Watcher(owner.clone())),
+    }
+    let snapshots = ThreadRef::new(meta.thread(), RefKind::Snapshots(slot.clone()));
+    let mut budget = MAX_HISTORY_WALK;
+    match advance(store, &snapshots, tip, writer.key(), &mut budget)? {
+        Advance::Moved => Ok(SnapshotsAccepted::Moved),
+        Advance::Kept => Ok(SnapshotsAccepted::Kept),
+        Advance::Diverged => Ok(SnapshotsAccepted::Diverged),
+    }
+}
+
 fn advance(
     store: &Store,
     thread_ref: &ThreadRef,
@@ -285,11 +362,13 @@ mod tests {
     use crate::{
         GitSigner,
         MetaError,
+        Participant,
         PinError,
         Tombstone,
-        VerifiedMeta,
+        add_participant,
         create_thread,
         load_meta,
+        node::tests::random_node,
         record_meta,
         thread::tests::{
             Setup,
@@ -751,5 +830,80 @@ mod tests {
             ),
             Err(ThreadError::NotFound(thread)) if thread == unfetched
         ));
+    }
+
+    fn listed(setup: &Setup, key: &ThreadKey, name: &str, role: Role) -> PrivateKey {
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let participant = Participant::new(
+            ParticipantName::new(name).unwrap(),
+            ParticipantKey::from_public_key(signer.public_key()).unwrap(),
+            age::x25519::Identity::generate().to_public(),
+            random_node(),
+        )
+        .unwrap()
+        .with_role(role);
+        add_participant(&setup.store, setup.thread, key, &setup.owner, participant).unwrap();
+        signer
+    }
+
+    #[test]
+    fn a_collaborators_fetched_snapshots_move_their_ref_forward_only_when_they_signed_them() {
+        let setup = setup();
+        let (key, _) = created(&setup);
+        let bob = listed(&setup, &key, "bob", Role::Collaborator);
+        let carol = listed(&setup, &key, "carol", Role::Watcher);
+        let meta = load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
+        let alice = ParticipantName::new("alice").unwrap();
+        let slot = |name: &str| {
+            AgentSlot::new(
+                ParticipantName::new(name).unwrap(),
+                AgentName::new("claude").unwrap(),
+            )
+        };
+        let head = |slot: &AgentSlot| {
+            setup
+                .store
+                .head(&ThreadRef::new(
+                    setup.thread,
+                    RefKind::Snapshots(slot.clone()),
+                ))
+                .unwrap()
+        };
+        let bobs = slot("bob");
+        let accept = |tip: ObjectId| accept_snapshots(&setup.store, &meta, &bobs, tip, &alice);
+        let first = commit_by(&setup, &bob, None, "f", b"one");
+        let second = commit_by(&setup, &bob, Some(first), "f", b"two");
+
+        assert_eq!(accept(first).unwrap(), SnapshotsAccepted::Moved);
+        assert_eq!(accept(second).unwrap(), SnapshotsAccepted::Moved);
+        assert_eq!(accept(first).unwrap(), SnapshotsAccepted::Kept);
+        let elsewhere = commit_by(&setup, &bob, Some(first), "f", b"elsewhere");
+        assert_eq!(accept(elsewhere).unwrap(), SnapshotsAccepted::Diverged);
+        let forged = commit_by(&setup, &setup.owner, Some(second), "f", b"not bob's");
+        assert!(matches!(
+            accept(forged),
+            Err(SnapshotsRefusal::Refused(Refusal::NotSigned(commit))) if commit == forged
+        ));
+        assert_eq!(head(&bobs), Some(second));
+
+        let carols = slot("carol");
+        let by_carol = commit_by(&setup, &carol, None, "f", b"carol's");
+        assert!(matches!(
+            accept_snapshots(&setup.store, &meta, &carols, by_carol, &alice),
+            Err(SnapshotsRefusal::Watcher(name)) if name.as_str() == "carol"
+        ));
+        assert_eq!(head(&carols), None);
+        let daves = slot("dave");
+        assert!(matches!(
+            accept_snapshots(&setup.store, &meta, &daves, first, &alice),
+            Err(SnapshotsRefusal::NotListed(name)) if name.as_str() == "dave"
+        ));
+        let alices = slot("alice");
+        let by_alice = commit(&setup, None, "f", b"alice's own");
+        assert!(matches!(
+            accept_snapshots(&setup.store, &meta, &alices, by_alice, &alice),
+            Err(SnapshotsRefusal::Own)
+        ));
+        assert_eq!(head(&alices), None);
     }
 }

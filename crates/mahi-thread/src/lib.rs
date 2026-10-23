@@ -29,8 +29,11 @@ pub use commits::{
 pub use fetched::{
     Accepted,
     Refusal,
+    SnapshotsAccepted,
+    SnapshotsRefusal,
     accept_fetched,
     accept_fetched_meta,
+    accept_snapshots,
 };
 pub use handoff::{
     BRIEFED_PROMPTS,
