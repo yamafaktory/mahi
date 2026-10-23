@@ -5,6 +5,7 @@
 use std::{
     collections::HashSet,
     io,
+    sync::atomic::AtomicBool,
 };
 
 use gix::{
@@ -26,6 +27,7 @@ pub use self::{
     trees::trees,
 };
 use crate::{
+    history_pack,
     merge,
     push,
     snapshot,
@@ -46,6 +48,11 @@ fn lines(data: &[u8]) -> impl FnMut(&mut String) -> io::Result<usize> + '_ {
             next.len() + 1
         }))
     }
+}
+
+/// Checks `data` as a pack a teammate's host sent with their snapshots, without writing it.
+pub fn history_pack(data: &[u8]) {
+    let _ = history_pack::index_pack(data, None, 1 << 20, &AtomicBool::new(false));
 }
 
 /// Reads the rest of `data`, split at newlines, as a remote's ref advertisement for a push of

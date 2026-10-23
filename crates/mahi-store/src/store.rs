@@ -206,6 +206,14 @@ pub enum StoreError {
     /// More commits would be walked than mahi allows.
     #[error("more than {0} commits to walk")]
     TooManyCommits(usize),
+    /// A commit is not in the history of another.
+    #[error("{commit} is not in the history of {tip}")]
+    NotInHistory {
+        /// The commit looked for.
+        commit: ObjectId,
+        /// The commit whose history was walked.
+        tip: ObjectId,
+    },
     /// A local branch does not exist.
     #[error("branch {0:?} does not exist")]
     NoBranch(String),

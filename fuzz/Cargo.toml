@@ -300,6 +300,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "store-history-pack"
+path = "fuzz_targets/store_history_pack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "session-files"
 path = "fuzz_targets/session_files.rs"
 test = false

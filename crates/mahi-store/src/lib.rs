@@ -10,6 +10,7 @@ mod fetch;
 #[cfg(any(fuzzing, feature = "fuzzing"))]
 pub mod fuzzing;
 mod history;
+mod history_pack;
 mod merge;
 mod pairing;
 mod push;
@@ -35,6 +36,10 @@ pub use gix::{
     ObjectId,
     objs::tree::EntryKind,
     protocol::transport::client::blocking_io::Transport,
+};
+pub use history_pack::{
+    HistoryLimits,
+    TakeLimits,
 };
 pub use merge::{
     Applied,

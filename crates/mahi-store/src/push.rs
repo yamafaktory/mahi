@@ -59,7 +59,7 @@ const MAX_REASON_CHARS: usize = 200;
 const PACK_BUFFER_BYTES: usize = 64 << 10;
 const AGENT: &str = "agent=mahi";
 const ENTRY_FRAMING_BYTES: u64 = 64;
-const PACK_FRAMING_BYTES: u64 = 32;
+pub(crate) const PACK_FRAMING_BYTES: u64 = 32;
 
 /// What pushing one thread ref did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,7 +519,7 @@ impl Store {
         Ok((objects, fits))
     }
 
-    fn objects_size(&self, objects: &[ObjectId]) -> Result<u64, StoreError> {
+    pub(crate) fn objects_size(&self, objects: &[ObjectId]) -> Result<u64, StoreError> {
         let mut size: u64 = 0;
         for object in objects {
             let full = self.repo.find_header(*object)?.size();
@@ -531,7 +531,7 @@ impl Store {
         Ok(size)
     }
 
-    fn mark_known(
+    pub(crate) fn mark_known(
         &self,
         tree: ObjectId,
         known: &mut HashSet<ObjectId>,
@@ -556,7 +556,7 @@ impl Store {
         Ok(())
     }
 
-    fn collect_new(
+    pub(crate) fn collect_new(
         &self,
         tree: ObjectId,
         known: &mut HashSet<ObjectId>,
@@ -584,7 +584,7 @@ impl Store {
         Ok(())
     }
 
-    fn write_pack(
+    pub(crate) fn write_pack(
         &self,
         objects: &[ObjectId],
         out: &mut dyn Write,
@@ -625,7 +625,7 @@ impl Store {
     }
 }
 
-fn check(interrupt: &AtomicBool) -> Result<(), StoreError> {
+pub(crate) fn check(interrupt: &AtomicBool) -> Result<(), StoreError> {
     if interrupt.load(Ordering::SeqCst) {
         Err(StoreError::Interrupted)
     } else {
