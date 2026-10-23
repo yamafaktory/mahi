@@ -74,6 +74,7 @@ use mahi_live::{
     Relays,
     SnapshotsAnswer,
     SnapshotsRequest,
+    TurnEnd,
     prompt_id,
 };
 use mahi_sandbox::WindowSize;
@@ -98,12 +99,17 @@ use rustix::fs::{
 use thiserror::Error;
 
 use crate::{
+    catch_up::{
+        CatchUp,
+        Heard,
+    },
     claims::Claims,
     profile,
     prompts::{
         Answer,
         Prompts,
     },
+    run,
     settings::Settings,
     teammates::Teammates,
     thread_lock::{
@@ -641,6 +647,7 @@ pub(crate) struct LiveHost {
     stop_broadcast: Arc<AtomicBool>,
     listener: JoinHandle<()>,
     publisher: JoinHandle<()>,
+    catch_up: JoinHandle<()>,
     broadcaster: JoinHandle<()>,
     config: ConfigDir,
     thread: ThreadId,
@@ -908,13 +915,7 @@ impl LiveHost {
         withdraw_address(&setup.config, thread);
         let shared = shared.clone();
         let node = Arc::clone(&shared.node);
-        let listed: Vec<HostAddress> = setup
-            .bootstrap
-            .iter()
-            .filter(|peer| participants.iter().any(|(node, _)| node == peer.node()))
-            .cloned()
-            .collect();
-        let topic = Arc::new(node.join(keys.topic(), &listed, None)?);
+        let topic = Arc::new(node.join(keys.topic(), &listed(setup, &participants), None)?);
         let sender = FrameSender::new(keys.clone(), setup.node_key.secret())?;
         let mut receiver = FrameReceiver::new(keys.clone(), participants);
         receiver.take_prompts_for(&sender, owner.clone());
@@ -930,13 +931,13 @@ impl LiveHost {
             }
             None => (None, None, None),
         };
-        shared
-            .threads
-            .add(thread, Hosting::new(&peers, &registry, &setup.config))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let hosting_thread = Hosting::new(&peers, &registry, &setup.config);
+        shared.threads.add(thread, hosting_thread.clone())?;
+        let (catch_up, heard) = hosting_thread.catch_up(&node, &owner, &stop);
         let (queue, tapped) = mpsc::sync_channel(TAP_QUEUE);
         let dropped = Arc::new(AtomicBool::new(false));
         let wanted = Arc::new(Mutex::new(VecDeque::with_capacity(PENDING_SCREENS)));
-        let stop = Arc::new(AtomicBool::new(false));
         let stop_broadcast = Arc::new(AtomicBool::new(false));
         let request = Arc::new(Mutex::new(Vec::new()));
         let (watch, watching) = watches.then(|| Watch::open(&request)).unzip();
@@ -963,6 +964,7 @@ impl LiveHost {
             wanted,
             stop: Arc::clone(&stop),
             claims: Arc::clone(&claims),
+            heard,
         };
         let publisher = {
             let (node, stop, config) = (Arc::clone(&node), Arc::clone(&stop), setup.config.clone());
@@ -983,6 +985,7 @@ impl LiveHost {
             broadcaster: thread::spawn(move || broadcaster.run()),
             listener: thread::spawn(move || listener.run()),
             publisher,
+            catch_up,
             config: setup.config.clone(),
             thread,
             owner,
@@ -1024,6 +1027,7 @@ impl LiveHost {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.listener.join();
         let _ = self.publisher.join();
+        run::join_within(self.catch_up, run::THREAD_STOP_WAIT);
         if let Some(prompts) = &self.prompts {
             prompts.close();
         }
@@ -1035,6 +1039,16 @@ impl LiveHost {
             let _ = node.close();
         }
     }
+}
+
+/// Returns the addresses of `setup`'s bootstrap that belong to `participants`.
+fn listed(setup: &LiveSetup, participants: &[(NodeId, ParticipantName)]) -> Vec<HostAddress> {
+    setup
+        .bootstrap
+        .iter()
+        .filter(|peer| participants.iter().any(|(node, _)| node == peer.node()))
+        .cloned()
+        .collect()
 }
 
 /// Returns the participant a host serves the agents of: the one whose agent `own` it runs, or
@@ -1119,6 +1133,27 @@ impl Hosting {
                     settings.fetch_limit
                 }),
         }
+    }
+
+    /// Starts catching up with the turn ends the host hears of teammates' agents, as `local`,
+    /// until `stop` is set; returns the thread doing it and where to note what is heard.
+    fn catch_up(
+        &self,
+        node: &Arc<LiveNode>,
+        local: &ParticipantName,
+        stop: &Arc<AtomicBool>,
+    ) -> (JoinHandle<()>, Arc<Heard>) {
+        let heard = Arc::new(Heard::default());
+        let catch_up = CatchUp {
+            node: Arc::clone(node),
+            git_dir: self.peers.git_dir.clone(),
+            thread: self.peers.thread,
+            owner: self.peers.owner.clone(),
+            local: local.clone(),
+            heard: Arc::clone(&heard),
+            fetch_limit: self.fetch_limit,
+        };
+        (catch_up.start(Arc::clone(stop)), heard)
     }
 
     fn serves(&self, slot: &AgentSlot) -> bool {
@@ -1672,6 +1707,7 @@ struct Listener {
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
     claims: Arc<Claims>,
+    heard: Arc<Heard>,
 }
 
 impl Listener {
@@ -1715,8 +1751,13 @@ impl Listener {
                     self.offer(&slot, received.participant, id, text);
                     continue;
                 }
-                Body::Claims { claims, .. } => {
+                Body::Claims { claims, turn_ends } => {
                     self.claims.hear(received.sender, claims);
+                    self.hear_turn_ends(&received.participant, received.sender, &turn_ends);
+                    continue;
+                }
+                Body::TurnEnded(ended) => {
+                    self.hear_turn_ends(&received.participant, received.sender, &[ended]);
                     continue;
                 }
                 _ => continue,
@@ -1731,6 +1772,15 @@ impl Listener {
                 wanted.push_back(challenge);
                 answered.insert(received.sender, Instant::now());
             }
+        }
+    }
+
+    fn hear_turn_ends(&self, participant: &ParticipantName, sender: NodeId, turn_ends: &[TurnEnd]) {
+        if participant == &self.owner {
+            return;
+        }
+        for ended in turn_ends {
+            self.heard.hear(sender, ended);
         }
     }
 
@@ -1953,7 +2003,7 @@ mod tests {
     };
 
     struct Hosted {
-        _repo: TempDir,
+        repo: TempDir,
         node_keys: TempDir,
         store: Store,
         owner_key: PrivateKey,
@@ -1989,7 +2039,7 @@ mod tests {
         .unwrap();
         let owner = ParticipantKey::from_public_key(owner_key.public_key()).unwrap();
         Hosted {
-            _repo: repo,
+            repo,
             node_keys,
             store,
             owner_key,
@@ -2219,6 +2269,20 @@ mod tests {
         node_key: &Path,
         (bootstrap, role): (Vec<HostAddress>, HostRole<'_>),
     ) -> (SharedNode, LiveHost) {
+        host_in(
+            hosted,
+            hosted.store.common_dir(),
+            (dir, node_key),
+            (bootstrap, role),
+        )
+    }
+
+    fn host_in(
+        hosted: &Hosted,
+        git_dir: &Path,
+        (dir, node_key): (&TempDir, &Path),
+        (bootstrap, role): (Vec<HostAddress>, HostRole<'_>),
+    ) -> (SharedNode, LiveHost) {
         let config = ConfigDir::resolve(Some(dir.path()), Some(dir.path())).unwrap();
         let shared = SharedNode::bind(&NodeKey::load(node_key).unwrap(), Relays::Disabled).unwrap();
         let setup = LiveSetup {
@@ -2236,12 +2300,111 @@ mod tests {
         let host = LiveHost::start_on(
             (&shared, lock),
             &setup,
-            (hosted.store.common_dir(), &keys),
+            (git_dir, &keys),
             role,
             Arc::new(Claims::default()),
         )
         .unwrap();
         (shared, host)
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_collaborators_host_fetches_and_accepts_a_teammates_announced_turn_end() {
+        let hosted = hosted();
+        let bob_signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let bob_node = NodeKey::generate().unwrap();
+        let bob = Participant::new(
+            ParticipantName::new("bob").unwrap(),
+            ParticipantKey::from_public_key(bob_signer.public_key()).unwrap(),
+            age::x25519::Identity::generate().to_public(),
+            NodeId::from_bytes(bob_node.public()).unwrap(),
+        )
+        .unwrap();
+        relist(&hosted, &bob, Role::Collaborator);
+        let bobs_clone = TempDir::new().unwrap();
+        copy_dir(hosted.repo.path(), bobs_clone.path());
+        let bob_store = Store::open(bobs_clone.path()).unwrap();
+        let slot = agent("bob");
+        let snapshots = ThreadRef::new(hosted.thread, RefKind::Snapshots(slot.clone()));
+        let work = bob_store.write_blob(b"bob's work").unwrap();
+        let tree = bob_store
+            .write_tree(&[("work", EntryKind::Blob, work)])
+            .unwrap();
+        let commits = CommitKey::new(bob_signer).unwrap();
+        let ended = bob_store
+            .append_signed(
+                &snapshots,
+                None,
+                tree,
+                &turn_end::message(&slot),
+                commits.signer(),
+            )
+            .unwrap();
+
+        let (bob_dir, alice_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let bob_key_file = bob_dir.path().join("node.key");
+        bob_node.save(&bob_key_file).unwrap();
+        let (bob_shared, bob_host) = host_in(
+            &hosted,
+            bob_store.common_dir(),
+            (&bob_dir, &bob_key_file),
+            (
+                Vec::new(),
+                HostRole::Agent(OwnAgent {
+                    slot: slot.clone(),
+                    size: WindowSize { rows: 4, cols: 40 },
+                    drawn: b"bob's agent",
+                    prompts: Arc::new(Prompts::default()),
+                }),
+            ),
+        );
+        let address = bob_shared.node.address(Duration::from_secs(1)).unwrap();
+        let (_alice_shared, alice_host) = host_on(
+            &hosted,
+            &alice_dir,
+            &hosted.node_keys.path().join("node.key"),
+            (
+                vec![address],
+                HostRole::Agent(OwnAgent {
+                    slot: agent("alice"),
+                    size: WindowSize { rows: 4, cols: 40 },
+                    drawn: b"alice's agent",
+                    prompts: Arc::new(Prompts::default()),
+                }),
+            ),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while hosted.store.head(&snapshots).unwrap() != Some(ended) {
+            assert!(
+                Instant::now() < deadline,
+                "bob's turn end never reached alice"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            hosted
+                .store
+                .read_entry(ended, "work", 64)
+                .unwrap()
+                .as_deref(),
+            Some(b"bob's work".as_slice())
+        );
+        alice_host.stop();
+        bob_host.stop();
     }
 
     fn watched_until(
