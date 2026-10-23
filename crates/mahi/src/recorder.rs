@@ -49,10 +49,10 @@ use crate::{
         Recorded,
         SNAPSHOT_MESSAGE,
     },
+    turn_end,
 };
 
 const FINAL_ATTEMPTS: usize = 3;
-const TURN_END_TRAILER: &str = "Mahi-Turn-End: ";
 
 /// Snapshots an agent's worktree on its own thread while the agent runs.
 #[derive(Debug)]
@@ -219,7 +219,7 @@ fn record(
     let abandon = signals.abandon;
     let mut first_error = None;
     let mut skipped = 0;
-    let turn_end = format!("{SNAPSHOT_MESSAGE}\n\n{TURN_END_TRAILER}{}\n", target.slot);
+    let turn_end = turn_end::message(&target.slot);
     let mut last_ended = None;
     loop {
         let trigger = signals.scheduler.wait();

@@ -63,6 +63,7 @@ use mahi_live::{
     PromptText,
     Relays,
     Ticket,
+    TurnEnd,
     prompt_id,
 };
 use mahi_sandbox::{
@@ -271,7 +272,8 @@ impl View {
             Body::Screen { slot, .. }
             | Body::Output { slot, .. }
             | Body::Resize { slot, .. }
-            | Body::Heartbeat { slot } => self.seen(slot),
+            | Body::Heartbeat { slot }
+            | Body::TurnEnded(TurnEnd { slot, .. }) => self.seen(slot),
             Body::ScreenRequest { .. }
             | Body::Prompt { .. }
             | Body::PromptAnswer { .. }
@@ -325,7 +327,8 @@ impl View {
             | Body::Heartbeat { .. }
             | Body::Prompt { .. }
             | Body::PromptAnswer { .. }
-            | Body::Claims { .. } => {}
+            | Body::Claims { .. }
+            | Body::TurnEnded(_) => {}
         }
     }
 

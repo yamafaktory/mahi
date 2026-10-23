@@ -101,6 +101,7 @@ use crate::{
         LiveLock,
         LockError,
     },
+    turn_end::LatestTurnEnds,
 };
 
 /// How often a host rereads its `meta` at most, whoever asks.
@@ -930,6 +931,7 @@ impl LiveHost {
             sent_at: Instant::now(),
             claims: (Arc::clone(&claims), me.clone(), None),
             request,
+            turn_ends: TurnEnds::new(git_dir, thread),
         };
         let listener = Listener {
             topic,
@@ -1328,14 +1330,35 @@ struct Broadcaster {
     sent_at: Instant,
     claims: (Arc<Claims>, Option<AgentSlot>, Option<Instant>),
     request: Arc<Mutex<Vec<Body>>>,
+    turn_ends: TurnEnds,
+}
+
+/// Where the broadcaster reads the turn-end snapshots of the agents it serves, what it read,
+/// and when.
+struct TurnEnds {
+    git_dir: PathBuf,
+    latest: LatestTurnEnds,
+    read_at: Option<Instant>,
+}
+
+impl TurnEnds {
+    fn new(git_dir: &Path, thread: ThreadId) -> Self {
+        Self {
+            git_dir: git_dir.to_path_buf(),
+            latest: LatestTurnEnds::new(thread),
+            read_at: None,
+        }
+    }
 }
 
 impl Broadcaster {
     fn run(mut self) {
+        let store = Store::open(&self.turn_ends.git_dir).ok();
         while !self.stopping() {
             self.send_screens_if_needed();
             self.send_request_if_any();
             self.send_answers(None);
+            self.send_turn_ends_if_any(store.as_ref());
             self.send_claims_if_needed();
             if self.sent_at.elapsed() >= HEARTBEAT_EVERY {
                 for slot in self.slots() {
@@ -1372,7 +1395,31 @@ impl Broadcaster {
             }
         }
         self.send_answers(Some(Instant::now() + LAST_ANSWERS_WAIT));
-        self.send(&Body::Claims { claims: Vec::new() });
+        self.send(&Body::Claims {
+            claims: Vec::new(),
+            turn_ends: self.turn_ends.latest.known(),
+        });
+    }
+
+    /// Announces each turn-end snapshot new among the agents this host serves, reading their
+    /// snapshots at most every [`LISTEN_PAUSE`].
+    fn send_turn_ends_if_any(&mut self, store: Option<&Store>) {
+        let Some(store) = store else {
+            return;
+        };
+        if self
+            .turn_ends
+            .read_at
+            .is_some_and(|at| at.elapsed() < LISTEN_PAUSE)
+        {
+            return;
+        }
+        self.turn_ends.read_at = Some(Instant::now());
+        let slots = self.slots();
+        let new = self.turn_ends.latest.refresh(store, &slots);
+        for ended in new {
+            self.send(&Body::TurnEnded(ended));
+        }
     }
 
     /// Sends the claims of the agents this host serves when they changed, and every
@@ -1385,6 +1432,7 @@ impl Broadcaster {
         }
         let body = Body::Claims {
             claims: claims.hosted(me.as_ref()),
+            turn_ends: self.turn_ends.latest.known(),
         };
         if self.send(&body) {
             self.claims.2 = Some(Instant::now());
@@ -1580,7 +1628,7 @@ impl Listener {
                     self.offer(&slot, received.participant, id, text);
                     continue;
                 }
-                Body::Claims { claims } => {
+                Body::Claims { claims, .. } => {
                     self.claims.hear(received.sender, claims);
                     continue;
                 }
@@ -1770,7 +1818,11 @@ pub(crate) fn screen_parts(
 mod tests {
     use std::sync::atomic::AtomicBool;
 
-    use mahi_core::AgentName;
+    use mahi_core::{
+        AgentName,
+        RefKind,
+        ThreadRef,
+    };
     use mahi_identity::{
         LocalIdentity,
         NodeKey,
@@ -2183,6 +2235,98 @@ mod tests {
         assert!(arrivals[0].first_words.starts_with("hello from alice"));
         bob.stop();
         alice.stop();
+    }
+
+    #[test]
+    fn a_host_announces_its_agents_new_turn_end_snapshot() {
+        let hosted = hosted();
+        let bob_node = NodeKey::generate().unwrap();
+        let bob_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let bob = Participant::new(
+            ParticipantName::new("bob").unwrap(),
+            ParticipantKey::from_public_key(bob_key.public_key()).unwrap(),
+            age::x25519::Identity::generate().to_public(),
+            NodeId::from_bytes(bob_node.public()).unwrap(),
+        )
+        .unwrap();
+        add_participant(
+            &hosted.store,
+            hosted.thread,
+            &hosted.thread_key,
+            &hosted.owner_key,
+            bob,
+        )
+        .unwrap();
+        let bob_dir = TempDir::new().unwrap();
+        let bob_key_file = bob_dir.path().join("node.key");
+        bob_node.save(&bob_key_file).unwrap();
+        let slot = AgentSlot::new(
+            ParticipantName::new("bob").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+        let own = OwnAgent {
+            slot: slot.clone(),
+            size: WindowSize { rows: 4, cols: 40 },
+            drawn: b"bob's agent",
+            prompts: Arc::new(Prompts::default()),
+        };
+        let (bob_shared, bob_host) = host_on(
+            &hosted,
+            &bob_dir,
+            &bob_key_file,
+            (Vec::new(), HostRole::Agent(own)),
+        );
+        let address = bob_shared.node.address(Duration::from_secs(1)).unwrap();
+        let alice_key = NodeKey::load(&hosted.node_keys.path().join("node.key")).unwrap();
+        let alice = LiveNode::bind_live(
+            alice_key.secret(),
+            Relays::Disabled,
+            Arc::new(peers(&hosted, REREAD_EVERY)),
+        )
+        .unwrap();
+        let keys = LiveKeys::derive(&hosted.thread_key, hosted.thread).unwrap();
+        let topic = alice
+            .join(keys.topic(), &[address], Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut sender = FrameSender::new(keys.clone(), alice_key.secret()).unwrap();
+        let mut receiver = FrameReceiver::new(keys, peers(&hosted, REREAD_EVERY).participants());
+
+        let snapshots = ThreadRef::new(hosted.thread, RefKind::Snapshots(slot.clone()));
+        let tree = hosted.store.write_tree(&[]).unwrap();
+        let mut ended = None;
+        let mut anchored = false;
+        let mut announced = None;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while announced.is_none() {
+            assert!(Instant::now() < deadline, "no turn end was announced");
+            if !anchored {
+                let request = receiver.request_screen().unwrap();
+                topic.broadcast(sender.seal(&request).unwrap()).unwrap();
+            }
+            let Ok(Some(frame)) = topic.receive(Duration::from_millis(200)) else {
+                continue;
+            };
+            let Ok(opened) = receiver.open(&frame) else {
+                continue;
+            };
+            match opened.body {
+                Body::Screen { .. } if !anchored => {
+                    anchored = true;
+                    ended = Some(
+                        hosted
+                            .store
+                            .append(&snapshots, None, tree, &crate::turn_end::message(&slot))
+                            .unwrap(),
+                    );
+                }
+                Body::TurnEnded(turn_end) => announced = Some(turn_end),
+                _ => {}
+            }
+        }
+        let announced = announced.unwrap();
+        assert_eq!(announced.slot, slot);
+        assert_eq!(announced.commit.as_slice(), ended.unwrap().as_bytes());
+        bob_host.stop();
     }
 
     fn watching(queue: usize) -> (Watching, Receiver<Received>) {

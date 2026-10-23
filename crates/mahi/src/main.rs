@@ -45,6 +45,7 @@ mod teammates;
 mod terminal;
 mod thread_lock;
 mod threads;
+mod turn_end;
 mod turns;
 mod ui;
 mod unlocked;

@@ -22,6 +22,7 @@ pub use endpoint::{
 };
 pub use frame::{
     Body,
+    COMMIT_BYTES,
     ClaimEntry,
     FrameError,
     FrameReceiver,
@@ -33,6 +34,7 @@ pub use frame::{
     MAX_COLUMNS,
     MAX_FRAME_BYTES,
     MAX_FRAME_CLAIMS,
+    MAX_FRAME_TURN_ENDS,
     MAX_PROMPT_BYTES,
     MAX_PROMPTS_PER_RUN,
     MAX_ROWS,
@@ -44,6 +46,7 @@ pub use frame::{
     PromptText,
     RUN_BYTES,
     Received,
+    TurnEnd,
     prompt_id,
 };
 pub use gossip::{

@@ -188,7 +188,8 @@ impl Teammates {
             Body::ScreenRequest { .. }
             | Body::Prompt { .. }
             | Body::PromptAnswer { .. }
-            | Body::Claims { .. } => false,
+            | Body::Claims { .. }
+            | Body::TurnEnded(_) => false,
         }
     }
 

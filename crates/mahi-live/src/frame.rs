@@ -76,6 +76,10 @@ pub const MAX_FRAME_CLAIMS: usize = 64;
 pub const MAX_CLAIM_BYTES: usize = 256;
 /// The longest a claim's note may be, in bytes.
 pub const MAX_CLAIM_NOTE_BYTES: usize = 200;
+/// The size of a commit's id.
+pub const COMMIT_BYTES: usize = 20;
+/// The most turn-end snapshots one claims frame names.
+pub const MAX_FRAME_TURN_ENDS: usize = 64;
 
 /// The keys of a thread's live stream, derived from its thread key: the gossip topic, which
 /// only participants can find, and the key frames are sealed with.
@@ -152,11 +156,25 @@ pub enum Body {
         /// What became of it.
         outcome: PromptOutcome,
     },
-    /// A host's whole list of the claims its agents hold, at most [`MAX_FRAME_CLAIMS`].
+    /// A host's whole list of the claims its agents hold, at most [`MAX_FRAME_CLAIMS`], with
+    /// the latest turn-end snapshot of each of its agents, at most [`MAX_FRAME_TURN_ENDS`].
     Claims {
         /// The claims, each of an agent of the sender.
         claims: Vec<ClaimEntry>,
+        /// The latest turn-end snapshots, each of an agent of the sender, one per agent.
+        turn_ends: Vec<TurnEnd>,
     },
+    /// The agent's turn ended, and this is its turn-end snapshot.
+    TurnEnded(TurnEnd),
+}
+
+/// The latest turn-end snapshot of an agent, as its host names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnEnd {
+    /// The agent.
+    pub slot: AgentSlot,
+    /// The snapshot's commit.
+    pub commit: [u8; COMMIT_BYTES],
 }
 
 /// An advisory claim on a path or a task, as a host sends it: the agent that holds it, what
@@ -361,7 +379,16 @@ enum WireBody<'a> {
     Claims {
         #[serde(borrow)]
         claims: Vec<WireClaim<'a>>,
+        #[serde(borrow)]
+        turn_ends: Vec<WireTurnEnd<'a>>,
     },
+    TurnEnded(#[serde(borrow)] WireTurnEnd<'a>),
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireTurnEnd<'a> {
+    slot: &'a str,
+    commit: [u8; COMMIT_BYTES],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -522,7 +549,6 @@ impl FrameSender {
     /// [`FrameError::Random`] if no nonce can be drawn.
     pub fn seal(&mut self, body: &Body) -> Result<Vec<u8>, FrameError> {
         let slot;
-        let slots: Vec<String>;
         let wire = match body {
             Body::Output { slot: owner, bytes } => {
                 check_chunk(bytes)?;
@@ -598,29 +624,57 @@ impl FrameSender {
                     outcome: outcome.code(),
                 }
             }
-            Body::Claims { claims } => {
-                check_claims(
-                    claims.len(),
-                    claims
-                        .iter()
-                        .map(|claim| (claim.what.as_str(), claim.note.as_deref())),
-                )?;
-                slots = claims.iter().map(|claim| claim.slot.to_string()).collect();
-                WireBody::Claims {
-                    claims: claims
-                        .iter()
-                        .zip(&slots)
-                        .map(|(claim, slot)| WireClaim {
-                            slot,
-                            what: &claim.what,
-                            note: claim.note.as_deref(),
-                            age_secs: claim.age_secs,
-                        })
-                        .collect(),
-                }
+            Body::Claims { claims, turn_ends } => return self.seal_claims(claims, turn_ends),
+            Body::TurnEnded(ended) => {
+                slot = ended.slot.to_string();
+                WireBody::TurnEnded(WireTurnEnd {
+                    slot: &slot,
+                    commit: ended.commit,
+                })
             }
         };
         self.seal_wire(wire)
+    }
+
+    fn seal_claims(
+        &mut self,
+        claims: &[ClaimEntry],
+        turn_ends: &[TurnEnd],
+    ) -> Result<Vec<u8>, FrameError> {
+        check_claims(
+            claims.len(),
+            claims
+                .iter()
+                .map(|claim| (claim.what.as_str(), claim.note.as_deref())),
+        )?;
+        check_turn_ends(turn_ends.iter().map(|ended| &ended.slot))?;
+        let slots: Vec<String> = claims
+            .iter()
+            .map(|claim| &claim.slot)
+            .chain(turn_ends.iter().map(|ended| &ended.slot))
+            .map(ToString::to_string)
+            .collect();
+        let (claim_slots, ended_slots) = slots.split_at(claims.len());
+        self.seal_wire(WireBody::Claims {
+            claims: claims
+                .iter()
+                .zip(claim_slots)
+                .map(|(claim, slot)| WireClaim {
+                    slot,
+                    what: &claim.what,
+                    note: claim.note.as_deref(),
+                    age_secs: claim.age_secs,
+                })
+                .collect(),
+            turn_ends: turn_ends
+                .iter()
+                .zip(ended_slots)
+                .map(|(ended, slot)| WireTurnEnd {
+                    slot,
+                    commit: ended.commit,
+                })
+                .collect(),
+        })
     }
 
     fn seal_wire(&mut self, wire: WireBody<'_>) -> Result<Vec<u8>, FrameError> {
@@ -827,10 +881,12 @@ impl FrameReceiver {
         if drawn_slot(&body).is_some_and(|slot| slot.participant() != &participant) {
             return Err(FrameError::NotTheirSlot);
         }
-        if let Body::Claims { claims } = &body
+        if let Body::Claims { claims, turn_ends } = &body
             && claims
                 .iter()
-                .any(|claim| claim.slot.participant() != &participant)
+                .map(|claim| &claim.slot)
+                .chain(turn_ends.iter().map(|ended| &ended.slot))
+                .any(|slot| slot.participant() != &participant)
         {
             return Err(FrameError::NotTheirSlot);
         }
@@ -1009,6 +1065,22 @@ pub(crate) fn claim_fits(what: &str, note: Option<&str>) -> bool {
         && note.is_none_or(|note| plain(note, MAX_CLAIM_NOTE_BYTES))
 }
 
+fn check_turn_ends<'a>(
+    slots: impl ExactSizeIterator<Item = &'a AgentSlot>,
+) -> Result<(), FrameError> {
+    if slots.len() > MAX_FRAME_TURN_ENDS {
+        return Err(FrameError::TooLarge);
+    }
+    let mut seen = Vec::with_capacity(slots.len());
+    for slot in slots {
+        if seen.contains(&slot) {
+            return Err(FrameError::Malformed);
+        }
+        seen.push(slot);
+    }
+    Ok(())
+}
+
 fn check_parts(part: u16, parts: u16) -> Result<(), FrameError> {
     if parts == 0 || parts > MAX_SCREEN_PARTS || part >= parts {
         return Err(FrameError::Malformed);
@@ -1022,7 +1094,8 @@ fn drawn_slot(body: &Body) -> Option<&AgentSlot> {
         | Body::Resize { slot, .. }
         | Body::Screen { slot, .. }
         | Body::Heartbeat { slot }
-        | Body::PromptAnswer { slot, .. } => Some(slot),
+        | Body::PromptAnswer { slot, .. }
+        | Body::TurnEnded(TurnEnd { slot, .. }) => Some(slot),
         Body::ScreenRequest { .. } | Body::Prompt { .. } | Body::Claims { .. } => None,
     }
 }
@@ -1104,25 +1177,55 @@ fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
             id,
             outcome: PromptOutcome::from_code(outcome).ok_or(FrameError::Malformed)?,
         },
-        WireBody::Claims { ref claims } => {
-            check_claims(
-                claims.len(),
-                claims.iter().map(|claim| (claim.what, claim.note)),
-            )?;
-            Body::Claims {
-                claims: claims
-                    .iter()
-                    .map(|claim| {
-                        Ok(ClaimEntry {
-                            slot: slot(claim.slot)?,
-                            what: claim.what.to_owned(),
-                            note: claim.note.map(str::to_owned),
-                            age_secs: claim.age_secs,
-                        })
-                    })
-                    .collect::<Result<_, FrameError>>()?,
-            }
-        }
+        WireBody::Claims {
+            ref claims,
+            ref turn_ends,
+        } => parse_claims(claims, turn_ends)?,
+        WireBody::TurnEnded(WireTurnEnd {
+            slot: owner,
+            commit,
+        }) => Body::TurnEnded(TurnEnd {
+            slot: slot(owner)?,
+            commit,
+        }),
+    })
+}
+
+fn parse_claims(
+    claims: &[WireClaim<'_>],
+    turn_ends: &[WireTurnEnd<'_>],
+) -> Result<Body, FrameError> {
+    let slot = |text: &str| text.parse::<AgentSlot>().map_err(|_| FrameError::Malformed);
+    check_claims(
+        claims.len(),
+        claims.iter().map(|claim| (claim.what, claim.note)),
+    )?;
+    if turn_ends.len() > MAX_FRAME_TURN_ENDS {
+        return Err(FrameError::TooLarge);
+    }
+    let turn_ends = turn_ends
+        .iter()
+        .map(|ended| {
+            Ok(TurnEnd {
+                slot: slot(ended.slot)?,
+                commit: ended.commit,
+            })
+        })
+        .collect::<Result<Vec<_>, FrameError>>()?;
+    check_turn_ends(turn_ends.iter().map(|ended| &ended.slot))?;
+    Ok(Body::Claims {
+        claims: claims
+            .iter()
+            .map(|claim| {
+                Ok(ClaimEntry {
+                    slot: slot(claim.slot)?,
+                    what: claim.what.to_owned(),
+                    note: claim.note.map(str::to_owned),
+                    age_secs: claim.age_secs,
+                })
+            })
+            .collect::<Result<_, FrameError>>()?,
+        turn_ends,
     })
 }
 
@@ -1783,6 +1886,97 @@ mod tests {
         );
     }
 
+    fn turn_end(participant: &str, byte: u8) -> TurnEnd {
+        TurnEnd {
+            slot: slot(participant),
+            commit: [byte; COMMIT_BYTES],
+        }
+    }
+
+    #[test]
+    fn a_turn_end_follows_the_senders_run_and_only_its_owner_announces_it() {
+        let thread = Thread::new();
+        let mut viewer = thread.receiver();
+        let mut host = thread.sender(1);
+        let ended = Body::TurnEnded(turn_end("alice", 7));
+        assert_eq!(
+            viewer.open(&host.seal(&ended).unwrap()),
+            Err(FrameError::Unanchored)
+        );
+        let request = viewer.request_screen().unwrap();
+        viewer
+            .open(&host.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
+        let frame = host.seal(&ended).unwrap();
+        assert_eq!(viewer.open(&frame).unwrap().body, ended);
+        assert_eq!(viewer.open(&frame), Err(FrameError::Replayed));
+        let mut mallory = thread.sender(3);
+        assert_eq!(
+            viewer.open(&mallory.seal(&ended).unwrap()),
+            Err(FrameError::NotTheirSlot)
+        );
+    }
+
+    #[test]
+    fn claims_carry_only_the_senders_turn_ends_one_per_agent_and_a_bounded_number() {
+        let thread = Thread::new();
+        let mut alice = thread.sender(1);
+        let mut receiver = thread.receiver();
+        let listed = Body::Claims {
+            claims: Vec::new(),
+            turn_ends: vec![turn_end("alice", 1)],
+        };
+        assert_eq!(
+            receiver.open(&alice.seal(&listed).unwrap()).unwrap().body,
+            listed
+        );
+        let mut mallory = thread.sender(3);
+        let forged = mallory
+            .seal(&Body::Claims {
+                claims: Vec::new(),
+                turn_ends: vec![turn_end("mallory", 1), turn_end("alice", 2)],
+            })
+            .unwrap();
+        assert_eq!(receiver.open(&forged), Err(FrameError::NotTheirSlot));
+        let twice = Body::Claims {
+            claims: Vec::new(),
+            turn_ends: vec![turn_end("alice", 1), turn_end("alice", 2)],
+        };
+        assert_eq!(alice.seal(&twice), Err(FrameError::Malformed));
+        let wire_twice = alice
+            .seal_wire(WireBody::Claims {
+                claims: Vec::new(),
+                turn_ends: vec![
+                    WireTurnEnd {
+                        slot: "alice.claude",
+                        commit: [1; COMMIT_BYTES],
+                    },
+                    WireTurnEnd {
+                        slot: "alice.claude",
+                        commit: [2; COMMIT_BYTES],
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(receiver.open(&wire_twice), Err(FrameError::Malformed));
+        let names: Vec<String> = (0..=MAX_FRAME_TURN_ENDS)
+            .map(|index| format!("alice.agent{index}"))
+            .collect();
+        let too_many = alice
+            .seal_wire(WireBody::Claims {
+                claims: Vec::new(),
+                turn_ends: names
+                    .iter()
+                    .map(|name| WireTurnEnd {
+                        slot: name,
+                        commit: [1; COMMIT_BYTES],
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        assert_eq!(receiver.open(&too_many), Err(FrameError::TooLarge));
+    }
+
     fn claim(participant: &str, what: &str) -> ClaimEntry {
         ClaimEntry {
             slot: slot(participant),
@@ -1798,13 +1992,22 @@ mod tests {
         let mut alice = thread.sender(1);
         let mut receiver = thread.receiver();
         let first = Body::Claims {
+            turn_ends: Vec::new(),
             claims: vec![claim("alice", "src/parser.rs")],
         };
         let older = alice.seal(&first).unwrap();
-        let newer = alice.seal(&Body::Claims { claims: Vec::new() }).unwrap();
+        let newer = alice
+            .seal(&Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+            })
+            .unwrap();
         assert_eq!(
             receiver.open(&newer).unwrap().body,
-            Body::Claims { claims: Vec::new() }
+            Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+            }
         );
         assert!(matches!(receiver.open(&older), Err(FrameError::Replayed)));
         assert!(matches!(receiver.open(&newer), Err(FrameError::Replayed)));
@@ -1812,7 +2015,10 @@ mod tests {
         let again = restarted.seal(&first).unwrap();
         assert_eq!(receiver.open(&again).unwrap().body, first);
         let later = restarted
-            .seal(&Body::Claims { claims: Vec::new() })
+            .seal(&Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+            })
             .unwrap();
         assert!(matches!(receiver.open(&older), Err(FrameError::Replayed)));
         assert!(receiver.open(&later).is_ok());
@@ -1826,6 +2032,7 @@ mod tests {
         let mut receiver = thread.receiver();
         let forged = mallory
             .seal(&Body::Claims {
+                turn_ends: Vec::new(),
                 claims: vec![claim("mallory", "a"), claim("alice", "b")],
             })
             .unwrap();
@@ -1834,6 +2041,7 @@ mod tests {
             Err(FrameError::NotTheirSlot)
         ));
         let many = Body::Claims {
+            turn_ends: Vec::new(),
             claims: (0..=MAX_FRAME_CLAIMS)
                 .map(|index| claim("mallory", &index.to_string()))
                 .collect(),
@@ -1847,6 +2055,7 @@ mod tests {
             &"x".repeat(MAX_CLAIM_BYTES + 1),
         ] {
             let odd = Body::Claims {
+                turn_ends: Vec::new(),
                 claims: vec![claim("mallory", what)],
             };
             assert!(
@@ -1855,6 +2064,7 @@ mod tests {
             );
             let wire = mallory
                 .seal_wire(WireBody::Claims {
+                    turn_ends: Vec::new(),
                     claims: vec![WireClaim {
                         slot: "mallory.claude",
                         what,
@@ -1875,11 +2085,22 @@ mod tests {
         let thread = Thread::new();
         let mut receiver = thread.receiver();
         let mut earlier = thread.sender(1);
-        let late = earlier.seal(&Body::Claims { claims: Vec::new() }).unwrap();
+        let late = earlier
+            .seal(&Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+            })
+            .unwrap();
         let mut current = thread.sender(1);
-        let first = current.seal(&Body::Claims { claims: Vec::new() }).unwrap();
+        let first = current
+            .seal(&Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+            })
+            .unwrap();
         let next = current
             .seal(&Body::Claims {
+                turn_ends: Vec::new(),
                 claims: vec![claim("alice", "docs")],
             })
             .unwrap();
