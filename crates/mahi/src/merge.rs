@@ -70,6 +70,7 @@ use crate::{
         CommitKey,
         ResumeError,
     },
+    settings_links,
     thread_lock::{
         AgentLock,
         LockError,
@@ -432,17 +433,35 @@ fn write_merge(
 }
 
 /// Says whether the tree `merged` changes no path an agent reads as its settings or
-/// instructions from the tree `ours`, telling so only when every changed path could be listed.
+/// instructions from the tree `ours`, neither one named as such nor one a settings link of
+/// `ours` reads through, telling so only when every changed path and every such link could
+/// be told.
 fn leaves_agent_settings_alone(store: &Store, ours: ObjectId, merged: ObjectId) -> bool {
-    store
-        .changed_paths(ours, merged, MAX_MERGED_PATHS)
-        .is_ok_and(|changes| {
-            !changes.truncated
-                && !changes
-                    .paths
-                    .iter()
-                    .any(|(path, _)| is_agent_settings(path))
-        })
+    let Ok(changes) = store.changed_paths(ours, merged, MAX_MERGED_PATHS) else {
+        return false;
+    };
+    if changes.truncated
+        || changes
+            .paths
+            .iter()
+            .any(|(path, _)| is_agent_settings(path))
+    {
+        return false;
+    }
+    if changes.paths.is_empty() {
+        return true;
+    }
+    let named = |path: &[u8]| is_agent_settings(&String::from_utf8_lossy(path));
+    let Some(linked) = settings_links::read_through(store, ours, &named) else {
+        return false;
+    };
+    !linked.iter().any(|read| {
+        let read = String::from_utf8_lossy(read);
+        changes
+            .paths
+            .iter()
+            .any(|(path, _)| settings_links::covers(read.as_bytes(), path.as_bytes()))
+    })
 }
 
 fn is_agent_settings(path: &str) -> bool {

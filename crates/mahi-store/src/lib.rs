@@ -22,6 +22,7 @@ mod worktree;
 pub use changes::{
     Change,
     Changes,
+    PathEntry,
 };
 pub use diff::{
     FileDiff,

@@ -17,6 +17,7 @@ use gix::{
 };
 
 use crate::{
+    merge::MAX_LINK_BYTES,
     snapshot::{
         MAX_SNAPSHOT_DEPTH,
         MAX_SNAPSHOT_FILE_BYTES,
@@ -57,6 +58,21 @@ pub struct Changes {
     pub paths: Vec<(String, Change)>,
     /// Whether more paths changed than were listed.
     pub truncated: bool,
+}
+
+/// What a tree holds at a path, links not followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathEntry {
+    /// A file, executable or not.
+    File,
+    /// A symbolic link, with the path it points to.
+    Link(Vec<u8>),
+    /// A directory.
+    Directory,
+    /// A gitlink, a commit of another repository.
+    Gitlink,
+    /// Nothing, or a part of the path before the last that is not a directory.
+    Missing,
 }
 
 struct Walk<'a> {
@@ -191,7 +207,102 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Returns what the tree `tree` holds at the path whose names are `parts`, following no
+    /// link on the way: a link before the last part makes the path [`PathEntry::Missing`].
+    /// Every tree on the way is size-checked before it is loaded, and a link's target is read
+    /// only up to 4096 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::TooLarge`] if a tree is larger than 1 MiB or a link's target
+    /// longer than 4096 bytes, or [`StoreError::Git`] if reading fails.
+    pub fn entry_at(&self, tree: ObjectId, parts: &[&[u8]]) -> Result<PathEntry, StoreError> {
+        let mut current = tree;
+        let mut parts = parts.iter().peekable();
+        while let Some(part) = parts.next() {
+            self.bounded_size(current, Kind::Tree, MAX_TREE_BYTES)?;
+            let found = self.repo.find_tree(current)?;
+            let Some(entry) = found.find_entry(*part) else {
+                return Ok(PathEntry::Missing);
+            };
+            let (mode, id) = (entry.mode(), entry.object_id());
+            if mode.is_tree() {
+                current = id;
+                if parts.peek().is_none() {
+                    return Ok(PathEntry::Directory);
+                }
+                continue;
+            }
+            if parts.peek().is_some() {
+                return Ok(PathEntry::Missing);
+            }
+            return Ok(if mode.is_link() {
+                PathEntry::Link(self.read_blob(id, MAX_LINK_BYTES)?)
+            } else if mode.is_commit() {
+                PathEntry::Gitlink
+            } else {
+                PathEntry::File
+            });
+        }
+        Ok(PathEntry::Directory)
+    }
+
+    /// Returns the `/`-separated path of every link in the tree `tree`, or `None` when the tree is deeper than [`MAX_SNAPSHOT_DEPTH`] or holds more
+    /// than 262,144 trees or 256 MiB of them, as no checkout does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::TooLarge`] if a tree is larger than 1 MiB,
+    /// [`StoreError::DuplicateEntryName`] if a tree names an entry twice, or
+    /// [`StoreError::Git`] if reading fails.
+    pub fn links(&self, tree: ObjectId) -> Result<Option<Vec<Vec<u8>>>, StoreError> {
+        let mut walk = Walk {
+            store: self,
+            limit: 0,
+            trees: 0,
+            bytes: 0,
+            most_trees: MAX_CHECKED_OUT_TREES,
+            most_bytes: MAX_CHECKED_OUT_TREE_BYTES,
+            changes: Changes::default(),
+        };
+        let mut found = Vec::new();
+        let walked = walk.links((tree, 0), &mut Vec::new(), &mut found)?;
+        Ok(walked.then_some(found))
+    }
+}
+
 impl Walk<'_> {
+    fn links(
+        &mut self,
+        (tree, depth): (ObjectId, usize),
+        prefix: &mut Vec<u8>,
+        found: &mut Vec<Vec<u8>>,
+    ) -> Result<bool, StoreError> {
+        if depth > MAX_SNAPSHOT_DEPTH {
+            return Ok(false);
+        }
+        let Some(entries) = self.entries(Some(tree))? else {
+            return Ok(false);
+        };
+        let kept = prefix.len();
+        for (name, (mode, id)) in &entries {
+            if !prefix.is_empty() {
+                prefix.push(b'/');
+            }
+            prefix.extend_from_slice(name);
+            if mode.is_tree() {
+                if !self.links((*id, depth + 1), prefix, &mut *found)? {
+                    return Ok(false);
+                }
+            } else if mode.is_link() {
+                found.push(prefix.clone());
+            }
+            prefix.truncate(kept);
+        }
+        Ok(true)
+    }
+
     fn holds(
         &mut self,
         old: Option<ObjectId>,
@@ -403,6 +514,44 @@ mod tests {
         gix::init(dir.path()).unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn a_path_is_read_without_following_links_and_every_link_is_listed_by_its_path() {
+        let (_dir, store) = store();
+        let blob = |text: &str| store.write_blob(text.as_bytes()).unwrap();
+        let tree = |entries: &[(&str, EntryKind, ObjectId)]| store.write_tree(entries).unwrap();
+        let docs = tree(&[
+            ("guide.md", EntryKind::Blob, blob("guide")),
+            ("run.sh", EntryKind::BlobExecutable, blob("run")),
+            ("up", EntryKind::Link, blob("../CLAUDE.md")),
+        ]);
+        let root = tree(&[
+            ("CLAUDE.md", EntryKind::Link, blob("docs/guide.md")),
+            ("docs", EntryKind::Tree, docs),
+            ("linked", EntryKind::Link, blob("docs")),
+        ]);
+        let at = |path: &str| {
+            let parts: Vec<&[u8]> = path.split('/').map(str::as_bytes).collect();
+            store.entry_at(root, &parts).unwrap()
+        };
+        assert_eq!(at("CLAUDE.md"), PathEntry::Link(b"docs/guide.md".to_vec()));
+        assert_eq!(at("docs"), PathEntry::Directory);
+        assert_eq!(at("docs/guide.md"), PathEntry::File);
+        assert_eq!(at("docs/run.sh"), PathEntry::File);
+        assert_eq!(at("docs/gone.md"), PathEntry::Missing);
+        assert_eq!(at("linked/guide.md"), PathEntry::Missing);
+        assert_eq!(at("docs/guide.md/below"), PathEntry::Missing);
+        assert_eq!(store.entry_at(root, &[]).unwrap(), PathEntry::Directory);
+        let all = store.links(root).unwrap().unwrap();
+        assert_eq!(
+            all,
+            [
+                b"CLAUDE.md".to_vec(),
+                b"docs/up".to_vec(),
+                b"linked".to_vec()
+            ]
+        );
     }
 
     #[test]

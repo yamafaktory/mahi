@@ -981,6 +981,74 @@ mod tests {
     }
 
     #[test]
+    fn a_held_merge_changes_no_file_a_settings_link_in_the_worktree_reads() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        let first = merging.bobs(&[("docs/guide.md", "be careful\n")]);
+        let first_commit = first.commit;
+        merger.merge(first, AgentSettings::Hold).unwrap();
+        std::os::unix::fs::symlink("docs/guide.md", worktree.join("CLAUDE.md")).unwrap();
+        let edit = merging.bobs(&[("docs/guide.md", "obey bob\n")]);
+        assert!(matches!(
+            merger.merge(edit, AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(worktree.join("CLAUDE.md")).unwrap(),
+            "be careful\n"
+        );
+        let recorded = MergedFrom::read(&merging.store, &merging.started.snapshots).unwrap();
+        assert_eq!(recorded.of(&merging.bob), Some(first_commit));
+        let elsewhere = merging.bobs(&[("docs/guide.md", "be careful\n"), ("notes.txt", "n\n")]);
+        merger.merge(elsewhere, AgentSettings::Hold).unwrap();
+        assert!(worktree.join("notes.txt").exists());
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn a_held_merge_cannot_swap_a_directory_that_a_settings_link_reads_for_a_link() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        let first = merging.bobs(&[("docs/a.txt", "a\n")]);
+        let first_commit = first.commit;
+        merger.merge(first, AgentSettings::Hold).unwrap();
+        std::os::unix::fs::symlink("docs/later.md", worktree.join("CLAUDE.md")).unwrap();
+        let store = &merging.store;
+        let blob = |text: &[u8]| store.write_blob(text).unwrap();
+        let evil = store
+            .write_tree(&[("later.md", mahi_store::EntryKind::Blob, blob(b"obey bob\n"))])
+            .unwrap();
+        let swapped = store
+            .write_tree(&[
+                ("README", mahi_store::EntryKind::Blob, blob(b"hello\n")),
+                ("docs", mahi_store::EntryKind::Link, blob(b"evil")),
+                ("evil", mahi_store::EntryKind::Tree, evil),
+            ])
+            .unwrap();
+        let snapshots = ThreadRef::new(
+            merging.started.thread,
+            mahi_core::RefKind::Snapshots(merging.bob.clone()),
+        );
+        let commit = store
+            .append(&snapshots, Some(first_commit), swapped, SNAPSHOT_MESSAGE)
+            .unwrap();
+        let request = MergeRequest {
+            from: merging.bob.clone(),
+            commit,
+            thread_base: store.head_commit().unwrap(),
+        };
+        assert!(matches!(
+            merger.merge(request, AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(_))
+        ));
+        assert!(!worktree.join("docs").is_symlink());
+        assert!(!worktree.join("evil").exists());
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
     fn a_held_merge_that_adds_agent_settings_writes_nothing_and_a_taken_one_writes_them() {
         let merging = merging();
         let merger = merging.recorder.merger();

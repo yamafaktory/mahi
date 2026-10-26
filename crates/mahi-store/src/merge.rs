@@ -82,7 +82,7 @@ use crate::{
 pub const MAX_MERGED_PATHS: usize = 65_536;
 /// The most bytes of files a merge writes into a worktree in all.
 pub const MAX_MERGE_WRITE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const MAX_LINK_BYTES: u64 = 4096;
+pub(crate) const MAX_LINK_BYTES: u64 = 4096;
 pub(crate) const TEMPORARY_PREFIX: &str = ".mahi-merge-";
 
 /// How a path of a merge conflicts.

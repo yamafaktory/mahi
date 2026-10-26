@@ -43,6 +43,7 @@ mod run;
 mod session;
 mod session_sync;
 mod settings;
+mod settings_links;
 mod sync;
 mod teammates;
 mod terminal;
