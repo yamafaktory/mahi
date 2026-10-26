@@ -157,6 +157,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::{
+    auto_merge::AutoMerge,
     claims::Claims,
     cli::{
         AgentAddCommand,
@@ -203,6 +204,7 @@ use crate::{
         Toolbox,
     },
     merge::{
+        AgentSettings,
         MergeDone,
         MergeRequest,
     },
@@ -1549,6 +1551,7 @@ impl Prepared {
             key.clone(),
         );
         let can_merge = raw.is_some() && terminal::is_interactive() && recorder.is_some();
+        let auto_merge = auto_merge(self.profile, self.owner.as_ref(), (&self.git_dir, &started));
         let (tools, prompts) = serve_tools(
             self.mcp,
             (self.owner, key, live.as_ref(), can_merge),
@@ -1571,6 +1574,7 @@ impl Prepared {
                 turns,
                 pusher,
                 prompts,
+                auto_merge,
             },
             proxy,
             live,
@@ -1723,7 +1727,7 @@ fn serve_merges(
 ) {
     merging.door.serve(serving, |request, waiting| {
         let done = inject::when_idle(activity, agent, writer, (serving, Pace::default()), || {
-            waiting().then(|| merging.merger.merge(request))
+            waiting().then(|| merging.merger.merge(request, AgentSettings::Take))
         });
         match done {
             None => Err("the agent ended before it was idle".to_owned()),
@@ -1748,6 +1752,25 @@ impl MergeServer {
             let _ = thread.join();
         }
     }
+}
+
+/// Takes the teammates' turn-end snapshots into the agent between its turns, on a thread of
+/// its own while `running` is set.
+fn spawn_auto_merge<A: AgentInput + Send + Sync + 'static, W: Write + Send + 'static>(
+    auto_merge: AutoMerge,
+    merger: Merger,
+    (activity, agent, writer): (&Arc<Activity>, &Arc<A>, &Arc<Mutex<W>>),
+    running: &Arc<AtomicBool>,
+) {
+    let (activity, agent, writer) = (Arc::clone(activity), Arc::clone(agent), Arc::clone(writer));
+    let running = Arc::clone(running);
+    thread::spawn(move || {
+        auto_merge.run(
+            &merger,
+            (&activity, &*agent, &writer),
+            (&running, Pace::default()),
+        );
+    });
 }
 
 /// Gives the agent the prompts the user accepts, on a thread of its own while `running` is
@@ -1777,7 +1800,7 @@ fn merged_for_agent(merger: Option<&Merger>, request: MergeRequest) -> String {
     let Some(merger) = merger else {
         return format!("mahi could not merge the work of {from}: this run takes no snapshots");
     };
-    let mut told = match merger.merge(request) {
+    let mut told = match merger.merge(request, AgentSettings::Take) {
         Ok(MergeDone::Merged {
             report,
             prompt: Some(prompt),
@@ -1857,6 +1880,22 @@ fn queue_own_prompt(prompts: &Prompts, own: &ParticipantName, prompt: &str) -> P
     prompts.offer(own.clone(), id, text)
 }
 
+/// Returns where `started`'s agent takes its teammates' work from between its turns, when its
+/// profile reports turn ends and the thread's owner is known.
+fn auto_merge(
+    profile: Option<&Profile>,
+    owner: Option<&ParticipantKey>,
+    (git_dir, started): (&Path, &Started),
+) -> Option<AutoMerge> {
+    profile.filter(|profile| profile.reports_turn_ends())?;
+    Some(AutoMerge {
+        git_dir: git_dir.to_path_buf(),
+        thread: started.thread,
+        owner: owner?.clone(),
+        own: started.slot.clone(),
+    })
+}
+
 /// Joins the live layer for `started`'s agent, unless it is off; a failure is reported, and the
 /// agent runs without it.
 fn start_live(setup: Option<LiveSetup>, git_dir: &Path, started: &Started) -> Option<Link> {
@@ -1931,6 +1970,7 @@ struct Background {
     pusher: Option<(Pusher, RemoteName)>,
     merging: Option<Merging>,
     prompts: Arc<Prompts>,
+    auto_merge: Option<AutoMerge>,
 }
 
 fn finish_turns(turns: Option<TurnWorker>) {
@@ -1980,6 +2020,7 @@ fn finish_run(
         pusher,
         merging,
         prompts,
+        auto_merge,
     } = background;
     let (code, received, _signals) = supervise(
         child,
@@ -1991,6 +2032,7 @@ fn finish_run(
             prompts,
             merging,
             merger: recorder.as_ref().map(Recorder::merger),
+            auto_merge,
         },
     );
     if let Some(live) = live {
@@ -2040,6 +2082,7 @@ struct AgentSide {
     prompts: Arc<Prompts>,
     merging: Option<Merging>,
     merger: Option<Merger>,
+    auto_merge: Option<AutoMerge>,
 }
 
 /// Passes the stop signals on as events until dropped, then stops listening, so a later
@@ -2103,6 +2146,7 @@ fn supervise(
         prompts,
         merging,
         merger,
+        auto_merge,
     } = side;
     let code = relay(
         child,
@@ -2111,7 +2155,7 @@ fn supervise(
         &user.activity,
         (events, &received),
         tap,
-        (Some(prompts), merging, merger),
+        (Some(prompts), merging, merger, auto_merge),
     );
     drop(raw);
     (code, received, watch)
@@ -2652,7 +2696,12 @@ fn relay(
     activity: &Arc<Activity>,
     (events, received): (mpsc::Sender<Event>, &Receiver<Event>),
     tap: Option<OutputTap>,
-    (prompts, merging, merger): (Option<Arc<Prompts>>, Option<Merging>, Option<Merger>),
+    (prompts, merging, merger, auto_merge): (
+        Option<Arc<Prompts>>,
+        Option<Merging>,
+        Option<Merger>,
+        Option<AutoMerge>,
+    ),
 ) -> Result<Outcome, RunError> {
     let (stop, stopped) = UnixStream::pair().map_err(RunError::Output)?;
     let writer = Arc::new(Mutex::new(child.writer()?));
@@ -2712,6 +2761,9 @@ fn relay(
         ),
         prompts.clone().filter(|_| palette.is_some()),
     );
+    if let Some((auto_merge, merger)) = auto_merge.zip(merger.clone()) {
+        spawn_auto_merge(auto_merge, merger, (activity, &screen, &writer), &running);
+    }
     if let Some(prompts) = prompts.filter(|_| palette.is_some()) {
         spawn_giver(
             prompts,
@@ -3475,6 +3527,7 @@ impl DraftWriter {
                 prompts: Arc::new(Prompts::default()),
                 merging: None,
                 merger: None,
+                auto_merge: None,
             },
         );
         closing.store(true, Ordering::SeqCst);
@@ -4002,6 +4055,7 @@ mod tests {
             report: "merged\n".to_owned(),
             commit: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
             tree: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
+            markers: prompt.is_some(),
             prompt,
         };
         let prompts = Prompts::default();

@@ -141,6 +141,16 @@ struct Approvals {
     chosen: fn(&[OsString]) -> bool,
 }
 
+impl Profile {
+    /// Says whether the agent's hooks report its turn ends: the built-in profiles' do.
+    pub(crate) fn reports_turn_ends(&self) -> bool {
+        match self.install {
+            Install::ClaudeCode | Install::Codex => true,
+            Install::Files(_) => false,
+        }
+    }
+}
+
 /// The file in the agent's state directory that tells it where `mahi mcp` is.
 pub(crate) const MCP_CONFIG: &str = "mcp.json";
 

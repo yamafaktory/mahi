@@ -67,6 +67,7 @@ impl Default for Pace {
 #[derive(Debug)]
 pub(crate) struct Activity {
     turn_open: AtomicBool,
+    turn_ended: AtomicBool,
     asking: AtomicBool,
     line_empty: AtomicBool,
     last: Mutex<Instant>,
@@ -76,6 +77,7 @@ impl Default for Activity {
     fn default() -> Self {
         Self {
             turn_open: AtomicBool::new(false),
+            turn_ended: AtomicBool::new(true),
             asking: AtomicBool::new(false),
             line_empty: AtomicBool::new(true),
             last: Mutex::new(Instant::now()),
@@ -104,6 +106,7 @@ impl Activity {
         if effect.interrupts {
             self.asking.store(false, Ordering::SeqCst);
             if self.turn_open.swap(false, Ordering::SeqCst) {
+                self.turn_ended.store(false, Ordering::SeqCst);
                 crate::report::send(&Report::Done);
             }
         }
@@ -120,11 +123,13 @@ impl Activity {
         match kind {
             HookKind::Prompt => {
                 self.turn_open.store(true, Ordering::SeqCst);
+                self.turn_ended.store(false, Ordering::SeqCst);
                 self.asking.store(false, Ordering::SeqCst);
                 crate::report::send(&Report::Working);
             }
             HookKind::TurnEnd => {
                 self.turn_open.store(false, Ordering::SeqCst);
+                self.turn_ended.store(true, Ordering::SeqCst);
                 self.asking.store(false, Ordering::SeqCst);
                 crate::report::send(&Report::Done);
             }
@@ -156,6 +161,14 @@ impl Activity {
         }
         let turn_over = !self.turn_open.load(Ordering::SeqCst) || quiet_for >= pace.stale_turn;
         turn_over && self.line_empty.load(Ordering::SeqCst) && quiet_for >= pace.quiet
+    }
+
+    /// Says whether the agent is idle after a turn its turn-end hook reported, or since it
+    /// started: an interrupt or a turn gone stale does not count.
+    fn is_idle_after_turn_end(&self, pace: &Pace) -> bool {
+        self.turn_ended.load(Ordering::SeqCst)
+            && !self.turn_open.load(Ordering::SeqCst)
+            && self.is_idle(pace)
     }
 }
 
@@ -303,6 +316,15 @@ pub(crate) fn give_accepted(
     }
 }
 
+/// What the agent must have done before an action runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Readiness {
+    /// Be idle, however its turn ended.
+    Idle,
+    /// Be idle after a turn its turn-end hook reported, or since it started.
+    AfterTurnEnd,
+}
+
 /// Runs `act` once the agent is idle and the palette closed, holding the agent's input while
 /// it runs, so neither the user's keys nor an accepted prompt come in between; returns `None`
 /// if `running` is cleared first.
@@ -313,12 +335,33 @@ pub(crate) fn when_idle<T>(
     (running, pace): (&AtomicBool, Pace),
     act: impl FnOnce() -> T,
 ) -> Option<T> {
+    when_ready(
+        activity,
+        agent,
+        writer,
+        (running, pace, Readiness::Idle),
+        act,
+    )
+}
+
+/// Runs `act` as [`when_idle`] does, once the agent is as `readiness` says.
+pub(crate) fn when_ready<T>(
+    activity: &Activity,
+    agent: &impl AgentInput,
+    writer: &Mutex<impl Write>,
+    (running, pace, readiness): (&AtomicBool, Pace, Readiness),
+    act: impl FnOnce() -> T,
+) -> Option<T> {
     while running.load(Ordering::SeqCst) {
         thread::sleep(pace.look_every);
         let Ok(input) = writer.lock() else {
             return None;
         };
-        if agent.palette_open() || !activity.is_idle(&pace) {
+        let ready = match readiness {
+            Readiness::Idle => activity.is_idle(&pace),
+            Readiness::AfterTurnEnd => activity.is_idle_after_turn_end(&pace),
+        };
+        if agent.palette_open() || !ready {
             continue;
         }
         let done = act();
@@ -438,6 +481,40 @@ mod tests {
         activity.saw(HookKind::Prompt, b"");
         thread::sleep(pace.stale_turn);
         assert!(activity.is_idle(&pace));
+    }
+
+    #[test]
+    fn only_a_reported_turn_end_or_the_start_lets_a_merge_in() {
+        let pace = fast();
+        let activity = Activity::default();
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_after_turn_end(&pace));
+        activity.saw(HookKind::Prompt, b"");
+        activity.keys(b"\x1b");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+        assert!(!activity.is_idle_after_turn_end(&pace));
+        activity.saw(HookKind::Prompt, b"");
+        thread::sleep(pace.stale_turn);
+        assert!(activity.is_idle(&pace));
+        assert!(!activity.is_idle_after_turn_end(&pace));
+        activity.saw(HookKind::TurnEnd, b"");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_after_turn_end(&pace));
+        activity.keys(b"half typed");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn an_escape_between_turns_keeps_merges_coming() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(HookKind::TurnEnd, b"");
+        activity.keys(b"\x1b");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_after_turn_end(&pace));
     }
 
     #[test]

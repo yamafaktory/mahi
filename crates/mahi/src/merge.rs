@@ -30,6 +30,7 @@ use mahi_store::{
     Conflict,
     GlobalPatterns,
     Left,
+    MAX_MERGED_PATHS,
     Merged,
     ObjectId,
     SnapshotCache,
@@ -74,6 +75,7 @@ const SNAPSHOT_ATTEMPTS: usize = 3;
 const LISTED: usize = 20;
 const LISTED_IN_PROMPT: usize = 10;
 const LONGEST_LISTED: usize = 200;
+const AGENT_SETTINGS: [&str; 5] = ["CLAUDE.md", "AGENTS.md", ".claude", ".mcp.json", ".codex"];
 
 #[derive(Debug, Error)]
 pub(crate) enum MergeError {
@@ -115,6 +117,12 @@ pub(crate) enum MergeError {
     NoWorktree(AgentSlot),
     #[error("{0} merged from more agents than mahi records")]
     TooManySources(AgentSlot),
+    #[error("the merge from {0} changes agent settings, which wait for the user")]
+    HoldsAgentSettings(AgentSlot),
+    #[error("{0} holds conflict markers from a merge and takes no other merge until it restarts")]
+    MarkersUnresolved(AgentSlot),
+    #[error("the merge wrote conflict markers but could not be recorded")]
+    MarkersWritten(#[source] Box<MergeError>),
     #[error("cannot catch the signals that stop mahi")]
     Signals(#[source] SignalError),
     #[error("the agent's mahi stopped recording before it could merge")]
@@ -161,6 +169,9 @@ pub(crate) enum MergeDone {
         tree: ObjectId,
         /// What to ask the agent when the merge left conflicts.
         prompt: Option<String>,
+        /// Whether the merged tree holds conflict markers in a file, even one left out of the
+        /// worktree.
+        markers: bool,
     },
 }
 
@@ -263,7 +274,7 @@ pub(crate) fn merge(
         merge_now(
             &store,
             recording,
-            &request,
+            (&request, AgentSettings::Take),
             (&mut SnapshotCache::default(), head),
             interrupt,
         )
@@ -298,8 +309,18 @@ fn ask_running(
     Ok(Outcome::Done(merge_door::ask(&door, request)?))
 }
 
+/// Whether a merge may write the paths an agent reads as its settings or instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentSettings {
+    /// Write them, as a merge the user asked for does.
+    Take,
+    /// Refuse the whole merge, before it writes anything, when it would change one.
+    Hold,
+}
+
 /// Merges `request` into `into`'s worktree, whose snapshots are at `head` and remembered in
-/// `cache`, from the base [`merge_base`] gives; then takes a snapshot whose trailers name
+/// `cache`, from the base [`merge_base`] gives, unless `settings` holds a merge that changes
+/// agent settings; then takes a snapshot whose trailers name
 /// `request.commit` and what that snapshot had itself merged, or, when the merge left a path as
 /// it was, the trailers it had before, so the next merge starts from the same base. Once the
 /// worktree is written, the snapshot is taken even if `interrupt` is set, so the written files
@@ -307,7 +328,7 @@ fn ask_running(
 pub(crate) fn merge_now(
     store: &Store,
     into: Recording<'_>,
-    request: &MergeRequest,
+    (request, settings): (&MergeRequest, AgentSettings),
     (cache, head): (&mut SnapshotCache, Option<ObjectId>),
     interrupt: &AtomicBool,
 ) -> Result<MergeDone, MergeError> {
@@ -327,7 +348,49 @@ pub(crate) fn merge_now(
     let ours = snapshot(store, into.worktree, (into.globals, cache), interrupt)?;
     let labels = (into.slot.to_string(), request.from.to_string());
     let merged = store.merge_trees(base, ours, theirs, (&labels.0, &labels.1))?;
-    let applied = store.apply_merge(into.worktree, ours, merged.tree, interrupt)?;
+    if settings == AgentSettings::Hold && !leaves_agent_settings_alone(store, ours, merged.tree) {
+        return Err(MergeError::HoldsAgentSettings(request.from.clone()));
+    }
+    let markers = merged
+        .conflicts
+        .iter()
+        .any(|(_, conflict)| *conflict == Conflict::Markers);
+    let written = write_merge(
+        store,
+        into,
+        (ours, merged.tree),
+        (&previous, &merged_from),
+        (cache, head),
+        interrupt,
+    );
+    let (applied, tree, commit) = written.map_err(|error| {
+        if markers {
+            MergeError::MarkersWritten(Box::new(error.into()))
+        } else {
+            error.into()
+        }
+    })?;
+    Ok(MergeDone::Merged {
+        report: report(&request.from, into.slot, &merged, &applied),
+        commit,
+        tree,
+        prompt: conflict_prompt(&request.from, &merged),
+        markers,
+    })
+}
+
+/// Writes the tree `merged` into `into`'s worktree over `ours`, then records the worktree in a
+/// snapshot after `head` with the trailers of `merged_from`, or of `previous` when a path was
+/// left as it was; returns what was written, the snapshot's tree and its commit.
+fn write_merge(
+    store: &Store,
+    into: Recording<'_>,
+    (ours, merged): (ObjectId, ObjectId),
+    (previous, merged_from): (&MergedFrom, &MergedFrom),
+    (cache, head): (&mut SnapshotCache, Option<ObjectId>),
+    interrupt: &AtomicBool,
+) -> Result<(Applied, ObjectId, ObjectId), StoreError> {
+    let applied = store.apply_merge(into.worktree, ours, merged, interrupt)?;
     let tree = snapshot(
         store,
         into.worktree,
@@ -335,9 +398,9 @@ pub(crate) fn merge_now(
         &AtomicBool::new(false),
     )?;
     let recorded = if applied.left.is_empty() {
-        &merged_from
+        merged_from
     } else {
-        &previous
+        previous
     };
     let commit = store.append_signed(
         into.snapshots,
@@ -346,11 +409,29 @@ pub(crate) fn merge_now(
         &recorded.message(),
         into.commits.signer(),
     )?;
-    Ok(MergeDone::Merged {
-        report: report(&request.from, into.slot, &merged, &applied),
-        commit,
-        tree,
-        prompt: conflict_prompt(&request.from, &merged),
+    Ok((applied, tree, commit))
+}
+
+/// Says whether the tree `merged` changes no path an agent reads as its settings or
+/// instructions from the tree `ours`, telling so only when every changed path could be listed.
+fn leaves_agent_settings_alone(store: &Store, ours: ObjectId, merged: ObjectId) -> bool {
+    store
+        .changed_paths(ours, merged, MAX_MERGED_PATHS)
+        .is_ok_and(|changes| {
+            !changes.truncated
+                && !changes
+                    .paths
+                    .iter()
+                    .any(|(path, _)| is_agent_settings(path))
+        })
+}
+
+fn is_agent_settings(path: &str) -> bool {
+    let mut parts = path.split('/');
+    parts.any(|part| {
+        AGENT_SETTINGS
+            .iter()
+            .any(|name| part.eq_ignore_ascii_case(name))
     })
 }
 
@@ -537,6 +618,35 @@ mod tests {
     use gix::bstr::BString;
 
     use super::*;
+
+    #[test]
+    fn agent_settings_are_named_at_any_depth_in_any_case_and_nothing_else_is() {
+        let settings = [
+            "CLAUDE.md",
+            "docs/agents.md",
+            ".claude/settings.json",
+            "sub/.Claude/commands/x.md",
+            ".mcp.json",
+            "a/b/.MCP.JSON",
+            ".codex/config.toml",
+            "AGENTS.md/inner",
+        ];
+        for path in settings {
+            assert!(is_agent_settings(path), "{path}");
+        }
+        let others = [
+            "CLAUDE.md.bak",
+            "my.claude",
+            "src/claude.rs",
+            "docs/AGENTS.txt",
+            "mcp.json",
+            ".codexrc",
+            "",
+        ];
+        for path in others {
+            assert!(!is_agent_settings(path), "{path}");
+        }
+    }
 
     #[test]
     fn the_report_lists_conflicts_and_left_paths_escaped_and_cut_short() {

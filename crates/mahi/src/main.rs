@@ -1,5 +1,6 @@
 //! The `mahi` binary.
 
+mod auto_merge;
 mod catch_up;
 mod claims;
 mod cli;
