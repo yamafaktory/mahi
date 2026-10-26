@@ -182,6 +182,9 @@ pub(crate) struct HookCommand {
     /// What happened.
     #[arg(value_parser = hook_kind())]
     pub(crate) kind: HookKind,
+    /// Prints, as Claude Code's prompt hook reads it, what mahi adds as context to the prompt.
+    #[arg(long)]
+    pub(crate) context: bool,
 }
 
 /// What the agent may reach and receive, for `mahi run` and `mahi resume`.
@@ -755,7 +758,17 @@ mod tests {
             parse(&["hook", "turn-end"]).unwrap(),
             Parsed {
                 command: Command::Hook(HookCommand {
-                    kind: HookKind::TurnEnd
+                    kind: HookKind::TurnEnd,
+                    context: false,
+                })
+            }
+        );
+        assert_eq!(
+            parse(&["hook", "prompt", "--context"]).unwrap(),
+            Parsed {
+                command: Command::Hook(HookCommand {
+                    kind: HookKind::Prompt,
+                    context: true,
                 })
             }
         );

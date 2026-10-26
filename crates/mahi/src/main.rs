@@ -253,7 +253,15 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
         ),
         Command::Hook(hook) => {
             if let Some(socket) = &environment.hook_socket {
-                let _ = hook::send(socket, hook.kind, io::stdin().lock());
+                if hook.context {
+                    hook::ask(socket, (hook.kind, io::stdin().lock()), |context| {
+                        let mut out = io::stdout().lock();
+                        writeln!(out, "{}", hook::prompt_context(context))?;
+                        out.flush()
+                    });
+                } else {
+                    let _ = hook::send(socket, hook.kind, io::stdin().lock());
+                }
             }
             0
         }

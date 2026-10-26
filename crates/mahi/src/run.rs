@@ -219,6 +219,11 @@ use crate::{
         NetworkError,
         Running,
     },
+    note::{
+        self,
+        NoteBy,
+        NoteContext,
+    },
     palette::{
         AgentTerminal,
         Repainter,
@@ -1553,11 +1558,12 @@ impl Prepared {
         );
         let can_merge = raw.is_some() && terminal::is_interactive() && recorder.is_some();
         let auto_merge = auto_merge(self.profile, self.owner.as_ref(), (&self.git_dir, &started));
+        let note_by = self.profile.map_or(NoteBy::ListAgents, Profile::note_by);
         let (tools, prompts) = serve_tools(
             self.mcp,
             (self.owner, key, live.as_ref(), can_merge),
             (&self.git_dir, config.clone()),
-            &started,
+            (&started, note_by),
         );
         let outcome = finish_run(
             child,
@@ -1640,7 +1646,7 @@ fn serve_tools(
         bool,
     ),
     (git_dir, config): (&Path, ConfigDir),
-    started: &Started,
+    (started, note_by): (&Started, NoteBy),
 ) -> (Arc<AtomicBool>, Arc<Prompts>) {
     let serving = Arc::new(AtomicBool::new(true));
     let prompts = live.map_or_else(|| Arc::new(Prompts::default()), Link::prompts);
@@ -1657,7 +1663,8 @@ fn serve_tools(
             can_merge.then(|| Arc::clone(&prompts)),
             claims,
         ),
-    );
+    )
+    .with_note_by(note_by);
     let flag = Arc::clone(&serving);
     thread::spawn(move || {
         let toolbox: Arc<dyn Toolbox> = Arc::new(tools);
@@ -1953,7 +1960,15 @@ fn start_background(
         let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
         let closing = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&closing);
-        thread::spawn(move || hook::serve(&hooks, &flag, &messages, &activity));
+        let context = Store::open(git_dir).ok().map(|store| NoteContext {
+            file: note::file(&store, started.thread, &started.slot),
+        });
+        thread::spawn(move || {
+            let context = context
+                .as_ref()
+                .map(|context| context as &dyn hook::Context);
+            hook::serve(&hooks, &flag, &messages, (&activity, context));
+        });
         let worker = thread::spawn(move || {
             turns::record(&transcript, &inputs, events.as_ref(), pushes.as_ref())
         });
@@ -3531,7 +3546,7 @@ impl DraftWriter {
         let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
         let hooks = prepared.hooks.try_clone().map_err(RunError::Scratch)?;
         let (flag, seen) = (Arc::clone(&closing), Arc::clone(&activity));
-        thread::spawn(move || hook::serve(&hooks, &flag, &messages, &seen));
+        thread::spawn(move || hook::serve(&hooks, &flag, &messages, (&seen, None)));
         thread::spawn(move || for _ in inputs {});
         let (code, received, _signals) = supervise(
             child,

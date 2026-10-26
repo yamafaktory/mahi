@@ -23,7 +23,10 @@ use serde::{
 };
 use thiserror::Error;
 
-use crate::sync_state;
+use crate::{
+    hook,
+    sync_state,
+};
 
 const NOTE_FILE: &str = "note";
 const MAX_NOTE_BYTES: usize = 1024 * 1024;
@@ -111,6 +114,50 @@ pub(crate) fn take(file: &Path) -> Result<Option<String>, NoteError> {
     };
     sync_state::remove(file).map_err(|error| NoteError::Io(file.to_path_buf(), error))?;
     Ok((!note.came.is_empty()).then(|| note.render()))
+}
+
+/// Returns the note kept in `file` as the text an agent reads, without taking it, or `None`
+/// when nothing came in or it cannot be read.
+pub(crate) fn peek(file: &Path) -> Option<String> {
+    let _kept = keeping().ok()?;
+    let note = Note::load(file).ok()?;
+    (!note.came.is_empty()).then(|| note.render())
+}
+
+/// Takes the note kept in `file` when it still reads `shown`, as an agent's hook read it; a
+/// note that grew meanwhile stays, so what came in since is not lost.
+pub(crate) fn take_shown(file: &Path, shown: &str) {
+    let Ok(_kept) = keeping() else {
+        return;
+    };
+    let still = Note::load(file).is_ok_and(|note| !note.came.is_empty() && note.render() == shown);
+    if still {
+        let _ = sync_state::remove(file);
+    }
+}
+
+/// The note of an agent's worktree, as its prompt hook adds it to the user's prompt.
+#[derive(Debug)]
+pub(crate) struct NoteContext {
+    pub(crate) file: PathBuf,
+}
+
+impl hook::Context for NoteContext {
+    fn peek(&self) -> Option<String> {
+        peek(&self.file)
+    }
+
+    fn taken(&self, shown: &str) {
+        take_shown(&self.file, shown);
+    }
+}
+
+/// How an agent gets the note: added to the user's prompt by its prompt hook, or from
+/// `list_agents`, which its instructions ask it to call at the start of each turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoteBy {
+    PromptHook,
+    ListAgents,
 }
 
 impl Listed {
@@ -455,6 +502,35 @@ mod tests {
         )
         .unwrap();
         assert!(take(&file).unwrap().unwrap().contains("` a.rs `"));
+    }
+
+    #[test]
+    fn a_note_the_hook_read_is_taken_but_one_that_grew_since_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let brought = |name: &str| vec![name.to_owned()];
+        let merged = |paths: &[String]| {
+            record(
+                &file,
+                &bob,
+                Merged {
+                    markers: &[],
+                    kept: &[],
+                    brought: paths,
+                },
+            )
+            .unwrap();
+        };
+        assert_eq!(peek(&file), None);
+        merged(&brought("a.rs"));
+        let shown = peek(&file).unwrap();
+        merged(&brought("b.rs"));
+        take_shown(&file, &shown);
+        let kept = peek(&file).unwrap();
+        assert!(kept.contains("` b.rs `"), "{kept}");
+        take_shown(&file, &kept);
+        assert_eq!(peek(&file), None);
     }
 
     #[test]

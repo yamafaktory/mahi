@@ -76,6 +76,7 @@ use crate::{
         EnvNameError,
         PASSED_ON,
     },
+    note::NoteBy,
     settings::AgentApprovals,
 };
 
@@ -142,6 +143,15 @@ struct Approvals {
 }
 
 impl Profile {
+    /// Says how the agent gets the note of what came into its worktree: Claude Code's prompt
+    /// hook adds it to the user's prompt, and any other agent calls `list_agents`.
+    pub(crate) fn note_by(&self) -> NoteBy {
+        match self.install {
+            Install::ClaudeCode => NoteBy::PromptHook,
+            Install::Codex | Install::Files(_) => NoteBy::ListAgents,
+        }
+    }
+
     /// Says whether the agent's hooks report its turn ends: the built-in profiles' do.
     pub(crate) fn reports_turn_ends(&self) -> bool {
         match self.install {
@@ -840,7 +850,7 @@ const CLAUDE_CODE_SETTINGS: &str = r#"{
   "skipDangerousModePermissionPrompt": true,
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook prompt" }] }
+      { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook prompt --context" }] }
     ],
     "PostToolUse": [
       { "matcher": "*", "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook tool" }] }

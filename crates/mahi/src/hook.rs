@@ -46,6 +46,8 @@ use rustix::event::{
 use crate::inject::Activity;
 
 const DEADLINE: Duration = Duration::from_secs(2);
+const CONTEXT_WAIT: Duration = Duration::from_secs(1);
+const MAX_CONTEXT_BYTES: usize = 1024 * 1024;
 const DRAIN_LIMIT: Duration = Duration::from_secs(5);
 const ERROR_PAUSE: Duration = Duration::from_millis(50);
 const POLL: Timespec = Timespec {
@@ -68,6 +70,10 @@ pub(crate) enum Delivery {
 ///
 /// A payload larger than that is replaced by an empty one, so the event itself still arrives.
 pub(crate) fn send(socket: &Path, kind: HookKind, input: impl Read) -> io::Result<()> {
+    sent(socket, kind, input)?.shutdown(Shutdown::Write)
+}
+
+fn sent(socket: &Path, kind: HookKind, input: impl Read) -> io::Result<UnixStream> {
     let mut payload = Vec::new();
     input
         .take(u64::try_from(MAX_PAYLOAD_BYTES).unwrap_or(u64::MAX) + 1)
@@ -78,17 +84,78 @@ pub(crate) fn send(socket: &Path, kind: HookKind, input: impl Read) -> io::Resul
     let mut stream = UnixStream::connect(socket)?;
     stream.set_write_timeout(Some(DEADLINE))?;
     stream.write_all(&message)?;
-    stream.shutdown(Shutdown::Write)
+    Ok(stream)
+}
+
+/// What mahi adds as context to the user's prompt, when the agent's prompt hook asks.
+pub(crate) trait Context: Send + Sync {
+    /// Returns the text to add, without giving it away yet.
+    fn peek(&self) -> Option<String>;
+
+    /// Gives away `shown`, which the hook read.
+    fn taken(&self, shown: &str);
+}
+
+/// Sends `kind` and `input` to the socket at `socket` as [`send`] does, then waits at most
+/// 1 s, from when it starts, for the context mahi adds to the user's prompt: its length as four
+/// big-endian bytes and its text. It hands the text to `print`, and says with one byte that it
+/// arrived only once `print` succeeded, so mahi gives the text away only then. Returns whether
+/// a text was printed.
+pub(crate) fn ask(
+    socket: &Path,
+    (kind, input): (HookKind, impl Read),
+    print: impl FnOnce(&str) -> io::Result<()>,
+) -> bool {
+    asked(socket, (kind, input), print).is_some()
+}
+
+fn asked(
+    socket: &Path,
+    (kind, input): (HookKind, impl Read),
+    print: impl FnOnce(&str) -> io::Result<()>,
+) -> Option<()> {
+    let deadline = Instant::now() + CONTEXT_WAIT;
+    let mut stream = sent(socket, kind, input).ok()?;
+    let mut length = [0_u8; 4];
+    read_by(&mut stream, &mut length, deadline)?;
+    let length = usize::try_from(u32::from_be_bytes(length)).ok()?;
+    if length == 0 || length > MAX_CONTEXT_BYTES {
+        return None;
+    }
+    let mut text = vec![0_u8; length];
+    read_by(&mut stream, &mut text, deadline)?;
+    let text = String::from_utf8(text).ok()?;
+    print(&text).ok()?;
+    stream.write_all(&[1]).ok()
+}
+
+/// Returns `context` as Claude Code's `UserPromptSubmit` hook prints it, to add it to the
+/// user's prompt.
+pub(crate) fn prompt_context(context: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    })
+    .to_string()
+}
+
+fn read_by(stream: &mut UnixStream, buffer: &mut [u8], deadline: Instant) -> Option<()> {
+    let left = deadline.checked_duration_since(Instant::now())?;
+    stream.set_read_timeout(Some(left)).ok()?;
+    stream.read_exact(buffer).ok()
 }
 
 /// Reads hook connections on `listener` one at a time and queues each valid message on
 /// `messages`, until `closing` is set and every connection already made has been read, or a
-/// few seconds have passed since. Then queues [`Delivery::End`].
+/// few seconds have passed since. Then queues [`Delivery::End`]. A prompt's hook is answered
+/// with what `context` adds to the prompt.
 pub(crate) fn serve(
     listener: &UnixListener,
     closing: &AtomicBool,
     messages: &SyncSender<Delivery>,
-    activity: &Activity,
+    (activity, context): (&Activity, Option<&dyn Context>),
 ) {
     let mut drain_until = None;
     let connections = iter::from_fn(|| {
@@ -116,7 +183,7 @@ pub(crate) fn serve(
         }
     });
     let dropped = match listener.set_nonblocking(true) {
-        Ok(()) => serve_connections(connections, messages, activity),
+        Ok(()) => serve_connections(connections, messages, (activity, context)),
         Err(_) => 0,
     };
     let _ = messages.send(Delivery::End { dropped });
@@ -148,19 +215,24 @@ fn wait_for_connection(listener: &UnixListener) {
 fn serve_connections(
     connections: impl Iterator<Item = io::Result<UnixStream>>,
     messages: &SyncSender<Delivery>,
-    activity: &Activity,
+    (activity, context): (&Activity, Option<&dyn Context>),
 ) -> u64 {
     let mut dropped = 0;
     for stream in connections {
-        let Ok(stream) = stream else {
+        let Ok(mut stream) = stream else {
             dropped += 1;
             continue;
         };
-        let Some(message) = receive(stream) else {
+        let Some(message) = receive(&mut stream) else {
             dropped += 1;
             continue;
         };
         activity.saw(message.kind, &message.payload);
+        if message.kind == HookKind::Prompt
+            && let Some(context) = context
+        {
+            answer(&mut stream, context);
+        }
         if message.kind == HookKind::Asks {
             continue;
         }
@@ -173,12 +245,34 @@ fn serve_connections(
     dropped
 }
 
-fn receive(mut stream: UnixStream) -> Option<HookMessage> {
+/// Answers a prompt's hook on `stream` with what `context` adds, and gives it away once the
+/// hook says it read it, within 1 s; a hook that asks nothing has closed the stream already.
+fn answer(stream: &mut UnixStream, context: &dyn Context) {
+    let text = context.peek().unwrap_or_default();
+    let Ok(length) = u32::try_from(text.len()) else {
+        return;
+    };
+    let mut reply = Vec::with_capacity(4 + text.len());
+    reply.extend_from_slice(&length.to_be_bytes());
+    reply.extend_from_slice(text.as_bytes());
+    if stream.set_write_timeout(Some(CONTEXT_WAIT)).is_err() || stream.write_all(&reply).is_err() {
+        return;
+    }
+    if text.is_empty() || !readable_by(stream, Instant::now() + CONTEXT_WAIT) {
+        return;
+    }
+    let mut read = [0_u8; 1];
+    if matches!(stream.read(&mut read), Ok(1)) && read == [1] {
+        context.taken(&text);
+    }
+}
+
+fn receive(stream: &mut UnixStream) -> Option<HookMessage> {
     let deadline = Instant::now() + DEADLINE;
     let mut received = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {
-        if !readable_by(&stream, deadline) {
+        if !readable_by(stream, deadline) {
             return None;
         }
         let read = match stream.read(&mut buffer) {
@@ -193,6 +287,9 @@ fn receive(mut stream: UnixStream) -> Option<HookMessage> {
         if received.len() > MAX_MESSAGE_BYTES {
             return None;
         }
+        if let Some(message) = hook::decode(&received) {
+            return Some(message);
+        }
     }
     hook::decode(&received)
 }
@@ -201,6 +298,7 @@ fn receive(mut stream: UnixStream) -> Option<HookMessage> {
 mod tests {
     use std::sync::{
         Arc,
+        Mutex,
         mpsc,
     };
 
@@ -220,7 +318,7 @@ mod tests {
         let closing = Arc::new(AtomicBool::new(false));
         let (sender, deliveries) = mpsc::sync_channel(4);
         let flag = Arc::clone(&closing);
-        thread::spawn(move || serve(&listener, &flag, &sender, &Activity::default()));
+        thread::spawn(move || serve(&listener, &flag, &sender, (&Activity::default(), None)));
         Server {
             _dir: dir,
             socket,
@@ -315,6 +413,118 @@ mod tests {
         assert_eq!(next(&server), message(HookKind::Tool, b""));
     }
 
+    #[derive(Debug, Default)]
+    struct Kept {
+        text: Mutex<Option<String>>,
+        taken: Mutex<Vec<String>>,
+    }
+
+    impl Context for Kept {
+        fn peek(&self) -> Option<String> {
+            self.text.lock().unwrap().clone()
+        }
+
+        fn taken(&self, shown: &str) {
+            self.taken.lock().unwrap().push(shown.to_owned());
+        }
+    }
+
+    fn context_server(kept: &Arc<Kept>) -> Server {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mahi.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let closing = Arc::new(AtomicBool::new(false));
+        let (sender, deliveries) = mpsc::sync_channel(4);
+        let (flag, kept) = (Arc::clone(&closing), Arc::clone(kept));
+        thread::spawn(move || {
+            serve(
+                &listener,
+                &flag,
+                &sender,
+                (&Activity::default(), Some(&*kept as &dyn Context)),
+            );
+        });
+        Server {
+            _dir: dir,
+            socket,
+            closing,
+            deliveries,
+        }
+    }
+
+    #[test]
+    fn a_prompt_hook_that_asks_gets_the_context_and_only_then_is_it_taken() {
+        let kept = Arc::new(Kept::default());
+        let server = context_server(&kept);
+        assert!(!ask(
+            &server.socket,
+            (HookKind::Prompt, &b"fix"[..]),
+            |_| Ok(())
+        ));
+        assert_eq!(next(&server), message(HookKind::Prompt, b"fix"));
+        *kept.text.lock().unwrap() = Some("merged bob.claude: ` a.rs `".to_owned());
+        send(&server.socket, HookKind::Prompt, &b"plain"[..]).unwrap();
+        assert_eq!(next(&server), message(HookKind::Prompt, b"plain"));
+        send(&server.socket, HookKind::TurnEnd, io::empty()).unwrap();
+        assert_eq!(next(&server), message(HookKind::TurnEnd, b""));
+        assert!(kept.taken.lock().unwrap().is_empty());
+        let mut printed = String::new();
+        let asked = ask(&server.socket, (HookKind::Prompt, &b"go"[..]), |text| {
+            printed.push_str(text);
+            Ok(())
+        });
+        assert!(asked);
+        assert_eq!(printed, "merged bob.claude: ` a.rs `");
+        assert_eq!(next(&server), message(HookKind::Prompt, b"go"));
+        send(&server.socket, HookKind::TurnEnd, io::empty()).unwrap();
+        assert_eq!(next(&server), message(HookKind::TurnEnd, b""));
+        assert_eq!(*kept.taken.lock().unwrap(), ["merged bob.claude: ` a.rs `"]);
+        server.closing.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_context_the_hook_could_not_print_or_did_not_confirm_is_not_taken() {
+        let kept = Arc::new(Kept::default());
+        *kept.text.lock().unwrap() = Some("merged bob.claude: ` a.rs `".to_owned());
+        let server = context_server(&kept);
+        let refused = ask(&server.socket, (HookKind::Prompt, &b"a"[..]), |_| {
+            Err(io::ErrorKind::BrokenPipe.into())
+        });
+        assert!(!refused);
+        assert_eq!(next(&server), message(HookKind::Prompt, b"a"));
+        for reply in [&b""[..], b"\x02"] {
+            let mut stream = UnixStream::connect(&server.socket).unwrap();
+            stream
+                .write_all(&mahi_agent::hook::encode(HookKind::Prompt, b"b").unwrap())
+                .unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut text = vec![0_u8; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut text).unwrap();
+            stream.write_all(reply).unwrap();
+            drop(stream);
+            assert_eq!(next(&server), message(HookKind::Prompt, b"b"));
+        }
+        send(&server.socket, HookKind::TurnEnd, io::empty()).unwrap();
+        assert_eq!(next(&server), message(HookKind::TurnEnd, b""));
+        assert!(kept.taken.lock().unwrap().is_empty());
+        server.closing.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn the_context_prints_as_claude_codes_prompt_hook_reads_it() {
+        let printed: serde_json::Value =
+            serde_json::from_str(&prompt_context("a \"quoted\" `note`\n")).unwrap();
+        assert_eq!(
+            printed["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert_eq!(
+            printed["hookSpecificOutput"]["additionalContext"],
+            "a \"quoted\" `note`\n"
+        );
+    }
+
     #[test]
     fn closing_reads_every_waiting_connection_before_the_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -327,7 +537,7 @@ mod tests {
             &listener,
             &AtomicBool::new(true),
             &sender,
-            &Activity::default(),
+            (&Activity::default(), None),
         );
         assert_eq!(
             deliveries.try_recv().unwrap(),
@@ -348,7 +558,11 @@ mod tests {
         let connections = vec![Err(io::Error::from(io::ErrorKind::OutOfMemory)), Ok(server)];
         let (sender, deliveries) = mpsc::sync_channel(4);
         assert_eq!(
-            serve_connections(connections.into_iter(), &sender, &Activity::default()),
+            serve_connections(
+                connections.into_iter(),
+                &sender,
+                (&Activity::default(), None)
+            ),
             1
         );
         assert_eq!(
@@ -368,7 +582,11 @@ mod tests {
             .collect();
         let (sender, deliveries) = mpsc::sync_channel(1);
         assert_eq!(
-            serve_connections(connections.into_iter(), &sender, &Activity::default()),
+            serve_connections(
+                connections.into_iter(),
+                &sender,
+                (&Activity::default(), None)
+            ),
             2
         );
         assert_eq!(deliveries.try_recv().unwrap(), message(HookKind::Tool, b""));
