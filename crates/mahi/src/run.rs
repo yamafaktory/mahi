@@ -182,6 +182,7 @@ use crate::{
         self,
         HandoffError,
     },
+    held_queue::HeldQueue,
     hook,
     hub::{
         Link,
@@ -1893,6 +1894,7 @@ fn auto_merge(
         thread: started.thread,
         owner: owner?.clone(),
         own: started.slot.clone(),
+        waiting: Arc::default(),
     })
 }
 
@@ -2721,12 +2723,14 @@ fn relay(
     });
     let shown_key = palette.map(|(key, _)| key.to_string());
     let out = Out::for_agent(title, shown_key.as_deref(), replies).map_err(RunError::Output)?;
-    let screen = Arc::new(Screen::new(
-        out,
-        repainter.clone(),
-        palette_key,
-        prompts.clone(),
-    ));
+    let waiting = auto_merge
+        .as_ref()
+        .filter(|_| palette.is_some())
+        .map(|auto_merge| Arc::clone(&auto_merge.waiting));
+    let screen = user_screen(
+        Screen::new(out, repainter.clone(), palette_key, prompts.clone()),
+        waiting.as_ref(),
+    );
     let running = Arc::new(AtomicBool::new(palette.is_some()));
     let commands = palette.and_then(|_| crate::commands::take());
     let key_opens = commands.is_none();
@@ -2751,6 +2755,7 @@ fn relay(
         Arc::clone(&screen),
         Arc::clone(&running),
         prompts.clone().zip(palette),
+        waiting,
     );
     let merge_server = spawn_merges(
         merging,
@@ -2802,6 +2807,14 @@ fn relay(
     outcome
 }
 
+/// Shares `screen`, listing the teammates' snapshots in `waiting` too when there is one.
+fn user_screen(screen: UserScreen, waiting: Option<&Arc<HeldQueue>>) -> Arc<UserScreen> {
+    Arc::new(match waiting {
+        Some(waiting) => screen.with_waiting(Arc::clone(waiting)),
+        None => screen,
+    })
+}
+
 /// Joins `thread` if it ends within `wait`, and otherwise leaves it running: one stuck writing
 /// to a terminal a leftover process still holds must not hang mahi.
 pub(crate) fn join_within(thread: thread::JoinHandle<()>, wait: Duration) {
@@ -2847,13 +2860,15 @@ fn follow_resizes(
     })
 }
 
-/// Ticks the palette's `screen` each second while `ticking` holds, and tells the user of each
-/// teammate's prompt that came to `told`'s prompts: through the workspace that started this
-/// mahi, if one did, otherwise with `told`'s notice on the terminal.
+/// Ticks the palette's `screen` each second while `ticking` holds, opens it on its own when a
+/// teammate's snapshot comes to `waiting`, and tells the user of each teammate's prompt that
+/// came to `told`'s prompts: through the workspace that started this mahi, if one did,
+/// otherwise with `told`'s notice on the terminal.
 fn spawn_ticker(
     screen: Arc<UserScreen>,
     ticking: Arc<AtomicBool>,
     told: Option<(Arc<Prompts>, (PaletteKey, Notice))>,
+    waiting: Option<Arc<HeldQueue>>,
 ) {
     thread::spawn(move || {
         let mut arrivals = Vec::new();
@@ -2861,6 +2876,12 @@ fn spawn_ticker(
         let mut text = String::new();
         while ticking.load(Ordering::SeqCst) {
             thread::sleep(PALETTE_TICK);
+            if screen.is_opening() {
+                let _ = screen.open_now();
+            }
+            if waiting.as_ref().is_some_and(|waiting| waiting.wants_open()) {
+                let _ = screen.open_guarded();
+            }
             let _ = screen.tick();
             if let Some((prompts, (key, notifier))) = &told {
                 prompts.take_arrivals(&mut arrivals);

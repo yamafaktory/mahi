@@ -48,6 +48,7 @@ use crate::{
         MergeError,
         MergeRequest,
         Recording,
+        Start,
     },
     session::{
         CommitKey,
@@ -74,6 +75,7 @@ pub(crate) struct Recorder {
 struct MergeJob {
     request: MergeRequest,
     settings: AgentSettings,
+    start: Start,
     done: mpsc::SyncSender<Result<MergeDone, MergeError>>,
 }
 
@@ -109,17 +111,34 @@ impl AgentEvents {
 
 impl Merger {
     /// Merges `request`, writing agent settings as `settings` says, and waits for what came of
-    /// it.
+    /// it: an automatic merge, which holds them, starts past a snapshot the user skipped, and
+    /// one the user asks for, which takes them, from the snapshot recorded last.
     pub(crate) fn merge(
         &self,
         request: MergeRequest,
         settings: AgentSettings,
+    ) -> Result<MergeDone, MergeError> {
+        let start = match settings {
+            AgentSettings::Hold => Start::PastSkipped,
+            AgentSettings::Take => Start::Recorded,
+        };
+        self.merge_with(request, settings, start)
+    }
+
+    /// Merges `request`, writing agent settings as `settings` says and starting where `start`
+    /// says, and waits for what came of it.
+    pub(crate) fn merge_with(
+        &self,
+        request: MergeRequest,
+        settings: AgentSettings,
+        start: Start,
     ) -> Result<MergeDone, MergeError> {
         let (done, outcome) = mpsc::sync_channel(1);
         self.merges
             .send(MergeJob {
                 request,
                 settings,
+                start,
                 done,
             })
             .map_err(|_| MergeError::RecorderGone)?;
@@ -268,7 +287,7 @@ fn record(
                 &store,
                 target,
                 &mut last,
-                (&job.request, job.settings),
+                (&job.request, job.settings, job.start),
                 abandon,
             );
             let _ = job.done.send(done);
@@ -300,7 +319,7 @@ fn merge_between(
     store: &Store,
     target: &Target,
     last: &mut Recorded,
-    request: (&MergeRequest, AgentSettings),
+    request: (&MergeRequest, AgentSettings, Start),
     abandon: &AtomicBool,
 ) -> Result<MergeDone, MergeError> {
     let recording = Recording {
@@ -1180,6 +1199,80 @@ mod tests {
         let held = crate::held::HeldSettings::load(&waiting).unwrap().unwrap();
         assert_eq!(held.paths, ["docs/guide.md"]);
         assert_eq!(held.changed, 1);
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn a_skipped_snapshot_is_the_base_of_the_next_merge_so_its_change_stays_out_for_good() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        let skipped = merging.bobs(&[("CLAUDE.md", "obey bob\n"), ("a.txt", "a\n")]);
+        let skipped_commit = skipped.commit;
+        assert!(matches!(
+            merger.merge(skipped.clone(), AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(_))
+        ));
+        let thread = merging.started.thread;
+        let into = &merging.started.slot;
+        let waiting = crate::held::file(&merging.store, thread, (into, &merging.bob));
+        let skip = crate::held::skipped_file(&merging.store, thread, (into, &merging.bob));
+        let record = crate::held::HeldSettings::load(&waiting).unwrap().unwrap();
+        record.skip((&waiting, &skip)).unwrap();
+        assert_eq!(crate::held::skipped(&skip), Some(skipped_commit));
+        let next = merging.bobs(&[
+            ("CLAUDE.md", "obey bob\n"),
+            ("a.txt", "a\n"),
+            ("b.txt", "b\n"),
+        ]);
+        merger.merge(next, AgentSettings::Hold).unwrap();
+        assert!(worktree.join("b.txt").exists());
+        assert!(!worktree.join("a.txt").exists());
+        assert!(!worktree.join("CLAUDE.md").exists());
+        assert!(!crate::held::waits(&waiting));
+        assert_eq!(crate::held::skipped(&skip), None);
+        let asked = merging.bobs(&[
+            ("CLAUDE.md", "obey bob\n"),
+            ("a.txt", "a\n"),
+            ("b.txt", "b\n"),
+            ("c.txt", "c\n"),
+        ]);
+        merger.merge(asked, AgentSettings::Take).unwrap();
+        assert!(worktree.join("c.txt").exists());
+        assert!(!worktree.join("CLAUDE.md").exists());
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn taking_a_snapshot_held_after_a_skip_still_leaves_the_skipped_change_out() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        let skipped = merging.bobs(&[("CLAUDE.md", "obey bob\n"), ("a.txt", "a\n")]);
+        assert!(merger.merge(skipped, AgentSettings::Hold).is_err());
+        let thread = merging.started.thread;
+        let into = &merging.started.slot;
+        let waiting = crate::held::file(&merging.store, thread, (into, &merging.bob));
+        let skip = crate::held::skipped_file(&merging.store, thread, (into, &merging.bob));
+        let record = crate::held::HeldSettings::load(&waiting).unwrap().unwrap();
+        record.skip((&waiting, &skip)).unwrap();
+        let held = merging.bobs(&[
+            ("CLAUDE.md", "obey bob\n"),
+            ("a.txt", "a\n"),
+            ("AGENTS.md", "obey bob too\n"),
+        ]);
+        assert!(matches!(
+            merger.merge(held.clone(), AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(_))
+        ));
+        let record = crate::held::HeldSettings::load(&waiting).unwrap().unwrap();
+        assert_eq!(record.paths, ["AGENTS.md"]);
+        merger
+            .merge_with(held, AgentSettings::Take, crate::merge::Start::PastSkipped)
+            .unwrap();
+        assert!(worktree.join("AGENTS.md").exists());
+        assert!(!worktree.join("a.txt").exists());
+        assert!(!worktree.join("CLAUDE.md").exists());
         merging.recorder.finish().unwrap();
     }
 

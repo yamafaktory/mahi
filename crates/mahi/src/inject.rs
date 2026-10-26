@@ -163,6 +163,12 @@ impl Activity {
         turn_over && self.line_empty.load(Ordering::SeqCst) && quiet_for >= pace.quiet
     }
 
+    /// Says whether the agent is idle with its turn closed, by its turn-end hook or an
+    /// interrupt: a turn only gone stale does not count.
+    fn is_idle_with_turn_closed(&self, pace: &Pace) -> bool {
+        !self.turn_open.load(Ordering::SeqCst) && self.is_idle(pace)
+    }
+
     /// Says whether the agent is idle after a turn its turn-end hook reported, or since it
     /// started: an interrupt or a turn gone stale does not count.
     fn is_idle_after_turn_end(&self, pace: &Pace) -> bool {
@@ -321,6 +327,8 @@ pub(crate) fn give_accepted(
 pub(crate) enum Readiness {
     /// Be idle, however its turn ended.
     Idle,
+    /// Be idle with its turn closed, by its turn-end hook or an interrupt, not only gone quiet.
+    TurnClosed,
     /// Be idle after a turn its turn-end hook reported, or since it started.
     AfterTurnEnd,
 }
@@ -359,6 +367,7 @@ pub(crate) fn when_ready<T>(
         };
         let ready = match readiness {
             Readiness::Idle => activity.is_idle(&pace),
+            Readiness::TurnClosed => activity.is_idle_with_turn_closed(&pace),
             Readiness::AfterTurnEnd => activity.is_idle_after_turn_end(&pace),
         };
         if agent.palette_open() || !ready {
@@ -504,6 +513,23 @@ mod tests {
         activity.keys(b"half typed");
         thread::sleep(pace.quiet);
         assert!(!activity.is_idle_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn a_turn_closed_by_its_hook_or_an_interrupt_counts_but_one_only_gone_quiet_does_not() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.saw(HookKind::Prompt, b"");
+        thread::sleep(pace.stale_turn);
+        assert!(activity.is_idle(&pace));
+        assert!(!activity.is_idle_with_turn_closed(&pace));
+        activity.keys(b"\x1b");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_with_turn_closed(&pace));
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(HookKind::TurnEnd, b"");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_with_turn_closed(&pace));
     }
 
     #[test]

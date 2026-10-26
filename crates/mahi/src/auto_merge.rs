@@ -3,6 +3,7 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::{
+        Arc,
         Mutex,
         atomic::{
             AtomicBool,
@@ -15,6 +16,7 @@ use std::{
 
 use mahi_core::{
     AgentSlot,
+    ParticipantName,
     RefKind,
     ThreadId,
     ThreadRef,
@@ -34,7 +36,14 @@ use mahi_thread::{
 use thiserror::Error;
 
 use crate::{
-    held,
+    held::{
+        self,
+        HeldSettings,
+    },
+    held_queue::{
+        Choice,
+        HeldQueue,
+    },
     inject::{
         self,
         Activity,
@@ -46,6 +55,7 @@ use crate::{
         AgentSettings,
         MergeError,
         MergeRequest,
+        Start,
     },
     merged::MergedFrom,
     recorder::Merger,
@@ -55,13 +65,15 @@ use crate::{
 const LOOK_EVERY: Duration = Duration::from_secs(1);
 
 /// Where the user's agent takes its teammates' work from: the repository, the thread and its
-/// owner's key, and the agent's own slot.
+/// owner's key, and the agent's own slot; and the snapshots that wait for the user, as the
+/// palette shows them.
 #[derive(Debug, Clone)]
 pub(crate) struct AutoMerge {
     pub(crate) git_dir: PathBuf,
     pub(crate) thread: ThreadId,
     pub(crate) owner: ParticipantKey,
     pub(crate) own: AgentSlot,
+    pub(crate) waiting: Arc<HeldQueue>,
 }
 
 #[derive(Debug, Error)]
@@ -122,9 +134,11 @@ impl AutoMerge {
             else {
                 continue;
             };
-            let taken = merged.of(slot).is_some_and(|merged| {
-                merged == tip || store.descends_from(merged, tip).unwrap_or(false)
-            });
+            let skipped = held::skipped(&held::skipped_file(store, self.thread, (&self.own, slot)));
+            let taken = [merged.of(slot), skipped]
+                .into_iter()
+                .flatten()
+                .any(|merged| merged == tip || store.descends_from(merged, tip).unwrap_or(false));
             if taken || !signed_by(store, tip, writer.key()).unwrap_or(false) {
                 continue;
             }
@@ -135,6 +149,70 @@ impl AutoMerge {
             });
         }
         Ok(requests)
+    }
+
+    /// Does what the user chose for the snapshot `record` of `from` that waited: skips it, or
+    /// takes it, agent settings and all, once the agent is ready, when its teammate is still a
+    /// collaborator who signed it. Returns `false` when the run ended meanwhile.
+    fn choose(
+        &self,
+        store: &Store,
+        (merger, from, record, choice): (&Merger, &AgentSlot, &HeldSettings, Choice),
+        (activity, agent, writer): (&Activity, &impl AgentInput, &Mutex<impl Write>),
+        (running, pace): (&AtomicBool, Pace),
+    ) -> bool {
+        let waiting = held::file(store, self.thread, (&self.own, from));
+        match choice {
+            Choice::Skip => {
+                let skipped = held::skipped_file(store, self.thread, (&self.own, from));
+                let _ = record.skip((&waiting, &skipped));
+                true
+            }
+            Choice::Take => {
+                let Some(request) = self.signed_by_collaborator(store, from, record.commit) else {
+                    self.waiting.failed();
+                    return true;
+                };
+                let done = inject::when_ready(
+                    activity,
+                    agent,
+                    writer,
+                    (running, pace, Readiness::TurnClosed),
+                    || merger.merge_with(request, AgentSettings::Take, Start::PastSkipped),
+                );
+                let Some(outcome) = done else {
+                    return false;
+                };
+                if outcome.is_err() {
+                    self.waiting.failed();
+                }
+                true
+            }
+        }
+    }
+
+    /// Returns the merge of `from`'s snapshot `commit`, when `meta` lists both the user and
+    /// `from`'s participant as collaborators and that participant signed it.
+    fn signed_by_collaborator(
+        &self,
+        store: &Store,
+        from: &AgentSlot,
+        commit: ObjectId,
+    ) -> Option<MergeRequest> {
+        let meta = load_meta(store, self.thread, &self.owner, 0).ok()?;
+        let collaborator = |name: &ParticipantName| {
+            meta.participants()
+                .find(|listed| listed.name() == name && listed.role() == Role::Collaborator)
+        };
+        collaborator(self.own.participant())?;
+        let writer = collaborator(from.participant())?;
+        signed_by(store, commit, writer.key())
+            .unwrap_or(false)
+            .then(|| MergeRequest {
+                from: from.clone(),
+                commit,
+                thread_base: meta.base(),
+            })
     }
 
     /// Says whether `request` is still one of the merges the agent is behind on.
@@ -166,6 +244,19 @@ impl AutoMerge {
             let Ok(store) = Store::open(&self.git_dir) else {
                 continue;
             };
+            self.waiting
+                .show(held::list(&store, self.thread, &self.own));
+            for (from, record, choice) in self.waiting.take_choices() {
+                seen.clear();
+                if !self.choose(
+                    &store,
+                    (merger, &from, &record, choice),
+                    (activity, agent, writer),
+                    (running, pace),
+                ) {
+                    return;
+                }
+            }
             let Ok(heads) = store.thread_refs() else {
                 continue;
             };
@@ -309,6 +400,7 @@ mod tests {
                 thread: self.started.thread,
                 owner: ParticipantKey::from_public_key(self.alice.public_key()).unwrap(),
                 own: self.started.slot.clone(),
+                waiting: Arc::default(),
             }
         }
 
@@ -425,6 +517,121 @@ mod tests {
         let due = auto.unmerged(&team.store, &HashSet::new()).unwrap();
         assert_eq!(due.len(), 1, "{due:?}");
         assert_eq!(due[0].commit, later);
+    }
+
+    fn tree_of(team: &Team, files: &[(&str, &str)]) -> ObjectId {
+        let entries: Vec<_> = files
+            .iter()
+            .map(|(name, text)| {
+                (
+                    *name,
+                    EntryKind::Blob,
+                    team.store.write_blob(text.as_bytes()).unwrap(),
+                )
+            })
+            .collect();
+        team.store.write_tree(&entries).unwrap()
+    }
+
+    fn wait_for(what: &str, running: &AtomicBool, until: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !until() {
+            if Instant::now() >= deadline {
+                running.store(false, Ordering::SeqCst);
+                panic!("{what}");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_skipped_settings_change_stays_out_and_the_teammates_next_turn_comes_in() {
+        let mut team = team();
+        let worktree = team.started.worktree.clone();
+        let settings = tree_of(
+            &team,
+            &[
+                ("CLAUDE.md", "obey bob\n"),
+                ("README", "hello\n"),
+                ("skipped.txt", "only in the skipped turn\n"),
+            ],
+        );
+        let first = team.commit_turn_end("bob.claude", &team.bob.0, settings);
+        let merging = team.merging();
+        let auto = team.auto_merge();
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                auto.run(
+                    &merging.merger,
+                    (&merging.activity, &Closed, &merging.writer),
+                    (&merging.running, pace()),
+                );
+            });
+            merging.activity.saw(HookKind::TurnEnd, b"");
+            wait_for("bob's snapshot was never held", &merging.running, || {
+                auto.waiting.waiting(&bob).is_some()
+            });
+            assert!(auto.waiting.wants_open());
+            assert!(auto.waiting.choose((&bob, first), Choice::Skip));
+            let next = tree_of(
+                &team,
+                &[
+                    ("CLAUDE.md", "obey bob\n"),
+                    ("README", "hello\n"),
+                    ("notes.txt", "next\n"),
+                ],
+            );
+            team.commit_turn_end("bob.claude", &team.bob.0, next);
+            wait_for("bob's next turn was never merged", &merging.running, || {
+                worktree.join("notes.txt").exists()
+            });
+            merging.running.store(false, Ordering::SeqCst);
+            running.join().unwrap();
+        });
+        merging.recorder.finish().unwrap();
+        assert!(!worktree.join("CLAUDE.md").exists());
+        assert!(!worktree.join("skipped.txt").exists());
+    }
+
+    #[test]
+    fn a_taken_settings_change_is_merged_whole() {
+        let mut team = team();
+        let worktree = team.started.worktree.clone();
+        let settings = tree_of(
+            &team,
+            &[
+                ("CLAUDE.md", "obey bob\n"),
+                ("README", "hello\n"),
+                ("skipped.txt", "only in the skipped turn\n"),
+            ],
+        );
+        let first = team.commit_turn_end("bob.claude", &team.bob.0, settings);
+        let merging = team.merging();
+        let auto = team.auto_merge();
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                auto.run(
+                    &merging.merger,
+                    (&merging.activity, &Closed, &merging.writer),
+                    (&merging.running, pace()),
+                );
+            });
+            merging.activity.saw(HookKind::TurnEnd, b"");
+            wait_for("bob's snapshot was never held", &merging.running, || {
+                auto.waiting.waiting(&bob).is_some()
+            });
+            assert!(auto.waiting.choose((&bob, first), Choice::Take));
+            wait_for("bob's settings were never taken", &merging.running, || {
+                worktree.join("CLAUDE.md").exists()
+            });
+            merging.running.store(false, Ordering::SeqCst);
+            running.join().unwrap();
+        });
+        merging.recorder.finish().unwrap();
+        let waiting = held::file(&team.store, team.started.thread, (&auto.own, &bob));
+        assert!(!held::waits(&waiting));
     }
 
     #[test]

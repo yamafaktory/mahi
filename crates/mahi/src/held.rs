@@ -23,6 +23,8 @@ use crate::{
 };
 
 const HELD_DIR: &str = "held";
+const SKIPPED_DIR: &str = "skipped";
+const MAX_SKIPPED_BYTES: u64 = 128;
 const MAX_HELD_BYTES: u64 = 64 * 1024;
 const MAX_HELD_PATHS: usize = 20;
 const LONGEST_PATH: usize = 200;
@@ -55,6 +57,48 @@ pub(crate) fn file(
     sync_state::dir(store, thread, into)
         .join(HELD_DIR)
         .join(from.to_string())
+}
+
+/// Returns where the snapshot of `from` the user skipped is kept, for `into`'s worktree in
+/// `thread`: the agent's sync directory, then `skipped/<participant>.<agent>` of `from`.
+pub(crate) fn skipped_file(
+    store: &Store,
+    thread: ThreadId,
+    (into, from): (&AgentSlot, &AgentSlot),
+) -> PathBuf {
+    sync_state::dir(store, thread, into)
+        .join(SKIPPED_DIR)
+        .join(from.to_string())
+}
+
+/// Returns the snapshot of a teammate the user skipped, kept in `file`, which their next turns
+/// merge from, or `None` when there is none or it cannot be read.
+pub(crate) fn skipped(file: &Path) -> Option<ObjectId> {
+    let bytes = sync_state::read(file, MAX_SKIPPED_BYTES).ok()??;
+    ObjectId::from_hex(&bytes).ok()
+}
+
+/// Every snapshot that waits for the user in `into`'s worktree in `thread`, with the teammate
+/// it came from, in the order of their slots; a record that cannot be read is left out.
+pub(crate) fn list(
+    store: &Store,
+    thread: ThreadId,
+    into: &AgentSlot,
+) -> Vec<(AgentSlot, HeldSettings)> {
+    let dir = sync_state::dir(store, thread, into).join(HELD_DIR);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut held: Vec<(AgentSlot, HeldSettings)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let from: AgentSlot = entry.file_name().to_str()?.parse().ok()?;
+            let record = HeldSettings::load(&dir.join(from.to_string())).ok()??;
+            Some((from, record))
+        })
+        .collect();
+    held.sort_by_cached_key(|(from, _)| from.to_string());
+    held
 }
 
 /// Says whether a snapshot of a teammate waits in `file`, or may: only a file surely missing
@@ -138,35 +182,55 @@ impl HeldSettings {
     pub(crate) fn release(file: &Path) -> Result<(), HeldError> {
         sync_state::remove(file).map_err(|error| HeldError::Io(file.to_path_buf(), error))
     }
+
+    /// Skips the snapshot kept in `file`: keeps it in `skipped`, so the teammate's next turns
+    /// merge from it and its change stays out, then stops holding it.
+    pub(crate) fn skip(&self, (file, skipped): (&Path, &Path)) -> Result<(), HeldError> {
+        sync_state::write(skipped, self.commit.to_hex().to_string().as_bytes())
+            .map_err(|error| HeldError::Io(skipped.to_path_buf(), error))?;
+        Self::release(file)
+    }
 }
 
-/// Stops holding each snapshot kept for `into`'s worktree in `thread` that `merged`, what the
-/// agent's snapshots record as merged, now holds: the held snapshot or a later one of its
-/// agent. A record that cannot be read or removed stays, so its teammate keeps waiting.
+/// Stops holding, or keeping as skipped, each snapshot kept for `into`'s worktree in `thread`
+/// that `merged`, what the agent's snapshots record as merged, now holds: that snapshot or a
+/// later one of its agent. A held record that cannot be read or removed stays, so its
+/// teammate keeps waiting.
 pub(crate) fn release_merged(
     store: &Store,
     thread: ThreadId,
     into: &AgentSlot,
     merged: &MergedFrom,
 ) {
-    let dir = sync_state::dir(store, thread, into).join(HELD_DIR);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Some(from) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<AgentSlot>().ok())
-        else {
+    let sync = sync_state::dir(store, thread, into);
+    for kind in [HELD_DIR, SKIPPED_DIR] {
+        let dir = sync.join(kind);
+        let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
-        let file = dir.join(from.to_string());
-        let (Ok(Some(held)), Some(taken)) = (HeldSettings::load(&file), merged.of(&from)) else {
-            continue;
-        };
-        if taken == held.commit || store.descends_from(taken, held.commit).unwrap_or(false) {
-            let _ = HeldSettings::release(&file);
+        for entry in entries.flatten() {
+            let Some(from) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<AgentSlot>().ok())
+            else {
+                continue;
+            };
+            let file = dir.join(from.to_string());
+            let kept = if kind == HELD_DIR {
+                HeldSettings::load(&file)
+                    .ok()
+                    .flatten()
+                    .map(|held| held.commit)
+            } else {
+                skipped(&file)
+            };
+            let (Some(kept), Some(taken)) = (kept, merged.of(&from)) else {
+                continue;
+            };
+            if taken == kept || store.descends_from(taken, kept).unwrap_or(false) {
+                let _ = sync_state::remove(&file);
+            }
         }
     }
 }

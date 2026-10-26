@@ -16,11 +16,16 @@ use std::{
     },
 };
 
+use mahi_core::{
+    AgentSlot,
+    is_invisible,
+};
 use mahi_live::PROMPT_ID_BYTES;
 use mahi_sandbox::{
     PtyResizer,
     WindowSize,
 };
+use mahi_store::ObjectId;
 use mahi_term::{
     OutputTracker,
     PaletteInput,
@@ -32,6 +37,11 @@ use mahi_term::{
 };
 
 use crate::{
+    held_queue::{
+        Choice,
+        HeldQueue,
+        Waiting,
+    },
     inject::AgentInput,
     prompts::{
         Decision,
@@ -45,6 +55,13 @@ const EMPTY: &str = "None yet: teammates watching this thread send them here";
 const HINT_READ: &str = "PgDn reads on · Ctrl-X rejects · Esc closes";
 const HINT_DECIDE: &str = "Enter accepts · Tab always · Ctrl-X rejects · Esc closes";
 const NO_TEAMMATES: &str = "Teammates cannot watch this run, so no prompts come";
+const HELD_DETAIL: &str = "changes agent settings";
+const HELD_READ: &str = "PgDn reads on · Ctrl-X skips · Esc closes";
+const HELD_DECIDE: &str = "Enter takes · Ctrl-X skips · Esc closes";
+const HELD_INTRO: &str = "Its turn changes what agents read as their settings or instructions:";
+const HELD_UNTOLD: &str = "(mahi could not tell which paths)";
+const HELD_BEHIND: &str = "Its later turns wait behind it.";
+const OPEN_GUARD: Duration = Duration::from_millis(500);
 const CLEAR: &[u8] = b"\x1b[2J";
 const REPAINT_PAUSE: Duration = Duration::from_millis(100);
 const DETAIL_CHARS: usize = 200;
@@ -152,7 +169,16 @@ pub(crate) struct Screen<W, T> {
     state: Mutex<State<W>>,
     terminal: T,
     prompts: Option<Arc<Prompts>>,
+    waiting: Option<Arc<HeldQueue>>,
     hint: String,
+}
+
+/// What a line of the palette stands for: a teammate's prompt, or a teammate's snapshot that
+/// waits because it changes agent settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Entry {
+    Prompt([u8; PROMPT_ID_BYTES]),
+    Held(AgentSlot, ObjectId),
 }
 
 #[derive(Debug)]
@@ -163,12 +189,22 @@ struct State<W> {
     held: Vec<u8>,
     filter: String,
     selected: usize,
-    selected_id: Option<[u8; PROMPT_ID_BYTES]>,
+    selected_id: Option<Entry>,
     scroll: usize,
     page: usize,
-    read_whole: Option<[u8; PROMPT_ID_BYTES]>,
+    read_whole: Option<Entry>,
     keys: PaletteKeys,
     notice: Vec<u8>,
+    guard: Guard,
+}
+
+/// Whether the palette drops the keys typed to it, as it does when it opened on its own: until
+/// it shows, then for 500 ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Guard {
+    Off,
+    UntilShown,
+    Until(Instant),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,11 +232,20 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                 read_whole: None,
                 keys: PaletteKeys::default(),
                 notice: Vec::new(),
+                guard: Guard::Off,
             }),
             terminal,
             prompts,
+            waiting: None,
             hint: format!("Esc closes · {key} twice sends {key} to the agent"),
         }
+    }
+
+    /// Lists, besides the prompts, the teammates' snapshots in `waiting` that wait because they
+    /// change agent settings, to take or to skip.
+    pub(crate) fn with_waiting(mut self, waiting: Arc<HeldQueue>) -> Self {
+        self.waiting = Some(waiting);
+        self
     }
 
     fn lock(&self) -> io::Result<MutexGuard<'_, State<W>>> {
@@ -298,6 +343,23 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         state.out.flush()
     }
 
+    /// Opens the palette on its own, for a snapshot that waits: the keys that come before it
+    /// shows and in its first 500 ms are dropped, so a key meant for the agent decides nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error writing to the screen gives.
+    pub(crate) fn open_guarded(&self) -> io::Result<()> {
+        {
+            let mut state = self.lock()?;
+            if state.mode != Mode::Agent {
+                return Ok(());
+            }
+            state.guard = Guard::UntilShown;
+        }
+        self.open()
+    }
+
     /// Opens the palette now, although the agent left a sequence unfinished, since it wrote
     /// nothing to finish it.
     ///
@@ -324,6 +386,14 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         let mut state = self.lock()?;
         if state.mode == Mode::Agent {
             return Ok(0);
+        }
+        let guarded = match state.guard {
+            Guard::Off => false,
+            Guard::UntilShown => true,
+            Guard::Until(until) => Instant::now() < until,
+        };
+        if guarded {
+            return Ok(bytes.len());
         }
         let State {
             keys,
@@ -374,12 +444,11 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                         PaletteInput::Tab => Decision::AlwaysAccept,
                         _ => Decision::Reject,
                     };
-                    let id = selected_id.or_else(|| self.id_at(filter, *selected));
+                    let id = selected_id
+                        .clone()
+                        .or_else(|| self.entry_at(filter, *selected));
                     let read = decision == Decision::Reject || (id.is_some() && id == *read_whole);
-                    if read
-                        && let Some((id, prompts)) = id.zip(self.prompts.as_ref())
-                        && prompts.decide(id, decision)
-                    {
+                    if read && id.as_ref().is_some_and(|id| self.decide(id, decision)) {
                         *selected_id = None;
                         changed = true;
                         closing |= decision != Decision::Reject;
@@ -470,6 +539,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         state.scroll = 0;
         state.read_whole = None;
         state.keys = PaletteKeys::default();
+        state.guard = Guard::Off;
         state.out.write_all(&held)?;
         write_notice(state)?;
         state.out.close_palette();
@@ -480,28 +550,33 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
     }
 
     fn draw(&self, state: &mut State<W>) -> io::Result<()> {
+        if state.guard == Guard::UntilShown {
+            state.guard = Guard::Until(Instant::now() + OPEN_GUARD);
+        }
         let size = self.terminal.size();
         let lines = self.waiting_lines(&state.filter);
         if let Some(position) = state
             .selected_id
-            .and_then(|id| lines.iter().position(|line| line.id == id))
+            .as_ref()
+            .and_then(|id| lines.iter().position(|line| line.id == *id))
         {
             state.selected = position;
         }
         state.selected = state.selected.min(lines.len().saturating_sub(1));
-        let selected_id = lines.get(state.selected).map(|line| line.id);
+        let selected_id = lines.get(state.selected).map(|line| line.id.clone());
         if selected_id != state.selected_id {
             state.scroll = 0;
         }
-        state.selected_id = selected_id;
-        let text = selected_id
-            .zip(self.prompts.as_ref())
-            .and_then(|(id, prompts)| prompts.text_of(id));
+        state.selected_id.clone_from(&selected_id);
+        let text = selected_id.as_ref().and_then(|id| self.text_of(id));
         let read_whole = selected_id.is_some() && state.read_whole == selected_id;
-        let hint = match (&text, read_whole) {
-            (None, _) => self.hint.as_str(),
-            (Some(_), false) => HINT_READ,
-            (Some(_), true) => HINT_DECIDE,
+        let held = matches!(selected_id, Some(Entry::Held(..)));
+        let hint = match (&text, read_whole, held) {
+            (None, ..) => self.hint.as_str(),
+            (Some(_), false, false) => HINT_READ,
+            (Some(_), true, false) => HINT_DECIDE,
+            (Some(_), false, true) => HELD_READ,
+            (Some(_), true, true) => HELD_DECIDE,
         };
         let items: Vec<PaletteItem<'_>> = lines
             .iter()
@@ -515,7 +590,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
             filter: &state.filter,
             items: &items,
             selected: state.selected,
-            empty: if self.prompts.is_some() {
+            empty: if self.prompts.is_some() || self.waiting.is_some() {
                 EMPTY
             } else {
                 NO_TEAMMATES
@@ -542,10 +617,28 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
 
     fn waiting_lines(&self, filter: &str) -> Vec<Line> {
         let mut lines = Vec::new();
+        let now = Instant::now();
+        if let Some(waiting) = &self.waiting {
+            waiting.each(|held| {
+                let from = held.from.to_string();
+                if contains_ignoring_case(&from, filter)
+                    || contains_ignoring_case(HELD_DETAIL, filter)
+                {
+                    let mut detail = String::with_capacity(HELD_DETAIL.len() + 8);
+                    push_age(&mut detail, now.saturating_duration_since(held.since));
+                    detail.push_str(" · ");
+                    detail.push_str(HELD_DETAIL);
+                    lines.push(Line {
+                        id: Entry::Held(held.from.clone(), held.held.commit),
+                        from,
+                        detail,
+                    });
+                }
+            });
+        }
         let Some(prompts) = &self.prompts else {
             return lines;
         };
-        let now = Instant::now();
         prompts.each_waiting(|waiting| {
             let from = waiting.from.as_str();
             let text = waiting.text.as_str();
@@ -555,7 +648,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                 detail.push_str(" · ");
                 detail.extend(text.chars().take(DETAIL_CHARS));
                 lines.push(Line {
-                    id: waiting.id,
+                    id: Entry::Prompt(waiting.id),
                     from: from.to_owned(),
                     detail,
                 });
@@ -564,20 +657,42 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         lines
     }
 
-    fn id_at(&self, filter: &str, index: usize) -> Option<[u8; PROMPT_ID_BYTES]> {
-        let mut found = None;
-        let mut seen = 0;
-        self.prompts.as_ref()?.each_waiting(|waiting| {
-            let shown = contains_ignoring_case(waiting.from.as_str(), filter)
-                || contains_ignoring_case(waiting.text.as_str(), filter);
-            if shown && found.is_none() {
-                if seen == index {
-                    found = Some(waiting.id);
-                }
-                seen += 1;
+    fn entry_at(&self, filter: &str, index: usize) -> Option<Entry> {
+        self.waiting_lines(filter)
+            .into_iter()
+            .nth(index)
+            .map(|line| line.id)
+    }
+
+    fn text_of(&self, entry: &Entry) -> Option<String> {
+        match entry {
+            Entry::Prompt(id) => self.prompts.as_ref()?.text_of(*id),
+            Entry::Held(from, commit) => self
+                .waiting
+                .as_ref()?
+                .waiting(from)
+                .filter(|waiting| waiting.held.commit == *commit)
+                .map(|waiting| held_text(&waiting)),
+        }
+    }
+
+    fn decide(&self, entry: &Entry, decision: Decision) -> bool {
+        match entry {
+            Entry::Prompt(id) => self
+                .prompts
+                .as_ref()
+                .is_some_and(|prompts| prompts.decide(*id, decision)),
+            Entry::Held(from, commit) => {
+                let choice = match decision {
+                    Decision::Accept => Choice::Take,
+                    Decision::Reject => Choice::Skip,
+                    Decision::AlwaysAccept => return false,
+                };
+                self.waiting
+                    .as_ref()
+                    .is_some_and(|waiting| waiting.choose((from, *commit), choice))
             }
-        });
-        found
+        }
     }
 
     /// Redraws the open palette, so the prompts that came and their ages show.
@@ -595,9 +710,39 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
 }
 
 struct Line {
-    id: [u8; PROMPT_ID_BYTES],
+    id: Entry,
     from: String,
     detail: String,
+}
+
+/// Returns what the palette shows of a snapshot that waits: the paths it changes that hold
+/// it, each without control or invisible characters, and that the teammate's later turns
+/// wait behind it.
+fn held_text(waiting: &Waiting) -> String {
+    let mut text = String::from(HELD_INTRO);
+    text.push('\n');
+    for path in &waiting.held.paths {
+        text.push_str("  ");
+        text.extend(path.chars().map(|c| {
+            if c.is_control() || is_invisible(c) {
+                '?'
+            } else {
+                c
+            }
+        }));
+        text.push('\n');
+    }
+    let more = waiting
+        .held
+        .changed
+        .saturating_sub(waiting.held.paths.len());
+    if waiting.held.paths.is_empty() {
+        let _ = writeln!(text, "  {HELD_UNTOLD}");
+    } else if more > 0 {
+        let _ = writeln!(text, "  and {more} more");
+    }
+    text.push_str(HELD_BEHIND);
+    text
 }
 
 fn contains_ignoring_case(text: &str, part: &str) -> bool {
@@ -950,15 +1095,24 @@ mod tests {
         screen
             .typed(b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x1b[B\x1b[B")
             .unwrap();
-        assert_eq!(screen.lock().unwrap().selected_id, Some([2; 16]));
+        assert_eq!(
+            screen.lock().unwrap().selected_id,
+            Some(Entry::Prompt([2; 16]))
+        );
         prompts.offer(name("dave"), [3; 16], text("x".repeat(8000).as_str()));
         screen.typed(b"\x1b[A").unwrap();
-        assert_eq!(screen.lock().unwrap().selected_id, Some([1; 16]));
+        assert_eq!(
+            screen.lock().unwrap().selected_id,
+            Some(Entry::Prompt([1; 16]))
+        );
         written(&screen);
         screen.tick().unwrap();
         let ticked = String::from_utf8_lossy(&written(&screen)).into_owned();
         assert!(ticked.contains("dave"), "{ticked}");
-        assert_eq!(screen.lock().unwrap().selected_id, Some([1; 16]));
+        assert_eq!(
+            screen.lock().unwrap().selected_id,
+            Some(Entry::Prompt([1; 16]))
+        );
         assert!(contains_ignoring_case("Fix The Parser", "the pars"));
         assert!(!contains_ignoring_case("fix", "fixes"));
     }
@@ -1004,7 +1158,10 @@ mod tests {
         screen.open().unwrap();
         assert_eq!(screen.typed(b"\x18").unwrap(), 1);
         assert!(screen.is_open());
-        assert_eq!(screen.lock().unwrap().selected_id, Some([2; 16]));
+        assert_eq!(
+            screen.lock().unwrap().selected_id,
+            Some(Entry::Prompt([2; 16]))
+        );
         screen.typed(b"\r").unwrap();
         assert!(!screen.is_open());
         assert_eq!(prompts.next_accepted().unwrap().id, [2; 16]);
@@ -1023,6 +1180,89 @@ mod tests {
         screen.close().unwrap();
         screen.output(b"\x1b[?2004h").unwrap();
         assert!(screen.bracketed_paste());
+    }
+
+    fn held_screen(terminal: &FakeTerminal) -> (Screen<Vec<u8>, &FakeTerminal>, Arc<HeldQueue>) {
+        let waiting = Arc::new(HeldQueue::default());
+        let screen = Screen::new(Vec::new(), terminal, PaletteKey::CTRL_SPACE, None)
+            .with_waiting(Arc::clone(&waiting));
+        let record = crate::held::HeldSettings::new(
+            mahi_store::ObjectId::from_bytes_or_panic(&[1; 20]),
+            &[
+                "CLAUDE.md".to_owned(),
+                ".claude/set\x1b]0;x\x07.json".to_owned(),
+            ],
+        );
+        waiting.show(vec![("bob.claude".parse().unwrap(), record)]);
+        (screen, waiting)
+    }
+
+    #[test]
+    fn a_held_snapshot_shows_its_paths_cleaned_and_enter_takes_it_and_closes() {
+        let terminal = FakeTerminal::default();
+        let (screen, waiting) = held_screen(&terminal);
+        screen.open().unwrap();
+        let drawn = String::from_utf8_lossy(&written(&screen)).into_owned();
+        assert!(drawn.contains("bob.claude"), "{drawn}");
+        assert!(drawn.contains("changes agent settings"), "{drawn}");
+        assert!(drawn.contains("CLAUDE.md"), "{drawn}");
+        assert!(drawn.contains(".claude/set?]0;x?.json"), "{drawn}");
+        assert!(drawn.contains("Its later turns wait behind it."), "{drawn}");
+        assert!(drawn.contains(" takes"), "{drawn}");
+        assert!(drawn.contains(" skips"), "{drawn}");
+        screen.typed(b"\r").unwrap();
+        assert!(!screen.is_open());
+        let choices = waiting.take_choices();
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].2, Choice::Take);
+    }
+
+    #[test]
+    fn ctrl_x_skips_a_held_snapshot_and_tab_does_nothing_to_it() {
+        let terminal = FakeTerminal::default();
+        let (screen, waiting) = held_screen(&terminal);
+        screen.open().unwrap();
+        screen.typed(b"\t").unwrap();
+        assert!(waiting.take_choices().is_empty());
+        screen.typed(b"\x18").unwrap();
+        assert!(screen.is_open());
+        let choices = waiting.take_choices();
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].2, Choice::Skip);
+    }
+
+    #[test]
+    fn the_palette_opened_for_a_held_snapshot_drops_keys_for_its_first_half_second() {
+        let terminal = FakeTerminal::default();
+        let (screen, waiting) = held_screen(&terminal);
+        screen.open_guarded().unwrap();
+        assert!(screen.is_open());
+        assert_eq!(screen.typed(b"\r").unwrap(), 1);
+        assert!(screen.is_open());
+        assert!(waiting.take_choices().is_empty());
+        thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"\r").unwrap();
+        assert!(!screen.is_open());
+        assert_eq!(waiting.take_choices().len(), 1);
+    }
+
+    #[test]
+    fn the_guard_starts_only_once_the_palette_shows_and_holds_every_key_until_then() {
+        let terminal = FakeTerminal::default();
+        let (screen, waiting) = held_screen(&terminal);
+        screen.output(b"\x1b[").unwrap();
+        screen.open_guarded().unwrap();
+        assert!(screen.is_opening());
+        thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        assert_eq!(screen.typed(b"\x18").unwrap(), 1);
+        assert!(waiting.take_choices().is_empty());
+        screen.output(b"m").unwrap();
+        assert!(!screen.is_opening());
+        screen.typed(b"\x18").unwrap();
+        assert!(waiting.take_choices().is_empty());
+        thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"\x18").unwrap();
+        assert_eq!(waiting.take_choices().len(), 1);
     }
 
     #[test]

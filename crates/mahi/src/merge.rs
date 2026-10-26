@@ -295,7 +295,7 @@ pub(crate) fn merge(
         merge_now(
             &store,
             recording,
-            (&request, AgentSettings::Take),
+            (&request, AgentSettings::Take, Start::Recorded),
             (&mut SnapshotCache::default(), head),
             interrupt,
         )
@@ -330,6 +330,16 @@ fn ask_running(
     Ok(Outcome::Done(merge_door::ask(&door, request)?))
 }
 
+/// Which snapshot of the teammate a merge starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Start {
+    /// The one the agent's snapshots record as merged last, as for a merge the user asks for.
+    Recorded,
+    /// The one the user skipped, when it is later than that, so its change stays out, as for
+    /// the merges sync makes.
+    PastSkipped,
+}
+
 /// Whether a merge may write the paths an agent reads as its settings or instructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentSettings {
@@ -352,7 +362,7 @@ pub(crate) enum AgentSettings {
 pub(crate) fn merge_now(
     store: &Store,
     into: Recording<'_>,
-    (request, settings): (&MergeRequest, AgentSettings),
+    (request, settings, start): (&MergeRequest, AgentSettings, Start),
     (cache, head): (&mut SnapshotCache, Option<ObjectId>),
     interrupt: &AtomicBool,
 ) -> Result<MergeDone, MergeError> {
@@ -361,6 +371,16 @@ pub(crate) fn merge_now(
     let theirs = merged_by(store, request.commit);
     let own = head.map(|head| (into.slot, head));
     let base = merge_base(store, (&merged_from, own), (request, &theirs))?;
+    let skipped = held::skipped_file(store, into.snapshots.thread(), (into.slot, &request.from));
+    let base = match held::skipped(&skipped) {
+        Some(skipped)
+            if start == Start::PastSkipped
+                && skip_is_base(store, skipped, (merged_from.of(&request.from), request))? =>
+        {
+            skipped
+        }
+        _ => base,
+    };
     if base == request.commit {
         held::release_merged(store, into.snapshots.thread(), into.slot, &merged_from);
         return Ok(already(into.slot, request));
@@ -447,6 +467,22 @@ fn write_merge(
         into.commits.signer(),
     )?;
     Ok((applied, tree, commit))
+}
+
+/// Says whether the snapshot `skipped`, which the user skipped, is the base for merging
+/// `request`: the requested snapshot is it or a later one, and it is later than `last`, the
+/// snapshot of the same agent merged last.
+fn skip_is_base(
+    store: &Store,
+    skipped: ObjectId,
+    (last, request): (Option<ObjectId>, &MergeRequest),
+) -> Result<bool, StoreError> {
+    let reaches = request.commit == skipped || store.descends_from(request.commit, skipped)?;
+    let newer = match last {
+        Some(last) => last != skipped && store.descends_from(skipped, last)?,
+        None => true,
+    };
+    Ok(reaches && newer)
 }
 
 /// Returns the paths an agent reads as its settings or instructions that a pair of trees in

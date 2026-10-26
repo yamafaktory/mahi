@@ -12,6 +12,7 @@ mod end;
 mod environment;
 mod handoff;
 mod held;
+mod held_queue;
 mod home;
 mod hook;
 mod hub;
