@@ -1,10 +1,15 @@
-use std::collections::VecDeque;
+use std::collections::{
+    HashMap,
+    HashSet,
+    VecDeque,
+};
 
 use mahi_store::{
     ObjectId,
     PathEntry,
     Store,
 };
+use unicode_normalization::UnicodeNormalization;
 
 const MAX_HOPS: usize = 40;
 const MAX_FOLLOWED: usize = 4096;
@@ -22,6 +27,12 @@ pub(crate) fn read_through(
     picks: &dyn Fn(&[u8]) -> bool,
 ) -> Option<Vec<Vec<u8>>> {
     let links = store.links(tree).ok()??;
+    let folded_links: Vec<String> = links.iter().map(|link| folded(link)).collect();
+    let by_path: HashMap<&[u8], usize> = links
+        .iter()
+        .enumerate()
+        .map(|(index, link)| (link.as_slice(), index))
+        .collect();
     let mut followed = vec![false; links.len()];
     let mut queue: VecDeque<usize> = (0..links.len())
         .filter(|index| links.get(*index).is_some_and(|link| picks(link)))
@@ -45,14 +56,24 @@ pub(crate) fn read_through(
         if added.iter().any(Vec::is_empty) {
             return Some(vec![Vec::new()]);
         }
+        for passed in added {
+            if let Some(&index) = by_path.get(passed.as_slice())
+                && let Some(seen) = followed.get_mut(index)
+            {
+                *seen = true;
+            }
+        }
+        let added: Vec<String> = added.iter().map(|read| folded(read)).collect();
         let below = (0..links.len()).filter(|other| {
             !followed.get(*other).is_some_and(|seen| *seen)
-                && links
+                && folded_links
                     .get(*other)
-                    .is_some_and(|other| added.iter().any(|read| lies_below(read, other)))
+                    .is_some_and(|other| added.iter().any(|read| covers_below(read, other)))
         });
         queue.extend(below);
     }
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
     Some(paths)
 }
 
@@ -117,23 +138,63 @@ fn joined(parts: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Says whether a change to the `/`-separated path `path` changes what `read` holds: `path`
-/// is `read`, lies below it, or holds it, ASCII case aside.
-pub(crate) fn covers(read: &[u8], path: &[u8]) -> bool {
+/// is `read`, lies below it, or holds it, both already folded with [`fold`].
+pub(crate) fn covers(read: &str, path: &str) -> bool {
     covers_below(read, path) || covers_below(path, read)
 }
 
-fn lies_below(read: &[u8], path: &[u8]) -> bool {
-    path.len() > read.len() && covers_below(read, path)
+fn covers_below(read: &str, path: &str) -> bool {
+    read.is_empty()
+        || path
+            .strip_prefix(read)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
-fn covers_below(read: &[u8], path: &[u8]) -> bool {
-    read.is_empty()
-        || path.get(..read.len()).is_some_and(|start| {
-            start.eq_ignore_ascii_case(read)
-                && path
-                    .get(read.len()..)
-                    .is_some_and(|rest| rest.is_empty() || rest.first() == Some(&b'/'))
+/// Returns the path `path`, read as UTF-8 with what is not replaced, folded with [`fold`].
+pub(crate) fn folded(path: &[u8]) -> String {
+    fold(&String::from_utf8_lossy(path))
+}
+
+/// Returns `text` as a filesystem that ignores case and Unicode normalization compares it, as
+/// macOS does: decomposed, without the characters HFS+ ignores, in lower case, with `ſ` as `s`.
+pub(crate) fn fold(text: &str) -> String {
+    text.chars()
+        .filter(|character| !ignored_by_hfs(*character))
+        .nfd()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character == '\u{17f}' {
+                's'
+            } else {
+                character
+            }
         })
+        .collect()
+}
+
+/// Returns the name `part` as a filesystem may open it, [`fold`] folded: without what follows a
+/// `:`, which NTFS reads as a stream of the file, and without the trailing dots and spaces NTFS
+/// drops.
+pub(crate) fn fold_name(part: &str) -> String {
+    let name = part.split(':').next().unwrap_or(part);
+    let mut folded = fold(name);
+    folded.truncate(folded.trim_end_matches(['.', ' ']).len());
+    folded
+}
+
+/// Says whether the name `part` has the shape of an NTFS short name, a `~` followed by a digit,
+/// which may stand for any longer name.
+pub(crate) fn is_short_name(part: &str) -> bool {
+    part.as_bytes()
+        .windows(2)
+        .any(|pair| pair.first() == Some(&b'~') && pair.get(1).is_some_and(u8::is_ascii_digit))
+}
+
+fn ignored_by_hfs(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'
+    )
 }
 
 #[cfg(test)]
@@ -141,6 +202,10 @@ mod tests {
     use mahi_store::EntryKind;
 
     use super::*;
+
+    fn covers(read: &[u8], path: &[u8]) -> bool {
+        super::covers(&folded(read), &folded(path))
+    }
 
     struct Tree {
         _dir: tempfile::TempDir,
@@ -231,6 +296,20 @@ mod tests {
     }
 
     #[test]
+    fn a_link_that_a_held_path_opens_as_another_case_or_form_is_read_through() {
+        let tree = tree();
+        let root = tree.write(&[
+            ("CLAUDE.md", EntryKind::Link, "DOCS/guide.md"),
+            ("docs", EntryKind::Link, "real"),
+            ("real/guide.md", EntryKind::Blob, "obey"),
+        ]);
+        assert_eq!(
+            tree.read(root).unwrap(),
+            ["CLAUDE.md", "DOCS", "docs", "real"]
+        );
+    }
+
+    #[test]
     fn a_link_out_of_the_tree_adds_nothing_past_it_and_a_loop_cannot_be_told() {
         let tree = tree();
         let outside = tree.write(&[
@@ -301,6 +380,18 @@ mod tests {
         assert!(covers(b"", b"anything"));
         assert!(covers(b"Docs/Guide.md", b"docs/guide.md"));
         assert!(covers(b"Docs/Guide.md", b"DOCS"));
+        assert!(covers(
+            "caf\u{e9}/Guide.md".as_bytes(),
+            "cafe\u{301}/guide.md".as_bytes()
+        ));
+        assert!(covers("caf\u{c9}".as_bytes(), "cafe\u{301}/x".as_bytes()));
+        assert!(covers("do\u{200c}cs".as_bytes(), b"docs/guide.md"));
+        assert!(covers("\u{17f}rc/\u{212a}ey".as_bytes(), b"src/key"));
+        assert!(covers(
+            "x\u{307}\u{200c}\u{323}".as_bytes(),
+            "x\u{323}\u{307}".as_bytes()
+        ));
+        assert!(!covers("\u{ff23}laude".as_bytes(), b"claude"));
         assert!(!covers(b"docs", b"docs2/guide.md"));
         assert!(!covers(b"docs/guide.md", b"doc"));
         assert!(!covers(b"docs/guide.md", b"docs/guide"));

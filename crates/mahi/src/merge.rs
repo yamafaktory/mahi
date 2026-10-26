@@ -455,21 +455,27 @@ fn leaves_agent_settings_alone(store: &Store, ours: ObjectId, merged: ObjectId) 
     let Some(linked) = settings_links::read_through(store, ours, &named) else {
         return false;
     };
+    let folded_changes: Vec<String> = changes
+        .paths
+        .iter()
+        .map(|(path, _)| settings_links::fold(path))
+        .collect();
     !linked.iter().any(|read| {
-        let read = String::from_utf8_lossy(read);
-        changes
-            .paths
+        let read = settings_links::folded(read);
+        folded_changes
             .iter()
-            .any(|(path, _)| settings_links::covers(read.as_bytes(), path.as_bytes()))
+            .any(|path| settings_links::covers(&read, path))
     })
 }
 
 fn is_agent_settings(path: &str) -> bool {
     let mut parts = path.split('/');
     parts.any(|part| {
-        AGENT_SETTINGS
-            .iter()
-            .any(|name| part.eq_ignore_ascii_case(name))
+        let folded = settings_links::fold_name(part);
+        settings_links::is_short_name(part)
+            || AGENT_SETTINGS
+                .iter()
+                .any(|name| folded.eq_ignore_ascii_case(name))
     })
 }
 
@@ -672,6 +678,18 @@ mod tests {
             "src/agents.OVERRIDE.md",
             "CLAUDE.local.md",
             "docs/claude.local.md",
+            ".clau\u{200d}de/settings.json",
+            "\u{feff}CLAUDE.md",
+            "CLAUDE.md.",
+            "CLAUDE.md . ",
+            "AGENTS.md:stream",
+            ".claude::$DATA/x",
+            "CLAUDE~1.MD",
+            "src/AGENTS~12.MD",
+            "AGENT\u{17f}.md",
+            "CLA\u{1e9e}UDE~1",
+            "CLAUDE.md. :x",
+            "\u{212a}/.codex",
         ];
         for path in settings {
             assert!(is_agent_settings(path), "{path}");
@@ -683,6 +701,11 @@ mod tests {
             "docs/AGENTS.txt",
             "AGENTS.override.md.bak",
             "CLAUDE.local",
+            "CLAUDE.md.bak.",
+            "backup~",
+            "~/notes",
+            "cla\u{301}ude.md",
+            "\u{ff23}\u{ff2c}\u{ff21}\u{ff35}\u{ff24}\u{ff25}.md",
             "mcp.json",
             ".codexrc",
             "",
