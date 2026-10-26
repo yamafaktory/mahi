@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     fmt::Write as _,
     fs,
@@ -55,6 +56,11 @@ use crate::{
         KeptConflicts,
     },
     environment::Environment,
+    held::{
+        self,
+        HeldError,
+        HeldSettings,
+    },
     merge_door::{
         self,
         DoorError,
@@ -133,6 +139,8 @@ pub(crate) enum MergeError {
     TooManySources(AgentSlot),
     #[error("the merge from {0} changes agent settings, which wait for the user")]
     HoldsAgentSettings(AgentSlot),
+    #[error(transparent)]
+    Held(#[from] HeldError),
     #[error(
         "{0} holds conflict markers from a merge and takes no other merge until they are resolved"
     )]
@@ -354,6 +362,7 @@ pub(crate) fn merge_now(
     let own = head.map(|head| (into.slot, head));
     let base = merge_base(store, (&merged_from, own), (request, &theirs))?;
     if base == request.commit {
+        held::release_merged(store, into.snapshots.thread(), into.slot, &merged_from);
         return Ok(already(into.slot, request));
     }
     if !merged_from.record(request.from.clone(), request.commit) {
@@ -368,8 +377,12 @@ pub(crate) fn merge_now(
     }
     let labels = (conflicts::label(into.slot), conflicts::label(&request.from));
     let merged = store.merge_trees(base, ours, theirs, (&labels.0, &labels.1))?;
+    let waiting = held::file(store, into.snapshots.thread(), (into.slot, &request.from));
     let compared = [(ours, merged.tree), (base, theirs)];
-    if settings == AgentSettings::Hold && !leaves_agent_settings_alone(store, ours, compared) {
+    if settings == AgentSettings::Hold
+        && let Some(paths) = agent_settings_changed(store, ours, compared)
+    {
+        HeldSettings::new(request.commit, &paths).keep(&waiting)?;
         return Err(MergeError::HoldsAgentSettings(request.from.clone()));
     }
     let markers = merged
@@ -392,6 +405,9 @@ pub(crate) fn merge_now(
         (cache, head),
         interrupt,
     )?;
+    if applied.left.is_empty() {
+        held::release_merged(store, into.snapshots.thread(), into.slot, &merged_from);
+    }
     Ok(MergeDone::Merged {
         report: report(&request.from, into.slot, &merged, &applied),
         commit,
@@ -433,46 +449,61 @@ fn write_merge(
     Ok((applied, tree, commit))
 }
 
-/// Says whether each pair of trees in `compared`, the agent's tree `ours` against the merged
-/// one and the base against the teammate's, changes no path an agent reads as its settings or
-/// instructions, neither one named as such nor one a settings link of `ours` reads through,
-/// telling so only when every changed path and every such link could be told.
-fn leaves_agent_settings_alone(
+/// Returns the paths an agent reads as its settings or instructions that a pair of trees in
+/// `compared`, the agent's tree `ours` against the merged one and the base against the
+/// teammate's, changes, either named as such or read through a settings link of `ours`, or
+/// `None` when they change none. Paths that cannot all be told give an empty list.
+fn agent_settings_changed(
     store: &Store,
     ours: ObjectId,
     compared: [(ObjectId, ObjectId); 2],
-) -> bool {
+) -> Option<Vec<String>> {
     let mut paths = Vec::new();
+    let mut named = Vec::new();
+    let mut seen = HashSet::new();
     for (old, new) in compared {
         let Ok(changes) = store.changed_paths(old, new, MAX_MERGED_PATHS) else {
-            return false;
+            return Some(Vec::new());
         };
-        if changes.truncated
-            || changes
-                .paths
-                .iter()
-                .any(|(path, _)| is_agent_settings(path))
-        {
-            return false;
+        if changes.truncated {
+            return Some(Vec::new());
         }
-        paths.extend(
-            changes
-                .paths
-                .iter()
-                .map(|(path, _)| settings_links::fold(path)),
-        );
+        for (path, _) in changes.paths {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            if is_agent_settings(&path) {
+                named.push(path);
+            } else {
+                paths.push(path);
+            }
+        }
+    }
+    if !named.is_empty() {
+        return Some(named);
     }
     if paths.is_empty() {
-        return true;
+        return None;
     }
-    let named = |path: &[u8]| is_agent_settings(&String::from_utf8_lossy(path));
-    let Some(linked) = settings_links::read_through(store, ours, &named) else {
-        return false;
+    let is_named = |path: &[u8]| is_agent_settings(&String::from_utf8_lossy(path));
+    let Some(linked) = settings_links::read_through(store, ours, &is_named) else {
+        return Some(Vec::new());
     };
-    !linked.iter().any(|read| {
-        let read = settings_links::folded(read);
-        paths.iter().any(|path| settings_links::covers(&read, path))
-    })
+    let linked: Vec<String> = linked
+        .iter()
+        .map(|read| settings_links::folded(read))
+        .collect();
+    let mut read = Vec::new();
+    for path in paths {
+        let folded = settings_links::fold(&path);
+        if linked
+            .iter()
+            .any(|link| settings_links::covers(link, &folded))
+        {
+            read.push(path);
+        }
+    }
+    (!read.is_empty()).then_some(read)
 }
 
 fn is_agent_settings(path: &str) -> bool {

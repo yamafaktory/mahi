@@ -34,6 +34,7 @@ use mahi_thread::{
 use thiserror::Error;
 
 use crate::{
+    held,
     inject::{
         self,
         Activity,
@@ -76,7 +77,8 @@ impl AutoMerge {
     /// user as a collaborator: for each agent of another
     /// collaborator `meta` lists, its latest turn-end snapshot, when it is not in `tried`, is
     /// signed by that collaborator, and neither it nor a later one of theirs was merged into
-    /// the agent yet.
+    /// the agent yet, unless a snapshot of theirs that changes agent settings waits for the
+    /// user, with their later turns behind it.
     pub(crate) fn unmerged(
         &self,
         store: &Store,
@@ -113,6 +115,9 @@ impl AutoMerge {
             }) else {
                 continue;
             };
+            if held::waits(&held::file(store, self.thread, (&self.own, slot))) {
+                continue;
+            }
             let Some(tip) = turn_end::latest(store, slot, *head).filter(|tip| !tried.contains(tip))
             else {
                 continue;
@@ -398,6 +403,28 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_teammates_later_turns_wait_behind_their_snapshot_held_for_the_user() {
+        let team = team();
+        let first = team.ended("bob.claude", Some(&team.bob.0));
+        let auto = team.auto_merge();
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let waiting = held::file(&team.store, team.started.thread, (&auto.own, &bob));
+        held::HeldSettings::new(first, &["CLAUDE.md".to_owned()])
+            .keep(&waiting)
+            .unwrap();
+        let later = team.ended("bob.claude", Some(&team.bob.0));
+        assert!(
+            auto.unmerged(&team.store, &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
+        held::HeldSettings::release(&waiting).unwrap();
+        let due = auto.unmerged(&team.store, &HashSet::new()).unwrap();
+        assert_eq!(due.len(), 1, "{due:?}");
+        assert_eq!(due[0].commit, later);
     }
 
     #[test]

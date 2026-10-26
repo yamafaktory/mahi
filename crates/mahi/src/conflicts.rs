@@ -1,12 +1,5 @@
 use std::{
-    fs::{
-        self,
-        File,
-    },
-    io::{
-        self,
-        Read,
-    },
+    io,
     path::{
         Path,
         PathBuf,
@@ -23,18 +16,10 @@ use mahi_store::{
     Store,
     StoreError,
 };
-use rustix::fs::{
-    Mode,
-    OFlags,
-};
 use thiserror::Error;
 
-use crate::{
-    profile,
-    session,
-};
+use crate::sync_state;
 
-const SYNC_DIR: &str = "sync";
 const CONFLICTS_FILE: &str = "conflicts";
 const MAX_KEPT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_KEPT_PATHS: usize = 2 * MAX_MERGED_PATHS;
@@ -71,10 +56,7 @@ pub(crate) fn label(slot: &AgentSlot) -> String {
 /// `<common git dir>/mahi/state/<thread>/sync/<participant>.<agent>/conflicts`, beside the
 /// agent's state directory, out of the agent's reach.
 pub(crate) fn file(store: &Store, thread: ThreadId, slot: &AgentSlot) -> PathBuf {
-    session::state_root(store, thread)
-        .join(SYNC_DIR)
-        .join(slot.to_string())
-        .join(CONFLICTS_FILE)
+    sync_state::dir(store, thread, slot).join(CONFLICTS_FILE)
 }
 
 impl KeptConflicts {
@@ -99,22 +81,13 @@ impl KeptConflicts {
 
     /// Reads the conflicts kept in `file`, or `None` when none are kept.
     pub(crate) fn load(file: &Path) -> Result<Option<Self>, ConflictsError> {
-        let mut bytes = Vec::new();
-        let read = File::open(file).and_then(|opened| {
-            opened
-                .take(MAX_KEPT_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .map(drop)
-        });
-        match read {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(ConflictsError::Io(file.to_path_buf(), error)),
-        }
         let malformed = || ConflictsError::Malformed(file.to_path_buf());
-        if bytes.len() as u64 > MAX_KEPT_BYTES {
-            return Err(malformed());
-        }
+        let bytes = match sync_state::read(file, MAX_KEPT_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(malformed()),
+            Err(error) => return Err(ConflictsError::Io(file.to_path_buf(), error)),
+        };
         let mut records = bytes
             .strip_suffix(b"\0")
             .ok_or_else(malformed)?
@@ -154,19 +127,8 @@ impl KeptConflicts {
         if self.paths.len() > MAX_KEPT_PATHS || bytes.len() as u64 > MAX_KEPT_BYTES {
             return Err(ConflictsError::TooMany);
         }
-        let failed = |error: io::Error| ConflictsError::Io(file.to_path_buf(), error);
-        let (Some(dir), Some(name)) = (file.parent(), file.file_name().and_then(|n| n.to_str()))
-        else {
-            return Err(failed(io::ErrorKind::InvalidInput.into()));
-        };
-        profile::create_private_dir(dir).map_err(failed)?;
-        let directory = rustix::fs::open(
-            dir,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| failed(error.into()))?;
-        profile::replace(&directory, name, &bytes).map_err(failed)
+        sync_state::write(file, &bytes)
+            .map_err(|error| ConflictsError::Io(file.to_path_buf(), error))
     }
 }
 
@@ -204,16 +166,14 @@ pub(crate) fn resolved(
     if store.changed_files_hold(kept.before, tree, &|line| is_marker(line, &slots))? {
         return Ok(false);
     }
-    match fs::remove_file(file) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => {
-            Err(ConflictsError::Io(file.to_path_buf(), error))
-        }
-        _ => Ok(true),
-    }
+    sync_state::remove(file).map_err(|error| ConflictsError::Io(file.to_path_buf(), error))?;
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use mahi_store::EntryKind;
 
     use super::*;

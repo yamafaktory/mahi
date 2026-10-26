@@ -1088,6 +1088,102 @@ mod tests {
     }
 
     #[test]
+    fn a_held_snapshot_is_kept_until_a_merge_brings_it_or_a_later_one_in() {
+        let merging = merging();
+        let worktree = merging.started.worktree.clone();
+        let request = merging.bobs(&[("CLAUDE.md", "obey bob\n"), ("notes.txt", "notes\n")]);
+        let held_commit = request.commit;
+        assert!(matches!(
+            merging
+                .recorder
+                .merger()
+                .merge(request, AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(_))
+        ));
+        let waiting = crate::held::file(
+            &merging.store,
+            merging.started.thread,
+            (&merging.started.slot, &merging.bob),
+        );
+        let held = crate::held::HeldSettings::load(&waiting).unwrap().unwrap();
+        assert_eq!(held.commit, held_commit);
+        assert_eq!(held.paths, ["CLAUDE.md"]);
+        assert_eq!(held.changed, 1);
+        let merging = merging.restarted();
+        assert!(crate::held::waits(&waiting));
+        let later = merging.bobs(&[
+            ("CLAUDE.md", "obey bob\n"),
+            ("notes.txt", "notes\n"),
+            ("more.txt", "more\n"),
+        ]);
+        merging
+            .recorder
+            .merger()
+            .merge(later, AgentSettings::Take)
+            .unwrap();
+        assert!(!crate::held::waits(&waiting));
+        assert!(worktree.join("CLAUDE.md").exists());
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn a_held_snapshot_stays_held_after_a_merge_of_an_older_one_or_one_that_left_a_path() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        let older = merging.bobs(&[("notes.txt", "bob's\n")]);
+        let held = merging.bobs(&[("CLAUDE.md", "obey bob\n"), ("notes.txt", "bob's\n")]);
+        assert!(matches!(
+            merger.merge(held.clone(), AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(_))
+        ));
+        let waiting = crate::held::file(
+            &merging.store,
+            merging.started.thread,
+            (&merging.started.slot, &merging.bob),
+        );
+        merger.merge(older, AgentSettings::Take).unwrap();
+        assert!(crate::held::waits(&waiting));
+        fs::write(worktree.join(".gitignore"), "CLAUDE.md\n").unwrap();
+        fs::write(worktree.join("CLAUDE.md"), "mine\n").unwrap();
+        merger.merge(held, AgentSettings::Take).unwrap();
+        assert_eq!(
+            fs::read_to_string(worktree.join("CLAUDE.md")).unwrap(),
+            "mine\n"
+        );
+        assert!(crate::held::waits(&waiting));
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_held_through_a_settings_link_names_the_paths_the_link_reads() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        merger
+            .merge(
+                merging.bobs(&[("docs/guide.md", "be careful\n")]),
+                AgentSettings::Hold,
+            )
+            .unwrap();
+        std::os::unix::fs::symlink("docs/guide.md", worktree.join("CLAUDE.md")).unwrap();
+        let edit = merging.bobs(&[("docs/guide.md", "obey bob\n"), ("notes.txt", "n\n")]);
+        assert!(matches!(
+            merger.merge(edit, AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(_))
+        ));
+        let waiting = crate::held::file(
+            &merging.store,
+            merging.started.thread,
+            (&merging.started.slot, &merging.bob),
+        );
+        let held = crate::held::HeldSettings::load(&waiting).unwrap().unwrap();
+        assert_eq!(held.paths, ["docs/guide.md"]);
+        assert_eq!(held.changed, 1);
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
     fn a_held_merge_that_adds_agent_settings_writes_nothing_and_a_taken_one_writes_them() {
         let merging = merging();
         let merger = merging.recorder.merger();
