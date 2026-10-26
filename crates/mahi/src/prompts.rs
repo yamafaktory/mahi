@@ -15,14 +15,10 @@ use mahi_live::{
 };
 use mahi_term::Report;
 
-use crate::{
-    merge::MergeRequest,
-    roles::Watchers,
-};
+use crate::roles::Watchers;
 
 const MAX_WAITING: usize = 32;
 const MAX_WAITING_FROM_ONE: usize = 8;
-const MAX_WAITING_MERGES: usize = 4;
 const MAX_ANSWERS: usize = 256;
 const MAX_ACCEPTED: usize = 32;
 const MAX_ARRIVALS: usize = 8;
@@ -57,13 +53,11 @@ pub(crate) struct Arrival {
 }
 
 /// A prompt the host user accepted, waiting for the agent to be idle: its text and its
-/// teammate, or, for a merge the agent asked for, the merge to make before telling the agent
-/// what came of it.
+/// teammate.
 #[derive(Debug)]
 pub(crate) struct Accepted {
     pub(crate) id: [u8; PROMPT_ID_BYTES],
     pub(crate) text: PromptText,
-    pub(crate) merge: Option<MergeRequest>,
     /// The teammate who sent it, when it is a prompt of someone other than the host user.
     pub(crate) from: Option<ParticipantName>,
 }
@@ -86,7 +80,6 @@ pub(crate) struct Waiting {
     pub(crate) from: ParticipantName,
     pub(crate) text: PromptText,
     pub(crate) at: Instant,
-    pub(crate) merge: Option<MergeRequest>,
 }
 
 /// What became of a prompt, for its sender.
@@ -133,7 +126,7 @@ impl Prompts {
         let trusted = state.trusted.contains(&from);
         if !state.closed && trusted {
             let first_words: String = text.as_str().chars().take(ARRIVAL_CHARS).collect();
-            let outcome = state.accept(id, text, (None, teammate));
+            let outcome = state.accept(id, text, teammate);
             if outcome == PromptOutcome::Accepted {
                 state.arrived(&from, &first_words, true);
             }
@@ -143,7 +136,7 @@ impl Prompts {
         let from_them = state
             .waiting
             .iter()
-            .filter(|waiting| waiting.from == from && waiting.merge.is_none())
+            .filter(|waiting| waiting.from == from)
             .count();
         let outcome = if state.closed
             || state.waiting.len() >= MAX_WAITING
@@ -157,57 +150,12 @@ impl Prompts {
                 from,
                 text,
                 at: Instant::now(),
-                merge: None,
             });
             state.report_waiting();
             PromptOutcome::Queued
         };
         state.answer(id, outcome);
         outcome
-    }
-
-    /// Takes the agent's request to merge `request`, described by `text`, which waits for the
-    /// host user's keypress whoever is always accepted: at most one for each agent merged from
-    /// and four in all; a request for an agent one already waits for takes its place.
-    pub(crate) fn offer_merge(
-        &self,
-        from: ParticipantName,
-        id: [u8; PROMPT_ID_BYTES],
-        (text, request): (PromptText, MergeRequest),
-    ) -> PromptOutcome {
-        let Ok(mut state) = self.state.lock() else {
-            return PromptOutcome::Dropped;
-        };
-        let same = state.waiting.iter_mut().find_map(|waiting| {
-            waiting
-                .merge
-                .as_mut()
-                .filter(|waiting| waiting.from == request.from)
-        });
-        if let Some(waiting) = same {
-            *waiting = request;
-            return PromptOutcome::Queued;
-        }
-        let merges = state
-            .waiting
-            .iter()
-            .filter_map(|waiting| waiting.merge.as_ref());
-        if state.closed
-            || state.waiting.len() >= MAX_WAITING
-            || merges.count() >= MAX_WAITING_MERGES
-        {
-            return PromptOutcome::Dropped;
-        }
-        state.arrived(&from, text.as_str(), false);
-        state.waiting.push_back(Waiting {
-            id,
-            from,
-            text,
-            at: Instant::now(),
-            merge: Some(request),
-        });
-        state.report_waiting();
-        PromptOutcome::Queued
     }
 
     /// Returns `from` when they are a teammate of the host user, once the host user is known,
@@ -234,20 +182,14 @@ impl Prompts {
         let teammate = self.teammate(&waiting.from);
         let outcome = match decision {
             Decision::Reject => PromptOutcome::Rejected,
-            Decision::Accept | Decision::AlwaysAccept if waiting.merge.is_some() => {
-                state.accept(waiting.id, waiting.text, (waiting.merge, None))
-            }
-            Decision::Accept => state.accept(waiting.id, waiting.text, (None, teammate)),
+            Decision::Accept => state.accept(waiting.id, waiting.text, teammate),
             Decision::AlwaysAccept => {
-                let outcome = state.accept(waiting.id, waiting.text, (None, teammate.clone()));
+                let outcome = state.accept(waiting.id, waiting.text, teammate.clone());
                 let from = waiting.from;
-                while let Some(position) = state
-                    .waiting
-                    .iter()
-                    .position(|other| other.from == from && other.merge.is_none())
+                while let Some(position) = state.waiting.iter().position(|other| other.from == from)
                 {
                     if let Some(other) = state.waiting.remove(position) {
-                        let outcome = state.accept(other.id, other.text, (None, teammate.clone()));
+                        let outcome = state.accept(other.id, other.text, teammate.clone());
                         state.answer(other.id, outcome);
                     }
                 }
@@ -323,22 +265,17 @@ impl State {
         });
     }
 
-    /// Queues `text`, or `merge`, for the agent, naming `from`, the teammate who sent it.
+    /// Queues `text` for the agent, naming `from`, the teammate who sent it.
     fn accept(
         &mut self,
         id: [u8; PROMPT_ID_BYTES],
         text: PromptText,
-        (merge, from): (Option<MergeRequest>, Option<ParticipantName>),
+        from: Option<ParticipantName>,
     ) -> PromptOutcome {
         if self.accepted.len() >= MAX_ACCEPTED {
             return PromptOutcome::Dropped;
         }
-        self.accepted.push_back(Accepted {
-            id,
-            text,
-            merge,
-            from,
-        });
+        self.accepted.push_back(Accepted { id, text, from });
         PromptOutcome::Accepted
     }
 
@@ -391,12 +328,9 @@ mod tests {
             prompts.offer(name("bob"), [id; 16], text());
         }
         prompts.offer(name("carol"), [4; 16], text());
-        prompts.offer_merge(name("alice"), [5; 16], (text(), request()));
-        prompts.offer_merge(name("alice"), [6; 16], (text(), request()));
         prompts.decide([9; 16], Decision::Reject);
         prompts.decide([1; 16], Decision::AlwaysAccept);
         prompts.offer(name("bob"), [7; 16], text());
-        prompts.decide([5; 16], Decision::Accept);
         prompts.close();
         let mut read = [0_u8; 256];
         let length = rustix::io::read(&reader, &mut read).unwrap();
@@ -409,7 +343,7 @@ mod tests {
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert_eq!(counts, [1, 2, 3, 4, 5, 2, 1, 0]);
+        assert_eq!(counts, [1, 2, 3, 4, 1, 0]);
     }
 
     #[derive(Debug, Default)]
@@ -461,8 +395,7 @@ mod tests {
             prompts.offer(name("alice"), [5; 16], text()),
             PromptOutcome::Queued
         );
-        prompts.offer_merge(name("bob"), [6; 16], (text(), request()));
-        assert_eq!(waiting(&prompts), 3);
+        assert_eq!(waiting(&prompts), 2);
         prompts.close();
         assert_eq!(
             prompts.offer(name("bob"), [7; 16], text()),
@@ -481,8 +414,6 @@ mod tests {
         prompts.decide([2; 16], Decision::Accept);
         prompts.decide([3; 16], Decision::AlwaysAccept);
         prompts.offer(name("carol"), [9; 16], text());
-        prompts.offer_merge(name("alice"), [4; 16], (text(), request()));
-        prompts.decide([4; 16], Decision::Accept);
         let senders: Vec<Option<String>> = std::iter::from_fn(|| prompts.next_accepted())
             .map(|accepted| accepted.from.map(|from| from.to_string()))
             .collect();
@@ -494,7 +425,6 @@ mod tests {
                 Some("carol".to_owned()),
                 Some("carol".to_owned()),
                 Some("carol".to_owned()),
-                None
             ]
         );
         let unknown = Prompts::default();
@@ -696,84 +626,5 @@ mod tests {
         many.take_arrivals(&mut arrivals);
         assert_eq!(arrivals.len(), MAX_ARRIVALS);
         assert_eq!(arrivals[0].from.as_str(), "p4");
-    }
-
-    fn request() -> MergeRequest {
-        MergeRequest {
-            from: "bob.codex".parse().unwrap(),
-            commit: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
-            thread_base: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
-        }
-    }
-
-    #[test]
-    fn a_merge_request_always_waits_for_the_user_and_is_accepted_with_its_merge() {
-        let prompts = Prompts::default();
-        let alice = name("alice");
-        prompts.offer(alice.clone(), [1; 16], text());
-        assert!(prompts.decide([1; 16], Decision::AlwaysAccept));
-        assert!(prompts.next_accepted().unwrap().merge.is_none());
-        assert_eq!(
-            prompts.offer_merge(alice.clone(), [2; 16], (text(), request())),
-            PromptOutcome::Queued
-        );
-        let aider = MergeRequest {
-            from: "bob.aider".parse().unwrap(),
-            ..request()
-        };
-        assert_eq!(
-            prompts.offer_merge(alice.clone(), [3; 16], (text(), aider)),
-            PromptOutcome::Queued
-        );
-        assert_eq!(waiting(&prompts), 2);
-        assert!(prompts.next_accepted().is_none());
-        assert!(prompts.decide([2; 16], Decision::AlwaysAccept));
-        assert_eq!(waiting(&prompts), 1);
-        let accepted = prompts.next_accepted().unwrap();
-        assert_eq!(accepted.merge, Some(request()));
-        assert!(prompts.decide([3; 16], Decision::Reject));
-        assert!(prompts.next_accepted().is_none());
-
-        let carol = name("carol");
-        prompts.offer_merge(carol.clone(), [5; 16], (text(), request()));
-        assert!(prompts.decide([5; 16], Decision::AlwaysAccept));
-        prompts.next_accepted();
-        assert_eq!(
-            prompts.offer(carol.clone(), [6; 16], text()),
-            PromptOutcome::Queued
-        );
-
-        let other = |agent: &str| MergeRequest {
-            from: format!("bob.{agent}").parse().unwrap(),
-            ..request()
-        };
-        let fresh = Prompts::default();
-        for (id, agent) in [(1_u8, "a"), (2, "b"), (3, "c"), (4, "d")] {
-            assert_eq!(
-                fresh.offer_merge(carol.clone(), [id; 16], (text(), other(agent))),
-                PromptOutcome::Queued
-            );
-        }
-        let newer = MergeRequest {
-            commit: mahi_store::ObjectId::null(gix::hash::Kind::Sha1),
-            ..other("a")
-        };
-        assert_eq!(
-            fresh.offer_merge(carol.clone(), [9; 16], (text(), newer.clone())),
-            PromptOutcome::Queued
-        );
-        assert_eq!(waiting(&fresh), 4);
-        assert_eq!(
-            fresh.offer_merge(carol.clone(), [8; 16], (text(), other("e"))),
-            PromptOutcome::Dropped
-        );
-        assert!(fresh.decide([1; 16], Decision::Accept));
-        assert_eq!(fresh.next_accepted().unwrap().merge, Some(newer));
-        assert_eq!(fresh.offer(carol, [7; 16], text()), PromptOutcome::Queued);
-        prompts.close();
-        assert_eq!(
-            prompts.offer_merge(alice, [4; 16], (text(), request())),
-            PromptOutcome::Dropped
-        );
     }
 }

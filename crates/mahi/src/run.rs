@@ -207,7 +207,6 @@ use crate::{
     merge::{
         AgentSettings,
         MergeDone,
-        MergeRequest,
     },
     merge_door::{
         self,
@@ -1556,12 +1555,11 @@ impl Prepared {
             session,
             key.clone(),
         );
-        let can_merge = raw.is_some() && terminal::is_interactive() && recorder.is_some();
         let auto_merge = auto_merge(self.profile, self.owner.as_ref(), (&self.git_dir, &started));
         let note_by = self.profile.map_or(NoteBy::ListAgents, Profile::note_by);
         let (tools, prompts) = serve_tools(
             self.mcp,
-            (self.owner, key, live.as_ref(), can_merge),
+            (self.owner, key, live.as_ref()),
             (&self.git_dir, config.clone()),
             (&started, note_by),
         );
@@ -1634,16 +1632,14 @@ fn split_at_separator(arguments: &[OsString]) -> (&[OsString], &[OsString]) {
 }
 
 /// Serves the tools of `started`'s agent, in the thread whose `meta` is `owner`'s and whose
-/// records `key` opens, to its `mahi mcp` at `listener` on a thread of its own; the agent may
-/// ask for merges when `can_merge`, as the user has a palette and the run takes snapshots.
-/// Returns the flag that stops it, and the palette's queue: `live`'s, or else this run's own.
+/// records `key` opens, to its `mahi mcp` at `listener` on a thread of its own. Returns the
+/// flag that stops it, and the palette's queue: `live`'s, or else this run's own.
 fn serve_tools(
     listener: UnixListener,
-    (owner, key, live, can_merge): (
+    (owner, key, live): (
         Option<ParticipantKey>,
         Option<Arc<ThreadKey>>,
         Option<&Link>,
-        bool,
     ),
     (git_dir, config): (&Path, ConfigDir),
     (started, note_by): (&Started, NoteBy),
@@ -1658,11 +1654,7 @@ fn serve_tools(
     let tools = ThreadTools::new(
         (git_dir.to_path_buf(), config),
         (started.thread, owner, key),
-        (
-            started.slot.clone(),
-            can_merge.then(|| Arc::clone(&prompts)),
-            claims,
-        ),
+        (started.slot.clone(), claims),
     )
     .with_note_by(note_by);
     let flag = Arc::clone(&serving);
@@ -1782,56 +1774,21 @@ fn spawn_auto_merge<A: AgentInput + Send + Sync + 'static, W: Write + Send + 'st
 }
 
 /// Gives the agent the prompts the user accepts, on a thread of its own while `running` is
-/// set, merging with `merger` the merges the agent asked for once they are accepted.
+/// set.
 fn spawn_giver<A: AgentInput + Send + Sync + 'static, W: Write + Send + 'static>(
     prompts: Arc<Prompts>,
     (activity, agent, writer): (Arc<Activity>, Arc<A>, Arc<Mutex<W>>),
     running: Arc<AtomicBool>,
-    merger: Option<Merger>,
 ) {
     thread::spawn(move || {
-        let merge = |request: MergeRequest| merged_for_agent(merger.as_ref(), request);
         inject::give_accepted(
             &prompts,
             &activity,
-            (&*agent, &merge),
+            &*agent,
             &writer,
             (&running, Pace::default()),
         );
     });
-}
-
-/// Merges `request`, which the user accepted for the agent, and returns what to tell the agent
-/// of it, at most as long as a prompt may be.
-fn merged_for_agent(merger: Option<&Merger>, request: MergeRequest) -> String {
-    let from = request.from.clone();
-    let Some(merger) = merger else {
-        return format!("mahi could not merge the work of {from}: this run takes no snapshots");
-    };
-    let mut told = match merger.merge(request, AgentSettings::Take) {
-        Ok(MergeDone::Merged {
-            report,
-            prompt: Some(prompt),
-            ..
-        }) => format!("The user accepted merging the work of {from}. {report}{prompt}"),
-        Ok(done) => format!(
-            "The user accepted merging the work of {from}. {}",
-            done.report()
-        ),
-        Err(error) => format!(
-            "mahi could not merge the work of {from}: {}",
-            crate::describe(&error)
-        ),
-    };
-    if told.len() > mahi_live::MAX_PROMPT_BYTES {
-        let mut end = mahi_live::MAX_PROMPT_BYTES - 3;
-        while !told.is_char_boundary(end) {
-            end -= 1;
-        }
-        told.truncate(end);
-        told.push_str("...");
-    }
-    told
 }
 
 /// Serves merges at `merging`'s door on a thread of its own, if there is one.
@@ -2781,7 +2738,7 @@ fn relay(
         ),
         prompts.clone().filter(|_| palette.is_some()),
     );
-    if let Some((auto_merge, merger)) = auto_merge.zip(merger.clone()) {
+    if let Some((auto_merge, merger)) = auto_merge.zip(merger) {
         spawn_auto_merge(auto_merge, merger, (activity, &screen, &writer), &running);
     }
     if let Some(prompts) = prompts.filter(|_| palette.is_some()) {
@@ -2789,7 +2746,6 @@ fn relay(
             prompts,
             (Arc::clone(activity), Arc::clone(&screen), writer),
             Arc::clone(&running),
-            merger,
         );
     }
     let following = follow_resizes(repainter, Arc::clone(&screen), tap.clone(), quitting);

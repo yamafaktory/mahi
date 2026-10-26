@@ -2930,12 +2930,7 @@ printf '%s\n' \
             listed.contains("- tester (owner): tester.tooler (you)"),
             "{listed}"
         );
-        assert_eq!(replies[2]["result"]["isError"], true);
-        let refused = replies[2]["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            refused.contains("cannot accept merges in this run"),
-            "{refused}"
-        );
+        assert_eq!(replies[2]["error"]["code"], -32602, "merge_from is gone");
         let text = |index: usize| {
             replies[index]["result"]["content"][0]["text"]
                 .as_str()
@@ -3060,43 +3055,6 @@ printf '%s\n' \
         .unwrap();
         let (code, text) = aider.finish();
         assert_eq!(code, 0, "{text}");
-    }
-
-    const ASKER: &str = r#"#!/bin/sh
-printf '%s\n' \
-  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
-  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"merge_from","arguments":{"agent":"tester.claude"}}}' \
-  | "$MAHI_BIN" mcp | grep -o 'Asked the user'
-printf 'asked\n'
-read line
-echo "told:$line"
-cat parser.rs
-"#;
-
-    #[test]
-    fn an_agent_asks_for_a_merge_the_user_accepts_it_and_the_agent_is_told_what_changed() {
-        let fixture = fixture();
-        let (thread, _claude) = worked_thread(&fixture);
-        let asker = script(&fixture, "asking", "codex", ASKER);
-        let mut session = Session::start(
-            &fixture,
-            &["agent", "add", &thread, "--", asker.to_str().unwrap()],
-        );
-        session.wait_for("Passphrase");
-        session.type_keys(format!("{PASSPHRASE}\n").as_bytes());
-        session.wait_for("Asked the user");
-        session.wait_for("asked");
-        session.type_keys(b"\0");
-        session.wait_for_screen("merge the latest work of tester.claude");
-        session.type_keys(b"\r");
-        session.wait_for("told:The user accepted merging the work of tester.claude.");
-        let (code, text) = session.finish();
-        assert_eq!(code, 0, "{text}");
-        assert!(
-            text.contains("merged tester.claude into tester.codex: 1 written"),
-            "{text}"
-        );
-        assert!(text.contains("fn parse() {}"), "{text}");
     }
 
     #[test]
