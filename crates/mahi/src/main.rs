@@ -29,6 +29,7 @@ mod merge;
 mod merge_door;
 mod merged;
 mod network;
+mod note;
 mod pair;
 mod palette;
 mod pane;

@@ -298,8 +298,8 @@ fn push_quote(out: &mut String, text: &str, max_chars: usize, max_lines: usize) 
 }
 
 /// Writes `text` on one line, at most `max_chars` characters, as a code span fenced longer than
-/// any run of backquotes in it.
-pub(crate) fn push_code(out: &mut String, text: &str, max_chars: usize) {
+/// any run of backquotes in it, without control or invisible characters.
+pub fn push_code(out: &mut String, text: &str, max_chars: usize) {
     let mut longest = 0;
     let mut run = 0;
     for character in shown_chars(text).take(max_chars) {

@@ -1277,6 +1277,34 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_sync_makes_leaves_a_note_and_one_the_user_asks_for_does_not() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let file = crate::note::file(
+            &merging.store,
+            merging.started.thread,
+            &merging.started.slot,
+        );
+        merger
+            .merge(merging.bobs(&[("asked.txt", "a\n")]), AgentSettings::Take)
+            .unwrap();
+        assert_eq!(crate::note::take(&file).unwrap(), None);
+        let request = merging.readme_conflict();
+        merger.merge(request, AgentSettings::Hold).unwrap();
+        let text = crate::note::take(&file).unwrap().unwrap();
+        assert!(
+            text.contains("Resolve these conflicts before anything else."),
+            "{text}"
+        );
+        assert!(
+            text.contains("Resolve the conflict markers in (from bob.codex): ` README `"),
+            "{text}"
+        );
+        assert!(!text.contains("merged bob.codex: ` README `"), "{text}");
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
     fn a_held_merge_that_adds_agent_settings_writes_nothing_and_a_taken_one_writes_them() {
         let merging = merging();
         let merger = merging.recorder.merger();

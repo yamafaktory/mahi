@@ -40,6 +40,7 @@ pub use handoff::{
     BRIEFED_REPLIES,
     Briefing,
     MAX_BRIEFING_BYTES,
+    push_code,
 };
 pub use key::{
     KeyError,

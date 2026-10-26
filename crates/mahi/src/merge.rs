@@ -66,6 +66,7 @@ use crate::{
         DoorError,
     },
     merged::MergedFrom,
+    note,
     run::{
         self,
         RunError,
@@ -428,6 +429,9 @@ pub(crate) fn merge_now(
     if applied.left.is_empty() {
         held::release_merged(store, into.snapshots.thread(), into.slot, &merged_from);
     }
+    if start == Start::PastSkipped {
+        note_merge(store, into, (&request.from, &merged), (ours, tree));
+    }
     Ok(MergeDone::Merged {
         report: report(&request.from, into.slot, &merged, &applied),
         commit,
@@ -467,6 +471,47 @@ fn write_merge(
         into.commits.signer(),
     )?;
     Ok((applied, tree, commit))
+}
+
+/// Adds to `into`'s note what the merge from `from` left in its worktree, whose tree went from
+/// `ours` to `tree`: the paths with markers, those where the agent's side was kept, and the
+/// files it changed. The merge stands whether or not the note could be kept.
+fn note_merge(
+    store: &Store,
+    into: Recording<'_>,
+    (from, merged): (&AgentSlot, &Merged),
+    (ours, tree): (ObjectId, ObjectId),
+) {
+    let of_kind = |kind: Conflict| -> Vec<String> {
+        merged
+            .conflicts
+            .iter()
+            .filter(|(_, conflict)| *conflict == kind)
+            .map(|(path, _)| path.to_string())
+            .collect()
+    };
+    let conflicting: HashSet<String> = merged
+        .conflicts
+        .iter()
+        .map(|(path, _)| path.to_string())
+        .collect();
+    let brought: Vec<String> = store
+        .changed_paths(ours, tree, MAX_MERGED_PATHS)
+        .map(|changes| {
+            let changed = changes.paths.into_iter().map(|(path, _)| path);
+            changed.filter(|path| !conflicting.contains(path)).collect()
+        })
+        .unwrap_or_default();
+    let file = note::file(store, into.snapshots.thread(), into.slot);
+    let _ = note::record(
+        &file,
+        from,
+        note::Merged {
+            markers: &of_kind(Conflict::Markers),
+            kept: &of_kind(Conflict::KeptOurs),
+            brought: &brought,
+        },
+    );
 }
 
 /// Says whether the snapshot `skipped`, which the user skipped, is the base for merging
