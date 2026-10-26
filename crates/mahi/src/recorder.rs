@@ -1049,6 +1049,45 @@ mod tests {
     }
 
     #[test]
+    fn a_held_merge_waits_for_a_teammates_settings_change_even_when_ours_is_kept() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        let first = merging.bobs(&[(".claude/logo.bin", "\0first\0")]);
+        let first_commit = first.commit;
+        merger.merge(first, AgentSettings::Take).unwrap();
+        fs::write(worktree.join(".claude/logo.bin"), b"\0ours\0").unwrap();
+        let theirs = merging.bobs(&[(".claude/logo.bin", "\0theirs\0")]);
+        assert!(matches!(
+            merger.merge(theirs, AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(_))
+        ));
+        let recorded = MergedFrom::read(&merging.store, &merging.started.snapshots).unwrap();
+        assert_eq!(recorded.of(&merging.bob), Some(first_commit));
+        assert_eq!(
+            fs::read(worktree.join(".claude/logo.bin")).unwrap(),
+            b"\0ours\0"
+        );
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn a_held_merge_waits_for_a_teammate_who_moves_a_settings_file_away() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        let first = merging.bobs(&[(".claude/settings.json", SETTINGS_V1)]);
+        merger.merge(first, AgentSettings::Take).unwrap();
+        let moved = merging.bobs(&[("docs/settings.json", SETTINGS_V1)]);
+        assert!(matches!(
+            merger.merge(moved, AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(_))
+        ));
+        assert!(worktree.join(".claude/settings.json").exists());
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
     fn a_held_merge_that_adds_agent_settings_writes_nothing_and_a_taken_one_writes_them() {
         let merging = merging();
         let merger = merging.recorder.merger();
