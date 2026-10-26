@@ -80,7 +80,15 @@ const SNAPSHOT_ATTEMPTS: usize = 3;
 const LISTED: usize = 20;
 const LISTED_IN_PROMPT: usize = 10;
 const LONGEST_LISTED: usize = 200;
-const AGENT_SETTINGS: [&str; 5] = ["CLAUDE.md", "AGENTS.md", ".claude", ".mcp.json", ".codex"];
+const AGENT_SETTINGS: [&str; 7] = [
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "AGENTS.md",
+    "AGENTS.override.md",
+    ".claude",
+    ".mcp.json",
+    ".codex",
+];
 
 #[derive(Debug, Error)]
 pub(crate) enum MergeError {
@@ -641,6 +649,10 @@ mod tests {
             "a/b/.MCP.JSON",
             ".codex/config.toml",
             "AGENTS.md/inner",
+            "AGENTS.override.md",
+            "src/agents.OVERRIDE.md",
+            "CLAUDE.local.md",
+            "docs/claude.local.md",
         ];
         for path in settings {
             assert!(is_agent_settings(path), "{path}");
@@ -650,6 +662,8 @@ mod tests {
             "my.claude",
             "src/claude.rs",
             "docs/AGENTS.txt",
+            "AGENTS.override.md.bak",
+            "CLAUDE.local",
             "mcp.json",
             ".codexrc",
             "",
