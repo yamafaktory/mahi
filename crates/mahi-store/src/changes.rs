@@ -11,6 +11,7 @@ use std::{
 
 use gix::{
     ObjectId,
+    bstr::ByteSlice,
     object::Kind,
     objs::tree::EntryMode,
 };
@@ -69,6 +70,7 @@ struct Walk<'a> {
 }
 
 type Entries = BTreeMap<Vec<u8>, (EntryMode, ObjectId)>;
+type Marks<'marks> = &'marks dyn Fn(&[u8]) -> bool;
 
 #[derive(Debug, Clone, Copy)]
 struct Counted {
@@ -155,7 +157,81 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Says whether a file of the tree `new` that the tree `old` does not hold as it is, at
+    /// that path with those contents and that mode, holds a line `marks` picks, a line's ending
+    /// `\r\n` read as `\n`; links and gitlinks hold none. Whatever cannot be read within the
+    /// limits a checkout has is said to hold one: a file over [`MAX_SNAPSHOT_FILE_BYTES`], a
+    /// directory deeper than [`MAX_SNAPSHOT_DEPTH`], more than 262,144 trees or 256 MiB of
+    /// them, or 64 GiB of files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::TooLarge`] if a tree is larger than 1 MiB,
+    /// [`StoreError::DuplicateEntryName`] if a tree names an entry twice,
+    /// [`StoreError::WrongObject`] if an entry's object is not of its mode's kind, or
+    /// [`StoreError::Git`] if reading fails.
+    pub fn changed_files_hold(
+        &self,
+        old: ObjectId,
+        new: ObjectId,
+        marks: &dyn Fn(&[u8]) -> bool,
+    ) -> Result<bool, StoreError> {
+        let mut walk = Walk {
+            store: self,
+            limit: 0,
+            trees: 0,
+            bytes: 0,
+            most_trees: MAX_CHECKED_OUT_TREES,
+            most_bytes: MAX_CHECKED_OUT_TREE_BYTES,
+            changes: Changes::default(),
+        };
+        let mut read = 0;
+        walk.holds(Some(old), new, 0, (marks, &mut read))
+    }
+}
+
 impl Walk<'_> {
+    fn holds(
+        &mut self,
+        old: Option<ObjectId>,
+        new: ObjectId,
+        depth: usize,
+        (marks, read): (Marks<'_>, &mut u64),
+    ) -> Result<bool, StoreError> {
+        if depth > MAX_SNAPSHOT_DEPTH {
+            return Ok(true);
+        }
+        let (Some(before), Some(after)) = (self.entries(old)?, self.entries(Some(new))?) else {
+            return Ok(true);
+        };
+        for (name, entry) in &after {
+            let (mode, id) = *entry;
+            let was = before.get(name).copied();
+            if was == Some(*entry) {
+                continue;
+            }
+            let held = if mode.is_tree() {
+                let was_tree = was.filter(|(mode, _)| mode.is_tree()).map(|(_, id)| id);
+                self.holds(was_tree, id, depth + 1, (marks, &mut *read))?
+            } else if mode.is_blob() {
+                match self.store.read_blob(id, MAX_SNAPSHOT_FILE_BYTES) {
+                    Ok(bytes) => {
+                        *read = read.saturating_add(bytes.len() as u64);
+                        *read > MAX_CHECKED_OUT_BYTES || bytes.lines().any(marks)
+                    }
+                    Err(StoreError::TooLarge { .. }) => true,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                false
+            };
+            if held {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     fn entries(&mut self, tree: Option<ObjectId>) -> Result<Option<Entries>, StoreError> {
         let Some(tree) = tree else {
             return Ok(Some(Entries::new()));
@@ -327,6 +403,39 @@ mod tests {
         gix::init(dir.path()).unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn only_a_file_new_where_it_is_can_hold_a_marked_line() {
+        let (_dir, store) = store();
+        let blob = |text: &str| store.write_blob(text.as_bytes()).unwrap();
+        let marked = blob("a\r\nMARK\r\nb\n");
+        let plain = blob("plain\nMARKED\n");
+        let marks: &dyn Fn(&[u8]) -> bool = &|line| line == b"MARK";
+        let tree = |entries: &[(&str, EntryKind, ObjectId)]| store.write_tree(entries).unwrap();
+        let old = tree(&[
+            ("kept.txt", EntryKind::Blob, marked),
+            ("plain.txt", EntryKind::Blob, plain),
+        ]);
+        assert!(!store.changed_files_hold(old, old, marks).unwrap());
+        let edited = tree(&[
+            ("kept.txt", EntryKind::Blob, marked),
+            ("plain.txt", EntryKind::Blob, blob("still plain\n")),
+        ]);
+        assert!(!store.changed_files_hold(old, edited, marks).unwrap());
+        let moved = tree(&[("moved.txt", EntryKind::Blob, marked)]);
+        assert!(store.changed_files_hold(old, moved, marks).unwrap());
+        let deep = tree(&[("inner.txt", EntryKind::Blob, marked)]);
+        let deeper = tree(&[("dir", EntryKind::Tree, deep)]);
+        let nested = tree(&[
+            ("kept.txt", EntryKind::Blob, marked),
+            ("src", EntryKind::Tree, deeper),
+        ]);
+        assert!(store.changed_files_hold(old, nested, marks).unwrap());
+        let executable = tree(&[("run.sh", EntryKind::BlobExecutable, marked)]);
+        assert!(store.changed_files_hold(old, executable, marks).unwrap());
+        let link = tree(&[("link", EntryKind::Link, marked)]);
+        assert!(!store.changed_files_hold(old, link, marks).unwrap());
     }
 
     #[test]

@@ -2716,11 +2716,11 @@ printf 'fn parse() { codex }\n' > parser.rs
         );
         let parser = fs::read_to_string(claude_tree.join("parser.rs")).unwrap();
         assert!(
-            parser.contains("<<<<<<< tester.claude\nfn parse() { claude }\n"),
+            parser.contains("<<<<<<< mahi tester.claude\nfn parse() { claude }\n"),
             "{parser}"
         );
         assert!(
-            parser.contains("fn parse() { codex }\n>>>>>>> tester.codex\n"),
+            parser.contains("fn parse() { codex }\n>>>>>>> mahi tester.codex\n"),
             "{parser}"
         );
 

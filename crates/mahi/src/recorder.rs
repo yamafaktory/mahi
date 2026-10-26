@@ -1,5 +1,8 @@
 use std::{
-    path::PathBuf,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::{
         Arc,
         atomic::{
@@ -37,6 +40,7 @@ use mahi_store::{
 use thiserror::Error;
 
 use crate::{
+    conflicts,
     merge::{
         self,
         AgentSettings,
@@ -144,13 +148,15 @@ pub(crate) enum RecordError {
 }
 
 /// Which snapshot to take: a plain one, committed only when the worktree changed, or the one
-/// that ends a turn, committed unless the last commit already ends a turn with the same tree.
+/// that ends a turn, committed unless the last commit already ends a turn with the same tree,
+/// or its tree leaves a conflict kept in `kept` unresolved.
 #[derive(Debug, Clone, Copy)]
 enum SnapshotKind<'msg> {
     Plain,
     TurnEnd {
         message: &'msg str,
         last_ended: Option<ObjectId>,
+        kept: &'msg Path,
     },
 }
 
@@ -232,19 +238,23 @@ fn record(
     let mut skipped = 0;
     let turn_end = turn_end::message(&target.slot);
     let mut last_ended = None;
-    let mut conflicted = false;
+    let kept = conflicts::file(&store, target.snapshots.thread(), &target.slot);
     loop {
         let trigger = signals.scheduler.wait();
         let closing = trigger == Trigger::Closed;
         let mut changed = false;
-        if signals.turn_ended.swap(false, Ordering::SeqCst) && !conflicted {
+        if signals.turn_ended.swap(false, Ordering::SeqCst) {
             let kind = SnapshotKind::TurnEnd {
                 message: &turn_end,
                 last_ended,
+                kept: &kept,
             };
+            let before = last.commit;
             let outcome = snapshot(&store, target, &mut last, kind, FINAL_ATTEMPTS, abandon);
             if let Ok((_, left_out)) = &outcome {
                 skipped = *left_out;
+            }
+            if last.commit != before {
                 last_ended = Some(last.commit);
             }
             let (ended_changed, error) = settle(outcome.map(|(changed, _)| changed), closing);
@@ -254,20 +264,12 @@ fn record(
             }
         }
         while let Ok(job) = signals.merges.try_recv() {
-            let done = if conflicted {
-                Err(MergeError::MarkersUnresolved(target.slot.clone()))
-            } else {
-                merge_between(
-                    &store,
-                    target,
-                    &mut last,
-                    (&job.request, job.settings),
-                    abandon,
-                )
-            };
-            conflicted |= matches!(
-                &done,
-                Ok(MergeDone::Merged { markers: true, .. }) | Err(MergeError::MarkersWritten(_))
+            let done = merge_between(
+                &store,
+                target,
+                &mut last,
+                (&job.request, job.settings),
+                abandon,
             );
             let _ = job.done.send(done);
         }
@@ -351,6 +353,11 @@ fn snapshot(
     let message = match kind {
         SnapshotKind::Plain if !changed => return Ok((false, skipped)),
         SnapshotKind::TurnEnd { last_ended, .. } if !changed && last_ended == Some(last.commit) => {
+            return Ok((false, skipped));
+        }
+        SnapshotKind::TurnEnd { kept, .. }
+            if !conflicts::resolved(store, &target.slot, kept, taken.tree).unwrap_or(false) =>
+        {
             return Ok((false, skipped));
         }
         SnapshotKind::Plain => SNAPSHOT_MESSAGE,
@@ -808,6 +815,7 @@ mod tests {
         _dir: tempfile::TempDir,
         store: Store,
         started: crate::session::Started,
+        signer: PrivateKey,
         recorder: Recorder,
         bob: mahi_core::AgentSlot,
     }
@@ -816,34 +824,94 @@ mod tests {
         let (dir, store) = repository_on_main();
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let mut started = start_with(&store, &signer).unwrap();
-        let recorder = Recorder::start(
+        let first = started.first_snapshot.take().unwrap();
+        let recorder = recording(&store, &started, &signer, first);
+        Merging {
+            _dir: dir,
+            store,
+            started,
+            signer,
+            recorder,
+            bob: "bob.codex".parse().unwrap(),
+        }
+    }
+
+    fn turn_ends_after(store: &Store, snapshots: &ThreadRef, commit: ObjectId) -> usize {
+        let mut at = store.head(snapshots).unwrap();
+        let mut ends = 0;
+        while let Some(walked) = at.filter(|walked| *walked != commit) {
+            let message = store.commit_message(walked).unwrap().to_string();
+            ends += usize::from(message.contains("Mahi-Turn-End"));
+            at = store.parent(walked).unwrap();
+        }
+        ends
+    }
+
+    fn recording(
+        store: &Store,
+        started: &crate::session::Started,
+        signer: &PrivateKey,
+        first: Recorded,
+    ) -> Recorder {
+        Recorder::start(
             Target {
                 git_dir: store.common_dir().to_path_buf(),
                 slot: started.slot.clone(),
                 worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
                 snapshots: started.snapshots.clone(),
                 globals: GlobalPatterns::default(),
-                commits: CommitKey::new(signer).unwrap(),
+                commits: CommitKey::new(signer.clone()).unwrap(),
             },
-            started.first_snapshot.take().unwrap(),
+            first,
             fast(),
-        );
-        Merging {
-            _dir: dir,
-            store,
-            started,
-            recorder,
-            bob: "bob.codex".parse().unwrap(),
-        }
+        )
     }
 
     impl Merging {
+        fn restarted(self) -> Self {
+            self.recorder.finish().unwrap();
+            let commit = self.store.head(&self.started.snapshots).unwrap().unwrap();
+            let first = Recorded {
+                commit,
+                tree: self.store.commit_tree(commit).unwrap(),
+                cache: mahi_store::SnapshotCache::default(),
+            };
+            let recorder = recording(&self.store, &self.started, &self.signer, first);
+            Self { recorder, ..self }
+        }
+
+        fn readme_conflict(&self) -> MergeRequest {
+            fs::write(self.started.worktree.join("README"), "alice\n").unwrap();
+            let mut request = self.bobs(&[]);
+            let readme = self.store.write_blob(b"bob\n").unwrap();
+            let tree = self
+                .store
+                .write_tree(&[("README", mahi_store::EntryKind::Blob, readme)])
+                .unwrap();
+            let snapshots = ThreadRef::new(
+                self.started.thread,
+                mahi_core::RefKind::Snapshots(self.bob.clone()),
+            );
+            request.commit = self
+                .store
+                .append(&snapshots, Some(request.commit), tree, SNAPSHOT_MESSAGE)
+                .unwrap();
+            request
+        }
+
+        fn kept(&self) -> PathBuf {
+            crate::conflicts::file(&self.store, self.started.thread, &self.started.slot)
+        }
+
         fn bobs(&self, files: &[(&str, &str)]) -> MergeRequest {
-            let mut root = vec![(
-                "README".to_owned(),
-                mahi_store::EntryKind::Blob,
-                self.store.write_blob(b"hello\n").unwrap(),
-            )];
+            let mut root = Vec::new();
+            if files.iter().all(|(path, _)| *path != "README") {
+                root.push((
+                    "README".to_owned(),
+                    mahi_store::EntryKind::Blob,
+                    self.store.write_blob(b"hello\n").unwrap(),
+                ));
+            }
             for (path, contents) in files {
                 let blob = self.store.write_blob(contents.as_bytes()).unwrap();
                 let entry = match path.split_once('/') {
@@ -936,21 +1004,7 @@ mod tests {
     fn no_turn_end_is_recorded_after_a_merge_that_left_conflicts() {
         let merging = merging();
         let merger = merging.recorder.merger();
-        fs::write(merging.started.worktree.join("README"), "alice\n").unwrap();
-        let mut request = merging.bobs(&[]);
-        let readme = merging.store.write_blob(b"bob\n").unwrap();
-        let tree = merging
-            .store
-            .write_tree(&[("README", mahi_store::EntryKind::Blob, readme)])
-            .unwrap();
-        let snapshots = ThreadRef::new(
-            merging.started.thread,
-            mahi_core::RefKind::Snapshots(merging.bob.clone()),
-        );
-        request.commit = merging
-            .store
-            .append(&snapshots, Some(request.commit), tree, SNAPSHOT_MESSAGE)
-            .unwrap();
+        let request = merging.readme_conflict();
         let MergeDone::Merged {
             commit: merge_commit,
             prompt: Some(_),
@@ -970,12 +1024,122 @@ mod tests {
         fs::write(merging.started.worktree.join("later"), "after").unwrap();
         events.turn_ended();
         merging.recorder.finish().unwrap();
-        let mut at = merging.store.head(&merging.started.snapshots).unwrap();
-        while let Some(commit) = at.filter(|commit| *commit != merge_commit) {
-            let message = merging.store.commit_message(commit).unwrap().to_string();
-            assert!(!message.contains("Mahi-Turn-End"), "{message}");
-            at = merging.store.parent(commit).unwrap();
-        }
+        assert_eq!(
+            turn_ends_after(&merging.store, &merging.started.snapshots, merge_commit),
+            0
+        );
+    }
+
+    #[test]
+    fn the_tree_kept_with_the_conflicts_is_one_the_agents_snapshots_keep() {
+        let merging = merging();
+        let request = merging.readme_conflict();
+        let MergeDone::Merged {
+            commit: merge_commit,
+            ..
+        } = merging
+            .recorder
+            .merger()
+            .merge(request, AgentSettings::Take)
+            .unwrap()
+        else {
+            panic!("the merge left no conflict");
+        };
+        let kept = crate::conflicts::KeptConflicts::load(&merging.kept())
+            .unwrap()
+            .unwrap();
+        let before = merging.store.parent(merge_commit).unwrap().unwrap();
+        assert_eq!(kept.before(), merging.store.commit_tree(before).unwrap());
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn the_conflicts_of_a_merge_outlive_a_restart_until_the_agent_resolves_them() {
+        let merging = merging();
+        let request = merging.readme_conflict();
+        let MergeDone::Merged {
+            commit: merge_commit,
+            ..
+        } = merging
+            .recorder
+            .merger()
+            .merge(request, AgentSettings::Take)
+            .unwrap()
+        else {
+            panic!("the merge left no conflict");
+        };
+        let readme = merging.started.worktree.join("README");
+        assert!(
+            fs::read_to_string(&readme)
+                .unwrap()
+                .starts_with("<<<<<<< mahi "),
+            "{}",
+            fs::read_to_string(&readme).unwrap()
+        );
+        let merging = merging.restarted();
+        let merger = merging.recorder.merger();
+        merging.recorder.events().turn_ended();
+        assert!(matches!(
+            merger.merge(
+                merging.bobs(&[("notes.txt", "more\n")]),
+                AgentSettings::Take
+            ),
+            Err(MergeError::MarkersUnresolved(_))
+        ));
+        assert!(merging.kept().exists());
+        fs::write(&readme, "alice and bob\n").unwrap();
+        merging.recorder.events().turn_ended();
+        let later = merging.bobs(&[("README", "bob\n"), ("notes.txt", "more\n")]);
+        assert!(matches!(
+            merger.merge(later, AgentSettings::Take).unwrap(),
+            MergeDone::Merged { prompt: None, .. }
+        ));
+        assert_eq!(fs::read_to_string(&readme).unwrap(), "alice and bob\n");
+        assert!(!merging.kept().exists());
+        merging.recorder.finish().unwrap();
+        assert_eq!(
+            turn_ends_after(&merging.store, &merging.started.snapshots, merge_commit),
+            1
+        );
+    }
+
+    fn assert_markers_hold_turn_ends(merging: &Merging, request: MergeRequest, marked: &str) {
+        let merger = merging.recorder.merger();
+        let MergeDone::Merged {
+            commit: merge_commit,
+            ..
+        } = merger.merge(request, AgentSettings::Take).unwrap()
+        else {
+            panic!("the merge did nothing");
+        };
+        let text = fs::read_to_string(merging.started.worktree.join(marked)).unwrap();
+        assert!(text.contains(" mahi "), "{text}");
+        merging.recorder.events().turn_ended();
+        assert!(matches!(
+            merger.merge(merging.bobs(&[("late.txt", "late\n")]), AgentSettings::Take),
+            Err(MergeError::MarkersUnresolved(_))
+        ));
+        assert!(merging.kept().exists());
+        assert_eq!(
+            turn_ends_after(&merging.store, &merging.started.snapshots, merge_commit),
+            0
+        );
+    }
+
+    #[test]
+    fn longer_markers_from_the_worktrees_attributes_hold_turn_ends() {
+        let merging = merging();
+        let worktree = merging.started.worktree.clone();
+        fs::write(
+            worktree.join(".gitattributes"),
+            "* conflict-marker-size=12\n",
+        )
+        .unwrap();
+        let request = merging.readme_conflict();
+        assert_markers_hold_turn_ends(&merging, request, "README");
+        let text = fs::read_to_string(worktree.join("README")).unwrap();
+        assert!(text.starts_with("<<<<<<<<<<<< mahi "), "{text}");
+        merging.recorder.finish().unwrap();
     }
 
     #[test]
@@ -986,7 +1150,6 @@ mod tests {
         let MergeDone::Merged {
             commit: merge_commit,
             prompt: Some(_),
-            markers: false,
             ..
         } = merger
             .merge(
@@ -997,39 +1160,22 @@ mod tests {
         else {
             panic!("the merge did not keep ours without markers");
         };
+        assert!(!merging.kept().exists());
         let later = merging.bobs(&[("logo.bin", "\0theirs\0"), ("notes.txt", "more\n")]);
         merger.merge(later, AgentSettings::Take).unwrap();
         merging.recorder.events().turn_ended();
         merging.recorder.finish().unwrap();
-        let mut at = merging.store.head(&merging.started.snapshots).unwrap();
-        let mut ended = false;
-        while let Some(commit) = at.filter(|commit| *commit != merge_commit) {
-            let message = merging.store.commit_message(commit).unwrap().to_string();
-            ended |= message.contains("Mahi-Turn-End");
-            at = merging.store.parent(commit).unwrap();
-        }
-        assert!(ended, "no turn end was recorded after the merge");
+        assert_eq!(
+            turn_ends_after(&merging.store, &merging.started.snapshots, merge_commit),
+            1
+        );
     }
 
     #[test]
     fn a_merge_that_wrote_markers_and_then_failed_still_stops_turn_ends_and_merges() {
         let merging = merging();
         let merger = merging.recorder.merger();
-        fs::write(merging.started.worktree.join("README"), "alice\n").unwrap();
-        let mut request = merging.bobs(&[]);
-        let readme = merging.store.write_blob(b"bob\n").unwrap();
-        let tree = merging
-            .store
-            .write_tree(&[("README", mahi_store::EntryKind::Blob, readme)])
-            .unwrap();
-        let bobs = ThreadRef::new(
-            merging.started.thread,
-            mahi_core::RefKind::Snapshots(merging.bob.clone()),
-        );
-        request.commit = merging
-            .store
-            .append(&bobs, Some(request.commit), tree, SNAPSHOT_MESSAGE)
-            .unwrap();
+        let request = merging.readme_conflict();
         thread::sleep(Duration::from_millis(300));
         let head = merging.store.head(&merging.started.snapshots).unwrap();
         let moved_tree = merging.store.commit_tree(head.unwrap()).unwrap();
@@ -1044,7 +1190,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             merger.merge(request, AgentSettings::Take),
-            Err(MergeError::MarkersWritten(_))
+            Err(MergeError::Store(_))
         ));
         let again = merging.bobs(&[("notes.txt", "more\n")]);
         assert!(matches!(

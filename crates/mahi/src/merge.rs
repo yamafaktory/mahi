@@ -49,6 +49,11 @@ use thiserror::Error;
 
 use crate::{
     cli::MergeCommand,
+    conflicts::{
+        self,
+        ConflictsError,
+        KeptConflicts,
+    },
     environment::Environment,
     merge_door::{
         self,
@@ -119,10 +124,12 @@ pub(crate) enum MergeError {
     TooManySources(AgentSlot),
     #[error("the merge from {0} changes agent settings, which wait for the user")]
     HoldsAgentSettings(AgentSlot),
-    #[error("{0} holds conflict markers from a merge and takes no other merge until it restarts")]
+    #[error(
+        "{0} holds conflict markers from a merge and takes no other merge until they are resolved"
+    )]
     MarkersUnresolved(AgentSlot),
-    #[error("the merge wrote conflict markers but could not be recorded")]
-    MarkersWritten(#[source] Box<MergeError>),
+    #[error(transparent)]
+    Conflicts(#[from] ConflictsError),
     #[error("cannot catch the signals that stop mahi")]
     Signals(#[source] SignalError),
     #[error("the agent's mahi stopped recording before it could merge")]
@@ -169,9 +176,6 @@ pub(crate) enum MergeDone {
         tree: ObjectId,
         /// What to ask the agent when the merge left conflicts.
         prompt: Option<String>,
-        /// Whether the merged tree holds conflict markers in a file, even one left out of the
-        /// worktree.
-        markers: bool,
     },
 }
 
@@ -319,8 +323,11 @@ pub(crate) enum AgentSettings {
 }
 
 /// Merges `request` into `into`'s worktree, whose snapshots are at `head` and remembered in
-/// `cache`, from the base [`merge_base`] gives, unless `settings` holds a merge that changes
-/// agent settings; then takes a snapshot whose trailers name
+/// `cache`, from the base [`merge_base`] gives, unless the worktree still holds the conflict
+/// markers of a merge before, or `settings` holds a merge that changes agent settings; keeps
+/// the paths it leaves with markers in the agent's state before it writes them, with the tree
+/// of `head`, which the agent's snapshots keep; then takes a
+/// snapshot whose trailers name
 /// `request.commit` and what that snapshot had itself merged, or, when the merge left a path as
 /// it was, the trailers it had before, so the next merge starts from the same base. Once the
 /// worktree is written, the snapshot is taken even if `interrupt` is set, so the written files
@@ -346,7 +353,11 @@ pub(crate) fn merge_now(
     merged_from.absorb(store, (&theirs, into.snapshots.thread()), Some(into.slot));
     let (base, theirs) = (store.commit_tree(base)?, store.commit_tree(request.commit)?);
     let ours = snapshot(store, into.worktree, (into.globals, cache), interrupt)?;
-    let labels = (into.slot.to_string(), request.from.to_string());
+    let kept = conflicts::file(store, into.snapshots.thread(), into.slot);
+    if !conflicts::resolved(store, into.slot, &kept, ours)? {
+        return Err(MergeError::MarkersUnresolved(into.slot.clone()));
+    }
+    let labels = (conflicts::label(into.slot), conflicts::label(&request.from));
     let merged = store.merge_trees(base, ours, theirs, (&labels.0, &labels.1))?;
     if settings == AgentSettings::Hold && !leaves_agent_settings_alone(store, ours, merged.tree) {
         return Err(MergeError::HoldsAgentSettings(request.from.clone()));
@@ -354,28 +365,28 @@ pub(crate) fn merge_now(
     let markers = merged
         .conflicts
         .iter()
-        .any(|(_, conflict)| *conflict == Conflict::Markers);
-    let written = write_merge(
+        .filter(|(_, conflict)| *conflict == Conflict::Markers)
+        .map(|(path, _)| path);
+    let before = match head {
+        Some(head) => store.commit_tree(head)?,
+        None => store.write_tree(&[])?,
+    };
+    if let Some(conflicts) = KeptConflicts::of_merge((&request.from, before), markers) {
+        conflicts.save(&kept)?;
+    }
+    let (applied, tree, commit) = write_merge(
         store,
         into,
         (ours, merged.tree),
         (&previous, &merged_from),
         (cache, head),
         interrupt,
-    );
-    let (applied, tree, commit) = written.map_err(|error| {
-        if markers {
-            MergeError::MarkersWritten(Box::new(error.into()))
-        } else {
-            error.into()
-        }
-    })?;
+    )?;
     Ok(MergeDone::Merged {
         report: report(&request.from, into.slot, &merged, &applied),
         commit,
         tree,
         prompt: conflict_prompt(&request.from, &merged),
-        markers,
     })
 }
 

@@ -4055,7 +4055,6 @@ mod tests {
             report: "merged\n".to_owned(),
             commit: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
             tree: mahi_store::ObjectId::empty_tree(gix::hash::Kind::Sha1),
-            markers: prompt.is_some(),
             prompt,
         };
         let prompts = Prompts::default();

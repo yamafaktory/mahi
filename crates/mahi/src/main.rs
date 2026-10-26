@@ -6,6 +6,7 @@ mod claims;
 mod cli;
 mod commands;
 mod compose;
+mod conflicts;
 mod credentials;
 mod end;
 mod environment;

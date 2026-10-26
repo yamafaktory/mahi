@@ -43,6 +43,7 @@ use crate::{
     },
     merge::{
         AgentSettings,
+        MergeError,
         MergeRequest,
     },
     merged::MergedFrom,
@@ -144,8 +145,9 @@ impl AutoMerge {
     /// behind on, one after the other, each once the agent is idle after a turn its hook
     /// reported, or since it started, with its input held, holding agent settings, and only when
     /// it is still due then;
-    /// each snapshot is tried once in this run, whatever the merge gives, and the thread refs
-    /// are looked through again only once one of them moved.
+    /// each snapshot is tried once in this run, whatever the merge gives, but for a merge
+    /// refused while the agent's conflicts are unresolved, and the thread refs are looked
+    /// through again only once one of them moved.
     pub(crate) fn run(
         &self,
         merger: &Merger,
@@ -170,7 +172,8 @@ impl AutoMerge {
             };
             seen = heads;
             for request in requests {
-                tried.insert(request.commit);
+                let commit = request.commit;
+                tried.insert(commit);
                 let done = inject::when_ready(
                     activity,
                     agent,
@@ -181,8 +184,11 @@ impl AutoMerge {
                             .then(|| merger.merge(request, AgentSettings::Hold))
                     },
                 );
-                if done.is_none() {
+                let Some(outcome) = done else {
                     return;
+                };
+                if let Some(Err(MergeError::MarkersUnresolved(_))) = outcome {
+                    tried.remove(&commit);
                 }
             }
         }
@@ -622,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_that_leaves_conflicts_stops_the_merges_of_the_run() {
+    fn a_merge_that_leaves_conflicts_holds_the_next_ones_until_the_agent_resolves_them() {
         let mut team = team();
         fs::write(team.started.worktree.join("README"), "alice\n").unwrap();
         team.ended_with_readme("bob.claude", &team.bob.0, "bob\n");
@@ -649,6 +655,26 @@ mod tests {
             let merged = MergedFrom::read(&team.store, &team.started.snapshots).unwrap();
             assert_ne!(merged.of(&"bob.claude".parse().unwrap()), Some(later));
             assert!(!team.started.worktree.join("notes.txt").exists());
+            fs::write(&readme, "alice and bob\n").unwrap();
+            merging.recorder.events().turn_ended();
+            merging.activity.saw(HookKind::TurnEnd, b"");
+            let bob = "bob.claude".parse().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while MergedFrom::read(&team.store, &team.started.snapshots)
+                .unwrap()
+                .of(&bob)
+                != Some(later)
+            {
+                if Instant::now() >= deadline {
+                    merging.running.store(false, Ordering::SeqCst);
+                    panic!("bob's later work was never merged");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                fs::read_to_string(team.started.worktree.join("notes.txt")).unwrap(),
+                "from bob.claude\n"
+            );
             merging.running.store(false, Ordering::SeqCst);
             running.join().unwrap();
         });
