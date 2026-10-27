@@ -63,9 +63,6 @@ pub(crate) enum Command {
     /// Runs more of your agents in a thread, each in its own terminal.
     #[command(subcommand)]
     Agent(AgentCommand),
-    /// Merges another agent's latest snapshot into the worktree of one of your agents in a
-    /// thread; lines both changed differently are left between conflict markers.
-    Merge(MergeCommand),
     /// Merges a thread's agents' work into its landing worktree, on a branch from the
     /// thread's landing branch, for you to curate into commits there with git.
     Land(LandCommand),
@@ -382,18 +379,6 @@ pub(crate) struct LandCommand {
     /// Arguments passed to the `--with` agent unchanged, after `--`.
     #[arg(last = true, value_name = "ARGUMENT", requires = "with")]
     pub(crate) arguments: Vec<OsString>,
-}
-
-#[derive(Debug, Args, PartialEq, Eq)]
-pub(crate) struct MergeCommand {
-    /// The thread, as `mahi threads` lists it.
-    pub(crate) thread: ThreadId,
-    /// The agent whose work to merge, as `<participant>.<agent>`.
-    #[arg(long, value_name = "PARTICIPANT.AGENT")]
-    pub(crate) from: AgentSlot,
-    /// Your agent to merge into; needed when you have several in the thread.
-    #[arg(long, value_name = "AGENT", value_parser = parse_agent)]
-    pub(crate) into: Option<AgentName>,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]

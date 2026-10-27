@@ -26,7 +26,6 @@ mod landed_branch;
 mod live;
 mod mcp;
 mod merge;
-mod merge_door;
 mod merged;
 mod network;
 mod note;
@@ -267,7 +266,6 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
         }
         Command::Mcp => serve_mcp(environment),
         Command::Land(command) => landed(&command, environment),
-        Command::Merge(command) => merged(&command, environment),
         Command::Handoff(command) => outcome_code(run::handoff(&command, environment)),
         Command::Agent(AgentCommand::Add(command)) => {
             outcome_code(run::agent_add(&command, environment))
@@ -368,28 +366,6 @@ fn report_with(context: &str, error: &dyn Error) {
 fn report_message(mut message: String, error: &dyn Error) {
     causes(&mut message, error);
     eprintln!("{message}");
-}
-
-/// Runs `mahi merge`, prints its report, and returns its exit code.
-fn merged(command: &cli::MergeCommand, environment: &Environment) -> i32 {
-    match merge::merge(command, environment) {
-        Ok(merge::Outcome::Done(report)) => {
-            eprint!("{report}");
-            0
-        }
-        Ok(merge::Outcome::Stopped(signal, report)) => {
-            if let Some(report) = report {
-                eprint!("{report}");
-            }
-            ui::before_dying();
-            signal.reraise();
-            128 + signal.number()
-        }
-        Err(error) => {
-            report(&error);
-            1
-        }
-    }
 }
 
 /// Runs `mahi purge`, prints its report, and returns its exit code.

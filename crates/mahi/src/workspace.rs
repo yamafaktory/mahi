@@ -617,10 +617,9 @@ enum Entry {
     Quit,
 }
 
-const THREAD_ACTIONS: [(ThreadChoice, &str); 7] = [
+const THREAD_ACTIONS: [(ThreadChoice, &str); 6] = [
     (ThreadChoice::AddAgent, "Add an agent to this thread"),
     (ThreadChoice::Handoff, "Hand off to another of your agents"),
-    (ThreadChoice::Merge, "Merge another agent's work"),
     (ThreadChoice::Land, "Land this thread"),
     (ThreadChoice::Push, "Push the landed commits"),
     (ThreadChoice::End, "End this thread"),
@@ -2727,7 +2726,6 @@ mod tests {
         for item in [
             "Add an agent to this thread",
             "Hand off to another of your agents",
-            "Merge another agent's work",
             "Land this thread",
             "Push the landed commits",
             "End this thread",

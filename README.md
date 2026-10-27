@@ -99,8 +99,7 @@ short pairing code such as `412-merit-intention`; the teammate runs
 yes, the teammate watches the thread live. Pairing meets through the remote `mahi remote`
 chose. Cards and tickets still work without it: `mahi id` prints the card a thread's owner
 needs, `mahi invite --collaborator <thread> <card>` turns it into a ticket, and `mahi join <ticket>` uses it.
-`mahi handoff`, `mahi agent` and `mahi merge`
-move work between agents.
+`mahi handoff` and `mahi agent` move work between agents.
 
 On the home screen, an agent you start, resume or add runs in its thread's tab, beside the list
 of the thread's agents and their state (working, done, asks you). The palette key
@@ -185,7 +184,6 @@ are recorded, and give it `mahi mcp`, so it gets the thread's tools. A profile f
 | `mahi threads` | Lists the repository's threads and their agents |
 | `mahi agent add <thread> -- <agent>` | Runs another of your agents in a thread |
 | `mahi handoff <thread> --from <p.agent> -- <agent>` | Starts an agent on another agent's work, with a briefing |
-| `mahi merge <thread> --from <p.agent>` | Merges another agent's work into your agent's worktree |
 | `mahi land <thread>` | Brings the thread's work back as a branch to curate into commits |
 | `mahi end <thread>` | Ends a thread: records a last snapshot and removes its worktree |
 | `mahi purge <thread>` | Deletes a thread here and on its remote |

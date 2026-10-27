@@ -55,7 +55,6 @@ use crate::{
         AgentSettings,
         MergeError,
         MergeRequest,
-        Start,
     },
     merged::MergedFrom,
     recorder::Merger,
@@ -178,7 +177,7 @@ impl AutoMerge {
                     agent,
                     writer,
                     (running, pace, Readiness::TurnClosed),
-                    || merger.merge_with(request, AgentSettings::Take, Start::PastSkipped),
+                    || merger.merge(request, AgentSettings::Take),
                 );
                 let Some(outcome) = done else {
                     return false;

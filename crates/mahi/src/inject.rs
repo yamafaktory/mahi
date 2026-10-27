@@ -318,34 +318,15 @@ pub(crate) fn give_accepted(
 /// What the agent must have done before an action runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Readiness {
-    /// Be idle, however its turn ended.
-    Idle,
     /// Be idle with its turn closed, by its turn-end hook or an interrupt, not only gone quiet.
     TurnClosed,
     /// Be idle after a turn its turn-end hook reported, or since it started.
     AfterTurnEnd,
 }
 
-/// Runs `act` once the agent is idle and the palette closed, holding the agent's input while
-/// it runs, so neither the user's keys nor an accepted prompt come in between; returns `None`
-/// if `running` is cleared first.
-pub(crate) fn when_idle<T>(
-    activity: &Activity,
-    agent: &impl AgentInput,
-    writer: &Mutex<impl Write>,
-    (running, pace): (&AtomicBool, Pace),
-    act: impl FnOnce() -> T,
-) -> Option<T> {
-    when_ready(
-        activity,
-        agent,
-        writer,
-        (running, pace, Readiness::Idle),
-        act,
-    )
-}
-
-/// Runs `act` as [`when_idle`] does, once the agent is as `readiness` says.
+/// Runs `act` once the agent is as `readiness` says and the palette closed, holding the agent's
+/// input while it runs, so neither the user's keys nor an accepted prompt come in between;
+/// returns `None` if `running` is cleared first.
 pub(crate) fn when_ready<T>(
     activity: &Activity,
     agent: &impl AgentInput,
@@ -359,7 +340,6 @@ pub(crate) fn when_ready<T>(
             return None;
         };
         let ready = match readiness {
-            Readiness::Idle => activity.is_idle(&pace),
             Readiness::TurnClosed => activity.is_idle_with_turn_closed(&pace),
             Readiness::AfterTurnEnd => activity.is_idle_after_turn_end(&pace),
         };
@@ -739,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn work_waits_for_the_idle_agent_and_holds_its_input_or_gives_up_when_the_run_ends() {
+    fn work_waits_for_the_agents_closed_turn_and_holds_its_input_or_gives_up_when_the_run_ends() {
         let activity = Arc::new(Activity::default());
         let agent = Arc::new(FakeAgent {
             palette_open: AtomicBool::new(false),
@@ -756,14 +736,22 @@ mod tests {
             );
             thread::spawn(move || {
                 let held = Arc::clone(&writer);
-                when_idle(&activity, &*agent, &writer, (&running, fast()), move || {
-                    held.try_lock().is_err()
-                })
+                when_ready(
+                    &activity,
+                    &*agent,
+                    &writer,
+                    (&running, fast(), Readiness::TurnClosed),
+                    move || held.try_lock().is_err(),
+                )
             })
         };
         thread::sleep(fast().quiet * 3);
         assert!(!worker.is_finished());
         activity.keys(b"\r");
+        activity.saw(HookKind::Prompt, b"");
+        thread::sleep(fast().stale_turn + fast().quiet * 3);
+        assert!(!worker.is_finished());
+        activity.saw(HookKind::TurnEnd, b"");
         assert_eq!(worker.join().unwrap(), Some(true));
 
         agent.palette_open.store(true, Ordering::SeqCst);
@@ -774,7 +762,15 @@ mod tests {
                 Arc::clone(&writer),
                 Arc::clone(&running),
             );
-            thread::spawn(move || when_idle(&activity, &*agent, &writer, (&running, fast()), || ()))
+            thread::spawn(move || {
+                when_ready(
+                    &activity,
+                    &*agent,
+                    &writer,
+                    (&running, fast(), Readiness::TurnClosed),
+                    || (),
+                )
+            })
         };
         thread::sleep(fast().quiet * 3);
         running.store(false, Ordering::SeqCst);

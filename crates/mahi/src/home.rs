@@ -968,7 +968,6 @@ fn command_words(
         HomeAction::Purge(thread) => vec!["purge".to_owned(), thread],
         HomeAction::AddAgent(thread) => agent_add_words(store, thread, environment)?,
         HomeAction::Handoff(thread) => handoff_words(store, thread, environment)?,
-        HomeAction::Merge(thread) => merge_words(store, &thread, environment)?,
         HomeAction::Push(thread) => push_words(store, thread, environment)?,
         HomeAction::Join => vec!["join".to_owned()],
         HomeAction::Remote => return Err(choose_remote(store, None)),
@@ -1140,15 +1139,6 @@ fn own_agents<'a>(slots: &'a [AgentSlot], me: &ParticipantName) -> Vec<&'a Agent
         .collect()
 }
 
-/// Returns the agents whose work a merge can take: all of them, but the user's own when it is
-/// their only agent, since it would merge into itself.
-fn merge_sources<'a>(slots: &'a [AgentSlot], mine: &[&AgentSlot]) -> Vec<&'a AgentSlot> {
-    slots
-        .iter()
-        .filter(|slot| !matches!(mine, [only] if *only == *slot))
-        .collect()
-}
-
 /// Picks one of `slots` in a dialog, after `first` when it is given, which picks `None`;
 /// returns `Err` with an empty status when the user stopped asking.
 fn pick_agent<'a>(
@@ -1250,58 +1240,6 @@ fn handoff_words(
         from,
         "--".to_owned(),
         program,
-    ])
-}
-
-/// Asks whose work to merge and, when the user has several agents in the thread, into which,
-/// and returns the command.
-fn merge_words(
-    store: &Store,
-    thread: &str,
-    environment: &Environment,
-) -> Result<Vec<String>, String> {
-    let slots = agents_of(store, thread)?;
-    let me = me(environment)?;
-    let mine = own_agents(&slots, &me);
-    if mine.is_empty() {
-        return Err(format!(
-            "you have no agent in thread {thread} to merge into"
-        ));
-    }
-    let sources = merge_sources(&slots, &mine);
-    if sources.is_empty() {
-        return Err(format!(
-            "thread {thread} has no other agent's work to merge"
-        ));
-    }
-    let from = pick_agent(
-        "Merge",
-        "Whose latest work should be merged?",
-        None,
-        &sources,
-        ToString::to_string,
-    )?
-    .ok_or_else(|| "no agent was chosen".to_owned())?;
-    let targets: Vec<&AgentSlot> = mine.into_iter().filter(|slot| *slot != from).collect();
-    let into = match targets.as_slice() {
-        [] => return Err(format!("{from} is your only agent in thread {thread}")),
-        [only] => *only,
-        several => pick_agent(
-            "Merge",
-            "Into which of your agents?",
-            None,
-            several,
-            ToString::to_string,
-        )?
-        .ok_or_else(|| "no agent was chosen".to_owned())?,
-    };
-    Ok(vec![
-        "merge".to_owned(),
-        thread.to_owned(),
-        "--from".to_owned(),
-        from.to_string(),
-        "--into".to_owned(),
-        into.agent().to_string(),
     ])
 }
 
@@ -1503,16 +1441,7 @@ fn add_remote(store: &mut Store) -> Result<Added, remote::RemoteError> {
 
 #[cfg(test)]
 mod tests {
-    use mahi_core::AgentName;
-
     use super::*;
-
-    fn slot(participant: &str, agent: &str) -> AgentSlot {
-        AgentSlot::new(
-            ParticipantName::new(participant).unwrap(),
-            AgentName::new(agent).unwrap(),
-        )
-    }
 
     #[test]
     fn the_home_screen_wakes_for_each_turn_of_a_waiting_tabs_spinner() {
@@ -1653,24 +1582,5 @@ mod tests {
                 (Role::Watcher, "🔒 Watcher: they watch your agents"),
             ]
         );
-    }
-
-    #[test]
-    fn a_merge_takes_any_agents_work_but_never_the_users_only_agent_into_itself() {
-        let slots = [
-            slot("alice", "codex"),
-            slot("bob", "claude"),
-            slot("bob", "codex"),
-        ];
-        let bob = ParticipantName::new("bob").unwrap();
-        let mine = own_agents(&slots, &bob);
-        assert_eq!(mine, [&slots[1], &slots[2]]);
-        assert_eq!(merge_sources(&slots, &mine).len(), 3);
-        let alone = [slot("alice", "codex"), slot("bob", "claude")];
-        let mine = own_agents(&alone, &bob);
-        assert_eq!(merge_sources(&alone, &mine), [&alone[0]]);
-        let carol = ParticipantName::new("carol").unwrap();
-        assert!(own_agents(&alone, &carol).is_empty());
-        assert_eq!(merge_sources(&alone, &[]).len(), 2);
     }
 }

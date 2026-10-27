@@ -120,8 +120,6 @@ pub enum HomeAction {
     AddAgent(String),
     /// Start the user's agent on another agent's work in the thread.
     Handoff(String),
-    /// Merge another agent's work into one of the user's agents in the thread.
-    Merge(String),
     /// Push the thread's landed commits, with its trailers.
     Push(String),
     /// Join a thread with a pairing code.
@@ -157,8 +155,6 @@ pub enum ThreadChoice {
     AddAgent,
     /// Start the user's agent on another agent's latest work.
     Handoff,
-    /// Merge another agent's work into one of the user's agents.
-    Merge,
     /// Land the thread, confirmed.
     Land,
     /// Push the thread's landed commits, with its trailers.
@@ -179,7 +175,6 @@ impl ThreadChoice {
             Self::Resume => "Resume: start your agent again where it stopped",
             Self::AddAgent => "Add an agent: run another of yours in it, in its own worktree",
             Self::Handoff => "Hand off: start your agent on another agent's latest work",
-            Self::Merge => "Merge: bring another agent's work into one of yours",
             Self::Land => "Land: merge its agents' work onto a branch to commit",
             Self::Push => "Push: add the thread's trailers to your commits and push the branch",
             Self::End => "End: save its work in a last snapshot and remove its worktrees",
@@ -197,7 +192,6 @@ impl ThreadChoice {
             Self::Resume => HomeAction::Resume(thread),
             Self::AddAgent => HomeAction::AddAgent(thread),
             Self::Handoff => HomeAction::Handoff(thread),
-            Self::Merge => HomeAction::Merge(thread),
             Self::Land => HomeAction::Land(thread),
             Self::Push => HomeAction::Push(thread),
             Self::End => HomeAction::End(thread),
@@ -337,9 +331,6 @@ impl Home {
             PaletteInput::Text('h') => {
                 return selected.map(|row| HomeAction::Handoff(row.thread.clone()));
             }
-            PaletteInput::Text('g') => {
-                return selected.map(|row| HomeAction::Merge(row.thread.clone()));
-            }
             _ => {}
         }
         None
@@ -382,14 +373,13 @@ impl Home {
             self.note = Some(NO_THREADS);
             return;
         };
-        let mut choices = Vec::with_capacity(9);
+        let mut choices = Vec::with_capacity(8);
         if row.owned {
             choices.push(ThreadChoice::Resume);
         }
         choices.extend([
             ThreadChoice::AddAgent,
             ThreadChoice::Handoff,
-            ThreadChoice::Merge,
             ThreadChoice::Land,
             ThreadChoice::Push,
             ThreadChoice::End,
@@ -444,7 +434,6 @@ impl Home {
                 "hand off",
                 "start your agent on another agent's latest work",
             ],
-            ["g", "merge", "bring another agent's work into one of yours"],
             [
                 "l",
                 "land",
@@ -939,13 +928,12 @@ mod tests {
         for (digit, action) in [
             ('2', HomeAction::AddAgent("t1".to_owned())),
             ('3', HomeAction::Handoff("t1".to_owned())),
-            ('4', HomeAction::Merge("t1".to_owned())),
-            ('6', HomeAction::Push("t1".to_owned())),
+            ('5', HomeAction::Push("t1".to_owned())),
         ] {
             assert_eq!(home.key(PaletteInput::Text(digit), &rows), Some(action));
             home.key(PaletteInput::Enter, &rows);
         }
-        assert_eq!(home.key(PaletteInput::Text('5'), &rows), None);
+        assert_eq!(home.key(PaletteInput::Text('4'), &rows), None);
         assert!(screen(&home, &rows, "").contains("Land thread t1?"));
         assert_eq!(
             home.key(PaletteInput::Text('y'), &rows),
@@ -956,12 +944,12 @@ mod tests {
         let teammate = screen(&home, &rows, "");
         assert!(!teammate.contains("Resume:"), "{teammate}");
         assert_eq!(
-            home.key(PaletteInput::Text('7'), &rows),
+            home.key(PaletteInput::Text('6'), &rows),
             Some(HomeAction::Invite("t2".to_owned()))
         );
         home.key(PaletteInput::Enter, &rows);
         assert_eq!(
-            home.key(PaletteInput::Text('8'), &rows),
+            home.key(PaletteInput::Text('7'), &rows),
             Some(HomeAction::Purge("t2".to_owned()))
         );
         assert_eq!(
@@ -974,10 +962,9 @@ mod tests {
             [
                 HomeAction::AddAgent("t2".to_owned()),
                 HomeAction::Handoff("t2".to_owned()),
-                HomeAction::Merge("t2".to_owned()),
             ]
         );
-        assert!(keys(&mut Home::default(), &[], "ahg").is_empty());
+        assert!(keys(&mut Home::default(), &[], "ah").is_empty());
     }
 
     #[test]

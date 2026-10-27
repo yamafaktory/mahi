@@ -1384,7 +1384,7 @@ pub(crate) fn hub_socket(runtime: &Path, thread: ThreadId) -> io::Result<PathBuf
 
 /// Returns the path of the socket `name` in mahi's private directory in `runtime`, creating
 /// that directory, or an error when the path is too long for a socket.
-pub(crate) fn private_socket(runtime: &Path, name: &str) -> io::Result<PathBuf> {
+fn private_socket(runtime: &Path, name: &str) -> io::Result<PathBuf> {
     let parent = rustix::fs::open(
         runtime,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,

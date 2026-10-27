@@ -48,7 +48,6 @@ use crate::{
         MergeError,
         MergeRequest,
         Recording,
-        Start,
     },
     session::{
         CommitKey,
@@ -75,7 +74,6 @@ pub(crate) struct Recorder {
 struct MergeJob {
     request: MergeRequest,
     settings: AgentSettings,
-    start: Start,
     done: mpsc::SyncSender<Result<MergeDone, MergeError>>,
 }
 
@@ -111,34 +109,17 @@ impl AgentEvents {
 
 impl Merger {
     /// Merges `request`, writing agent settings as `settings` says, and waits for what came of
-    /// it: an automatic merge, which holds them, starts past a snapshot the user skipped, and
-    /// one the user asks for, which takes them, from the snapshot recorded last.
+    /// it.
     pub(crate) fn merge(
         &self,
         request: MergeRequest,
         settings: AgentSettings,
-    ) -> Result<MergeDone, MergeError> {
-        let start = match settings {
-            AgentSettings::Hold => Start::PastSkipped,
-            AgentSettings::Take => Start::Recorded,
-        };
-        self.merge_with(request, settings, start)
-    }
-
-    /// Merges `request`, writing agent settings as `settings` says and starting where `start`
-    /// says, and waits for what came of it.
-    pub(crate) fn merge_with(
-        &self,
-        request: MergeRequest,
-        settings: AgentSettings,
-        start: Start,
     ) -> Result<MergeDone, MergeError> {
         let (done, outcome) = mpsc::sync_channel(1);
         self.merges
             .send(MergeJob {
                 request,
                 settings,
-                start,
                 done,
             })
             .map_err(|_| MergeError::RecorderGone)?;
@@ -287,7 +268,7 @@ fn record(
                 &store,
                 target,
                 &mut last,
-                (&job.request, job.settings, job.start),
+                (&job.request, job.settings),
                 abandon,
             );
             let _ = job.done.send(done);
@@ -319,7 +300,7 @@ fn merge_between(
     store: &Store,
     target: &Target,
     last: &mut Recorded,
-    request: (&MergeRequest, AgentSettings, Start),
+    request: (&MergeRequest, AgentSettings),
     abandon: &AtomicBool,
 ) -> Result<MergeDone, MergeError> {
     let recording = Recording {
@@ -803,13 +784,16 @@ mod tests {
         };
         let MergeDone::Merged {
             commit: merge_commit,
-            prompt,
             ..
         } = merger.merge(request.clone(), AgentSettings::Take).unwrap()
         else {
             panic!("nothing was merged");
         };
-        assert_eq!(prompt, None);
+        let note = crate::note::file(&store, started.thread, &started.slot);
+        let told = crate::note::take(&note).unwrap().unwrap();
+        assert!(told.contains("merged bob.codex: "), "{told}");
+        assert!(!told.contains("conflict"), "{told}");
+        assert!(!told.contains("Your version was kept"), "{told}");
         assert_eq!(store.head(&started.snapshots).unwrap(), Some(merge_commit));
         assert_eq!(
             fs::read_to_string(started.worktree.join("notes.txt")).unwrap(),
@@ -817,7 +801,7 @@ mod tests {
         );
         assert!(matches!(
             merger.merge(request.clone(), AgentSettings::Take).unwrap(),
-            MergeDone::Already(_)
+            MergeDone::Already
         ));
         fs::write(started.worktree.join("later"), "after the merge").unwrap();
         recorder.finish().unwrap();
@@ -916,6 +900,11 @@ mod tests {
                 .append(&snapshots, Some(request.commit), tree, SNAPSHOT_MESSAGE)
                 .unwrap();
             request
+        }
+
+        fn note(&self) -> String {
+            let file = crate::note::file(&self.store, self.started.thread, &self.started.slot);
+            crate::note::take(&file).unwrap().unwrap_or_default()
         }
 
         fn kept(&self) -> PathBuf {
@@ -1146,6 +1135,30 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_that_leaves_a_path_records_no_trailer_and_is_tried_again() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        fs::write(worktree.join(".gitignore"), "notes.txt\n").unwrap();
+        fs::write(worktree.join("notes.txt"), "local\n").unwrap();
+        let request = merging.bobs(&[("notes.txt", "bob's\n")]);
+        for _ in 0..2 {
+            let MergeDone::Merged { commit, .. } =
+                merger.merge(request.clone(), AgentSettings::Take).unwrap()
+            else {
+                panic!("the merge was not tried");
+            };
+            let recorded = crate::merged::MergedFrom::read_from(&merging.store, Some(commit));
+            assert_eq!(recorded.unwrap().of(&merging.bob), None);
+        }
+        assert_eq!(
+            fs::read_to_string(worktree.join("notes.txt")).unwrap(),
+            "local\n"
+        );
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
     fn a_held_snapshot_stays_held_after_a_merge_of_an_older_one_or_one_that_left_a_path() {
         let merging = merging();
         let merger = merging.recorder.merger();
@@ -1231,13 +1244,13 @@ mod tests {
         assert!(!worktree.join("CLAUDE.md").exists());
         assert!(!crate::held::waits(&waiting));
         assert_eq!(crate::held::skipped(&skip), None);
-        let asked = merging.bobs(&[
+        let taken = merging.bobs(&[
             ("CLAUDE.md", "obey bob\n"),
             ("a.txt", "a\n"),
             ("b.txt", "b\n"),
             ("c.txt", "c\n"),
         ]);
-        merger.merge(asked, AgentSettings::Take).unwrap();
+        merger.merge(taken, AgentSettings::Take).unwrap();
         assert!(worktree.join("c.txt").exists());
         assert!(!worktree.join("CLAUDE.md").exists());
         merging.recorder.finish().unwrap();
@@ -1267,9 +1280,7 @@ mod tests {
         ));
         let record = crate::held::HeldSettings::load(&waiting).unwrap().unwrap();
         assert_eq!(record.paths, ["AGENTS.md"]);
-        merger
-            .merge_with(held, AgentSettings::Take, crate::merge::Start::PastSkipped)
-            .unwrap();
+        merger.merge(held, AgentSettings::Take).unwrap();
         assert!(worktree.join("AGENTS.md").exists());
         assert!(!worktree.join("a.txt").exists());
         assert!(!worktree.join("CLAUDE.md").exists());
@@ -1277,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_sync_makes_leaves_a_note_and_one_the_user_asks_for_does_not() {
+    fn every_merge_leaves_a_note_of_what_it_brought_and_its_conflicts() {
         let merging = merging();
         let merger = merging.recorder.merger();
         let file = crate::note::file(
@@ -1286,9 +1297,10 @@ mod tests {
             &merging.started.slot,
         );
         merger
-            .merge(merging.bobs(&[("asked.txt", "a\n")]), AgentSettings::Take)
+            .merge(merging.bobs(&[("taken.txt", "a\n")]), AgentSettings::Take)
             .unwrap();
-        assert_eq!(crate::note::take(&file).unwrap(), None);
+        let text = crate::note::take(&file).unwrap().unwrap();
+        assert!(text.contains("merged bob.codex: ` taken.txt `"), "{text}");
         let request = merging.readme_conflict();
         merger.merge(request, AgentSettings::Hold).unwrap();
         let text = crate::note::take(&file).unwrap().unwrap();
@@ -1331,12 +1343,12 @@ mod tests {
         let request = merging.readme_conflict();
         let MergeDone::Merged {
             commit: merge_commit,
-            prompt: Some(_),
             ..
         } = merger.merge(request, AgentSettings::Take).unwrap()
         else {
-            panic!("the merge left no conflict");
+            panic!("nothing was merged");
         };
+        assert!(merging.kept().exists());
         let again = merging.bobs(&[("notes.txt", "more\n")]);
         assert!(matches!(
             merger.merge(again, AgentSettings::Take),
@@ -1413,11 +1425,15 @@ mod tests {
         assert!(merging.kept().exists());
         fs::write(&readme, "alice and bob\n").unwrap();
         merging.recorder.events().turn_ended();
+        merging.note();
         let later = merging.bobs(&[("README", "bob\n"), ("notes.txt", "more\n")]);
         assert!(matches!(
             merger.merge(later, AgentSettings::Take).unwrap(),
-            MergeDone::Merged { prompt: None, .. }
+            MergeDone::Merged { .. }
         ));
+        let told = merging.note();
+        assert!(!told.contains("conflict"), "{told}");
+        assert!(!told.contains("Your version was kept"), "{told}");
         assert_eq!(fs::read_to_string(&readme).unwrap(), "alice and bob\n");
         assert!(!merging.kept().exists());
         merging.recorder.finish().unwrap();
@@ -1473,7 +1489,6 @@ mod tests {
         fs::write(merging.started.worktree.join("logo.bin"), b"\0ours\0").unwrap();
         let MergeDone::Merged {
             commit: merge_commit,
-            prompt: Some(_),
             ..
         } = merger
             .merge(
@@ -1484,6 +1499,17 @@ mod tests {
         else {
             panic!("the merge did not keep ours without markers");
         };
+        let note = crate::note::file(
+            &merging.store,
+            merging.started.thread,
+            &merging.started.slot,
+        );
+        let told = crate::note::take(&note).unwrap().unwrap();
+        assert!(
+            told.contains("Your version was kept, but bob.codex changed these too")
+                && told.contains("` logo.bin `"),
+            "{told}"
+        );
         assert!(!merging.kept().exists());
         let later = merging.bobs(&[("logo.bin", "\0theirs\0"), ("notes.txt", "more\n")]);
         merger.merge(later, AgentSettings::Take).unwrap();

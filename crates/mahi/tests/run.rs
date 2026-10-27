@@ -1608,7 +1608,7 @@ cat parser.rs
         let claude = script(&fixture, "palette-action", "claude", agent);
         script(&fixture, "palette-action", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_end = [b"\x1b[B".repeat(11), b"\r".to_vec()].concat();
+        let to_end = [b"\x1b[B".repeat(10), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
@@ -1759,7 +1759,7 @@ cat parser.rs
         let claude = script(&fixture, "palette-declined", "claude", agent);
         script(&fixture, "palette-declined", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_end = [b"\x1b[B".repeat(11), b"\r".to_vec()].concat();
+        let to_end = [b"\x1b[B".repeat(10), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
@@ -2561,66 +2561,6 @@ printf 'from codex\n' > codex.txt
 printf 'fn parse() { codex }\n' > parser.rs
 ";
 
-    fn snapshots_of(thread: &str, agent: &str) -> ThreadRef {
-        ThreadRef::new(
-            thread.parse().unwrap(),
-            RefKind::Snapshots(AgentSlot::new(
-                ParticipantName::new("tester").unwrap(),
-                AgentName::new(agent).unwrap(),
-            )),
-        )
-    }
-
-    fn add_codex_from_claude(fixture: &Fixture, thread: &str) {
-        let codex = script(fixture, "merging", "codex", CODEX_WRITES);
-        let (code, output) = in_terminal(
-            fixture,
-            &[
-                "agent",
-                "add",
-                thread,
-                "--from",
-                "tester.claude",
-                "--",
-                codex.to_str().unwrap(),
-            ],
-            Some(PASSPHRASE),
-        );
-        assert_eq!(code, 0, "{output}");
-    }
-
-    #[test]
-    fn the_home_screen_adds_an_agent_from_another_ones_work_then_merges_it_back() {
-        let fixture = fixture();
-        let (thread, _claude) = worked_thread(&fixture);
-        let codex = script(&fixture, "home-merging", "codex", CODEX_WRITES);
-        let path = format!("{}:/usr/bin:/bin:/usr", codex.parent().unwrap().display());
-        let passphrase = format!("{PASSPHRASE}\r");
-        let (code, output) = in_terminal_typing(
-            terminal_command(&fixture, &[]).env("PATH", &path),
-            &[
-                (&thread, b"a"),
-                ("What should its worktree start from?", b"2"),
-                ("Passphrase", passphrase.as_bytes()),
-                (
-                    &format!("mahi agent add {thread} --from tester.claude -- codex: done"),
-                    b"g",
-                ),
-                ("Whose latest work should be merged?", b"2"),
-                (
-                    &format!("mahi merge {thread} --from tester.codex --into claude: done"),
-                    b"q",
-                ),
-            ],
-        );
-        assert_eq!(code, 0, "{output}");
-        let claude_tree = worktree_named(&fixture, &format!("{thread}.claude"));
-        assert_eq!(
-            fs::read_to_string(claude_tree.join("codex.txt")).unwrap(),
-            "from codex\n"
-        );
-    }
-
     #[test]
     fn the_home_screen_pushes_a_landing_from_the_thread_menu() {
         let fixture = fixture();
@@ -2629,7 +2569,7 @@ printf 'fn parse() { codex }\n' > parser.rs
             terminal_command(&fixture, &[]),
             &[
                 (&thread, b"\r"),
-                ("Push: add the thread's trailers", b"6"),
+                ("Push: add the thread's trailers", b"5"),
                 (&format!("thread {thread} is not landed here yet"), b"q"),
             ],
         );
@@ -2642,11 +2582,11 @@ printf 'fn parse() { codex }\n' > parser.rs
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
                 (&thread, b"\r"),
-                ("Push: add the thread's trailers", b"6"),
+                ("Push: add the thread's trailers", b"5"),
                 ("Just push", b"1"),
                 ("no remote is chosen", b""),
                 (&format!("mahi land {thread} --push failed"), b"\r"),
-                ("Push: add the thread's trailers", b"6"),
+                ("Push: add the thread's trailers", b"5"),
                 ("Push, then let claude rewrite the pull request draft", b"2"),
                 (
                     &format!("mahi land {thread} --push --with claude failed"),
@@ -2682,196 +2622,6 @@ printf 'fn parse() { codex }\n' > parser.rs
             pane_at(&output, "parse()").contains("│fn parse() {}"),
             "{output}"
         );
-    }
-
-    #[test]
-    fn another_agents_work_is_merged_into_a_stopped_agent_once_with_markers_where_both_changed() {
-        let fixture = fixture();
-        let (thread, _claude) = worked_thread(&fixture);
-        add_codex_from_claude(&fixture, &thread);
-        let claude_tree = worktree_named(&fixture, &format!("{thread}.claude"));
-        fs::write(claude_tree.join("parser.rs"), "fn parse() { claude }\n").unwrap();
-
-        let merged = fixture.mahi(&[
-            "merge",
-            &thread,
-            "--from",
-            "tester.codex",
-            "--into",
-            "claude",
-        ]);
-        let report = String::from_utf8_lossy(&merged.stderr);
-        assert!(merged.status.success(), "{report}");
-        assert!(
-            report.contains("merged tester.codex into tester.claude: 2 written, 0 removed"),
-            "{report}"
-        );
-        assert!(
-            report.contains("conflict markers to resolve in: \"parser.rs\""),
-            "{report}"
-        );
-        assert_eq!(
-            fs::read_to_string(claude_tree.join("codex.txt")).unwrap(),
-            "from codex\n"
-        );
-        let parser = fs::read_to_string(claude_tree.join("parser.rs")).unwrap();
-        assert!(
-            parser.contains("<<<<<<< mahi tester.claude\nfn parse() { claude }\n"),
-            "{parser}"
-        );
-        assert!(
-            parser.contains("fn parse() { codex }\n>>>>>>> mahi tester.codex\n"),
-            "{parser}"
-        );
-
-        let store = Store::open(&fixture.repo).unwrap();
-        let claude_snapshots = snapshots_of(&thread, "claude");
-        let codex_head = store
-            .head(&snapshots_of(&thread, "codex"))
-            .unwrap()
-            .unwrap();
-        let head = store.head(&claude_snapshots).unwrap().unwrap();
-        let message = store.commit_message(head).unwrap();
-        assert!(
-            message
-                .to_string()
-                .contains(&format!("Mahi-Merged: tester.codex {codex_head}")),
-            "{message}"
-        );
-        all_signed_by(&store, &claude_snapshots, &fixture.owner);
-
-        let again = fixture.mahi(&[
-            "merge",
-            &thread,
-            "--from",
-            "tester.codex",
-            "--into",
-            "claude",
-        ]);
-        let report = String::from_utf8_lossy(&again.stderr);
-        assert!(again.status.success(), "{report}");
-        assert!(
-            report.contains("tester.claude already has the latest snapshot of tester.codex"),
-            "{report}"
-        );
-        later_merges_start_from_the_recorded_snapshots(&fixture, &thread, &store, &claude_tree);
-
-        assert!(fixture.mahi(&["end", &thread]).status.success());
-    }
-
-    fn merge_report(fixture: &Fixture, thread: &str, from: &str, into: &str) -> String {
-        let merged = fixture.mahi(&["merge", thread, "--from", from, "--into", into]);
-        let report = String::from_utf8_lossy(&merged.stderr).into_owned();
-        assert!(merged.status.success(), "{report}");
-        report
-    }
-
-    fn later_merges_start_from_the_recorded_snapshots(
-        fixture: &Fixture,
-        thread: &str,
-        store: &Store,
-        claude_tree: &Path,
-    ) {
-        let codex_root = std::iter::successors(
-            store.head(&snapshots_of(thread, "codex")).unwrap(),
-            |commit| store.parent(*commit).unwrap(),
-        )
-        .last()
-        .unwrap();
-        let claude_merge = store
-            .head(&snapshots_of(thread, "claude"))
-            .unwrap()
-            .unwrap();
-        let claude_before = store.parent(claude_merge).unwrap().unwrap();
-        let codex_start = store.commit_message(codex_root).unwrap().to_string();
-        assert!(
-            codex_start.contains(&format!("Mahi-Merged: tester.claude {claude_before}")),
-            "{codex_start}"
-        );
-
-        fs::write(claude_tree.join("parser.rs"), "fn parse() { codex }\n").unwrap();
-        let codex_tree = worktree_named(fixture, &format!("{thread}.codex"));
-        fs::write(codex_tree.join("codex.txt"), "from codex\nmore\n").unwrap();
-        let (code, output) = in_terminal(
-            fixture,
-            &["resume", thread, "--agent", "codex", "--", "true"],
-            Some(PASSPHRASE),
-        );
-        assert_eq!(code, 0, "{output}");
-        let report = merge_report(fixture, thread, "tester.codex", "claude");
-        assert!(!report.contains("conflict"), "{report}");
-        assert_eq!(
-            fs::read_to_string(claude_tree.join("codex.txt")).unwrap(),
-            "from codex\nmore\n"
-        );
-        assert_eq!(
-            fs::read_to_string(claude_tree.join("parser.rs")).unwrap(),
-            "fn parse() { codex }\n"
-        );
-    }
-
-    const WAITER: &str = r"#!/bin/sh
-printf 'waiting\n'
-touch started
-i=0
-until [ -e done ] || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done
-cat parser.rs
-";
-
-    #[test]
-    fn a_running_agents_mahi_merges_once_the_agent_is_idle() {
-        let fixture = fixture();
-        let (thread, _claude) = worked_thread(&fixture);
-        let waiter = script(&fixture, "waiting", "codex", WAITER);
-        let running = add_agent_in_background(&fixture, thread.parse().unwrap(), &waiter, "off");
-        let mut codex_tree = PathBuf::new();
-        wait_until("the agent to start", || {
-            fixture
-                .thread_worktrees()
-                .into_iter()
-                .find(|path| path.ends_with(format!("{thread}.codex")))
-                .is_some_and(|path| {
-                    codex_tree = path;
-                    codex_tree.join("started").exists()
-                })
-        });
-        assert!(!codex_tree.join("parser.rs").exists());
-        let merged = merge_report(&fixture, &thread, "tester.claude", "codex");
-        assert!(
-            merged.contains(
-                "codex is in use by another mahi; asking it to merge once the agent is idle"
-            ),
-            "{merged}"
-        );
-        assert!(
-            merged.contains("merged tester.claude into tester.codex: 1 written, 0 removed"),
-            "{merged}"
-        );
-        assert!(codex_tree.join("parser.rs").exists());
-        fs::write(codex_tree.join("done"), "").unwrap();
-        let (code, output) = running.join().unwrap();
-        assert_eq!(code, 0, "{output}");
-        assert!(output.contains("fn parse() {}"), "{output}");
-
-        let store = Store::open(&fixture.repo).unwrap();
-        let claude_head = store
-            .head(&snapshots_of(&thread, "claude"))
-            .unwrap()
-            .unwrap();
-        let trailer = format!("Mahi-Merged: tester.claude {claude_head}");
-        let recorded = std::iter::successors(
-            store.head(&snapshots_of(&thread, "codex")).unwrap(),
-            |commit| store.parent(*commit).unwrap(),
-        )
-        .any(|commit| {
-            store
-                .commit_message(commit)
-                .unwrap()
-                .to_string()
-                .contains(&trailer)
-        });
-        assert!(recorded);
-        all_signed_by(&store, &snapshots_of(&thread, "codex"), &fixture.owner);
     }
 
     #[test]
@@ -3151,7 +2901,7 @@ printf '%s\n' \
     }
 
     #[test]
-    fn work_taken_over_by_a_handoff_lands_and_merges_back_without_conflicts() {
+    fn work_taken_over_by_a_handoff_lands_without_conflicts() {
         let fixture = fixture();
         let (thread, _claude) = worked_thread(&fixture);
         let helper = script(
@@ -3184,20 +2934,6 @@ printf '%s\n' \
         let landing = worktree_named(&fixture, &format!("{thread}@land"));
         assert_eq!(
             fs::read_to_string(landing.join("parser.rs")).unwrap(),
-            "fn parse() {}\nfn check() {}\n"
-        );
-
-        let report = merge_report(&fixture, &thread, "tester.helper", "claude");
-        assert!(
-            report.contains("merged tester.helper into tester.claude: 1 written"),
-            "{report}"
-        );
-        assert!(!report.contains("conflict"), "{report}");
-        assert_eq!(
-            fs::read_to_string(
-                worktree_named(&fixture, &format!("{thread}.claude")).join("parser.rs")
-            )
-            .unwrap(),
             "fn parse() {}\nfn check() {}\n"
         );
         assert!(fixture.mahi(&["end", &thread]).status.success());
@@ -3243,88 +2979,6 @@ printf '%s\n' \
         assert_eq!(
             fs::read_to_string(landing.join("parser.rs")).unwrap(),
             "fn parse() {}\nfn check() {}\n"
-        );
-        assert!(fixture.mahi(&["end", &thread]).status.success());
-    }
-
-    #[test]
-    fn merging_taken_over_work_into_a_third_agent_records_the_work_it_started_from() {
-        let fixture = fixture();
-        let (thread, _claude) = worked_thread(&fixture);
-        let helper = script(
-            &fixture,
-            "extending",
-            "helper",
-            "#!/bin/sh\nprintf 'fn check() {}\\n' >> parser.rs\n",
-        );
-        let third = script(&fixture, "idle", "third", "#!/bin/sh\n");
-        for arguments in [
-            vec![
-                "handoff",
-                &thread,
-                "--from",
-                "tester.claude",
-                "--",
-                helper.to_str().unwrap(),
-            ],
-            vec!["agent", "add", &thread, "--", third.to_str().unwrap()],
-        ] {
-            let (code, output) = in_terminal(&fixture, &arguments, Some(PASSPHRASE));
-            assert_eq!(code, 0, "{output}");
-        }
-
-        let report = merge_report(&fixture, &thread, "tester.helper", "third");
-        assert!(
-            report.contains("merged tester.helper into tester.third: 1 written"),
-            "{report}"
-        );
-        let report = merge_report(&fixture, &thread, "tester.claude", "third");
-        assert!(
-            report.contains("tester.third already has the latest snapshot of tester.claude"),
-            "{report}"
-        );
-        assert_eq!(
-            fs::read_to_string(
-                worktree_named(&fixture, &format!("{thread}.third")).join("parser.rs")
-            )
-            .unwrap(),
-            "fn parse() {}\nfn check() {}\n"
-        );
-        assert!(fixture.mahi(&["end", &thread]).status.success());
-    }
-
-    #[test]
-    fn a_merge_that_leaves_a_path_unwritten_is_not_recorded_and_is_tried_again() {
-        let fixture = fixture();
-        let (thread, _claude) = worked_thread(&fixture);
-        let ignoring = script(
-            &fixture,
-            "ignoring",
-            "ignoring",
-            "#!/bin/sh\nprintf 'parser.rs\\n' > .gitignore\nprintf 'local\\n' > parser.rs\n",
-        );
-        let (code, output) = in_terminal(
-            &fixture,
-            &["agent", "add", &thread, "--", ignoring.to_str().unwrap()],
-            Some(PASSPHRASE),
-        );
-        assert_eq!(code, 0, "{output}");
-
-        for _ in 0..2 {
-            let report = merge_report(&fixture, &thread, "tester.claude", "ignoring");
-            assert!(
-                report.contains("left as they were (something else is in the way): \"parser.rs\""),
-                "{report}"
-            );
-            assert!(report.contains("this merge is not recorded"), "{report}");
-            assert!(!report.contains("already has"), "{report}");
-        }
-        assert_eq!(
-            fs::read_to_string(
-                worktree_named(&fixture, &format!("{thread}.ignoring")).join("parser.rs")
-            )
-            .unwrap(),
-            "local\n"
         );
         assert!(fixture.mahi(&["end", &thread]).status.success());
     }
@@ -3468,47 +3122,6 @@ printf '%s\n' \
             "{}",
             String::from_utf8_lossy(&again.stderr)
         );
-    }
-
-    #[test]
-    fn a_merge_into_itself_into_an_unnamed_agent_of_several_or_from_an_unlisted_one_is_refused() {
-        let fixture = fixture();
-        let (thread, _claude) = worked_thread(&fixture);
-        add_codex_from_claude(&fixture, &thread);
-        for (args, said) in [
-            (
-                vec![
-                    "merge",
-                    &thread,
-                    "--from",
-                    "tester.claude",
-                    "--into",
-                    "claude",
-                ],
-                "tester.claude cannot be merged into itself",
-            ),
-            (
-                vec!["merge", &thread, "--from", "tester.codex"],
-                "several agents",
-            ),
-            (
-                vec![
-                    "merge",
-                    &thread,
-                    "--from",
-                    "mallory.claude",
-                    "--into",
-                    "claude",
-                ],
-                "does not list mallory",
-            ),
-        ] {
-            let refused = fixture.mahi(&args);
-            let report = String::from_utf8_lossy(&refused.stderr);
-            assert_eq!(refused.status.code(), Some(1), "{report}");
-            assert!(report.contains(said), "{report}");
-        }
-        assert!(fixture.mahi(&["end", &thread]).status.success());
     }
 
     #[test]
