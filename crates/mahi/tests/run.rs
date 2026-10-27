@@ -1069,7 +1069,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         session.wait_for("ready");
         assert!(session.text().contains("Ctrl-Space opens mahi's palette"));
         session.type_keys(b"\0");
-        session.wait_for_screen("╭ Teammates' prompts");
+        session.wait_for_screen("╭ Held turns");
         session.type_keys(b"abc");
         session.wait_for_screen("› abc");
         session.type_keys(b"\x1b");
@@ -1095,7 +1095,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         );
         session.wait_for("ready");
         session.type_keys(b"\0");
-        session.wait_for_screen("╭ Teammates' prompts");
+        session.wait_for_screen("╭ Held turns");
         let (code, text) = session.finish();
         assert_eq!(code, 0, "{text}");
         let box_at = text.find('╭').unwrap();
@@ -1122,7 +1122,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         session.type_keys(b"\0\r");
         session.wait_for("^@");
         session.type_keys(b"\x1b[15~");
-        session.wait_for_screen("╭ Teammates' prompts");
+        session.wait_for_screen("╭ Held turns");
         session.type_keys(b"\x1b[15~");
         session.type_keys(b"x\r");
         let (code, text) = session.finish();
@@ -1700,7 +1700,7 @@ cat parser.rs
                 ("Which agent should start the thread?", b"1"),
                 ("agent-ready", b"x\x00\x00y"),
                 ("x^@y", b"\x00p"),
-                ("Teammates' prompts", b"z"),
+                ("Held turns", b"z"),
                 ("› z", b"\x00\x00w"),
                 ("^@w", b"\x00q"),
                 ("stop it and quit?", b"y"),

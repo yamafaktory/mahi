@@ -271,10 +271,7 @@ impl View {
             | Body::Resize { slot, .. }
             | Body::Heartbeat { slot }
             | Body::TurnEnded(TurnEnd { slot, .. }) => self.seen(slot),
-            Body::ScreenRequest { .. }
-            | Body::Prompt { .. }
-            | Body::PromptAnswer { .. }
-            | Body::Claims { .. } => {}
+            Body::ScreenRequest { .. } | Body::Claims { .. } => {}
         }
         match body {
             Body::Screen {
@@ -322,8 +319,6 @@ impl View {
             }
             Body::ScreenRequest { .. }
             | Body::Heartbeat { .. }
-            | Body::Prompt { .. }
-            | Body::PromptAnswer { .. }
             | Body::Claims { .. }
             | Body::TurnEnded(_) => {}
         }

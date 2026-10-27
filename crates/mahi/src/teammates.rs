@@ -185,11 +185,7 @@ impl Teammates {
                 teammate.screen = Watched::Drawn(Box::new(screen));
                 true
             }
-            Body::ScreenRequest { .. }
-            | Body::Prompt { .. }
-            | Body::PromptAnswer { .. }
-            | Body::Claims { .. }
-            | Body::TurnEnded(_) => false,
+            Body::ScreenRequest { .. } | Body::Claims { .. } | Body::TurnEnded(_) => false,
         }
     }
 

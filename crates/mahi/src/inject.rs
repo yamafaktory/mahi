@@ -1,9 +1,5 @@
 use std::{
-    borrow::Cow,
-    io::{
-        self,
-        Write,
-    },
+    io::Write,
     sync::{
         Mutex,
         atomic::{
@@ -22,29 +18,18 @@ use mahi_agent::{
     hook::HookKind,
     payload::asks_user,
 };
-use mahi_core::{
-    ParticipantName,
-    is_invisible,
-};
 use mahi_term::Report;
 
-use crate::prompts::Prompts;
-
-const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
 const INTERRUPT: u8 = 0x03;
 const KILL_LINE: u8 = 0x15;
 const ESC: u8 = 0x1b;
 
-/// How the injector paces itself: how long the agent and the user must be quiet, how often it
-/// looks, how long it waits between the prompt and its Enter, and after how long without
-/// output or keys a turn the agent never reported ended counts as over.
+/// How work that waits for the agent paces itself: how long the agent and the user must be
+/// quiet, and how often it looks.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Pace {
     pub(crate) quiet: Duration,
     pub(crate) look_every: Duration,
-    pub(crate) enter_after: Duration,
-    pub(crate) stale_turn: Duration,
 }
 
 impl Default for Pace {
@@ -52,8 +37,6 @@ impl Default for Pace {
         Self {
             quiet: Duration::from_secs(2),
             look_every: Duration::from_millis(200),
-            enter_after: Duration::from_millis(50),
-            stale_turn: Duration::from_secs(60),
         }
     }
 }
@@ -144,11 +127,6 @@ impl Activity {
         self.touched();
     }
 
-    fn typed_prompt(&self) {
-        self.line_empty.store(true, Ordering::SeqCst);
-        self.touched();
-    }
-
     fn is_idle(&self, pace: &Pace) -> bool {
         let Ok(quiet_for) = self.last.lock().map(|last| last.elapsed()) else {
             return false;
@@ -156,22 +134,15 @@ impl Activity {
         if self.asking.load(Ordering::SeqCst) {
             return false;
         }
-        let turn_over = !self.turn_open.load(Ordering::SeqCst) || quiet_for >= pace.stale_turn;
-        turn_over && self.line_empty.load(Ordering::SeqCst) && quiet_for >= pace.quiet
-    }
-
-    /// Says whether the agent is idle with its turn closed, by its turn-end hook or an
-    /// interrupt: a turn only gone stale does not count.
-    fn is_idle_with_turn_closed(&self, pace: &Pace) -> bool {
-        !self.turn_open.load(Ordering::SeqCst) && self.is_idle(pace)
+        !self.turn_open.load(Ordering::SeqCst)
+            && self.line_empty.load(Ordering::SeqCst)
+            && quiet_for >= pace.quiet
     }
 
     /// Says whether the agent is idle after a turn its turn-end hook reported, or since it
-    /// started: an interrupt or a turn gone stale does not count.
+    /// started: an interrupt does not count.
     fn is_idle_after_turn_end(&self, pace: &Pace) -> bool {
-        self.turn_ended.load(Ordering::SeqCst)
-            && !self.turn_open.load(Ordering::SeqCst)
-            && self.is_idle(pace)
+        self.turn_ended.load(Ordering::SeqCst) && self.is_idle(pace)
     }
 }
 
@@ -270,49 +241,10 @@ fn kitty_key(params: &[u8], effect: &mut LineEffect) {
     }
 }
 
-/// The agent's side of what the injector needs: whether mahi's palette is open, and whether the
-/// agent turned bracketed paste on.
+/// The agent's side of what waits for it: whether mahi's palette is open.
 pub(crate) trait AgentInput {
     /// Returns whether the palette is open, when nothing is given to the agent.
     fn palette_open(&self) -> bool;
-    /// Returns whether the agent takes pasted text as a bracketed paste.
-    fn bracketed_paste(&self) -> bool;
-}
-
-/// Gives the agent each accepted prompt when it is idle and the palette closed, while
-/// `running` is set: as a bracketed paste when the agent turned that on, then Enter on its
-/// own. It holds the agent's input while it looks and types, so neither the user's keys nor
-/// the palette come in between.
-pub(crate) fn give_accepted(
-    prompts: &Prompts,
-    activity: &Activity,
-    agent: &impl AgentInput,
-    writer: &Mutex<impl Write>,
-    (running, pace): (&AtomicBool, Pace),
-) {
-    let mut typed = Vec::new();
-    while running.load(Ordering::SeqCst) {
-        thread::sleep(pace.look_every);
-        let Ok(mut input) = writer.lock() else {
-            return;
-        };
-        if agent.palette_open() || !activity.is_idle(&pace) {
-            continue;
-        }
-        let Some(accepted) = prompts.next_accepted() else {
-            continue;
-        };
-        typed.clear();
-        encode(
-            &tagged(accepted.text.as_str(), accepted.from.as_ref()),
-            agent.bracketed_paste(),
-            &mut typed,
-        );
-        if type_in(&mut *input, &typed, pace.enter_after).is_err() {
-            return;
-        }
-        activity.typed_prompt();
-    }
 }
 
 /// What the agent must have done before an action runs.
@@ -325,7 +257,7 @@ pub(crate) enum Readiness {
 }
 
 /// Runs `act` once the agent is as `readiness` says and the palette closed, holding the agent's
-/// input while it runs, so neither the user's keys nor an accepted prompt come in between;
+/// input while it runs, so no key of the user's comes in between;
 /// returns `None` if `running` is cleared first.
 pub(crate) fn when_ready<T>(
     activity: &Activity,
@@ -340,7 +272,7 @@ pub(crate) fn when_ready<T>(
             return None;
         };
         let ready = match readiness {
-            Readiness::TurnClosed => activity.is_idle_with_turn_closed(&pace),
+            Readiness::TurnClosed => activity.is_idle(&pace),
             Readiness::AfterTurnEnd => activity.is_idle_after_turn_end(&pace),
         };
         if agent.palette_open() || !ready {
@@ -353,98 +285,21 @@ pub(crate) fn when_ready<T>(
     None
 }
 
-fn type_in(input: &mut impl Write, typed: &[u8], enter_after: Duration) -> io::Result<()> {
-    input.write_all(typed)?;
-    input.flush()?;
-    thread::sleep(enter_after);
-    input.write_all(b"\r")?;
-    input.flush()
-}
-
-/// Returns `text` as it is typed for the agent: after `[from <name>]` when a teammate sent it,
-/// so the agent tells them from its user.
-fn tagged<'a>(text: &'a str, from: Option<&ParticipantName>) -> Cow<'a, str> {
-    match from {
-        Some(from) => Cow::Owned(format!("[from {from}] {text}")),
-        None => Cow::Borrowed(text),
-    }
-}
-
-/// Writes `text` as the keys that type it into the agent: control characters other than
-/// newlines and tabs, and invisible ones, are left out, so nothing in it can end the paste or
-/// act as a key; without bracketed paste, newlines and tabs become spaces, so the prompt is
-/// one line the agent takes at once.
-fn encode(text: &str, bracketed: bool, out: &mut Vec<u8>) {
-    if bracketed {
-        out.extend_from_slice(PASTE_START);
-    }
-    let mut buffer = [0_u8; 4];
-    for character in text.chars() {
-        let character = match character {
-            '\n' if bracketed => '\r',
-            '\t' if bracketed => '\t',
-            '\n' | '\t' => ' ',
-            _ if character.is_control() || is_invisible(character) => continue,
-            _ => character,
-        };
-        out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
-    }
-    if bracketed {
-        out.extend_from_slice(PASTE_END);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use mahi_live::PromptText;
-
     use super::*;
-    use crate::prompts::Decision;
-
-    #[test]
-    fn a_teammates_prompt_is_typed_after_their_name_and_the_users_as_it_is() {
-        let bob = ParticipantName::new("bob").unwrap();
-        assert_eq!(tagged("say hello", Some(&bob)), "[from bob] say hello");
-        assert_eq!(tagged("say hello", None), "say hello");
-        assert_eq!(
-            encoded(&tagged("two\nlines", Some(&bob)), true),
-            b"\x1b[200~[from bob] two\rlines\x1b[201~"
-        );
-    }
-
-    fn encoded(text: &str, bracketed: bool) -> Vec<u8> {
-        let mut out = Vec::new();
-        encode(text, bracketed, &mut out);
-        out
-    }
 
     fn fast() -> Pace {
         Pace {
             quiet: Duration::from_millis(100),
             look_every: Duration::from_millis(10),
-            enter_after: Duration::from_millis(5),
-            stale_turn: Duration::from_millis(400),
         }
     }
 
     #[test]
-    fn a_prompt_is_pasted_whole_and_nothing_in_it_can_end_the_paste() {
-        assert_eq!(
-            encoded("fix it\nthen test\ttoo", true),
-            b"\x1b[200~fix it\rthen test\ttoo\x1b[201~"
-        );
-        assert_eq!(
-            encoded("a\x1b[201~\x03b\u{202e}\u{7f}\u{9b}c\r", true),
-            b"\x1b[200~a[201~bc\x1b[201~"
-        );
-        assert_eq!(encoded("two\nlines\tand tab", false), b"two lines and tab");
-        assert_eq!(encoded("\x1b\x04x", false), b"x");
-    }
-
-    #[test]
-    fn a_turn_keeps_the_agent_busy_until_it_ends_is_interrupted_or_goes_stale() {
+    fn a_turn_keeps_the_agent_busy_until_it_ends_or_is_interrupted_however_long_it_stays_quiet() {
         let pace = fast();
         let activity = Activity::default();
         assert!(!activity.is_idle(&pace));
@@ -461,8 +316,8 @@ mod tests {
         thread::sleep(pace.quiet);
         assert!(activity.is_idle(&pace));
         activity.saw(HookKind::Prompt, b"");
-        thread::sleep(pace.stale_turn);
-        assert!(activity.is_idle(&pace));
+        thread::sleep(pace.quiet * 4);
+        assert!(!activity.is_idle(&pace));
     }
 
     #[test]
@@ -477,8 +332,7 @@ mod tests {
         assert!(activity.is_idle(&pace));
         assert!(!activity.is_idle_after_turn_end(&pace));
         activity.saw(HookKind::Prompt, b"");
-        thread::sleep(pace.stale_turn);
-        assert!(activity.is_idle(&pace));
+        thread::sleep(pace.quiet * 4);
         assert!(!activity.is_idle_after_turn_end(&pace));
         activity.saw(HookKind::TurnEnd, b"");
         thread::sleep(pace.quiet);
@@ -493,16 +347,15 @@ mod tests {
         let pace = fast();
         let activity = Activity::default();
         activity.saw(HookKind::Prompt, b"");
-        thread::sleep(pace.stale_turn);
-        assert!(activity.is_idle(&pace));
-        assert!(!activity.is_idle_with_turn_closed(&pace));
+        thread::sleep(pace.quiet * 4);
+        assert!(!activity.is_idle(&pace));
         activity.keys(b"\x1b");
         thread::sleep(pace.quiet);
-        assert!(activity.is_idle_with_turn_closed(&pace));
+        assert!(activity.is_idle(&pace));
         activity.saw(HookKind::Prompt, b"");
         activity.saw(HookKind::TurnEnd, b"");
         thread::sleep(pace.quiet);
-        assert!(activity.is_idle_with_turn_closed(&pace));
+        assert!(activity.is_idle(&pace));
     }
 
     #[test]
@@ -558,26 +411,25 @@ mod tests {
     }
 
     #[test]
-    fn a_question_keeps_prompts_out_however_long_it_waits_until_the_user_answers() {
+    fn a_question_outside_a_turn_keeps_merges_out_however_long_it_waits_until_the_user_answers() {
         let pace = fast();
         let activity = Activity::default();
-        activity.saw(HookKind::Prompt, b"");
         activity.saw(
             HookKind::Asks,
             br#"{"notification_type":"permission_prompt"}"#,
         );
-        thread::sleep(pace.stale_turn);
+        thread::sleep(pace.quiet * 4);
         assert!(!activity.is_idle(&pace));
         activity.keys(b"\x1b[B");
-        thread::sleep(pace.stale_turn);
+        thread::sleep(pace.quiet * 4);
         assert!(!activity.is_idle(&pace));
         activity.keys(b"\r");
-        thread::sleep(pace.stale_turn);
+        thread::sleep(pace.quiet);
         assert!(activity.is_idle(&pace));
     }
 
     #[test]
-    fn a_line_the_user_left_unfinished_keeps_prompts_out() {
+    fn a_line_the_user_left_unfinished_keeps_merges_out() {
         let pace = fast();
         let activity = Activity::default();
         activity.keys(b"half a thou");
@@ -653,69 +505,6 @@ mod tests {
         fn palette_open(&self) -> bool {
             self.palette_open.load(Ordering::SeqCst)
         }
-
-        fn bracketed_paste(&self) -> bool {
-            true
-        }
-    }
-
-    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !done() {
-            assert!(Instant::now() < deadline, "{what}");
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    #[test]
-    fn accepted_prompts_are_typed_only_while_the_palette_is_closed_and_the_agent_idle() {
-        let prompts = Arc::new(Prompts::default());
-        let bob = ParticipantName::new("bob").unwrap();
-        for (id, text) in [(1, "first"), (2, "second")] {
-            prompts.offer(
-                bob.clone(),
-                [id; 16],
-                PromptText::new(text.to_owned()).unwrap(),
-            );
-            prompts.decide([id; 16], Decision::Accept);
-        }
-        let activity = Arc::new(Activity::default());
-        let agent = Arc::new(FakeAgent {
-            palette_open: AtomicBool::new(true),
-        });
-        let writer = Arc::new(Mutex::new(Vec::new()));
-        let running = Arc::new(AtomicBool::new(true));
-        let worker = {
-            let (prompts, activity, agent, writer, running) = (
-                Arc::clone(&prompts),
-                Arc::clone(&activity),
-                Arc::clone(&agent),
-                Arc::clone(&writer),
-                Arc::clone(&running),
-            );
-            thread::spawn(move || {
-                give_accepted(&prompts, &activity, &*agent, &writer, (&running, fast()));
-            })
-        };
-        thread::sleep(fast().quiet * 3);
-        assert!(writer.lock().unwrap().is_empty());
-        activity.keys(b"mine");
-        agent.palette_open.store(false, Ordering::SeqCst);
-        thread::sleep(fast().quiet * 3);
-        assert!(writer.lock().unwrap().is_empty());
-        activity.keys(b"\r");
-        wait_until("the first prompt was never typed", || {
-            writer.lock().unwrap().ends_with(b"\r")
-        });
-        assert_eq!(
-            writer.lock().unwrap().as_slice(),
-            b"\x1b[200~first\x1b[201~\r"
-        );
-        wait_until("the second prompt was never typed", || {
-            writer.lock().unwrap().ends_with(b"second\x1b[201~\r")
-        });
-        running.store(false, Ordering::SeqCst);
-        worker.join().unwrap();
     }
 
     #[test]
@@ -749,7 +538,7 @@ mod tests {
         assert!(!worker.is_finished());
         activity.keys(b"\r");
         activity.saw(HookKind::Prompt, b"");
-        thread::sleep(fast().stale_turn + fast().quiet * 3);
+        thread::sleep(fast().quiet * 5);
         assert!(!worker.is_finished());
         activity.saw(HookKind::TurnEnd, b"");
         assert_eq!(worker.join().unwrap(), Some(true));

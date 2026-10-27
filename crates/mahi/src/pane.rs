@@ -79,18 +79,6 @@ impl Write for Out {
 }
 
 impl ScreenOut for Out {
-    fn pass_through(&mut self, notice: &[u8]) -> io::Result<()> {
-        match self {
-            Self::Direct(out) => out.write_all(notice),
-            Self::Pane(pane) => {
-                if !pane.finished {
-                    pane.notices.extend_from_slice(notice);
-                }
-                Ok(())
-            }
-        }
-    }
-
     fn resize(&mut self, size: WindowSize) {
         if let Self::Pane(pane) = self {
             pane.resize(size);
@@ -146,7 +134,6 @@ pub(crate) struct Pane {
     title: String,
     hint: Option<String>,
     replies: mpsc::SyncSender<Vec<u8>>,
-    notices: Vec<u8>,
     scratch: Vec<u8>,
     finished: bool,
 }
@@ -169,7 +156,6 @@ impl Pane {
             title: title.to_owned(),
             hint: palette_key.map(str::to_owned),
             replies,
-            notices: Vec::new(),
             scratch: Vec::new(),
             finished: false,
         };
@@ -209,10 +195,7 @@ impl Pane {
         self.terminal.backend_mut().resize(size.rows, size.cols);
         self.terminal.autoresize()?;
         let all = [
-            (
-                self.hint.as_deref().unwrap_or_default(),
-                "teammates' prompts",
-            ),
+            (self.hint.as_deref().unwrap_or_default(), "held turns"),
             ("exit the agent", "back to the threads"),
         ];
         let first = usize::from(self.hint.is_none());
@@ -233,7 +216,6 @@ impl Pane {
         if drawn.is_ok() {
             self.screen.take_passed(&mut self.scratch);
         }
-        self.scratch.append(&mut self.notices);
         self.scratch.extend_from_slice(END_SYNC);
         let mut out = io::stdout().lock();
         out.write_all(&self.scratch)?;
@@ -248,7 +230,6 @@ impl Pane {
         self.finished = true;
         self.scratch.clear();
         self.screen.undo(&mut self.scratch);
-        self.scratch.append(&mut self.notices);
         let mut out = io::stdout().lock();
         let _ = out.write_all(&self.scratch);
         let _ = out.flush();

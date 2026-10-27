@@ -218,7 +218,7 @@ the same time also connect to each other directly. [DESIGN.md](DESIGN.md) specif
   filter on Linux, Seatbelt on macOS. Its only way out is mahi's proxy, to the hosts its
   profile allows.
 - **Live layer.** Peers connect directly over QUIC with [iroh](https://www.iroh.computer)
-  (hole punching, with relays as a fallback) and share the live terminal, prompts and claims
+  (hole punching, with relays as a fallback) and share the live terminal, claims and turn ends
   over [iroh-gossip](https://github.com/n0-computer/iroh-gossip), one topic per thread, sealed
   with a key derived from the thread key so only its participants can read them. TLS is
   [rustls](https://github.com/rustls/rustls) with mahi's own pure-Rust crypto provider, built

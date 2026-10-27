@@ -335,10 +335,6 @@ mod tests {
         fn palette_open(&self) -> bool {
             false
         }
-
-        fn bracketed_paste(&self) -> bool {
-            false
-        }
     }
 
     struct Team {
@@ -702,8 +698,6 @@ mod tests {
         Pace {
             quiet: Duration::from_millis(50),
             look_every: Duration::from_millis(10),
-            enter_after: Duration::from_millis(1),
-            stale_turn: Duration::from_secs(60),
         }
     }
 

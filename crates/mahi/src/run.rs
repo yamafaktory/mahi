@@ -4,10 +4,7 @@ use std::{
         OsStr,
         OsString,
     },
-    fmt::{
-        self,
-        Write as _,
-    },
+    fmt,
     fs::{
         self,
         File,
@@ -187,7 +184,6 @@ use crate::{
         OutputTap,
     },
     inject::{
-        self,
         Activity,
         AgentInput,
         Pace,
@@ -228,10 +224,6 @@ use crate::{
     prompt::{
         Prompt,
         TerminalPrompt,
-    },
-    prompts::{
-        Arrival,
-        Prompts,
     },
     recorder::{
         Merger,
@@ -1546,7 +1538,7 @@ impl Prepared {
         );
         let auto_merge = auto_merge(self.profile, self.owner.as_ref(), (&self.git_dir, &started));
         let note_by = self.profile.map_or(NoteBy::ListAgents, Profile::note_by);
-        let (tools, prompts) = serve_tools(
+        let tools = serve_tools(
             self.mcp,
             (self.owner, key, live.as_ref()),
             (&self.git_dir, config.clone()),
@@ -1559,14 +1551,12 @@ impl Prepared {
                 title: format!("{} · thread {}", started.slot, started.thread),
                 palette_key: self.palette_key,
                 activity,
-                notice: notice(environment),
             },
             termination,
             Background {
                 recorder,
                 turns,
                 pusher,
-                prompts,
                 auto_merge,
             },
             proxy,
@@ -1631,13 +1621,12 @@ fn serve_tools(
     ),
     (git_dir, config): (&Path, ConfigDir),
     (started, note_by): (&Started, NoteBy),
-) -> (Arc<AtomicBool>, Arc<Prompts>) {
+) -> Arc<AtomicBool> {
     let serving = Arc::new(AtomicBool::new(true));
-    let prompts = live.map_or_else(|| Arc::new(Prompts::default()), Link::prompts);
     let claims = live.map_or_else(|| Arc::new(Claims::default()), Link::claims);
     let Some(owner) = owner else {
         eprintln!("mahi: the agent's tools are off, since the thread's owner is not known");
-        return (serving, prompts);
+        return serving;
     };
     let tools = ThreadTools::new(
         (git_dir.to_path_buf(), config),
@@ -1650,7 +1639,7 @@ fn serve_tools(
         let toolbox: Arc<dyn Toolbox> = Arc::new(tools);
         mcp::serve(&listener, &flag, &toolbox);
     });
-    (serving, prompts)
+    serving
 }
 
 /// Starts pushing the refs of `started`'s agent to the remote `setup` names, and returns the
@@ -1679,24 +1668,6 @@ fn spawn_auto_merge<A: AgentInput + Send + Sync + 'static, W: Write + Send + 'st
         auto_merge.run(
             &merger,
             (&activity, &*agent, &writer),
-            (&running, Pace::default()),
-        );
-    });
-}
-
-/// Gives the agent the prompts the user accepts, on a thread of its own while `running` is
-/// set.
-fn spawn_giver<A: AgentInput + Send + Sync + 'static, W: Write + Send + 'static>(
-    prompts: Arc<Prompts>,
-    (activity, agent, writer): (Arc<Activity>, Arc<A>, Arc<Mutex<W>>),
-    running: Arc<AtomicBool>,
-) {
-    thread::spawn(move || {
-        inject::give_accepted(
-            &prompts,
-            &activity,
-            &*agent,
-            &writer,
             (&running, Pace::default()),
         );
     });
@@ -1799,7 +1770,6 @@ struct Background {
     recorder: Option<Recorder>,
     turns: Option<TurnWorker>,
     pusher: Option<(Pusher, RemoteName)>,
-    prompts: Arc<Prompts>,
     auto_merge: Option<AutoMerge>,
 }
 
@@ -1832,7 +1802,6 @@ struct UserSide {
     title: String,
     palette_key: PaletteKey,
     activity: Arc<Activity>,
-    notice: Notice,
 }
 
 fn finish_run(
@@ -1848,7 +1817,6 @@ fn finish_run(
         recorder,
         turns,
         pusher,
-        prompts,
         auto_merge,
     } = background;
     let (code, received, _signals) = supervise(
@@ -1858,7 +1826,6 @@ fn finish_run(
         termination,
         AgentSide {
             tap: live.as_ref().map(Link::tap),
-            prompts,
             merger: recorder.as_ref().map(Recorder::merger),
             auto_merge,
         },
@@ -1903,10 +1870,9 @@ fn finish_run(
 }
 
 /// What the run hands the agent's side of the terminal: where its output is copied for
-/// teammates, the palette's queue, and the recorder's merges.
+/// teammates, and the recorder's merges.
 struct AgentSide {
     tap: Option<OutputTap>,
-    prompts: Arc<Prompts>,
     merger: Option<Merger>,
     auto_merge: Option<AutoMerge>,
 }
@@ -1969,18 +1935,17 @@ fn supervise(
     let interactive = raw.is_some() && terminal::is_interactive();
     let AgentSide {
         tap,
-        prompts,
         merger,
         auto_merge,
     } = side;
     let code = relay(
         child,
         &user.title,
-        interactive.then_some((user.palette_key, user.notice)),
+        interactive.then_some(user.palette_key),
         &user.activity,
         (events, &received),
         tap,
-        (Some(prompts), merger, auto_merge),
+        (merger, auto_merge),
     );
     drop(raw);
     (code, received, watch)
@@ -2517,16 +2482,16 @@ impl Host {
 fn relay(
     child: PtyChild,
     title: &str,
-    palette: Option<(PaletteKey, Notice)>,
+    palette: Option<PaletteKey>,
     activity: &Arc<Activity>,
     (events, received): (mpsc::Sender<Event>, &Receiver<Event>),
     tap: Option<OutputTap>,
-    (prompts, merger, auto_merge): (Option<Arc<Prompts>>, Option<Merger>, Option<AutoMerge>),
+    (merger, auto_merge): (Option<Merger>, Option<AutoMerge>),
 ) -> Result<Outcome, RunError> {
     let (stop, stopped) = UnixStream::pair().map_err(RunError::Output)?;
     let writer = Arc::new(Mutex::new(child.writer()?));
     let repainter = Repainter::new(child.resizer()?);
-    let palette_key = palette.map(|(key, _)| key).unwrap_or_default();
+    let palette_key = palette.unwrap_or_default();
     let (replies, answers) = mpsc::sync_channel::<Vec<u8>>(MOST_QUEUED_REPLIES);
     let answering = Arc::clone(&writer);
     thread::spawn(move || {
@@ -2539,14 +2504,14 @@ fn relay(
             }
         }
     });
-    let shown_key = palette.map(|(key, _)| key.to_string());
+    let shown_key = palette.map(|key| key.to_string());
     let out = Out::for_agent(title, shown_key.as_deref(), replies).map_err(RunError::Output)?;
     let waiting = auto_merge
         .as_ref()
         .filter(|_| palette.is_some())
         .map(|auto_merge| Arc::clone(&auto_merge.waiting));
     let screen = user_screen(
-        Screen::new(out, repainter.clone(), palette_key, prompts.clone()),
+        Screen::new(out, repainter.clone(), palette_key),
         waiting.as_ref(),
     );
     let running = Arc::new(AtomicBool::new(palette.is_some()));
@@ -2562,28 +2527,16 @@ fn relay(
             });
         });
     }
-    let input = palette.map(|(key, _)| (Arc::clone(&screen), KeyScanner::new(key), key_opens));
+    let input = palette.map(|key| (Arc::clone(&screen), KeyScanner::new(key), key_opens));
     let (input_writer, input_activity) = (Arc::clone(&writer), Arc::clone(activity));
     let (quit, quitting) = UnixStream::pair().map_err(RunError::Output)?;
     let input_quitting = quitting.try_clone().map_err(RunError::Output)?;
     let forwarding = thread::spawn(move || {
         forward_input(&input_writer, input, &input_activity, &input_quitting);
     });
-    spawn_ticker(
-        Arc::clone(&screen),
-        Arc::clone(&running),
-        prompts.clone().zip(palette),
-        waiting,
-    );
+    spawn_ticker(Arc::clone(&screen), Arc::clone(&running), waiting);
     if let Some((auto_merge, merger)) = auto_merge.zip(merger) {
         spawn_auto_merge(auto_merge, merger, (activity, &screen, &writer), &running);
-    }
-    if let Some(prompts) = prompts.filter(|_| palette.is_some()) {
-        spawn_giver(
-            prompts,
-            (Arc::clone(activity), Arc::clone(&screen), writer),
-            Arc::clone(&running),
-        );
     }
     let following = follow_resizes(repainter, Arc::clone(&screen), tap.clone(), quitting);
     let mut reader = child.reader()?;
@@ -2667,20 +2620,14 @@ fn follow_resizes(
     })
 }
 
-/// Ticks the palette's `screen` each second while `ticking` holds, opens it on its own when a
-/// teammate's snapshot comes to `waiting`, and tells the user of each teammate's prompt that
-/// came to `told`'s prompts: through the workspace that started this mahi, if one did,
-/// otherwise with `told`'s notice on the terminal.
+/// Ticks the palette's `screen` each second while `ticking` holds, and opens it on its own
+/// when a teammate's snapshot comes to `waiting`.
 fn spawn_ticker(
     screen: Arc<UserScreen>,
     ticking: Arc<AtomicBool>,
-    told: Option<(Arc<Prompts>, (PaletteKey, Notice))>,
     waiting: Option<Arc<HeldQueue>>,
 ) {
     thread::spawn(move || {
-        let mut arrivals = Vec::new();
-        let mut notice = Vec::new();
-        let mut text = String::new();
         while ticking.load(Ordering::SeqCst) {
             thread::sleep(PALETTE_TICK);
             if screen.is_opening() {
@@ -2690,38 +2637,8 @@ fn spawn_ticker(
                 let _ = screen.open_guarded();
             }
             let _ = screen.tick();
-            if let Some((prompts, (key, notifier))) = &told {
-                prompts.take_arrivals(&mut arrivals);
-                for arrival in arrivals.drain(..) {
-                    notice.clear();
-                    text.clear();
-                    arrival_text(&arrival, *key, &mut text);
-                    if crate::report::connected() {
-                        crate::report::send(&mahi_term::Report::Notify(std::mem::take(&mut text)));
-                        continue;
-                    }
-                    notifier.write("mahi", &text, &mut notice);
-                    let _ = screen.notify(&notice);
-                }
-            }
         }
     });
-}
-
-fn arrival_text(arrival: &Arrival, key: PaletteKey, out: &mut String) {
-    let _ = if arrival.accepted {
-        write!(
-            out,
-            "{}'s prompt goes to the agent: {}",
-            arrival.from, arrival.first_words
-        )
-    } else {
-        write!(
-            out,
-            "{} sent a prompt ({key} to read it): {}",
-            arrival.from, arrival.first_words
-        )
-    };
 }
 
 fn await_outcome(
@@ -3347,12 +3264,10 @@ impl DraftWriter {
                 title: "writing the pull request draft".to_owned(),
                 palette_key: prepared.palette_key,
                 activity,
-                notice: notice(environment),
             },
             termination,
             AgentSide {
                 tap: None,
-                prompts: Arc::new(Prompts::default()),
                 merger: None,
                 auto_merge: None,
             },
@@ -3481,7 +3396,6 @@ mod tests {
             },
             StillTerminal,
             PaletteKey::default(),
-            None,
         );
         let progress = Arc::new(AtomicU64::new(0));
         let (events, received) = mpsc::channel();

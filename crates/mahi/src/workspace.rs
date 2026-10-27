@@ -517,7 +517,6 @@ struct Running {
     closed: bool,
     ending: Ending,
     state: AgentState,
-    prompts: u16,
     told_asks: Option<Instant>,
     commands: Option<File>,
 }
@@ -707,7 +706,6 @@ impl Workspace {
             closed: false,
             ending: Ending::Running,
             state: AgentState::Done,
-            prompts: 0,
             told_asks: None,
             commands: Some(commands),
         };
@@ -764,7 +762,6 @@ impl Workspace {
                     }
                     self.passed = passed;
                 }
-                ChildEvent::Report(id, Report::Notify(text)) => self.notify(id, &text, out),
                 ChildEvent::Report(id, report) => {
                     changed |= self.take_report(id, &report, out);
                 }
@@ -1349,7 +1346,6 @@ impl Workspace {
         let hit = ThreadView {
             agents: &agents,
             selected: tab.selected,
-            prompts: 0,
             list,
             hints: &[],
             waiting: None,
@@ -1392,7 +1388,6 @@ impl Workspace {
         let point = ThreadView {
             agents: &[],
             selected: 0,
-            prompts: 0,
             list,
             hints: &[],
             waiting: None,
@@ -1499,7 +1494,7 @@ impl Workspace {
         );
         if self.shows_running() {
             add(
-                "Show this agent's teammates' prompts".to_owned(),
+                "Show this agent's held turns".to_owned(),
                 "p".to_owned(),
                 Entry::AgentPalette,
             );
@@ -1752,11 +1747,6 @@ impl Workspace {
         let cursor = ThreadView {
             agents: &agents,
             selected: tab.selected,
-            prompts: tab
-                .agents
-                .iter()
-                .map(|running| usize::from(running.prompts))
-                .sum(),
             list: self.list_place(body.width),
             hints: match &told {
                 _ if failed => &failed_hints,
@@ -1777,18 +1767,6 @@ impl Workspace {
                 .iter()
                 .any(|running| running.state == AgentState::AsksYou),
         })
-    }
-
-    /// Writes to `out` the notification `text` that the child `id` reported, titled with its
-    /// tab.
-    fn notify(&self, id: usize, text: &str, out: &mut Vec<u8>) {
-        let tab = self
-            .tabs
-            .iter()
-            .find(|tab| tab.agents.iter().any(|running| running.id == id))
-            .map_or("", |tab| tab.title.as_str());
-        let title = format!("mahi {tab}");
-        self.notice.write(title.trim_end(), text, out);
     }
 
     /// Takes what the child `id` reported about its agent, writing to `out` the bell and a
@@ -1838,8 +1816,7 @@ impl Workspace {
                 }
                 running.state = AgentState::AsksYou;
             }
-            Report::Prompts(count) => running.prompts = *count,
-            Report::Thread(_) | Report::Notify(_) => {}
+            Report::Thread(_) => {}
         }
         true
     }
@@ -2031,7 +2008,6 @@ mod tests {
             closed: false,
             ending: Ending::Running,
             state: AgentState::Done,
-            prompts: 0,
             told_asks: None,
             commands: None,
         }
@@ -2239,7 +2215,7 @@ mod tests {
             "Show agent agent (✓ done)",
             "Go to the next agent waiting for you",
             "Hide the agents' list",
-            "Show this agent's teammates' prompts",
+            "Show this agent's held turns",
             "Pass Ctrl-Space through to the agent",
             "Quit mahi",
         ] {
@@ -2949,34 +2925,9 @@ mod tests {
         assert!(!workspace.take_report(id, &Report::Thread(thread), &mut Vec::new()));
         assert!(workspace.take_report(id, &Report::Asks, &mut Vec::new()));
         assert!(workspace.tab_titles().next().unwrap().asks);
-        workspace.take_report(id, &Report::Prompts(2), &mut Vec::new());
-        assert_eq!(workspace.tabs[0].agents[0].prompts, 2);
         workspace.take_report(id, &Report::Done, &mut Vec::new());
         assert_eq!(workspace.tabs[0].agents[0].state, AgentState::Done);
         assert!(!workspace.take_report(99, &Report::Done, &mut Vec::new()));
-    }
-
-    #[test]
-    fn a_notification_a_hidden_child_reports_reaches_the_terminal_titled_with_its_tab() {
-        let mut workspace = Workspace::new(
-            PaletteKey::default(),
-            Notice::for_terminal(TerminalHints::default()),
-        );
-        let agent = running(&mut workspace, "sleep 5");
-        let id = agent.id;
-        workspace.tabs.push(tab("3e5c8646", vec![agent]));
-        workspace.selected = 0;
-        let text = "bob sent a prompt: fix it".to_owned();
-        workspace
-            .sender
-            .send(ChildEvent::Report(id, Report::Notify(text)))
-            .unwrap();
-        let mut out = Vec::new();
-        workspace.take_output(&mut out);
-        assert_eq!(
-            out,
-            b"\x1b]9;mahi 3e5c8646: bob sent a prompt: fix it\x07\x07"
-        );
     }
 
     #[test]

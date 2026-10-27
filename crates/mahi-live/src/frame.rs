@@ -52,21 +52,13 @@ pub const MIN_ROWS: u16 = 2;
 /// The fewest columns a screen or a resize may have, so a wide character fits in a row.
 pub const MIN_COLUMNS: u16 = 2;
 
-const SIGNED_LABEL: &[u8] = b"mahi-live-v1";
-const TOPIC_INFO: &[u8] = b"mahi-live-topic-v1";
-const SEAL_INFO: &[u8] = b"mahi-live-seal-v1";
+const SIGNED_LABEL: &[u8] = b"mahi-live-v2";
+const TOPIC_INFO: &[u8] = b"mahi-live-topic-v2";
+const SEAL_INFO: &[u8] = b"mahi-live-seal-v2";
 const NONCE_BYTES: usize = 24;
 const EPOCH_BYTES: usize = 16;
 const CHALLENGE_BYTES: usize = 16;
 const REMEMBERED_CHALLENGES: usize = 256;
-/// The largest prompt a teammate can send an agent, in bytes.
-pub const MAX_PROMPT_BYTES: usize = 8 * 1024;
-/// The size of a prompt's id.
-pub const PROMPT_ID_BYTES: usize = 16;
-/// The size of the id of one run of a sender.
-pub const RUN_BYTES: usize = EPOCH_BYTES;
-/// The most prompts a host takes from one node in one of its runs.
-pub const MAX_PROMPTS_PER_RUN: usize = 1024;
 /// How many runs of a sender a receiver remembers, refusing lists of claims no newer than
 /// the newest seen from the same run.
 const REMEMBERED_RUNS: usize = 8;
@@ -136,26 +128,6 @@ pub enum Body {
         /// At most [`MAX_CHUNK_BYTES`] of the screen.
         bytes: Vec<u8>,
     },
-    /// A participant asks the agent `slot` to take a prompt.
-    Prompt {
-        /// The agent the prompt is for.
-        slot: AgentSlot,
-        /// The run of the agent's host the prompt is for, so no later run takes it.
-        run: [u8; RUN_BYTES],
-        /// A random id the answers carry.
-        id: [u8; PROMPT_ID_BYTES],
-        /// The prompt's text.
-        text: PromptText,
-    },
-    /// The host of the agent `slot` says what became of a prompt.
-    PromptAnswer {
-        /// The agent the prompt was for.
-        slot: AgentSlot,
-        /// The prompt's id.
-        id: [u8; PROMPT_ID_BYTES],
-        /// What became of it.
-        outcome: PromptOutcome,
-    },
     /// A host's whole list of the claims its agents hold, at most [`MAX_FRAME_CLAIMS`], with
     /// the latest turn-end snapshot of each of its agents, at most [`MAX_FRAME_TURN_ENDS`].
     Claims {
@@ -191,83 +163,6 @@ pub struct ClaimEntry {
     pub note: Option<String>,
     /// How long ago the claim was taken, in seconds.
     pub age_secs: u32,
-}
-
-/// The text of a prompt a teammate sends an agent: not empty, and at most
-/// [`MAX_PROMPT_BYTES`].
-#[derive(Clone, PartialEq, Eq)]
-pub struct PromptText(String);
-
-impl PromptText {
-    /// Checks `text` as a prompt's text.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FrameError::Malformed`] if `text` is empty, or [`FrameError::TooLarge`] if it
-    /// is longer than [`MAX_PROMPT_BYTES`].
-    pub fn new(text: String) -> Result<Self, FrameError> {
-        check_prompt(&text)?;
-        Ok(Self(text))
-    }
-
-    /// Returns the text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for PromptText {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PromptText")
-            .field("bytes", &self.0.len())
-            .finish_non_exhaustive()
-    }
-}
-
-/// What became of a prompt a teammate sent an agent, as its host tells.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptOutcome {
-    /// The prompt waits for the host user.
-    Queued,
-    /// The host user accepted it.
-    Accepted,
-    /// The host user rejected it.
-    Rejected,
-    /// The host let it go without the host user accepting or rejecting it.
-    Dropped,
-}
-
-impl PromptOutcome {
-    pub(crate) fn code(self) -> u8 {
-        match self {
-            Self::Queued => 0,
-            Self::Accepted => 1,
-            Self::Rejected => 2,
-            Self::Dropped => 3,
-        }
-    }
-
-    pub(crate) fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Queued),
-            1 => Some(Self::Accepted),
-            2 => Some(Self::Rejected),
-            3 => Some(Self::Dropped),
-            _ => None,
-        }
-    }
-}
-
-/// Draws a new prompt id.
-///
-/// # Errors
-///
-/// Returns [`FrameError::Random`] if the random source fails.
-pub fn prompt_id() -> Result<[u8; PROMPT_ID_BYTES], FrameError> {
-    let mut id = [0_u8; PROMPT_ID_BYTES];
-    getrandom::fill(&mut id).map_err(|_| FrameError::Random)?;
-    Ok(id)
 }
 
 /// A frame a receiver accepted.
@@ -314,12 +209,6 @@ pub enum FrameError {
     /// The frame comes from a run of its sender this receiver has not anchored with a screen.
     #[error("the frame comes from a run this viewer has not seen start")]
     Unanchored,
-    /// The prompt is for another run, or this receiver takes no prompts.
-    #[error("the prompt is not for this run")]
-    OtherRun,
-    /// The sender sent more than [`MAX_PROMPTS_PER_RUN`] prompts in this run.
-    #[error("the sender sent too many prompts")]
-    TooManyPrompts,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -364,17 +253,6 @@ enum WireBody<'a> {
     },
     Heartbeat {
         slot: &'a str,
-    },
-    Prompt {
-        slot: &'a str,
-        run: [u8; RUN_BYTES],
-        id: [u8; PROMPT_ID_BYTES],
-        text: &'a str,
-    },
-    PromptAnswer {
-        slot: &'a str,
-        id: [u8; PROMPT_ID_BYTES],
-        outcome: u8,
     },
     Claims {
         #[serde(borrow)]
@@ -535,12 +413,6 @@ impl FrameSender {
         self.keys.topic()
     }
 
-    /// Returns the id of this run, which prompts for it carry.
-    #[must_use]
-    pub fn run(&self) -> [u8; RUN_BYTES] {
-        self.epoch
-    }
-
     /// Seals and signs `body` as the next frame.
     ///
     /// # Errors
@@ -596,32 +468,6 @@ impl FrameSender {
                     part: *part,
                     parts: *parts,
                     bytes,
-                }
-            }
-            Body::Prompt {
-                slot: owner,
-                run,
-                id,
-                text,
-            } => {
-                slot = owner.to_string();
-                WireBody::Prompt {
-                    slot: &slot,
-                    run: *run,
-                    id: *id,
-                    text: text.as_str(),
-                }
-            }
-            Body::PromptAnswer {
-                slot: owner,
-                id,
-                outcome,
-            } => {
-                slot = owner.to_string();
-                WireBody::PromptAnswer {
-                    slot: &slot,
-                    id: *id,
-                    outcome: outcome.code(),
                 }
             }
             Body::Claims { claims, turn_ends } => return self.seal_claims(claims, turn_ends),
@@ -724,7 +570,6 @@ struct SenderState {
     epoch: [u8; EPOCH_BYTES],
     sequence: u64,
     anchored_with: [u8; CHALLENGE_BYTES],
-    stale: bool,
 }
 
 /// Checks and opens the frames one viewer or host receives, and keeps what replay protection
@@ -736,8 +581,6 @@ pub struct FrameReceiver {
     challenge: Option<[u8; CHALLENGE_BYTES]>,
     requests: VecDeque<[u8; CHALLENGE_BYTES]>,
     seen_requests: HashSet<[u8; CHALLENGE_BYTES]>,
-    own_run: Option<OwnRun>,
-    prompts: HashMap<NodeId, HashSet<[u8; PROMPT_ID_BYTES]>>,
     claims: HashMap<NodeId, ClaimsSeen>,
 }
 
@@ -745,12 +588,6 @@ pub struct FrameReceiver {
 #[derive(Debug, Default)]
 struct ClaimsSeen {
     runs: VecDeque<([u8; EPOCH_BYTES], u64)>,
-}
-
-#[derive(Debug)]
-struct OwnRun {
-    run: [u8; RUN_BYTES],
-    owner: ParticipantName,
 }
 
 impl fmt::Debug for FrameReceiver {
@@ -774,41 +611,8 @@ impl FrameReceiver {
             challenge: None,
             requests: VecDeque::with_capacity(REMEMBERED_CHALLENGES),
             seen_requests: HashSet::with_capacity(REMEMBERED_CHALLENGES),
-            own_run: None,
-            prompts: HashMap::new(),
             claims: HashMap::new(),
         }
-    }
-
-    /// Takes the prompts for the agents of `owner` in the run of `sender`, the host's own; a
-    /// receiver takes no prompts until it is told its run.
-    pub fn take_prompts_for(&mut self, sender: &FrameSender, owner: ParticipantName) {
-        let run = sender.run();
-        if self.own_run.as_ref().is_none_or(|own| own.run != run) {
-            self.prompts.clear();
-        }
-        self.own_run = Some(OwnRun { run, owner });
-    }
-
-    /// Returns the run of `sender` this receiver follows, which a prompt for its agents
-    /// carries, or `None` before a screen of it anchored one, and while frames of another run
-    /// of it come that no screen anchored yet, such as after its mahi restarted.
-    #[must_use]
-    pub fn run_of(&self, sender: &NodeId) -> Option<[u8; RUN_BYTES]> {
-        self.senders
-            .get(sender)
-            .filter(|state| !state.stale)
-            .map(|state| state.epoch)
-    }
-
-    /// Returns the node of `participant` and the run of it this receiver follows, which a
-    /// prompt for one of its agents goes to, or `None` before a screen of it anchored one.
-    #[must_use]
-    pub fn run_for(&self, participant: &ParticipantName) -> Option<(NodeId, [u8; RUN_BYTES])> {
-        self.participants
-            .iter()
-            .filter(|(_, name)| *name == participant)
-            .find_map(|(node, _)| self.run_of(node).map(|run| (*node, run)))
     }
 
     /// Replaces the participants, as a newer `meta` lists them; nodes no longer listed are
@@ -907,9 +711,6 @@ impl FrameReceiver {
         if let Body::ScreenRequest { challenge } = body {
             return self.remember_request(*challenge);
         }
-        if let Body::Prompt { slot, run, id, .. } = body {
-            return self.remember_prompt(sender, slot, *run, *id);
-        }
         if let Body::Claims { .. } = body {
             return self.remember_claims(sender, plain);
         }
@@ -920,7 +721,6 @@ impl FrameReceiver {
             }
             if let Some(current) = self.senders.get_mut(&sender) {
                 current.sequence = plain.sequence;
-                current.stale = false;
             }
             return Ok(());
         }
@@ -936,17 +736,11 @@ impl FrameReceiver {
                         epoch: plain.epoch,
                         sequence: plain.sequence,
                         anchored_with: *challenge,
-                        stale: false,
                     },
                 );
                 Ok(())
             }
-            _ => {
-                if let Some(current) = self.senders.get_mut(&sender) {
-                    current.stale = true;
-                }
-                Err(FrameError::Unanchored)
-            }
+            _ => Err(FrameError::Unanchored),
         }
     }
 
@@ -973,30 +767,6 @@ impl FrameReceiver {
         Ok(())
     }
 
-    fn remember_prompt(
-        &mut self,
-        sender: NodeId,
-        slot: &AgentSlot,
-        run: [u8; RUN_BYTES],
-        id: [u8; PROMPT_ID_BYTES],
-    ) -> Result<(), FrameError> {
-        let Some(own) = self.own_run.as_ref().filter(|own| own.run == run) else {
-            return Err(FrameError::OtherRun);
-        };
-        if slot.participant() != &own.owner {
-            return Err(FrameError::NotTheirSlot);
-        }
-        let seen = self.prompts.entry(sender).or_default();
-        if seen.contains(&id) {
-            return Err(FrameError::Replayed);
-        }
-        if seen.len() >= MAX_PROMPTS_PER_RUN {
-            return Err(FrameError::TooManyPrompts);
-        }
-        seen.insert(id);
-        Ok(())
-    }
-
     fn remember_request(&mut self, challenge: [u8; CHALLENGE_BYTES]) -> Result<(), FrameError> {
         if !self.seen_requests.insert(challenge) {
             return Err(FrameError::Replayed);
@@ -1009,16 +779,6 @@ impl FrameReceiver {
         self.requests.push_back(challenge);
         Ok(())
     }
-}
-
-fn check_prompt(text: &str) -> Result<(), FrameError> {
-    if text.is_empty() {
-        return Err(FrameError::Malformed);
-    }
-    if text.len() > MAX_PROMPT_BYTES {
-        return Err(FrameError::TooLarge);
-    }
-    Ok(())
 }
 
 fn check_size(rows: u16, columns: u16) -> Result<(), FrameError> {
@@ -1094,9 +854,8 @@ fn drawn_slot(body: &Body) -> Option<&AgentSlot> {
         | Body::Resize { slot, .. }
         | Body::Screen { slot, .. }
         | Body::Heartbeat { slot }
-        | Body::PromptAnswer { slot, .. }
         | Body::TurnEnded(TurnEnd { slot, .. }) => Some(slot),
-        Body::ScreenRequest { .. } | Body::Prompt { .. } | Body::Claims { .. } => None,
+        Body::ScreenRequest { .. } | Body::Claims { .. } => None,
     }
 }
 
@@ -1154,29 +913,6 @@ fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
                 bytes: bytes.to_vec(),
             }
         }
-        WireBody::Prompt {
-            slot: owner,
-            run,
-            id,
-            text,
-        } => {
-            check_prompt(text)?;
-            Body::Prompt {
-                slot: slot(owner)?,
-                run,
-                id,
-                text: PromptText(text.to_owned()),
-            }
-        }
-        WireBody::PromptAnswer {
-            slot: owner,
-            id,
-            outcome,
-        } => Body::PromptAnswer {
-            slot: slot(owner)?,
-            id,
-            outcome: PromptOutcome::from_code(outcome).ok_or(FrameError::Malformed)?,
-        },
         WireBody::Claims {
             ref claims,
             ref turn_ends,
@@ -1345,16 +1081,13 @@ mod tests {
         viewer.open(&old_screen).unwrap();
 
         let mut restarted = thread.sender(1);
-        assert_eq!(viewer.run_of(&node(1)), Some(old.run()));
         let fresh = restarted.seal(&output("alice", "new run")).unwrap();
         assert_eq!(viewer.open(&fresh), Err(FrameError::Unanchored));
-        assert_eq!(viewer.run_of(&node(1)), None);
         let request = viewer.request_screen().unwrap();
         assert_eq!(viewer.open(&old_screen), Err(FrameError::Replayed));
         viewer
             .open(&restarted.seal(&screen("alice", &request)).unwrap())
             .unwrap();
-        assert_eq!(viewer.run_of(&node(1)), Some(restarted.run()));
         let next = restarted.seal(&output("alice", "followed")).unwrap();
         assert_eq!(
             viewer.open(&next).unwrap().body,
@@ -1624,240 +1357,6 @@ mod tests {
             Err(FrameError::Unanchored)
         );
         assert!(!format!("{:?}", thread.keys()).contains("seal"));
-    }
-
-    fn prompt(run: [u8; RUN_BYTES], id: [u8; PROMPT_ID_BYTES], text: &str) -> Body {
-        Body::Prompt {
-            slot: slot("alice"),
-            run,
-            id,
-            text: PromptText::new(text.to_owned()).unwrap(),
-        }
-    }
-
-    fn hosting(thread: &Thread) -> (FrameSender, FrameReceiver) {
-        let alice = thread.sender(1);
-        let mut host = thread.receiver();
-        host.take_prompts_for(&alice, ParticipantName::new("alice").unwrap());
-        (alice, host)
-    }
-
-    #[test]
-    fn a_participants_prompt_reaches_the_host_once() {
-        let thread = Thread::new();
-        let (alice, mut host) = hosting(&thread);
-        let mut bob = thread.sender(2);
-        let id = prompt_id().unwrap();
-        let body = prompt(alice.run(), id, "fix the parser test");
-        let frame = bob.seal(&body).unwrap();
-        let received = host.open(&frame).unwrap();
-        assert_eq!(received.participant.as_str(), "bob");
-        assert_eq!(received.body, body);
-        assert_eq!(host.open(&frame), Err(FrameError::Replayed));
-        let again = bob.seal(&prompt(alice.run(), id, "same id")).unwrap();
-        assert_eq!(host.open(&again), Err(FrameError::Replayed));
-        let mut carol = thread.sender(3);
-        let same_id_elsewhere = carol.seal(&prompt(alice.run(), id, "mine")).unwrap();
-        assert!(host.open(&same_id_elsewhere).is_ok());
-        let mut stranger = thread.sender(9);
-        let from_stranger = stranger
-            .seal(&prompt(alice.run(), prompt_id().unwrap(), "hi"))
-            .unwrap();
-        assert_eq!(host.open(&from_stranger), Err(FrameError::NotParticipant));
-        let for_bob = Body::Prompt {
-            slot: slot("bob"),
-            run: alice.run(),
-            id: prompt_id().unwrap(),
-            text: PromptText::new("hi".to_owned()).unwrap(),
-        };
-        let misdirected = carol.seal(&for_bob).unwrap();
-        assert_eq!(host.open(&misdirected), Err(FrameError::NotTheirSlot));
-    }
-
-    #[test]
-    fn a_participant_removed_and_listed_again_cannot_replay_a_prompt() {
-        let thread = Thread::new();
-        let (alice, mut host) = hosting(&thread);
-        let mut bob = thread.sender(2);
-        let frame = bob
-            .seal(&prompt(alice.run(), prompt_id().unwrap(), "hi"))
-            .unwrap();
-        host.open(&frame).unwrap();
-        let alice_only = [(node(1), ParticipantName::new("alice").unwrap())];
-        host.set_participants(alice_only.clone());
-        assert_eq!(host.open(&frame), Err(FrameError::NotParticipant));
-        host.set_participants(
-            alice_only
-                .into_iter()
-                .chain([(node(2), ParticipantName::new("bob").unwrap())]),
-        );
-        assert_eq!(host.open(&frame), Err(FrameError::Replayed));
-    }
-
-    #[test]
-    fn a_prompt_is_taken_only_by_the_run_it_names() {
-        let thread = Thread::new();
-        let (alice, mut host) = hosting(&thread);
-        let mut bob = thread.sender(2);
-        let frame = bob
-            .seal(&prompt(alice.run(), prompt_id().unwrap(), "hi"))
-            .unwrap();
-        let mut viewer = thread.receiver();
-        assert_eq!(viewer.open(&frame), Err(FrameError::OtherRun));
-
-        let restarted = thread.sender(1);
-        host.take_prompts_for(&restarted, ParticipantName::new("alice").unwrap());
-        assert_eq!(host.open(&frame), Err(FrameError::OtherRun));
-        let fresh = bob
-            .seal(&prompt(restarted.run(), prompt_id().unwrap(), "hi"))
-            .unwrap();
-        assert!(host.open(&fresh).is_ok());
-    }
-
-    #[test]
-    fn a_viewer_learns_the_run_its_prompts_name_from_the_hosts_screen() {
-        let thread = Thread::new();
-        let mut viewer = thread.receiver();
-        let mut alice = thread.sender(1);
-        assert_eq!(viewer.run_of(&node(1)), None);
-        assert_eq!(
-            viewer.run_for(&ParticipantName::new("alice").unwrap()),
-            None
-        );
-        let request = viewer.request_screen().unwrap();
-        viewer
-            .open(&alice.seal(&screen("alice", &request)).unwrap())
-            .unwrap();
-        assert_eq!(viewer.run_of(&node(1)), Some(alice.run()));
-        let named = |name: &str| ParticipantName::new(name).unwrap();
-        assert_eq!(
-            viewer.run_for(&named("alice")),
-            Some((node(1), alice.run()))
-        );
-        assert_eq!(viewer.run_for(&named("nobody")), None);
-    }
-
-    #[test]
-    fn a_host_remembers_every_prompt_of_a_run_up_to_its_limit() {
-        let thread = Thread::new();
-        let (alice, mut host) = hosting(&thread);
-        let mut bob = thread.sender(2);
-        let first = bob
-            .seal(&prompt(alice.run(), prompt_id().unwrap(), "first"))
-            .unwrap();
-        host.open(&first).unwrap();
-        for _ in 1..MAX_PROMPTS_PER_RUN {
-            let next = bob
-                .seal(&prompt(alice.run(), prompt_id().unwrap(), "next"))
-                .unwrap();
-            host.open(&next).unwrap();
-        }
-        assert_eq!(host.open(&first), Err(FrameError::Replayed));
-        let over = bob
-            .seal(&prompt(alice.run(), prompt_id().unwrap(), "over"))
-            .unwrap();
-        assert_eq!(host.open(&over), Err(FrameError::TooManyPrompts));
-        let mut carol = thread.sender(3);
-        let other_sender = carol
-            .seal(&prompt(alice.run(), prompt_id().unwrap(), "mine"))
-            .unwrap();
-        assert!(host.open(&other_sender).is_ok());
-    }
-
-    #[test]
-    fn prompt_text_is_bounded_and_kept_out_of_debug_output() {
-        assert_eq!(PromptText::new(String::new()), Err(FrameError::Malformed));
-        assert!(PromptText::new("x".repeat(MAX_PROMPT_BYTES)).is_ok());
-        assert_eq!(
-            PromptText::new("x".repeat(MAX_PROMPT_BYTES + 1)),
-            Err(FrameError::TooLarge)
-        );
-        let text = PromptText::new("the secret plan".to_owned()).unwrap();
-        assert_eq!(text.as_str(), "the secret plan");
-        let body = prompt([0; RUN_BYTES], [0; PROMPT_ID_BYTES], "the secret plan");
-        assert!(!format!("{body:?}").contains("secret"));
-    }
-
-    #[test]
-    fn empty_oversized_or_non_utf8_prompt_text_is_refused() {
-        let thread = Thread::new();
-        let (alice, mut host) = hosting(&thread);
-        let mut bob = thread.sender(2);
-        let over = "x".repeat(MAX_PROMPT_BYTES + 1);
-        for (text, error) in [
-            ("", FrameError::Malformed),
-            (over.as_str(), FrameError::TooLarge),
-        ] {
-            let frame = bob
-                .seal_wire(WireBody::Prompt {
-                    slot: "alice.claude",
-                    run: alice.run(),
-                    id: prompt_id().unwrap(),
-                    text,
-                })
-                .unwrap();
-            assert_eq!(host.open(&frame), Err(error));
-        }
-        let mut plain = postcard::to_allocvec(&WirePlain {
-            epoch: [0; EPOCH_BYTES],
-            sequence: 1,
-            body: WireBody::Prompt {
-                slot: "alice.claude",
-                run: alice.run(),
-                id: [0; PROMPT_ID_BYTES],
-                text: "ab",
-            },
-        })
-        .unwrap();
-        let last = plain.len() - 1;
-        plain[last] = 0xff;
-        assert!(matches!(
-            decode_exact::<WirePlain<'_>>(&plain),
-            Err(FrameError::Malformed)
-        ));
-    }
-
-    #[test]
-    fn only_the_agents_owner_answers_its_prompts() {
-        let thread = Thread::new();
-        let mut viewer = thread.receiver();
-        let mut alice = thread.sender(1);
-        let mut mallory = thread.sender(3);
-        let request = viewer.request_screen().unwrap();
-        viewer
-            .open(&alice.seal(&screen("alice", &request)).unwrap())
-            .unwrap();
-        let id = prompt_id().unwrap();
-        let answer = Body::PromptAnswer {
-            slot: slot("alice"),
-            id,
-            outcome: PromptOutcome::Accepted,
-        };
-        let received = viewer.open(&alice.seal(&answer).unwrap()).unwrap();
-        assert_eq!(received.body, answer);
-        let forged = mallory.seal(&answer).unwrap();
-        assert_eq!(viewer.open(&forged), Err(FrameError::NotTheirSlot));
-        let unknown = alice
-            .seal_wire(WireBody::PromptAnswer {
-                slot: "alice.claude",
-                id,
-                outcome: 4,
-            })
-            .unwrap();
-        assert_eq!(viewer.open(&unknown), Err(FrameError::Malformed));
-    }
-
-    #[test]
-    fn every_prompt_outcome_code_round_trips() {
-        for outcome in [
-            PromptOutcome::Queued,
-            PromptOutcome::Accepted,
-            PromptOutcome::Rejected,
-            PromptOutcome::Dropped,
-        ] {
-            assert_eq!(PromptOutcome::from_code(outcome.code()), Some(outcome));
-        }
-        assert_eq!(PromptOutcome::from_code(4), None);
     }
 
     #[test]

@@ -8,10 +8,7 @@ use std::io::{
     Write,
 };
 
-use mahi_core::{
-    AgentSlot,
-    ParticipantName,
-};
+use mahi_core::AgentSlot;
 use thiserror::Error;
 
 use crate::frame::{
@@ -21,9 +18,6 @@ use crate::frame::{
     MAX_ROWS,
     MIN_COLUMNS,
     MIN_ROWS,
-    PROMPT_ID_BYTES,
-    PromptOutcome,
-    PromptText,
     claim_fits,
 };
 
@@ -35,9 +29,7 @@ const HELLO: u8 = 1;
 const SCREEN: u8 = 2;
 const OUTPUT: u8 = 3;
 const RESIZE: u8 = 4;
-const ANSWER: u8 = 5;
 const WELCOME: u8 = 6;
-const OFFER: u8 = 7;
 const CLAIMS: u8 = 8;
 
 /// The most claims one local message carries.
@@ -75,24 +67,8 @@ pub enum LocalMessage {
         /// Its width in columns.
         columns: u16,
     },
-    /// What became of a prompt the host passed on.
-    Answer {
-        /// The prompt.
-        id: [u8; PROMPT_ID_BYTES],
-        /// What became of it.
-        outcome: PromptOutcome,
-    },
     /// The host serves the agent.
     Welcome,
-    /// A prompt a teammate sent the agent.
-    Offer {
-        /// The teammate.
-        from: ParticipantName,
-        /// The prompt's id.
-        id: [u8; PROMPT_ID_BYTES],
-        /// Its text.
-        text: PromptText,
-    },
     /// Claims: the ones a mahi's agent holds, sent to the host, or every claim the host knows,
     /// sent to the user's other mahis; at most [`MAX_LOCAL_CLAIMS`].
     Claims(Vec<ClaimEntry>),
@@ -159,18 +135,7 @@ impl LocalMessage {
                 out.push(RESIZE);
                 put_size(out, *rows, *columns)?;
             }
-            Self::Answer { id, outcome } => {
-                out.push(ANSWER);
-                out.extend_from_slice(id);
-                out.push(outcome.code());
-            }
             Self::Welcome => out.push(WELCOME),
-            Self::Offer { from, id, text } => {
-                out.push(OFFER);
-                put_name(out, from.as_str())?;
-                out.extend_from_slice(id);
-                out.extend_from_slice(text.as_str().as_bytes());
-            }
             Self::Claims(claims) => {
                 out.push(CLAIMS);
                 if claims.len() > MAX_LOCAL_CLAIMS {
@@ -238,21 +203,7 @@ impl LocalMessage {
                 let (rows, columns) = reader.size()?;
                 Self::Resize { rows, columns }
             }
-            ANSWER => {
-                let id = reader.id()?;
-                let outcome =
-                    PromptOutcome::from_code(reader.byte()?).ok_or(LocalError::Malformed)?;
-                Self::Answer { id, outcome }
-            }
             WELCOME => Self::Welcome,
-            OFFER => {
-                let from =
-                    ParticipantName::new(reader.name()?).map_err(|_| LocalError::Malformed)?;
-                let id = reader.id()?;
-                let text = std::str::from_utf8(reader.rest()).map_err(|_| LocalError::Malformed)?;
-                let text = PromptText::new(text.to_owned()).map_err(|_| LocalError::Malformed)?;
-                Self::Offer { from, id, text }
-            }
             CLAIMS => Self::Claims(reader.claims()?),
             _ => return Err(LocalError::Malformed),
         };
@@ -407,12 +358,6 @@ impl<'a> Reader<'a> {
         Ok(claims)
     }
 
-    fn id(&mut self) -> Result<[u8; PROMPT_ID_BYTES], LocalError> {
-        self.take(PROMPT_ID_BYTES)?
-            .try_into()
-            .map_err(|_| LocalError::Malformed)
-    }
-
     fn rest(&mut self) -> &'a [u8] {
         std::mem::take(&mut self.0)
     }
@@ -428,7 +373,10 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use mahi_core::AgentName;
+    use mahi_core::{
+        AgentName,
+        ParticipantName,
+    };
     use proptest::prelude::*;
 
     use super::*;
@@ -465,16 +413,7 @@ mod tests {
                 rows: MAX_ROWS,
                 columns: MAX_COLUMNS,
             },
-            LocalMessage::Answer {
-                id: [7; PROMPT_ID_BYTES],
-                outcome: PromptOutcome::Rejected,
-            },
             LocalMessage::Welcome,
-            LocalMessage::Offer {
-                from: ParticipantName::new("bob").unwrap(),
-                id: [9; PROMPT_ID_BYTES],
-                text: PromptText::new("fix the tests\nplease".to_owned()).unwrap(),
-            },
         ] {
             assert_eq!(round_trip(&message), message);
         }
@@ -523,21 +462,11 @@ mod tests {
     }
 
     #[test]
-    fn bad_names_outcomes_kinds_and_leftovers_are_refused() {
-        let mut offer = vec![OFFER, 3];
-        offer.extend_from_slice(b"Bob");
-        offer.extend_from_slice(&[0; PROMPT_ID_BYTES]);
-        offer.extend_from_slice(b"hi");
-        assert!(LocalMessage::decode(&offer).is_err());
-        let mut answer = vec![ANSWER];
-        answer.extend_from_slice(&[0; PROMPT_ID_BYTES]);
-        answer.push(9);
-        assert!(LocalMessage::decode(&answer).is_err());
-        answer.pop();
-        answer.push(1);
-        assert!(LocalMessage::decode(&answer).is_ok());
-        answer.push(0);
-        assert!(LocalMessage::decode(&answer).is_err());
+    fn bad_kinds_slots_and_leftovers_are_refused() {
+        let retired_prompt_kinds = [5, 7];
+        for kind in retired_prompt_kinds {
+            assert!(LocalMessage::decode(&[kind]).is_err());
+        }
         assert!(LocalMessage::decode(&[WELCOME, 0]).is_err());
         assert!(LocalMessage::decode(&[200]).is_err());
         assert!(LocalMessage::decode(&[]).is_err());

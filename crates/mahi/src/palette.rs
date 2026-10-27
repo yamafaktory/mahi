@@ -20,7 +20,6 @@ use mahi_core::{
     AgentSlot,
     is_invisible,
 };
-use mahi_live::PROMPT_ID_BYTES;
 use mahi_sandbox::{
     PtyResizer,
     WindowSize,
@@ -43,18 +42,11 @@ use crate::{
         Waiting,
     },
     inject::AgentInput,
-    prompts::{
-        Decision,
-        Prompts,
-    },
 };
 
 const MAX_HELD_BYTES: usize = 1024 * 1024;
-const TITLE: &str = "Teammates' prompts";
-const EMPTY: &str = "None yet: teammates watching this thread send them here";
-const HINT_READ: &str = "PgDn reads on · Ctrl-X rejects · Esc closes";
-const HINT_DECIDE: &str = "Enter accepts · Tab always · Ctrl-X rejects · Esc closes";
-const NO_TEAMMATES: &str = "Teammates cannot watch this run, so no prompts come";
+const TITLE: &str = "Held turns";
+const EMPTY: &str = "No teammate's turn waits for you";
 const HELD_DETAIL: &str = "changes agent settings";
 const HELD_READ: &str = "PgDn reads on · Ctrl-X skips · Esc closes";
 const HELD_DECIDE: &str = "Enter takes · Ctrl-X skips · Esc closes";
@@ -64,20 +56,10 @@ const HELD_BEHIND: &str = "Its later turns wait behind it.";
 const OPEN_GUARD: Duration = Duration::from_millis(500);
 const CLEAR: &[u8] = b"\x1b[2J";
 const REPAINT_PAUSE: Duration = Duration::from_millis(100);
-const DETAIL_CHARS: usize = 200;
 
 /// Where the screen writes the agent's output and mahi's palette: straight to the user's
 /// terminal, or into a pane mahi draws.
 pub(crate) trait ScreenOut: Write {
-    /// Writes mahi's own `notice` as it is, past what the agent's output goes through.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error writing gives.
-    fn pass_through(&mut self, notice: &[u8]) -> io::Result<()> {
-        self.write_all(notice)
-    }
-
     /// Takes the agent's terminal's new `size` before the agent draws for it.
     fn resize(&mut self, _size: WindowSize) {}
 
@@ -168,18 +150,13 @@ impl AgentTerminal for Repainter {
 pub(crate) struct Screen<W, T> {
     state: Mutex<State<W>>,
     terminal: T,
-    prompts: Option<Arc<Prompts>>,
     waiting: Option<Arc<HeldQueue>>,
     hint: String,
 }
 
-/// What a line of the palette stands for: a teammate's prompt, or a teammate's snapshot that
-/// waits because it changes agent settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Entry {
-    Prompt([u8; PROMPT_ID_BYTES]),
-    Held(AgentSlot, ObjectId),
-}
+/// What a line of the palette stands for: a teammate's snapshot that waits because it changes
+/// agent settings, by its teammate and its commit.
+type Entry = (AgentSlot, ObjectId);
 
 #[derive(Debug)]
 struct State<W> {
@@ -194,7 +171,6 @@ struct State<W> {
     page: usize,
     read_whole: Option<Entry>,
     keys: PaletteKeys,
-    notice: Vec<u8>,
     guard: Guard,
 }
 
@@ -215,9 +191,8 @@ enum Mode {
 }
 
 impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
-    /// Starts a screen that writes to `out`, with the palette closed; the palette lists the
-    /// teammates' `prompts`, when teammates can send any.
-    pub(crate) fn new(out: W, terminal: T, key: PaletteKey, prompts: Option<Arc<Prompts>>) -> Self {
+    /// Starts a screen that writes to `out`, with the palette closed.
+    pub(crate) fn new(out: W, terminal: T, key: PaletteKey) -> Self {
         Self {
             state: Mutex::new(State {
                 out,
@@ -231,18 +206,16 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                 page: 0,
                 read_whole: None,
                 keys: PaletteKeys::default(),
-                notice: Vec::new(),
                 guard: Guard::Off,
             }),
             terminal,
-            prompts,
             waiting: None,
             hint: format!("Esc closes · {key} twice sends {key} to the agent"),
         }
     }
 
-    /// Lists, besides the prompts, the teammates' snapshots in `waiting` that wait because they
-    /// change agent settings, to take or to skip.
+    /// Lists the teammates' snapshots in `waiting` that wait because they change agent
+    /// settings, to take or to skip.
     pub(crate) fn with_waiting(mut self, waiting: Arc<HeldQueue>) -> Self {
         self.waiting = Some(waiting);
         self
@@ -264,14 +237,12 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         if state.out.overlays() {
             state.tracker.feed(bytes);
             state.out.write_all(bytes)?;
-            write_notice(&mut state)?;
             return state.out.flush();
         }
         match state.mode {
             Mode::Agent => {
                 state.tracker.feed(bytes);
                 state.out.write_all(bytes)?;
-                write_notice(&mut state)?;
             }
             Mode::Opening => {
                 let written = state.tracker.feed_until_drawable(bytes);
@@ -280,7 +251,6 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                 if state.tracker.can_draw() {
                     state.held.extend_from_slice(later);
                     state.mode = Mode::Open;
-                    write_notice(&mut state)?;
                     self.draw(&mut state)?;
                 }
             }
@@ -289,26 +259,6 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                 self.release(&mut state)?;
             }
             Mode::Open => state.held.extend_from_slice(bytes),
-        }
-        state.out.flush()
-    }
-
-    /// Writes `notice`, the sequence that asks the terminal for a notification, where the
-    /// agent's output allows it: at once when it does, and otherwise as soon as it does,
-    /// replacing a notice still waiting.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error writing to the screen gives.
-    pub(crate) fn notify(&self, notice: &[u8]) -> io::Result<()> {
-        let mut state = self.lock()?;
-        state.notice.clear();
-        state.notice.extend_from_slice(notice);
-        if state.mode == Mode::Open {
-            let pending = std::mem::take(&mut state.notice);
-            state.out.pass_through(&pending)?;
-        } else if state.mode == Mode::Agent {
-            write_notice(&mut state)?;
         }
         state.out.flush()
     }
@@ -438,23 +388,24 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                     *scroll = scroll.saturating_sub((*page).max(1));
                     changed = true;
                 }
-                PaletteInput::Enter | PaletteInput::Tab | PaletteInput::Reject => {
-                    let decision = match input {
-                        PaletteInput::Enter => Decision::Accept,
-                        PaletteInput::Tab => Decision::AlwaysAccept,
-                        _ => Decision::Reject,
+                PaletteInput::Enter | PaletteInput::Reject => {
+                    let choice = if input == PaletteInput::Enter {
+                        Choice::Take
+                    } else {
+                        Choice::Skip
                     };
                     let id = selected_id
                         .clone()
                         .or_else(|| self.entry_at(filter, *selected));
-                    let read = decision == Decision::Reject || (id.is_some() && id == *read_whole);
-                    if read && id.as_ref().is_some_and(|id| self.decide(id, decision)) {
+                    let read = choice == Choice::Skip || (id.is_some() && id == *read_whole);
+                    if read && id.as_ref().is_some_and(|id| self.choose(id, choice)) {
                         *selected_id = None;
                         changed = true;
-                        closing |= decision != Decision::Reject;
+                        closing |= choice == Choice::Take;
                     }
                 }
-                PaletteInput::Up | PaletteInput::Left | PaletteInput::Right => {}
+                PaletteInput::Up | PaletteInput::Tab | PaletteInput::Left | PaletteInput::Right => {
+                }
             }
             !escaped && !closing
         });
@@ -541,7 +492,6 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         state.keys = PaletteKeys::default();
         state.guard = Guard::Off;
         state.out.write_all(&held)?;
-        write_notice(state)?;
         state.out.close_palette();
         if was_open && !state.out.overlays() {
             self.terminal.repaint();
@@ -570,13 +520,10 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         state.selected_id.clone_from(&selected_id);
         let text = selected_id.as_ref().and_then(|id| self.text_of(id));
         let read_whole = selected_id.is_some() && state.read_whole == selected_id;
-        let held = matches!(selected_id, Some(Entry::Held(..)));
-        let hint = match (&text, read_whole, held) {
-            (None, ..) => self.hint.as_str(),
-            (Some(_), false, false) => HINT_READ,
-            (Some(_), true, false) => HINT_DECIDE,
-            (Some(_), false, true) => HELD_READ,
-            (Some(_), true, true) => HELD_DECIDE,
+        let hint = match (&text, read_whole) {
+            (None, _) => self.hint.as_str(),
+            (Some(_), false) => HELD_READ,
+            (Some(_), true) => HELD_DECIDE,
         };
         let items: Vec<PaletteItem<'_>> = lines
             .iter()
@@ -590,11 +537,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
             filter: &state.filter,
             items: &items,
             selected: state.selected,
-            empty: if self.prompts.is_some() || self.waiting.is_some() {
-                EMPTY
-            } else {
-                NO_TEAMMATES
-            },
+            empty: EMPTY,
             hint,
             preview: text.as_deref().map(|text| Preview {
                 text,
@@ -629,31 +572,13 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                     detail.push_str(" · ");
                     detail.push_str(HELD_DETAIL);
                     lines.push(Line {
-                        id: Entry::Held(held.from.clone(), held.held.commit),
+                        id: (held.from.clone(), held.held.commit),
                         from,
                         detail,
                     });
                 }
             });
         }
-        let Some(prompts) = &self.prompts else {
-            return lines;
-        };
-        prompts.each_waiting(|waiting| {
-            let from = waiting.from.as_str();
-            let text = waiting.text.as_str();
-            if contains_ignoring_case(from, filter) || contains_ignoring_case(text, filter) {
-                let mut detail = String::with_capacity(DETAIL_CHARS + 8);
-                push_age(&mut detail, now.saturating_duration_since(waiting.at));
-                detail.push_str(" · ");
-                detail.extend(text.chars().take(DETAIL_CHARS));
-                lines.push(Line {
-                    id: Entry::Prompt(waiting.id),
-                    from: from.to_owned(),
-                    detail,
-                });
-            }
-        });
         lines
     }
 
@@ -664,38 +589,21 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
             .map(|line| line.id)
     }
 
-    fn text_of(&self, entry: &Entry) -> Option<String> {
-        match entry {
-            Entry::Prompt(id) => self.prompts.as_ref()?.text_of(*id),
-            Entry::Held(from, commit) => self
-                .waiting
-                .as_ref()?
-                .waiting(from)
-                .filter(|waiting| waiting.held.commit == *commit)
-                .map(|waiting| held_text(&waiting)),
-        }
+    fn text_of(&self, (from, commit): &Entry) -> Option<String> {
+        self.waiting
+            .as_ref()?
+            .waiting(from)
+            .filter(|waiting| waiting.held.commit == *commit)
+            .map(|waiting| held_text(&waiting))
     }
 
-    fn decide(&self, entry: &Entry, decision: Decision) -> bool {
-        match entry {
-            Entry::Prompt(id) => self
-                .prompts
-                .as_ref()
-                .is_some_and(|prompts| prompts.decide(*id, decision)),
-            Entry::Held(from, commit) => {
-                let choice = match decision {
-                    Decision::Accept => Choice::Take,
-                    Decision::Reject => Choice::Skip,
-                    Decision::AlwaysAccept => return false,
-                };
-                self.waiting
-                    .as_ref()
-                    .is_some_and(|waiting| waiting.choose((from, *commit), choice))
-            }
-        }
+    fn choose(&self, (from, commit): &Entry, choice: Choice) -> bool {
+        self.waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.choose((from, *commit), choice))
     }
 
-    /// Redraws the open palette, so the prompts that came and their ages show.
+    /// Redraws the open palette, so the held turns that came and their ages show.
     ///
     /// # Errors
     ///
@@ -757,19 +665,6 @@ impl<W: ScreenOut, T: AgentTerminal> AgentInput for Screen<W, T> {
     fn palette_open(&self) -> bool {
         self.is_open()
     }
-
-    fn bracketed_paste(&self) -> bool {
-        self.lock()
-            .is_ok_and(|state| state.tracker.bracketed_paste())
-    }
-}
-
-fn write_notice<W: ScreenOut>(state: &mut State<W>) -> io::Result<()> {
-    if state.notice.is_empty() || !state.tracker.is_ground() {
-        return Ok(());
-    }
-    let notice = std::mem::take(&mut state.notice);
-    state.out.pass_through(&notice)
 }
 
 fn push_age(out: &mut String, age: Duration) {
@@ -807,12 +702,7 @@ mod tests {
     }
 
     fn screen(terminal: &FakeTerminal) -> Screen<Vec<u8>, &FakeTerminal> {
-        Screen::new(
-            Vec::new(),
-            terminal,
-            PaletteKey::CTRL_SPACE,
-            Some(Arc::new(Prompts::default())),
-        )
+        Screen::new(Vec::new(), terminal, PaletteKey::CTRL_SPACE)
     }
 
     fn written(screen: &Screen<Vec<u8>, &FakeTerminal>) -> Vec<u8> {
@@ -832,7 +722,6 @@ mod tests {
     #[derive(Debug, Default)]
     struct Recording {
         drawn: Vec<u8>,
-        passed: Vec<u8>,
         events: Arc<Mutex<Vec<String>>>,
         finished: bool,
         overlay: Option<Vec<u8>>,
@@ -853,11 +742,6 @@ mod tests {
     }
 
     impl ScreenOut for Recording {
-        fn pass_through(&mut self, notice: &[u8]) -> io::Result<()> {
-            self.passed.extend_from_slice(notice);
-            Ok(())
-        }
-
         fn resize(&mut self, size: WindowSize) {
             self.events
                 .lock()
@@ -897,7 +781,6 @@ mod tests {
             },
             &terminal,
             PaletteKey::CTRL_SPACE,
-            None,
         );
         screen.output(b"\x1b]2;unfinished").unwrap();
         screen.open().unwrap();
@@ -920,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn notices_skip_the_agents_screen_and_a_resize_reaches_it_before_the_agent() {
+    fn a_resize_reaches_the_screen_before_the_agent_and_nothing_is_drawn_after_finish() {
         let terminal = FakeTerminal::default();
         let events = Arc::new(Mutex::new(Vec::new()));
         let screen = Screen::new(
@@ -930,10 +813,8 @@ mod tests {
             },
             &terminal,
             PaletteKey::CTRL_SPACE,
-            None,
         );
         screen.output(b"agent").unwrap();
-        screen.notify(b"\x1b]9;hi\x07").unwrap();
         let followed = screen
             .follow_size(WindowSize { rows: 3, cols: 4 }, || {
                 events.lock().unwrap().push("follow".to_owned());
@@ -941,11 +822,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(followed, 7);
-        {
-            let state = screen.lock().unwrap();
-            assert_eq!(state.out.drawn, b"agent");
-            assert_eq!(state.out.passed, b"\x1b]9;hi\x07");
-        }
+        assert_eq!(screen.lock().unwrap().out.drawn, b"agent");
         screen.finish().unwrap();
         screen.output(b"late").unwrap();
         assert_eq!(screen.lock().unwrap().out.drawn, b"agent");
@@ -1067,52 +944,57 @@ mod tests {
         assert!(!reopened.contains("fi"));
     }
 
+    fn held(teammate: &str, commit: u8, paths: &[&str]) -> (AgentSlot, crate::held::HeldSettings) {
+        let paths: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+        (
+            teammate.parse().unwrap(),
+            crate::held::HeldSettings::new(ObjectId::from_bytes_or_panic(&[commit; 20]), &paths),
+        )
+    }
+
     #[test]
-    fn waiting_prompts_are_listed_filtered_and_selected() {
+    fn held_turns_are_listed_filtered_and_selected() {
         let terminal = FakeTerminal::default();
-        let prompts = Arc::new(Prompts::default());
-        let screen = Screen::new(
-            Vec::new(),
-            &terminal,
-            PaletteKey::CTRL_SPACE,
-            Some(Arc::clone(&prompts)),
-        );
-        let text = |text: &str| mahi_live::PromptText::new(text.to_owned()).unwrap();
-        let name = |name: &str| mahi_core::ParticipantName::new(name).unwrap();
-        prompts.offer(name("bob"), [1; 16], text("fix the parser test"));
-        prompts.offer(name("carol"), [2; 16], text("add a changelog entry"));
+        let waiting = Arc::new(HeldQueue::default());
+        let screen = screen(&terminal).with_waiting(Arc::clone(&waiting));
+        waiting.show(vec![
+            held("bob.claude", 1, &["CLAUDE.md"]),
+            held("carol.codex", 2, &["AGENTS.md"]),
+        ]);
         screen.open().unwrap();
         let drawn = String::from_utf8_lossy(&written(&screen)).into_owned();
-        assert!(drawn.contains("bob"), "{drawn}");
-        assert!(drawn.contains("0s · fix the parser test"), "{drawn}");
-        assert!(drawn.contains("carol"), "{drawn}");
-        screen.typed(b"changelog").unwrap();
+        assert!(drawn.contains(TITLE), "{drawn}");
+        assert!(drawn.contains("bob.claude"), "{drawn}");
+        assert!(drawn.contains("0s · changes agent settings"), "{drawn}");
+        assert!(drawn.contains("carol.codex"), "{drawn}");
+        screen.typed(b"carol").unwrap();
         let filtered = String::from_utf8_lossy(&written(&screen)).into_owned();
         assert!(
             filtered.contains("carol") && !filtered.contains("bob"),
             "{filtered}"
         );
-        screen
-            .typed(b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x1b[B\x1b[B")
-            .unwrap();
-        assert_eq!(
-            screen.lock().unwrap().selected_id,
-            Some(Entry::Prompt([2; 16]))
+        screen.typed(b"\x7f\x7f\x7f\x7f\x7f\x1b[B\x1b[B").unwrap();
+        let carol = (
+            "carol.codex".parse().unwrap(),
+            ObjectId::from_bytes_or_panic(&[2; 20]),
         );
-        prompts.offer(name("dave"), [3; 16], text("x".repeat(8000).as_str()));
+        assert_eq!(screen.lock().unwrap().selected_id, Some(carol));
+        let bob = (
+            "bob.claude".parse().unwrap(),
+            ObjectId::from_bytes_or_panic(&[1; 20]),
+        );
         screen.typed(b"\x1b[A").unwrap();
-        assert_eq!(
-            screen.lock().unwrap().selected_id,
-            Some(Entry::Prompt([1; 16]))
-        );
+        assert_eq!(screen.lock().unwrap().selected_id, Some(bob.clone()));
+        waiting.show(vec![
+            held("bob.claude", 1, &["CLAUDE.md"]),
+            held("carol.codex", 2, &["AGENTS.md"]),
+            held("dave.claude", 3, &[".mcp.json"]),
+        ]);
         written(&screen);
         screen.tick().unwrap();
         let ticked = String::from_utf8_lossy(&written(&screen)).into_owned();
-        assert!(ticked.contains("dave"), "{ticked}");
-        assert_eq!(
-            screen.lock().unwrap().selected_id,
-            Some(Entry::Prompt([1; 16]))
-        );
+        assert!(ticked.contains("dave.claude"), "{ticked}");
+        assert_eq!(screen.lock().unwrap().selected_id, Some(bob));
         assert!(contains_ignoring_case("Fix The Parser", "the pars"));
         assert!(!contains_ignoring_case("fix", "fixes"));
     }
@@ -1133,59 +1015,16 @@ mod tests {
     }
 
     #[test]
-    fn without_a_live_layer_the_palette_says_no_prompts_come() {
+    fn a_palette_with_nothing_held_says_no_teammates_turn_waits() {
         let terminal = FakeTerminal::default();
-        let screen = Screen::new(Vec::new(), &terminal, PaletteKey::CTRL_SPACE, None);
+        let screen = screen(&terminal);
         screen.open().unwrap();
-        assert!(String::from_utf8_lossy(&written(&screen)).contains("Teammates cannot watch"));
-    }
-
-    #[test]
-    fn enter_accepts_and_closes_ctrl_x_rejects_and_stays_and_tab_always_accepts() {
-        let terminal = FakeTerminal::default();
-        let prompts = Arc::new(Prompts::default());
-        let screen = Screen::new(
-            Vec::new(),
-            &terminal,
-            PaletteKey::CTRL_SPACE,
-            Some(Arc::clone(&prompts)),
-        );
-        let text = |text: &str| mahi_live::PromptText::new(text.to_owned()).unwrap();
-        let name = |name: &str| mahi_core::ParticipantName::new(name).unwrap();
-        prompts.offer(name("bob"), [1; 16], text("one"));
-        prompts.offer(name("carol"), [2; 16], text("two"));
-        prompts.offer(name("dave"), [3; 16], text("three"));
-        screen.open().unwrap();
-        assert_eq!(screen.typed(b"\x18").unwrap(), 1);
-        assert!(screen.is_open());
-        assert_eq!(
-            screen.lock().unwrap().selected_id,
-            Some(Entry::Prompt([2; 16]))
-        );
-        screen.typed(b"\r").unwrap();
-        assert!(!screen.is_open());
-        assert_eq!(prompts.next_accepted().unwrap().id, [2; 16]);
-        screen.open().unwrap();
-        screen.typed(b"\t").unwrap();
-        assert!(!screen.is_open());
-        assert_eq!(prompts.next_accepted().unwrap().id, [3; 16]);
-        assert_eq!(
-            prompts.offer(name("dave"), [4; 16], text("four")),
-            mahi_live::PromptOutcome::Accepted
-        );
-        screen.open().unwrap();
-        screen.typed(b"\r").unwrap();
-        assert!(screen.is_open());
-        assert!(!screen.bracketed_paste());
-        screen.close().unwrap();
-        screen.output(b"\x1b[?2004h").unwrap();
-        assert!(screen.bracketed_paste());
+        assert!(String::from_utf8_lossy(&written(&screen)).contains(EMPTY));
     }
 
     fn held_screen(terminal: &FakeTerminal) -> (Screen<Vec<u8>, &FakeTerminal>, Arc<HeldQueue>) {
         let waiting = Arc::new(HeldQueue::default());
-        let screen = Screen::new(Vec::new(), terminal, PaletteKey::CTRL_SPACE, None)
-            .with_waiting(Arc::clone(&waiting));
+        let screen = screen(terminal).with_waiting(Arc::clone(&waiting));
         let record = crate::held::HeldSettings::new(
             mahi_store::ObjectId::from_bytes_or_panic(&[1; 20]),
             &[
@@ -1266,79 +1105,31 @@ mod tests {
     }
 
     #[test]
-    fn a_long_prompt_is_accepted_only_after_it_was_read_to_the_end() {
+    fn a_long_held_turn_is_taken_only_after_it_was_read_to_the_end() {
         let terminal = FakeTerminal::default();
-        let prompts = Arc::new(Prompts::default());
-        let screen = Screen::new(
-            Vec::new(),
-            &terminal,
-            PaletteKey::CTRL_SPACE,
-            Some(Arc::clone(&prompts)),
-        );
-        let long = (1..=60).fold(String::new(), |mut long, n| {
-            writeln!(long, "step {n}").unwrap();
-            long
-        });
-        let name = mahi_core::ParticipantName::new("bob").unwrap();
-        prompts.offer(name, [1; 16], mahi_live::PromptText::new(long).unwrap());
+        let waiting = Arc::new(HeldQueue::default());
+        let screen = screen(&terminal).with_waiting(Arc::clone(&waiting));
+        let paths: Vec<String> = (1..=20).map(|n| format!("dir{n}/CLAUDE.md")).collect();
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        waiting.show(vec![held("bob.claude", 1, &paths)]);
         screen.open().unwrap();
         let first = shown(&written(&screen));
         assert!(
-            first.contains("step 1") && !first.contains("step 60"),
+            first.contains("dir1/CLAUDE.md") && !first.contains(HELD_BEHIND),
             "{first}"
         );
         assert!(first.contains("PgDn reads on"), "{first}");
-        screen.typed(b"\r\t").unwrap();
+        screen.typed(b"\r").unwrap();
         assert!(screen.is_open());
-        assert!(prompts.next_accepted().is_none());
+        assert!(waiting.take_choices().is_empty());
         for _ in 0..3 {
             screen.typed(b"\x1b[6~").unwrap();
         }
         let end = shown(&written(&screen));
-        assert!(end.contains("step 60"), "{end}");
-        assert!(end.contains("Enter accepts"), "{end}");
+        assert!(end.contains(HELD_BEHIND), "{end}");
+        assert!(end.contains("Enter takes"), "{end}");
         screen.typed(b"\r").unwrap();
         assert!(!screen.is_open());
-        assert_eq!(prompts.next_accepted().unwrap().id, [1; 16]);
-    }
-
-    #[test]
-    fn a_notice_waiting_while_the_palette_was_forced_open_comes_after_the_held_output() {
-        let terminal = FakeTerminal::default();
-        let screen = screen(&terminal);
-        screen.output(b"\x1b]0;tit").unwrap();
-        screen.open().unwrap();
-        screen.notify(b"NOTICE").unwrap();
-        screen.open_now().unwrap();
-        written(&screen);
-        screen.output(b"le\x07after").unwrap();
-        screen.close().unwrap();
-        let out = written(&screen);
-        let notice = out.windows(6).position(|window| window == b"NOTICE");
-        assert_eq!(notice, Some(out.len() - 6), "{out:?}");
-        assert!(out.starts_with(b"le\x07after"));
-        screen.output(b"\x1b7saved").unwrap();
-        written(&screen);
-        screen.notify(b"TOLD").unwrap();
-        assert_eq!(written(&screen), b"TOLD");
-    }
-
-    #[test]
-    fn a_notice_waits_for_the_agent_to_finish_a_sequence() {
-        let terminal = FakeTerminal::default();
-        let screen = screen(&terminal);
-        screen.notify(b"\x07").unwrap();
-        assert_eq!(written(&screen), b"\x07");
-        screen.output(b"\x1b[1;3").unwrap();
-        written(&screen);
-        screen.notify(b"first").unwrap();
-        screen.notify(b"second").unwrap();
-        assert!(written(&screen).is_empty());
-        screen.output(b"1m").unwrap();
-        assert_eq!(written(&screen), b"1msecond");
-        screen.open().unwrap();
-        written(&screen);
-        screen.notify(b"open").unwrap();
-        assert_eq!(written(&screen), b"open");
+        assert_eq!(waiting.take_choices().len(), 1);
     }
 }

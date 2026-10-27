@@ -309,16 +309,14 @@ fn badge() -> Span<'static> {
     Span::styled(" mahi ", Theme::selected())
 }
 
-/// A thread's tab: one of its agents at full size, the list of its agents, the teammates'
-/// prompts waiting, and the keys that reach mahi.
+/// A thread's tab: one of its agents at full size, the list of its agents, and the keys that
+/// reach mahi.
 #[derive(Debug, Clone, Copy)]
 pub struct ThreadView<'a> {
     /// The thread's agents: the user's own first, then each teammate's.
     pub agents: &'a [WorkspaceAgent<'a>],
     /// The agent shown at full size, as an index in `agents`.
     pub selected: usize,
-    /// How many of the teammates' prompts wait for the user.
-    pub prompts: usize,
     /// Where the list goes.
     pub list: ListPlace,
     /// The keys that reach mahi, and what they do.
@@ -505,14 +503,6 @@ impl<'a> ThreadView<'a> {
                 ]),
                 ListRow::Agent(index) => self.agent_line(index),
             });
-        }
-        if self.prompts > 0 {
-            lines.push(Line::default());
-            let plural = if self.prompts == 1 { "" } else { "s" };
-            lines.push(Line::from(Span::styled(
-                format!("✉ {} prompt{plural} waiting", self.prompts),
-                Theme::code(),
-            )));
         }
         for (line, row) in lines.into_iter().zip(inner.rows()) {
             line.render(row, buffer);
@@ -730,7 +720,6 @@ mod tests {
         let cursor = ThreadView {
             agents: &AGENTS,
             selected: 0,
-            prompts: 2,
             list: ListPlace::Beside,
             hints: &[("ctrl-space", "workspace")],
             waiting: None,
@@ -765,7 +754,7 @@ mod tests {
                 "bob's",
                 " ○ codex",
                 "",
-                "✉ 2 prompts waiting",
+                "",
             ],
             "{shown}"
         );
@@ -790,7 +779,6 @@ mod tests {
         let view = ThreadView {
             agents: &agents,
             selected: 1,
-            prompts: 0,
             list: ListPlace::Beside,
             hints: &[],
             waiting: None,
@@ -826,7 +814,6 @@ mod tests {
         let view = ThreadView {
             agents: &[],
             selected: 0,
-            prompts: 0,
             list: ListPlace::Hidden,
             hints: &[],
             waiting: Some(("⠋", "waiting for the thread's host")),
@@ -856,7 +843,6 @@ mod tests {
         let cursor = ThreadView {
             agents: &AGENTS,
             selected: 1,
-            prompts: 0,
             list: ListPlace::Over,
             hints: &[],
             waiting: None,
@@ -870,7 +856,6 @@ mod tests {
         let cursor = ThreadView {
             agents: &AGENTS,
             selected: 1,
-            prompts: 0,
             list: ListPlace::Hidden,
             hints: &[],
             waiting: None,
@@ -915,7 +900,6 @@ mod tests {
             ThreadView {
                 agents: &AGENTS,
                 selected: 0,
-                prompts: 0,
                 list,
                 hints: &[],
                 waiting: None,
@@ -957,7 +941,6 @@ mod tests {
         let view = ThreadView {
             agents: &AGENTS,
             selected: 0,
-            prompts: 0,
             list: ListPlace::Beside,
             hints: &[],
             waiting: None,
@@ -992,7 +975,6 @@ mod tests {
         let view = ThreadView {
             agents: &AGENTS,
             selected: 0,
-            prompts: 0,
             list: ListPlace::Beside,
             hints: &[],
             waiting: None,
@@ -1027,7 +1009,6 @@ mod tests {
                 ThreadView {
                     agents: &AGENTS,
                     selected: 5,
-                    prompts: 1,
                     list,
                     hints: &[("q", "quit")],
                     waiting: None,

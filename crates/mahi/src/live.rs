@@ -66,10 +66,7 @@ use mahi_live::{
     LiveTopic,
     MAX_CHUNK_BYTES,
     MAX_SCREEN_PARTS,
-    PROMPT_ID_BYTES,
     Peers,
-    PromptOutcome,
-    PromptText,
     Received,
     Relays,
     SnapshotsAnswer,
@@ -104,10 +101,6 @@ use crate::{
     },
     claims::Claims,
     profile,
-    prompts::{
-        Answer,
-        Prompts,
-    },
     run,
     settings::Settings,
     teammates::Teammates,
@@ -160,8 +153,6 @@ pub(crate) enum HostError {
 
 /// How many chunks of output wait for the broadcaster before newer ones are dropped.
 const TAP_QUEUE: usize = 1024;
-/// How many prompts for another mahi's agent wait for it to take them.
-const GUEST_OFFERS: usize = 32;
 /// How often a host answers the screen requests of one requester at most.
 const SCREEN_EVERY: Duration = Duration::from_secs(1);
 /// How many screen requests from different requesters wait to be answered together.
@@ -186,10 +177,6 @@ const NODE_NAME_BYTES: usize = 64;
 const MAX_SCANNED_ENTRIES: usize = 256;
 const MAX_PUBLISHED_BYTES: u64 = 4096;
 const PUBLISH_EVERY: Duration = Duration::from_secs(2);
-/// How long a host that stops keeps telling senders their prompts were dropped.
-const LAST_ANSWERS_WAIT: Duration = Duration::from_secs(2);
-/// The most answers a host keeps to send again after the network failed it.
-const MAX_UNSENT_ANSWERS: usize = 256;
 /// The most frames of teammates' agents the workspace's host keeps until the workspace reads
 /// them.
 const WATCH_QUEUE: usize = 1024;
@@ -479,61 +466,11 @@ impl HostTap {
     }
 }
 
-/// A prompt a teammate sent an agent another mahi of the user runs, for that mahi to offer
-/// its agent.
-#[derive(Debug)]
-pub(crate) struct Offer {
-    pub(crate) from: ParticipantName,
-    pub(crate) id: [u8; PROMPT_ID_BYTES],
-    pub(crate) text: PromptText,
-}
-
-/// Where the prompts for one of the agents a host serves go, and its answers come from.
-enum Inbox {
-    Local(Arc<Prompts>),
-    Remote {
-        offers: SyncSender<Offer>,
-        answers: Arc<Mutex<VecDeque<Answer>>>,
-    },
-}
-
 struct Hosted {
     id: AgentId,
     slot: AgentSlot,
     screen: Arc<Mutex<Screen>>,
-    inbox: Inbox,
     held_through: u64,
-    unsent: Vec<Answer>,
-    leaving: Option<Instant>,
-}
-
-impl Hosted {
-    fn is_leaving(&self) -> bool {
-        self.leaving.is_some()
-    }
-
-    fn owes_answers(&self) -> bool {
-        !self.unsent.is_empty()
-            || match &self.inbox {
-                Inbox::Local(_) => false,
-                Inbox::Remote { answers, .. } => {
-                    answers.lock().is_ok_and(|answers| !answers.is_empty())
-                }
-            }
-    }
-
-    fn take_unsent(&mut self) -> Vec<Answer> {
-        let mut answers = std::mem::take(&mut self.unsent);
-        if let Inbox::Remote {
-            answers: queued, ..
-        } = &self.inbox
-            && let Ok(mut queued) = queued.lock()
-        {
-            answers.extend(queued.drain(..));
-        }
-        answers.truncate(MAX_UNSENT_ANSWERS);
-        answers
-    }
 }
 
 /// The agents a host serves: its own, and those of the user's other mahis in the thread.
@@ -544,20 +481,9 @@ struct Registry {
 }
 
 impl Registry {
-    fn add(
-        &mut self,
-        slot: AgentSlot,
-        size: WindowSize,
-        inbox: Inbox,
-    ) -> Option<(AgentId, Arc<Mutex<Screen>>)> {
-        let mut unsent = Vec::new();
-        if let Some(index) = self.agents.iter().position(|hosted| hosted.slot == slot) {
-            let left = self.agents.get_mut(index)?;
-            if !left.is_leaving() {
-                return None;
-            }
-            unsent = left.take_unsent();
-            self.agents.swap_remove(index);
+    fn add(&mut self, slot: AgentSlot, size: WindowSize) -> Option<(AgentId, Arc<Mutex<Screen>>)> {
+        if self.agents.iter().any(|hosted| hosted.slot == slot) {
+            return None;
         }
         let id = self.next;
         self.next = self.next.checked_add(1)?;
@@ -569,10 +495,7 @@ impl Registry {
             id,
             slot,
             screen: Arc::clone(&screen),
-            inbox,
             held_through: 0,
-            unsent,
-            leaving: None,
         });
         Some((id, screen))
     }
@@ -580,42 +503,15 @@ impl Registry {
     fn get(&mut self, id: AgentId) -> Option<&mut Hosted> {
         self.agents.iter_mut().find(|hosted| hosted.id == id)
     }
-
-    fn forget_left(&mut self, now: Instant) {
-        self.agents.retain(|hosted| {
-            hosted
-                .leaving
-                .is_none_or(|until| now < until && hosted.owes_answers())
-        });
-    }
 }
 
 /// An agent of another of the user's mahis in the thread, which this host serves while that
-/// mahi stays connected: its output and resizes go through `tap`, the prompts teammates send it
-/// arrive on `offers`, and its answers go to `answers`. Dropping it stops serving the agent,
-/// once the answers it passed on are sent or [`LAST_ANSWERS_WAIT`] is over.
+/// mahi stays connected: its output and resizes go through `tap`. Dropping it stops serving
+/// the agent.
 pub(crate) struct Guest {
     id: AgentId,
     registry: Arc<Mutex<Registry>>,
     pub(crate) tap: HostTap,
-    offers: Option<Receiver<Offer>>,
-    answers: Arc<Mutex<VecDeque<Answer>>>,
-}
-
-impl Guest {
-    /// Hands over the prompts teammates send the agent, once.
-    pub(crate) fn take_offers(&mut self) -> Option<Receiver<Offer>> {
-        self.offers.take()
-    }
-
-    /// Passes on what became of a prompt, for its sender; past 256 unsent, answers are lost.
-    pub(crate) fn answer(&self, answer: Answer) {
-        if let Ok(mut answers) = self.answers.lock()
-            && answers.len() < MAX_UNSENT_ANSWERS
-        {
-            answers.push_back(answer);
-        }
-    }
 }
 
 impl std::fmt::Debug for Guest {
@@ -626,10 +522,8 @@ impl std::fmt::Debug for Guest {
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        if let Ok(mut registry) = self.registry.lock()
-            && let Some(hosted) = registry.get(self.id)
-        {
-            hosted.leaving = Some(Instant::now() + LAST_ANSWERS_WAIT);
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.agents.retain(|hosted| hosted.id != self.id);
         }
     }
 }
@@ -650,7 +544,6 @@ pub(crate) struct LiveHost {
     config: ConfigDir,
     thread: ThreadId,
     owner: ParticipantName,
-    prompts: Option<Arc<Prompts>>,
     claims: Arc<Claims>,
     me: Option<AgentSlot>,
     registry: Arc<Mutex<Registry>>,
@@ -797,14 +690,12 @@ impl Watching {
     }
 }
 
-/// The agent a host runs itself: its slot, its terminal's size and what it drew, and the
-/// prompts teammates send it.
+/// The agent a host runs itself: its slot, its terminal's size and what it drew.
 #[derive(Debug)]
 pub(crate) struct OwnAgent<'a> {
     pub(crate) slot: AgentSlot,
     pub(crate) size: WindowSize,
     pub(crate) drawn: &'a [u8],
-    pub(crate) prompts: Arc<Prompts>,
 }
 
 impl std::fmt::Debug for Registry {
@@ -824,17 +715,12 @@ impl LiveHost {
         git_dir: &Path,
         (slot, keys): (AgentSlot, &LiveKeys),
         (size, drawn): (WindowSize, &[u8]),
-        (prompts, claims): (Arc<Prompts>, Arc<Claims>),
+        claims: Arc<Claims>,
     ) -> Result<Self, HostError> {
         let hosting =
             LiveLock::try_acquire(&setup.config, keys.thread())?.ok_or(HostError::AnotherHost)?;
         let shared = SharedNode::bind(&setup.node_key, setup.relays)?;
-        let own = OwnAgent {
-            slot,
-            size,
-            drawn,
-            prompts,
-        };
+        let own = OwnAgent { slot, size, drawn };
         Self::start_on(
             (&shared, hosting),
             setup,
@@ -870,19 +756,11 @@ impl LiveHost {
         let node = Arc::clone(&shared.node);
         let topic = Arc::new(node.join(keys.topic(), &listed(setup, &participants), None)?);
         let sender = FrameSender::new(keys.clone(), setup.node_key.secret())?;
-        let mut receiver = FrameReceiver::new(keys.clone(), participants);
-        receiver.take_prompts_for(&sender, owner.clone());
+        let receiver = FrameReceiver::new(keys.clone(), participants);
         let registry = Arc::new(Mutex::new(Registry::default()));
-        let (me, prompts, own_tap) = match own {
-            Some(own) => {
-                let (slot, prompts) = (own.slot.clone(), Arc::clone(&own.prompts));
-                (
-                    Some(slot),
-                    Some(prompts),
-                    Some(register_own(&registry, own)?),
-                )
-            }
-            None => (None, None, None),
+        let (me, own_tap) = match own {
+            Some(own) => (Some(own.slot.clone()), Some(register_own(&registry, own)?)),
+            None => (None, None),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let hosting_thread = Hosting::new(&peers, &registry, &setup.config);
@@ -912,7 +790,6 @@ impl LiveHost {
             receiver,
             owner: owner.clone(),
             watching,
-            registry: Arc::clone(&registry),
             peers: Arc::clone(&peers),
             wanted,
             stop: Arc::clone(&stop),
@@ -942,7 +819,6 @@ impl LiveHost {
             config: setup.config.clone(),
             thread,
             owner,
-            prompts,
             claims,
             me,
             registry,
@@ -975,15 +851,12 @@ impl LiveHost {
     }
 
     /// Stops the live layer once the agent it runs, if it runs one, is gone: output still
-    /// queued is dropped, and so are that agent's prompts waiting, whose senders are told.
+    /// queued is dropped.
     pub(crate) fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.listener.join();
         let _ = self.publisher.join();
         run::join_within(self.catch_up, run::THREAD_STOP_WAIT);
-        if let Some(prompts) = &self.prompts {
-            prompts.close();
-        }
         self.stop_broadcast.store(true, Ordering::SeqCst);
         let _ = self.broadcaster.join();
         withdraw_address(&self.config, self.thread);
@@ -1030,7 +903,7 @@ fn register_own(
     let (agent, screen) = registry
         .lock()
         .ok()
-        .and_then(|mut registry| registry.add(own.slot, own.size, Inbox::Local(own.prompts)))
+        .and_then(|mut registry| registry.add(own.slot, own.size))
         .ok_or(HostError::SlotTaken)?;
     if let Ok(mut copy) = screen.lock() {
         copy.parser.process(own.drawn);
@@ -1110,12 +983,9 @@ impl Hosting {
     }
 
     fn serves(&self, slot: &AgentSlot) -> bool {
-        self.registry.lock().is_ok_and(|registry| {
-            registry
-                .agents
-                .iter()
-                .any(|hosted| &hosted.slot == slot && !hosted.is_leaving())
-        })
+        self.registry
+            .lock()
+            .is_ok_and(|registry| registry.agents.iter().any(|hosted| &hosted.slot == slot))
     }
 
     fn snapshots(&self, request: &SnapshotsRequest) -> Option<SnapshotsAnswer> {
@@ -1239,53 +1109,12 @@ impl HostHandle {
         Some(screen.parser.screen().contents())
     }
 
-    /// Offers a teammate's prompt to the agent `slot` as a received frame would, for tests.
-    #[cfg(test)]
-    pub(crate) fn offer(
-        &self,
-        slot: &AgentSlot,
-        from: ParticipantName,
-        id: [u8; PROMPT_ID_BYTES],
-        text: PromptText,
-    ) {
-        let registry = self.registry.lock().unwrap();
-        let hosted = registry
-            .agents
-            .iter()
-            .find(|hosted| &hosted.slot == slot)
-            .unwrap();
-        if let Inbox::Remote { offers, .. } = &hosted.inbox {
-            offers.try_send(Offer { from, id, text }).unwrap();
-        }
-    }
-
-    /// Takes the answers the agent `slot` sent back, for tests.
-    #[cfg(test)]
-    pub(crate) fn answers_of(&self, slot: &AgentSlot) -> Vec<Answer> {
-        let registry = self.registry.lock().unwrap();
-        let hosted = registry
-            .agents
-            .iter()
-            .find(|hosted| &hosted.slot == slot)
-            .unwrap();
-        match &hosted.inbox {
-            Inbox::Remote { answers, .. } => answers.lock().unwrap().drain(..).collect(),
-            Inbox::Local(_) => Vec::new(),
-        }
-    }
-
     /// Returns how many agents this handle serves, for tests.
     #[cfg(test)]
     pub(crate) fn served(&self) -> usize {
         self.registry
             .lock()
-            .map(|registry| {
-                registry
-                    .agents
-                    .iter()
-                    .filter(|hosted| !hosted.is_leaving())
-                    .count()
-            })
+            .map(|registry| registry.agents.len())
             .unwrap_or_default()
     }
 
@@ -1301,17 +1130,11 @@ impl HostHandle {
         if slot.participant() != &self.owner {
             return Err(HostError::NotOwnSlot);
         }
-        let (offers, offered) = mpsc::sync_channel(GUEST_OFFERS);
-        let answers = Arc::new(Mutex::new(VecDeque::new()));
-        let inbox = Inbox::Remote {
-            offers,
-            answers: Arc::clone(&answers),
-        };
         let (id, screen) = self
             .registry
             .lock()
             .ok()
-            .and_then(|mut registry| registry.add(slot, size, inbox))
+            .and_then(|mut registry| registry.add(slot, size))
             .ok_or(HostError::SlotTaken)?;
         self.dropped.store(true, Ordering::SeqCst);
         Ok(Guest {
@@ -1323,8 +1146,6 @@ impl HostHandle {
                 queue: self.queue.clone(),
                 dropped: Arc::clone(&self.dropped),
             },
-            offers: Some(offered),
-            answers,
         })
     }
 }
@@ -1432,7 +1253,6 @@ impl Broadcaster {
         while !self.stopping() {
             self.send_screens_if_needed();
             self.send_request_if_any();
-            self.send_answers(None);
             self.send_turn_ends_if_any(store.as_ref());
             self.send_claims_if_needed();
             if self.sent_at.elapsed() >= HEARTBEAT_EVERY {
@@ -1469,7 +1289,6 @@ impl Broadcaster {
                 self.dropped.store(true, Ordering::SeqCst);
             }
         }
-        self.send_answers(Some(Instant::now() + LAST_ANSWERS_WAIT));
         self.send(&Body::Claims {
             claims: Vec::new(),
             turn_ends: self.turn_ends.latest.known(),
@@ -1533,57 +1352,10 @@ impl Broadcaster {
                 registry
                     .agents
                     .iter()
-                    .filter(|hosted| !hosted.is_leaving())
                     .map(|hosted| hosted.slot.clone())
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    fn send_answers(&mut self, deadline: Option<Instant>) {
-        let mut owed: Vec<(AgentId, AgentSlot, Vec<Answer>)> = match self.registry.lock() {
-            Ok(mut registry) => registry
-                .agents
-                .iter_mut()
-                .map(|hosted| {
-                    let mut answers = hosted.take_unsent();
-                    if let Inbox::Local(prompts) = &hosted.inbox {
-                        prompts.take_answers(&mut answers);
-                    }
-                    (hosted.id, hosted.slot.clone(), answers)
-                })
-                .collect(),
-            Err(_) => return,
-        };
-        let mut failed = false;
-        for (_, slot, answers) in &mut owed {
-            let mut sent = 0;
-            for answer in answers.iter() {
-                if failed || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    break;
-                }
-                let body = Body::PromptAnswer {
-                    slot: slot.clone(),
-                    id: answer.id,
-                    outcome: answer.outcome,
-                };
-                if !self.send(&body) {
-                    failed = true;
-                    break;
-                }
-                sent += 1;
-            }
-            answers.drain(..sent);
-            answers.truncate(MAX_UNSENT_ANSWERS);
-        }
-        if let Ok(mut registry) = self.registry.lock() {
-            for (id, _, answers) in owed {
-                if let Some(hosted) = registry.get(id) {
-                    hosted.unsent = answers;
-                }
-            }
-            registry.forget_left(Instant::now());
-        }
     }
 
     fn stopping(&self) -> bool {
@@ -1604,11 +1376,7 @@ impl Broadcaster {
         }
         let mut screens = Vec::new();
         if let Ok(mut registry) = self.registry.lock() {
-            for hosted in registry
-                .agents
-                .iter_mut()
-                .filter(|hosted| !hosted.is_leaving())
-            {
+            for hosted in &mut registry.agents {
                 let Ok(screen) = hosted.screen.lock() else {
                     continue;
                 };
@@ -1649,13 +1417,12 @@ impl Broadcaster {
 }
 
 /// Reads the topic, passes the screen requests of participants to the broadcaster, at most
-/// one per second from each, and takes the prompts they send the host's agents.
+/// one per second from each.
 struct Listener {
     topic: Arc<LiveTopic>,
     receiver: FrameReceiver,
     owner: ParticipantName,
     watching: Option<Watching>,
-    registry: Arc<Mutex<Registry>>,
     peers: Arc<HostPeers>,
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
@@ -1699,10 +1466,6 @@ impl Listener {
             };
             let challenge = match received.body {
                 Body::ScreenRequest { challenge } => challenge,
-                Body::Prompt { slot, id, text, .. } => {
-                    self.offer(&slot, received.participant, id, text);
-                    continue;
-                }
                 Body::Claims { claims, turn_ends } => {
                     self.claims.hear(received.sender, claims);
                     self.hear_turn_ends(&received.participant, received.sender, &turn_ends);
@@ -1733,37 +1496,6 @@ impl Listener {
         }
         for ended in turn_ends {
             self.heard.hear(sender, ended);
-        }
-    }
-
-    fn offer(
-        &self,
-        slot: &AgentSlot,
-        from: ParticipantName,
-        id: [u8; PROMPT_ID_BYTES],
-        text: PromptText,
-    ) {
-        let Ok(registry) = self.registry.lock() else {
-            return;
-        };
-        let Some(hosted) = registry.agents.iter().find(|hosted| &hosted.slot == slot) else {
-            return;
-        };
-        match &hosted.inbox {
-            Inbox::Local(prompts) => {
-                prompts.offer(from, id, text);
-            }
-            Inbox::Remote { offers, answers } => {
-                if offers.try_send(Offer { from, id, text }).is_err()
-                    && let Ok(mut answers) = answers.lock()
-                    && answers.len() < MAX_UNSENT_ANSWERS
-                {
-                    answers.push_back(Answer {
-                        id,
-                        outcome: PromptOutcome::Dropped,
-                    });
-                }
-            }
         }
     }
 }
@@ -2124,7 +1856,6 @@ mod tests {
                 slot,
                 size: WindowSize { rows: 24, cols: 80 },
                 drawn: b"",
-                prompts: Arc::new(Prompts::default()),
             };
             LiveHost::start_on(
                 (&shared, lock),
@@ -2319,7 +2050,6 @@ mod tests {
                     slot: slot.clone(),
                     size: WindowSize { rows: 4, cols: 40 },
                     drawn: b"bob's agent",
-                    prompts: Arc::new(Prompts::default()),
                 }),
             ),
         );
@@ -2334,7 +2064,6 @@ mod tests {
                     slot: agent("alice"),
                     size: WindowSize { rows: 4, cols: 40 },
                     drawn: b"alice's agent",
-                    prompts: Arc::new(Prompts::default()),
                 }),
             ),
         );
@@ -2419,7 +2148,6 @@ mod tests {
             slot: slot.clone(),
             size: WindowSize { rows: 4, cols: 40 },
             drawn: b"bob's agent",
-            prompts: Arc::default(),
         };
         let (_bob_shared, bob) = host_on(
             &hosted,
@@ -2470,7 +2198,6 @@ mod tests {
             slot: slot.clone(),
             size: WindowSize { rows: 4, cols: 40 },
             drawn: b"bob's agent",
-            prompts: Arc::new(Prompts::default()),
         };
         let (bob_shared, bob_host) = host_on(
             &hosted,
@@ -2573,11 +2300,7 @@ mod tests {
                 .registry
                 .lock()
                 .unwrap()
-                .add(
-                    (*slot).clone(),
-                    WindowSize { rows: 4, cols: 40 },
-                    Inbox::Local(Arc::new(Prompts::default())),
-                )
+                .add((*slot).clone(), WindowSize { rows: 4, cols: 40 })
                 .unwrap();
         }
         let threads = HostedThreads::default();
@@ -2749,7 +2472,6 @@ mod tests {
             slot: slot.clone(),
             size: WindowSize { rows: 4, cols: 40 },
             drawn: b"bob's agent",
-            prompts: Arc::new(Prompts::default()),
         };
         let (bob_shared, bob_host) = host_on(
             &hosted,
@@ -3088,42 +2810,19 @@ mod tests {
     }
 
     #[test]
-    fn a_leaving_guest_is_kept_until_its_answers_are_sent_and_its_slot_can_come_back() {
+    fn a_served_slot_is_refused_again_until_its_guest_leaves() {
         let alice = ParticipantName::new("alice").unwrap();
         let codex = AgentSlot::new(alice.clone(), AgentName::new("codex").unwrap());
         let size = WindowSize { rows: 24, cols: 80 };
         let (handle, _tapped) = HostHandle::for_tests(alice);
-        let dropped = Answer {
-            id: [1; 16],
-            outcome: PromptOutcome::Dropped,
-        };
         let guest = handle.serve(codex.clone(), size).unwrap();
-        guest.answer(dropped);
-        drop(guest);
-        assert_eq!(handle.served(), 0);
-        handle.registry.lock().unwrap().forget_left(Instant::now());
-        assert_eq!(handle.registry.lock().unwrap().agents.len(), 1);
-
-        let guest = handle.serve(codex.clone(), size).unwrap();
-        {
-            let registry = handle.registry.lock().unwrap();
-            assert_eq!(registry.agents.len(), 1);
-            assert_eq!(registry.agents.first().unwrap().unsent, [dropped]);
-        }
+        assert_eq!(handle.served(), 1);
         assert!(handle.serve(codex.clone(), size).is_err());
         drop(guest);
-        handle.registry.lock().unwrap().forget_left(Instant::now());
-        assert_eq!(handle.registry.lock().unwrap().agents.len(), 1);
-        handle
-            .registry
-            .lock()
-            .unwrap()
-            .forget_left(Instant::now() + LAST_ANSWERS_WAIT);
-        assert!(handle.registry.lock().unwrap().agents.is_empty());
-
+        assert_eq!(handle.served(), 0);
         let guest = handle.serve(codex, size).unwrap();
+        assert_eq!(handle.served(), 1);
         drop(guest);
-        handle.registry.lock().unwrap().forget_left(Instant::now());
         assert!(handle.registry.lock().unwrap().agents.is_empty());
     }
 
