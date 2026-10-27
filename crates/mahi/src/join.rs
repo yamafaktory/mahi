@@ -58,13 +58,10 @@ use mahi_live::{
     LiveKeys,
     LiveNode,
     LiveTopic,
-    PROMPT_ID_BYTES,
     Peers,
-    PromptText,
     Relays,
     Ticket,
     TurnEnd,
-    prompt_id,
 };
 use mahi_sandbox::{
     SignalError,
@@ -97,7 +94,6 @@ use crate::{
         JoinCommand,
         LaunchOptions,
     },
-    compose::Composer,
     environment::{
         Environment,
         LiveMode,
@@ -138,6 +134,7 @@ use crate::{
         AgentLock,
         LockError,
     },
+    viewer_palette::ViewerPalette,
 };
 
 const META_WAIT: Duration = Duration::from_secs(30);
@@ -784,8 +781,8 @@ fn watch(
     let mut sender = FrameSender::new(LiveKeys::derive(&thread_key, thread)?, node_key.secret())?;
     drop(thread_key);
     let key = Settings::load(config)?.palette_key;
-    eprintln!("mahi: watching {follows}'s agent; press q to leave, {key} to write it a prompt");
-    let composer = Composer::new(key, follows.as_str());
+    eprintln!("mahi: watching {follows}'s agent; press q to leave, {key} to switch agents");
+    let palette = ViewerPalette::new(key);
     let leave = Arc::new(AtomicBool::new(false));
     let signals = TerminationSignals::listen().map_err(JoinError::Signals)?;
     let (quit, quitting) = UnixStream::pair().map_err(JoinError::Terminal)?;
@@ -811,7 +808,7 @@ fn watch(
     let (keys, reading) = read_keys(&leave, quitting);
     let ended = show(
         (&topic, &mut frames, &mut sender),
-        (View::new(follows), composer),
+        (View::new(follows), palette),
         (&keys, &leave),
     );
     drop(quit);
@@ -840,14 +837,13 @@ enum Ended {
 
 fn show(
     (topic, frames, sender): (&LiveTopic, &mut FrameReceiver, &mut FrameSender),
-    (mut view, mut composer): (View, Composer),
+    (mut view, mut palette): (View, ViewerPalette),
     (keys, leave): (&Receiver<Vec<u8>>, &AtomicBool),
 ) -> Ended {
     let mut asked_at: Option<Instant> = None;
     let mut dropped = topic.dropped();
     let mut unanchored = false;
     let mut heard_at = Instant::now();
-    let mut showing_from: Option<NodeId> = None;
     let resized = watch_resizes();
     while !leave.load(Ordering::SeqCst) {
         let lost = topic.dropped() != dropped;
@@ -873,7 +869,7 @@ fn show(
             view.redraw_all();
             palette_changed = true;
         }
-        let mut wait = if composer.is_open() {
+        let mut wait = if palette.is_open() {
             TYPING_PAUSE
         } else {
             RECEIVE_PAUSE
@@ -891,27 +887,15 @@ fn show(
                         continue;
                     }
                     heard_at = Instant::now();
-                    match received.body {
-                        Body::PromptAnswer { id, outcome, .. } => {
-                            let from_host = showing_from == Some(received.sender);
-                            palette_changed |= from_host && composer.answered(id, outcome);
-                        }
-                        body => {
-                            let screen = matches!(body, Body::Screen { .. });
-                            view.apply(&received.participant, body);
-                            if screen && view.is_showing() {
-                                showing_from = Some(received.sender);
-                            }
-                        }
-                    }
+                    view.apply(&received.participant, received.body);
                 }
                 Err(FrameError::Unanchored) => unanchored = true,
                 Err(_) => {}
             }
         }
         while let Ok(chunk) = keys.try_recv() {
-            let was_open = composer.is_open();
-            let typed = composer.typed(&chunk);
+            let was_open = palette.is_open();
+            let typed = palette.typed(&chunk);
             if typed.quit {
                 return Ended::Left;
             }
@@ -920,16 +904,11 @@ fn show(
                 view.switch_to(slot);
                 asked_at = None;
             }
-            if let Some(text) = typed.send {
-                let id = showing_from
-                    .and_then(|host| send_prompt(&text, &view, frames, sender, (topic, host)));
-                composer.sent(id, &text);
-            }
-            if was_open && !composer.is_open() {
+            if was_open && !palette.is_open() {
                 view.redraw_all();
             }
         }
-        draw(&mut view, &mut composer, palette_changed);
+        draw(&mut view, &mut palette, palette_changed);
         if heard_at.elapsed() > HOST_SILENCE {
             return Ended::Silent;
         }
@@ -938,44 +917,18 @@ fn show(
 }
 
 /// Draws what changed of the view, and the palette over it when it is open and either changed.
-fn draw(view: &mut View, composer: &mut Composer, mut palette_changed: bool) {
-    palette_changed |= composer.set_agents(view.agents(), view.slot());
+fn draw(view: &mut View, palette: &mut ViewerPalette, mut palette_changed: bool) {
+    palette_changed |= palette.set_agents(view.agents(), view.slot());
     let drawn = view.render();
     let mut output = io::stdout().lock();
     if let Some(drawn) = &drawn {
         let _ = output.write_all(drawn);
     }
-    if composer.is_open() && (drawn.is_some() || palette_changed) {
+    if palette.is_open() && (drawn.is_some() || palette_changed) {
         let size = terminal::size();
-        let _ = composer.draw(size.rows, size.cols, &mut output);
+        let _ = palette.draw(size.rows, size.cols, &mut output);
     }
     let _ = output.flush();
-}
-
-/// Sends `text` as a prompt to the agent the view shows, in the run of its host the viewer
-/// follows, and returns its id; `None` when no screen of the agent arrived yet or it could not
-/// be sent.
-fn send_prompt(
-    text: &str,
-    view: &View,
-    frames: &FrameReceiver,
-    sender: &mut FrameSender,
-    (topic, host): (&LiveTopic, NodeId),
-) -> Option<[u8; PROMPT_ID_BYTES]> {
-    let slot = view.slot()?.clone();
-    let run = frames.run_of(&host)?;
-    let text = PromptText::new(text.to_owned()).ok()?;
-    let id = prompt_id().ok()?;
-    let frame = sender
-        .seal(&Body::Prompt {
-            slot,
-            run,
-            id,
-            text,
-        })
-        .ok()?;
-    topic.broadcast(frame).ok()?;
-    Some(id)
 }
 
 /// Notes when the viewer's terminal changes size, so the view and the palette are drawn again.

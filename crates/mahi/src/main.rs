@@ -5,7 +5,6 @@ mod catch_up;
 mod claims;
 mod cli;
 mod commands;
-mod compose;
 mod conflicts;
 mod credentials;
 mod end;
@@ -56,6 +55,7 @@ mod turn_end;
 mod turns;
 mod ui;
 mod unlocked;
+mod viewer_palette;
 mod workspace;
 mod workspace_live;
 

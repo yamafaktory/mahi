@@ -41,7 +41,6 @@ use mahi_identity::{
 use mahi_live::{
     FrameError,
     LiveKeys,
-    PromptText,
     Relays,
 };
 use mahi_store::{
@@ -93,19 +92,6 @@ use crate::{
 /// How often the workspace checks whether the owner purged a thread it only watches, while
 /// none of its teammates' agents is online.
 const PURGE_CHECK_EVERY: Duration = Duration::from_secs(10);
-
-/// What came of a prompt the user wrote to a teammate's agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Prompted {
-    /// It goes to the agent's host, which asks its owner to accept it.
-    Sent,
-    /// The agent is not live, so it was not sent.
-    Offline,
-    /// The workspace does not host the thread, so it was not sent.
-    NotHosted,
-    /// It held no text.
-    Empty,
-}
 
 /// Hosting a thread's live layer for the workspace failed.
 #[derive(Debug, Error)]
@@ -289,32 +275,6 @@ impl WorkspaceLive {
             }
         }
         changed
-    }
-
-    /// Sends `text` as a prompt to the teammate's agent in `slot` of `thread`, through the
-    /// host of `thread` the workspace runs, while the agent is live; returns what came of it.
-    pub(crate) fn prompt(&self, thread: ThreadId, slot: &AgentSlot, text: &str) -> Prompted {
-        if text.trim().is_empty() {
-            return Prompted::Empty;
-        }
-        let Some(hosted) = self.hosted.get(&thread) else {
-            return Prompted::NotHosted;
-        };
-        let Some(watch) = hosted.host.watch() else {
-            return Prompted::NotHosted;
-        };
-        let live = hosted
-            .teammates
-            .agents()
-            .any(|(listed, online)| listed == slot && online);
-        if !live {
-            return Prompted::Offline;
-        }
-        let Ok(text) = PromptText::new(text.to_owned()) else {
-            return Prompted::Empty;
-        };
-        watch.prompt(slot.clone(), text);
-        Prompted::Sent
     }
 
     /// Returns the teammates' agents the workspace watches in `thread`, while it hosts it.

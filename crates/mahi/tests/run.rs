@@ -4790,7 +4790,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
     }
 
     #[test]
-    fn a_teammate_sends_a_prompt_the_host_reads_and_accepts_into_the_agent() {
+    fn a_watching_teammates_palette_lists_the_agents_and_sends_the_host_nothing() {
         let fixture = fixture();
         save_identity(&fixture);
         let mut host = Session::start_with(
@@ -4823,30 +4823,27 @@ echo stray > "$CODEX_HOME/history.jsonl"
         keys.write_all(format!("{PASSPHRASE}\n").as_bytes())
             .unwrap();
         wait_until("bob to see the agent", || seen("ready"));
+        keys.write_all(b"look here\r").unwrap();
         keys.write_all(b"\0").unwrap();
         wait_until("bob's palette", || {
             let mut screen = vt100::Parser::new(24, 200, 0);
             screen.process(&watched.lock().unwrap());
-            screen.screen().contents().contains("Enter sends")
+            let contents = screen.screen().contents();
+            contents.contains("switch agents") && contents.contains("watching")
         });
         keys.write_all(b"run the tests\r").unwrap();
-        wait_until("the host to queue bob's prompt", || seen("waiting"));
-
-        host.wait_for(
-            "\x1b]9;mahi: bob sent a prompt (Ctrl-Space to read it): run the tests\x07\x07",
-        );
-        host.type_keys(b"\0");
-        host.wait_for_screen("run the tests");
-        host.type_keys(b"\r");
-        host.wait_for("got:[from bob] run the tests");
-        wait_until("bob to learn it was accepted", || seen("accepted"));
         keys.write_all(b"\x1b").unwrap();
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(Duration::from_secs(3));
         keys.write_all(b"q").unwrap();
         assert_eq!(exit_of(&mut join), 0);
+        host.type_keys(b"done\r");
+        host.wait_for("got:done");
         host.type_keys(b"end\r");
         let (code, text) = host.finish();
         assert_eq!(code, 0, "{text}");
+        assert!(!text.contains("sent a prompt"), "{text}");
+        assert!(!text.contains("run the tests"), "{text}");
+        assert!(!text.contains("look here"), "{text}");
     }
 
     fn all_signed_by(store: &Store, thread_ref: &ThreadRef, key: &ParticipantKey) {

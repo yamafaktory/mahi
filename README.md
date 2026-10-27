@@ -10,9 +10,9 @@
 
 mahi lets several engineers work together in real time with any terminal coding agent, such as
 Claude Code or Codex. Each agent runs in a sandbox, in a git worktree of its own. Teammates
-watch it live and can hand it prompts, take over its work or merge it. Peers connect directly,
-with no mahi server, and a thread's history is kept in the project's own git remote, with what
-the agents were asked and replied encrypted.
+watch it live and can take over its work, and each one's agent takes the others' work
+between its turns. Peers connect directly, with no mahi server, and a thread's history is kept
+in the project's own git remote, with what the agents were asked and replied encrypted.
 
 mahi is a single Rust binary for Linux and macOS, and for Windows through WSL 2. Its home is
 [mahi.social](https://mahi.social).

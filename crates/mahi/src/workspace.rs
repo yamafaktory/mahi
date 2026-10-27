@@ -29,7 +29,6 @@ use mahi_core::{
     ThreadId,
 };
 use mahi_identity::LocalIdentity;
-use mahi_live::MAX_PROMPT_BYTES;
 use mahi_sandbox::{
     PtyChild,
     PtyCommand,
@@ -87,16 +86,12 @@ use crate::{
         SPIN_EVERY,
         SPINNER,
     },
-    workspace_live::{
-        Prompted,
-        WorkspaceLive,
-    },
+    workspace_live::WorkspaceLive,
 };
 
 const READ_CHUNK: usize = 16 * 1024;
 const STOP_POLL: Duration = Duration::from_millis(20);
 const TOLD_FOR: Duration = Duration::from_secs(6);
-const COMPOSE: &str = "Type a prompt for the agent; Enter sends it to its host";
 const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 pub(crate) const MOUSE_OFF: &[u8] = b"\x1b[?1002l\x1b[?1006l";
 const QUEUED_WRITES: usize = 64;
@@ -366,8 +361,6 @@ pub(crate) struct Workspace {
     next_id: usize,
     scanner: KeyScanner,
     palette: Option<Palette>,
-    composing: Option<Composing>,
-    composed: bool,
     told: Option<Told>,
     chosen: Option<Moved>,
     list_shown: bool,
@@ -500,21 +493,6 @@ impl Tab {
     }
 }
 
-/// Returns what the tab's last line tells of a prompt written to the agent in `slot`.
-fn told_of(prompted: Prompted, slot: &AgentSlot) -> Option<String> {
-    match prompted {
-        Prompted::Sent => Some(format!(
-            "sent to {slot}; {} accepts it in their palette",
-            slot.participant()
-        )),
-        Prompted::Offline => Some(format!("{slot} is offline; the prompt was not sent")),
-        Prompted::NotHosted => {
-            Some("the thread is not watched here; the prompt was not sent".to_owned())
-        }
-        Prompted::Empty => None,
-    }
-}
-
 /// What the last line of a thread's tab tells for a few seconds, after its label.
 #[derive(Debug)]
 struct Told {
@@ -594,16 +572,6 @@ struct Palette {
     key: Vec<u8>,
 }
 
-/// A prompt the user writes to a teammate's agent in `slot` of `thread`, which goes to the
-/// agent's host when it is sent.
-#[derive(Debug)]
-struct Composing {
-    dialog: Dialog,
-    keys: PaletteKeys,
-    thread: ThreadId,
-    slot: AgentSlot,
-}
-
 /// What an entry of the workspace's palette does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
@@ -639,8 +607,6 @@ impl Workspace {
             next_id: 0,
             scanner: KeyScanner::new(palette_key),
             palette: None,
-            composing: None,
-            composed: false,
             told: None,
             chosen: None,
             list_shown: true,
@@ -755,7 +721,6 @@ impl Workspace {
         }
         self.selected = index + 1;
         self.palette = None;
-        self.composing = None;
         Ok(())
     }
 
@@ -882,7 +847,6 @@ impl Workspace {
             {
                 changed = true;
                 self.palette = None;
-                self.composing = None;
                 let selected = tab.agents.get(tab.selected).map(|running| running.id);
                 for running in &mut tab.agents {
                     if running.ending == Ending::Closed && self.applied == Some(running.id) {
@@ -935,7 +899,6 @@ impl Workspace {
         self.tabs.retain(|tab| !tab.is_done());
         self.selected = selected;
         self.palette = None;
-        self.composing = None;
         true
     }
 
@@ -954,7 +917,6 @@ impl Workspace {
         }
         self.selected = index + 1;
         self.palette = None;
-        self.composing = None;
         self.host(thread);
     }
 
@@ -1281,12 +1243,11 @@ impl Workspace {
         }
         self.mouse.joined = joined;
         let chosen = self.chosen.take();
-        let composed = std::mem::take(&mut self.composed);
         if new {
             Moved::New
         } else if let Some(chosen) = chosen {
             chosen
-        } else if self.view_state() == before && !composed {
+        } else if self.view_state() == before {
             Moved::Nothing
         } else {
             Moved::Shown
@@ -1355,7 +1316,7 @@ impl Workspace {
             self.give_agent(event, body, position, true);
             return false;
         }
-        if self.palette.is_some() || self.composing.is_some() {
+        if self.palette.is_some() {
             return false;
         }
         if bar.contains(position) {
@@ -1456,7 +1417,6 @@ impl Workspace {
             std::mem::replace(&mut self.scanner, KeyScanner::new(PaletteKey::default()));
         for segment in scanner.scan(typed) {
             match segment {
-                Segment::Palette(_) if self.composing.is_some() => {}
                 Segment::Palette(key) => {
                     if self.palette.take().is_some() {
                         self.send(key);
@@ -1464,7 +1424,6 @@ impl Workspace {
                         self.open_palette(key);
                     }
                 }
-                Segment::Pass(bytes) if self.composing.is_some() => self.compose(bytes, threads),
                 Segment::Pass(bytes) => {
                     let used = self.palette_keys(bytes);
                     self.pass(bytes.get(used..).unwrap_or_default(), threads);
@@ -1641,8 +1600,12 @@ impl Workspace {
         };
         self.selected = index + 1;
         self.palette = None;
-        self.composing = None;
-        self.tell(label, Some(text.to_owned()), thread);
+        self.told = Some(Told {
+            label,
+            text: text.to_owned(),
+            at: Instant::now(),
+            thread,
+        });
         true
     }
 
@@ -1676,7 +1639,7 @@ impl Workspace {
 
     /// Says whether the palette is open.
     pub(crate) fn palette_open(&self) -> bool {
-        self.palette.is_some() || self.composing.is_some()
+        self.palette.is_some()
     }
 
     /// Draws the open palette over `area`.
@@ -1684,44 +1647,13 @@ impl Workspace {
         if let Some(palette) = &self.palette {
             palette.menu.render(area, buffer);
         }
-        if let Some(composing) = &self.composing {
-            composing.dialog.render(area, buffer);
-        }
     }
 
     fn pass(&mut self, bytes: &[u8], threads: &mut Vec<u8>) {
         if self.selected == 0 {
             threads.extend_from_slice(bytes);
-        } else if let Some((thread, slot)) = self.shown_teammate() {
-            if bytes.is_empty() {
-                return;
-            }
-            self.composing = Some(Composing {
-                dialog: Dialog::prompt(
-                    &format!("Prompt for {slot}"),
-                    vec![COMPOSE.to_owned()],
-                    MAX_PROMPT_BYTES,
-                ),
-                keys: PaletteKeys::default(),
-                thread,
-                slot,
-            });
-            self.compose(bytes, threads);
         } else {
             self.send(bytes);
-        }
-    }
-
-    /// Tells `told`, if anything, after `label` on the last line of `thread`'s tab for a few
-    /// seconds.
-    fn tell(&mut self, label: &'static str, told: Option<String>, thread: ThreadId) {
-        if let Some(text) = told {
-            self.told = Some(Told {
-                label,
-                text,
-                at: Instant::now(),
-                thread,
-            });
         }
     }
 
@@ -1736,63 +1668,6 @@ impl Workspace {
             self.told = None;
         }
         old
-    }
-
-    /// Returns the thread and the slot of the teammate's agent the shown tab shows, if it
-    /// shows one.
-    fn shown_teammate(&self) -> Option<(ThreadId, AgentSlot)> {
-        let tab = self.tabs.get(self.selected.checked_sub(1)?)?;
-        if tab.agents.get(tab.selected).is_some() {
-            return None;
-        }
-        Some((tab.thread?, tab.watching.clone()?))
-    }
-
-    /// Types `bytes` into the prompt being written: Enter sends it to the teammate's agent
-    /// through the thread's host, and Escape drops it.
-    fn compose(&mut self, bytes: &[u8], threads: &mut Vec<u8>) {
-        let Some(mut composing) = self.composing.take() else {
-            return;
-        };
-        self.composed = true;
-        let mut answered = None;
-        let used = composing.keys.read(bytes, |input| {
-            answered = composing.dialog.key(input);
-            answered.is_none()
-        });
-        match answered {
-            Some(Answer::Text(text)) => {
-                let prompted = match &self.live {
-                    _ if text.trim().is_empty() => Prompted::Empty,
-                    Some(live) => live.prompt(composing.thread, &composing.slot, &text),
-                    None => Prompted::NotHosted,
-                };
-                self.tell(
-                    "prompt",
-                    told_of(prompted, &composing.slot),
-                    composing.thread,
-                );
-                if matches!(prompted, Prompted::Offline | Prompted::NotHosted) {
-                    composing.dialog = Dialog::prompt(
-                        &format!("Prompt for {}", composing.slot),
-                        vec![COMPOSE.to_owned()],
-                        MAX_PROMPT_BYTES,
-                    );
-                    for c in text.chars() {
-                        composing.dialog.key(PaletteInput::Pasted(c));
-                    }
-                    self.composing = Some(composing);
-                    self.compose(bytes.get(used..).unwrap_or_default(), threads);
-                    return;
-                }
-            }
-            Some(_) => {}
-            None => {
-                self.composing = Some(composing);
-                return;
-            }
-        }
-        self.pass(bytes.get(used..).unwrap_or_default(), threads);
     }
 
     /// Asks the shown agent's mahi to open its own palette; a request its pipe has no room for
@@ -2424,82 +2299,24 @@ mod tests {
     }
 
     #[test]
-    fn typing_on_a_teammates_agent_writes_a_prompt_for_it_until_escape() {
+    fn typing_on_a_teammates_agent_reaches_no_one_and_opens_nothing() {
         let mut workspace = Workspace::new(
             PaletteKey::default(),
             Notice::for_terminal(TerminalHints::default()),
         );
         let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
         workspace.watch_thread(thread);
-        let mut threads = Vec::new();
-        assert_eq!(workspace.type_keys(b"x", &mut threads), Moved::Nothing);
-        assert!(workspace.composing.is_none());
         workspace.tabs[0].watching = Some(AgentSlot::new(
             mahi_core::ParticipantName::new("alice").unwrap(),
             mahi_core::AgentName::new("claude").unwrap(),
         ));
-        assert_eq!(workspace.type_keys(b"hello", &mut threads), Moved::Shown);
-        assert!(workspace.palette_open());
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
-        workspace.render_palette(buffer.area, &mut buffer);
-        let drawn: String = buffer
-            .content()
-            .iter()
-            .map(ratatui_core::buffer::Cell::symbol)
-            .collect();
-        assert!(drawn.contains("Prompt for alice.claude"), "{drawn}");
-        assert!(drawn.contains("› hello"), "{drawn}");
-        assert!(threads.is_empty());
-        workspace.type_keys(b"\x00", &mut threads);
-        assert!(workspace.palette.is_none());
-        assert!(workspace.composing.is_some());
-        workspace.type_keys(b"\x1b", &mut threads);
-        assert!(workspace.composing.is_none());
-        workspace.type_keys(b"again\rnext", &mut threads);
-        let told = workspace.told.as_ref().map(|told| told.text.as_str());
+        let mut threads = Vec::new();
         assert_eq!(
-            told,
-            Some("the thread is not watched here; the prompt was not sent")
+            workspace.type_keys(b"hello\r", &mut threads),
+            Moved::Nothing
         );
-        assert!(workspace.composing.is_some());
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
-        workspace.render_palette(buffer.area, &mut buffer);
-        let drawn: String = buffer
-            .content()
-            .iter()
-            .map(ratatui_core::buffer::Cell::symbol)
-            .collect();
-        assert!(drawn.contains("› againnext"), "{drawn}");
-        workspace.type_keys(b"\x1b", &mut threads);
-        workspace.type_keys(b"   \r", &mut threads);
-        assert!(workspace.composing.is_none());
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
-        workspace.render(
-            Header {
-                repository: "r",
-                remote: "origin (private)",
-                remote_chosen: true,
-                remote_key: false,
-                identity: "me",
-            },
-            Rect::new(0, 0, 80, 1),
-            Rect::new(0, 1, 80, 19),
-            &mut buffer,
-        );
-        let drawn: String = buffer
-            .content()
-            .iter()
-            .map(ratatui_core::buffer::Cell::symbol)
-            .collect();
-        assert!(
-            drawn.contains("prompt the thread is not watched here"),
-            "{drawn}"
-        );
-        assert!(!workspace.forget_told());
-        if let Some(told) = workspace.told.as_mut() {
-            told.at = Instant::now().checked_sub(TOLD_FOR).unwrap();
-        }
-        assert!(workspace.forget_told());
+        assert!(threads.is_empty());
+        assert!(!workspace.palette_open());
         assert!(workspace.told.is_none());
     }
 
@@ -2579,15 +2396,8 @@ mod tests {
         assert_eq!(workspace.tabs.len(), 1);
         assert!(workspace.tabs[0].watch_only);
         workspace.tabs[0].agents.clear();
-        workspace.tabs[0].watching = Some(AgentSlot::new(
-            mahi_core::ParticipantName::new("alice").unwrap(),
-            mahi_core::AgentName::new("claude").unwrap(),
-        ));
-        workspace.type_keys(b"half a prompt", &mut threads);
-        assert!(workspace.composing.is_some());
         workspace.leave_thread(thread);
         assert!(workspace.tabs.is_empty());
-        assert!(workspace.composing.is_none());
     }
 
     #[test]
@@ -2627,7 +2437,15 @@ mod tests {
             .map(ratatui_core::buffer::Cell::symbol)
             .collect();
         assert!(drawn.contains("invite done"), "{drawn}");
-        assert!(workspace.palette.is_none() && workspace.composing.is_none());
+        assert!(workspace.palette.is_none());
+        assert!(!workspace.forget_told());
+        assert!(workspace.told.is_some());
+        if let Some(told) = workspace.told.as_mut() {
+            told.at = Instant::now().checked_sub(TOLD_FOR).unwrap();
+        }
+        assert!(workspace.forget_told());
+        assert!(workspace.told.is_none());
+        assert!(!workspace.forget_told());
     }
 
     #[test]

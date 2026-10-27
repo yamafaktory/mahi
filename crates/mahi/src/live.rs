@@ -75,7 +75,6 @@ use mahi_live::{
     SnapshotsAnswer,
     SnapshotsRequest,
     TurnEnd,
-    prompt_id,
 };
 use mahi_sandbox::WindowSize;
 use mahi_store::{
@@ -194,7 +193,6 @@ const MAX_UNSENT_ANSWERS: usize = 256;
 /// The most frames of teammates' agents the workspace's host keeps until the workspace reads
 /// them.
 const WATCH_QUEUE: usize = 1024;
-const PROMPTS_WAITING: usize = 16;
 /// The most bytes of teammates' agents' terminals the workspace's host keeps until the
 /// workspace reads them.
 const WATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -688,7 +686,6 @@ pub(crate) struct Watch {
     lost: Arc<AtomicBool>,
     ask: Arc<AtomicBool>,
     queued: Arc<AtomicUsize>,
-    prompts: Arc<Mutex<Vec<(AgentSlot, PromptText)>>>,
 }
 
 impl Watch {
@@ -698,35 +695,20 @@ impl Watch {
         let (passed, frames) = mpsc::sync_channel(WATCH_QUEUE);
         let (lost, ask) = (Arc::<AtomicBool>::default(), Arc::<AtomicBool>::default());
         let queued = Arc::<AtomicUsize>::default();
-        let prompts = Arc::<Mutex<Vec<(AgentSlot, PromptText)>>>::default();
         let watching = Watching {
             frames: passed,
             lost: Arc::clone(&lost),
             ask: Arc::clone(&ask),
             request: Arc::clone(request),
             queued: Arc::clone(&queued),
-            prompts: Arc::clone(&prompts),
         };
         let watch = Self {
             frames,
             lost,
             ask,
             queued,
-            prompts,
         };
         (watch, watching)
-    }
-
-    /// Sends `text` as a prompt to the teammate's agent in `slot`, through its host, once a
-    /// screen of that host anchored the run the prompt names; at most [`PROMPTS_WAITING`]
-    /// wait, the oldest going first.
-    pub(crate) fn prompt(&self, slot: AgentSlot, text: PromptText) {
-        if let Ok(mut prompts) = self.prompts.lock() {
-            if prompts.len() >= PROMPTS_WAITING {
-                prompts.remove(0);
-            }
-            prompts.push((slot, text));
-        }
     }
 
     /// Applies to `teammates` at `now` what their hosts sent since the last call, and asks
@@ -766,7 +748,6 @@ struct Watching {
     ask: Arc<AtomicBool>,
     request: Arc<Mutex<Vec<Body>>>,
     queued: Arc<AtomicUsize>,
-    prompts: Arc<Mutex<Vec<(AgentSlot, PromptText)>>>,
 }
 
 impl Watching {
@@ -813,34 +794,6 @@ impl Watching {
         if let (Ok(request), Ok(mut queue)) = (receiver.request_screen(), self.request.lock()) {
             queue.push(request);
         }
-    }
-
-    /// Hands the broadcaster, sealed for the run `receiver` follows of each teammate's host,
-    /// the prompts the workspace sends whose host a screen anchored; the others wait.
-    fn prompt_if_any(&self, receiver: &FrameReceiver) {
-        let Ok(mut prompts) = self.prompts.lock() else {
-            return;
-        };
-        if prompts.is_empty() {
-            return;
-        }
-        let Ok(mut queue) = self.request.lock() else {
-            return;
-        };
-        prompts.retain(|(slot, text)| {
-            let Some((_, run)) = receiver.run_for(slot.participant()) else {
-                return true;
-            };
-            if let Ok(id) = prompt_id() {
-                queue.push(Body::Prompt {
-                    slot: slot.clone(),
-                    run,
-                    id,
-                    text: text.clone(),
-                });
-            }
-            false
-        });
     }
 }
 
@@ -1561,7 +1514,7 @@ impl Broadcaster {
         }
     }
 
-    /// Sends the screen request and the prompts the workspace asked for, if any.
+    /// Sends the screen request the workspace asked for, if any.
     fn send_request_if_any(&mut self) {
         let requests = self
             .request
@@ -1723,7 +1676,6 @@ impl Listener {
             if let Some(watching) = &self.watching {
                 watching.note_dropped(self.topic.dropped(), &mut dropped);
                 watching.ask_if_wanted(&mut self.receiver);
-                watching.prompt_if_any(&self.receiver);
             }
             let Ok(Some(frame)) = self.topic.receive(LISTEN_PAUSE) else {
                 continue;
@@ -2428,7 +2380,7 @@ mod tests {
     }
 
     #[test]
-    fn the_workspaces_host_watches_a_teammates_agent_and_sends_it_a_prompt() {
+    fn the_workspaces_host_watches_a_teammates_agent() {
         let hosted = hosted();
         let bob_node = NodeKey::generate().unwrap();
         let bob_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
@@ -2463,12 +2415,11 @@ mod tests {
             ParticipantName::new("bob").unwrap(),
             AgentName::new("claude").unwrap(),
         );
-        let prompts = Arc::new(Prompts::default());
         let own = OwnAgent {
             slot: slot.clone(),
             size: WindowSize { rows: 4, cols: 40 },
             drawn: b"bob's agent",
-            prompts: Arc::clone(&prompts),
+            prompts: Arc::default(),
         };
         let (_bob_shared, bob) = host_on(
             &hosted,
@@ -2484,22 +2435,6 @@ mod tests {
         bob.tap().unwrap().output(b" works");
         let shown = watched_until(watch, &mut teammates, &slot, "bob's agent works");
         assert!(shown.contains("bob's agent works"), "{shown:?}");
-        watch.prompt(
-            slot.clone(),
-            PromptText::new("hello from alice".to_owned()).unwrap(),
-        );
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut arrivals = Vec::new();
-        while arrivals.is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "the prompt never reached bob's host"
-            );
-            prompts.take_arrivals(&mut arrivals);
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert_eq!(arrivals[0].from.as_str(), "alice");
-        assert!(arrivals[0].first_words.starts_with("hello from alice"));
         bob.stop();
         alice.stop();
     }
@@ -2861,7 +2796,6 @@ mod tests {
             ask: Arc::default(),
             request: Arc::default(),
             queued: Arc::default(),
-            prompts: Arc::default(),
         };
         (watching, frames)
     }
