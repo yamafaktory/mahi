@@ -2506,10 +2506,11 @@ fn relay(
     });
     let shown_key = palette.map(|key| key.to_string());
     let out = Out::for_agent(title, shown_key.as_deref(), replies).map_err(RunError::Output)?;
-    let waiting = auto_merge
+    let syncing = auto_merge.zip(merger);
+    let waiting = syncing
         .as_ref()
         .filter(|_| palette.is_some())
-        .map(|auto_merge| Arc::clone(&auto_merge.waiting));
+        .map(|(auto_merge, _)| Arc::clone(&auto_merge.waiting));
     let screen = user_screen(
         Screen::new(out, repainter.clone(), palette_key),
         waiting.as_ref(),
@@ -2535,7 +2536,7 @@ fn relay(
         forward_input(&input_writer, input, &input_activity, &input_quitting);
     });
     spawn_ticker(Arc::clone(&screen), Arc::clone(&running), waiting);
-    if let Some((auto_merge, merger)) = auto_merge.zip(merger) {
+    if let Some((auto_merge, merger)) = syncing {
         spawn_auto_merge(auto_merge, merger, (activity, &screen, &writer), &running);
     }
     let following = follow_resizes(repainter, Arc::clone(&screen), tap.clone(), quitting);

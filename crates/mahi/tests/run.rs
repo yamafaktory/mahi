@@ -1070,6 +1070,7 @@ content = '{{"bin": "{mahi_bin}"}}'
         assert!(session.text().contains("Ctrl-Space opens mahi's palette"));
         session.type_keys(b"\0");
         session.wait_for_screen("╭ Held turns");
+        session.wait_for_screen("This run takes in no teammates' work");
         session.type_keys(b"abc");
         session.wait_for_screen("› abc");
         session.type_keys(b"\x1b");

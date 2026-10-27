@@ -47,6 +47,8 @@ use crate::{
 const MAX_HELD_BYTES: usize = 1024 * 1024;
 const TITLE: &str = "Held turns";
 const EMPTY: &str = "No teammate's turn waits for you";
+const NO_SYNC: &str = "This run takes in no teammates' work";
+const NO_MATCH: &str = "No held turn matches the filter";
 const HELD_DETAIL: &str = "changes agent settings";
 const HELD_READ: &str = "PgDn reads on · Ctrl-X skips · Esc closes";
 const HELD_DECIDE: &str = "Enter takes · Ctrl-X skips · Esc closes";
@@ -537,7 +539,11 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
             filter: &state.filter,
             items: &items,
             selected: state.selected,
-            empty: EMPTY,
+            empty: match (&self.waiting, state.filter.is_empty()) {
+                (None, _) => NO_SYNC,
+                (Some(_), true) => EMPTY,
+                (Some(_), false) => NO_MATCH,
+            },
             hint,
             preview: text.as_deref().map(|text| Preview {
                 text,
@@ -1015,11 +1021,36 @@ mod tests {
     }
 
     #[test]
-    fn a_palette_with_nothing_held_says_no_teammates_turn_waits() {
+    fn an_empty_palette_in_a_run_that_takes_in_work_says_no_turn_waits() {
         let terminal = FakeTerminal::default();
-        let screen = screen(&terminal);
-        screen.open().unwrap();
-        assert!(String::from_utf8_lossy(&written(&screen)).contains(EMPTY));
+        let syncing = screen(&terminal).with_waiting(Arc::new(HeldQueue::default()));
+        syncing.open().unwrap();
+        let drawn = String::from_utf8_lossy(&written(&syncing)).into_owned();
+        assert!(drawn.contains(EMPTY) && !drawn.contains(NO_SYNC), "{drawn}");
+    }
+
+    #[test]
+    fn an_empty_palette_in_a_run_that_takes_in_no_work_says_so() {
+        let terminal = FakeTerminal::default();
+        let alone = screen(&terminal);
+        alone.open().unwrap();
+        let drawn = String::from_utf8_lossy(&written(&alone)).into_owned();
+        assert!(drawn.contains(NO_SYNC) && !drawn.contains(EMPTY), "{drawn}");
+    }
+
+    #[test]
+    fn a_filter_that_hides_every_held_turn_says_none_matches_not_that_none_waits() {
+        let terminal = FakeTerminal::default();
+        let waiting = Arc::new(HeldQueue::default());
+        let filtered = screen(&terminal).with_waiting(Arc::clone(&waiting));
+        waiting.show(vec![held("bob.claude", 1, &["CLAUDE.md"])]);
+        filtered.open().unwrap();
+        filtered.typed(b"xyz").unwrap();
+        let drawn = String::from_utf8_lossy(&written(&filtered)).into_owned();
+        assert!(
+            drawn.contains(NO_MATCH) && !drawn.contains(EMPTY),
+            "{drawn}"
+        );
     }
 
     fn held_screen(terminal: &FakeTerminal) -> (Screen<Vec<u8>, &FakeTerminal>, Arc<HeldQueue>) {
