@@ -35,13 +35,16 @@ pub use frame::{
     MAX_COLUMNS,
     MAX_FRAME_BYTES,
     MAX_FRAME_CLAIMS,
+    MAX_FRAME_STATES,
     MAX_FRAME_TURN_ENDS,
     MAX_ROWS,
     MAX_SCREEN_PARTS,
     MIN_COLUMNS,
     MIN_ROWS,
     Received,
+    StateEntry,
     TurnEnd,
+    TurnState,
 };
 pub use gossip::{
     LiveTopic,

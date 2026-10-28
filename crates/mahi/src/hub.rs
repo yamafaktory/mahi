@@ -41,6 +41,7 @@ use mahi_live::{
     MAX_ROWS,
     MIN_COLUMNS,
     MIN_ROWS,
+    TurnState,
 };
 use mahi_sandbox::WindowSize;
 
@@ -74,6 +75,7 @@ pub(crate) struct OutputTap {
 struct TapState {
     mirror: vt100::Parser,
     target: Target,
+    turn: Option<TurnState>,
 }
 
 enum Target {
@@ -95,6 +97,7 @@ impl OutputTap {
             state: Arc::new(Mutex::new(TapState {
                 mirror: mahi_term::new_screen(size.rows, size.cols),
                 target: Target::Nobody,
+                turn: None,
             })),
         }
     }
@@ -148,6 +151,24 @@ impl OutputTap {
         }
     }
 
+    /// Takes the agent's new state, which the host tells teammates; one the guest's queue has
+    /// no room for goes again with the next whole screen.
+    pub(crate) fn turn(&self, turn: TurnState) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.turn = Some(turn);
+        match &state.target {
+            Target::Nobody => {}
+            Target::Host(tap) => tap.turn(turn),
+            Target::Guest(queue, resync) => {
+                if queue.try_send(LocalMessage::State(turn)).is_err() {
+                    resync.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
     fn drawn(&self) -> (WindowSize, Vec<u8>) {
         self.state.lock().map_or_else(
             |_| (WindowSize { rows: 24, cols: 80 }, Vec::new()),
@@ -167,12 +188,16 @@ impl OutputTap {
         if let Ok(mut state) = self.state.lock() {
             let (size, screen) = drawn_from(&state.mirror);
             host.reset(size, &screen);
+            if let Some(turn) = state.turn {
+                host.turn(turn);
+            }
             state.target = Target::Host(host);
         }
     }
 
-    /// Sends the mirror as a whole screen to the host, dropping the output and resizes still
-    /// queued, which it already holds; under the tap's lock, so none comes in between.
+    /// Sends the mirror as a whole screen to the host, then the agent's state, dropping the
+    /// output, resizes and states still queued, which they hold; under the tap's lock, so
+    /// none comes in between.
     fn resend_screen(
         &self,
         queued: &Receiver<LocalMessage>,
@@ -183,13 +208,18 @@ impl OutputTap {
         };
         while queued.try_recv().is_ok() {}
         let (size, screen) = drawn_from(&state.mirror);
+        let turn = state.turn;
         drop(state);
         LocalMessage::Screen {
             rows: size.rows,
             columns: size.cols,
             screen,
         }
-        .write_to(writer)
+        .write_to(writer)?;
+        match turn {
+            Some(turn) => LocalMessage::State(turn).write_to(writer),
+            None => Ok(()),
+        }
     }
 }
 
@@ -375,6 +405,7 @@ fn read_guest(
                 &screen,
             ),
             LocalMessage::Claims(held) => claims.hear_guest(slot, held),
+            LocalMessage::State(turn) => guest.tap.turn(turn),
             LocalMessage::Hello { .. } | LocalMessage::Welcome => {
                 return Err(LocalError::Malformed);
             }
@@ -689,6 +720,7 @@ impl Joining {
 mod tests {
     use std::time::Instant;
 
+    use mahi_agent::hook::HookKind;
     use mahi_core::{
         AgentName,
         ParticipantName,
@@ -700,6 +732,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::inject::Activity;
 
     fn slot(participant: &str, agent: &str) -> AgentSlot {
         AgentSlot::new(
@@ -753,6 +786,59 @@ mod tests {
         eventually("leaving", || handle.served() == 0);
         hub.stop();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_guests_state_reaches_the_host_when_it_links_and_when_it_changes() {
+        let (_dir, path, hub, handle) = hub();
+        let codex = slot("alice", "codex");
+        let tap = OutputTap::new(WindowSize { rows: 24, cols: 80 });
+        tap.turn(TurnState::Working);
+        let link = GuestLink::connect(&path, &codex, &tap, &Arc::new(Claims::default())).unwrap();
+        eventually("the state told before linking", || {
+            handle.state_of(&codex) == Some(TurnState::Working)
+        });
+        tap.turn(TurnState::Asks);
+        eventually("the new state", || {
+            handle.state_of(&codex) == Some(TurnState::Asks)
+        });
+        link.close();
+        hub.stop();
+    }
+
+    #[test]
+    fn a_tap_that_takes_over_the_hosting_hands_the_host_its_agents_state() {
+        let (handle, _tapped) = HostHandle::for_tests(ParticipantName::new("alice").unwrap());
+        let codex = slot("alice", "codex");
+        let size = WindowSize { rows: 24, cols: 80 };
+        let guest = handle.serve(codex.clone(), size).unwrap();
+        let tap = OutputTap::new(size);
+        tap.turn(TurnState::Done);
+        assert_eq!(handle.state_of(&codex), None);
+        tap.attach(guest.tap.clone());
+        assert_eq!(handle.state_of(&codex), Some(TurnState::Done));
+        tap.turn(TurnState::Working);
+        assert_eq!(handle.state_of(&codex), Some(TurnState::Working));
+    }
+
+    #[test]
+    fn an_agents_activity_tells_its_host_each_state_it_reaches() {
+        let (handle, _tapped) = HostHandle::for_tests(ParticipantName::new("alice").unwrap());
+        let codex = slot("alice", "codex");
+        let size = WindowSize { rows: 24, cols: 80 };
+        let guest = handle.serve(codex.clone(), size).unwrap();
+        let tap = OutputTap::new(size);
+        tap.attach(guest.tap.clone());
+        let activity = Activity::telling(Some(tap));
+        activity.saw(HookKind::Prompt, b"");
+        assert_eq!(handle.state_of(&codex), Some(TurnState::Working));
+        activity.saw(
+            HookKind::Asks,
+            br#"{"notification_type":"permission_prompt"}"#,
+        );
+        assert_eq!(handle.state_of(&codex), Some(TurnState::Asks));
+        activity.keys(b"\x03");
+        assert_eq!(handle.state_of(&codex), Some(TurnState::Done));
     }
 
     #[test]

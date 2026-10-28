@@ -18,7 +18,10 @@ use mahi_agent::{
     hook::HookKind,
     payload::asks_user,
 };
+use mahi_live::TurnState;
 use mahi_term::Report;
+
+use crate::hub::OutputTap;
 
 const INTERRUPT: u8 = 0x03;
 const KILL_LINE: u8 = 0x15;
@@ -43,7 +46,8 @@ impl Default for Pace {
 
 /// What the agent and the user did last, to tell when the agent is idle: its turn ended, as
 /// its hook reports, or was interrupted, the user's own input line is empty, and nothing was
-/// written or typed for a while.
+/// written or typed for a while. Its changes happen one at a time, so the states it tells
+/// arrive in the order they happen.
 #[derive(Debug)]
 pub(crate) struct Activity {
     turn_open: AtomicBool,
@@ -51,6 +55,8 @@ pub(crate) struct Activity {
     asking: AtomicBool,
     line_empty: AtomicBool,
     last: Mutex<Instant>,
+    tap: Option<OutputTap>,
+    changing: Mutex<()>,
 }
 
 impl Default for Activity {
@@ -61,11 +67,33 @@ impl Default for Activity {
             asking: AtomicBool::new(false),
             line_empty: AtomicBool::new(true),
             last: Mutex::new(Instant::now()),
+            tap: None,
+            changing: Mutex::new(()),
         }
     }
 }
 
 impl Activity {
+    /// Starts with nothing done yet, telling each change of the agent's state to `tap` too,
+    /// when there is one, for the teammates.
+    pub(crate) fn telling(tap: Option<OutputTap>) -> Self {
+        Self {
+            tap,
+            ..Self::default()
+        }
+    }
+
+    fn tell(&self, state: TurnState) {
+        crate::report::send(&match state {
+            TurnState::Working => Report::Working,
+            TurnState::Done => Report::Done,
+            TurnState::Asks => Report::Asks,
+        });
+        if let Some(tap) = &self.tap {
+            tap.turn(state);
+        }
+    }
+
     /// Notes output from the agent or keys from the user.
     pub(crate) fn touched(&self) {
         if let Ok(mut last) = self.last.lock() {
@@ -83,44 +111,50 @@ impl Activity {
         }
         self.touched();
         let effect = line_effect(bytes);
+        let Ok(_changing) = self.changing.lock() else {
+            return;
+        };
         if effect.interrupts {
             self.asking.store(false, Ordering::SeqCst);
             if self.turn_open.swap(false, Ordering::SeqCst) {
                 self.turn_ended.store(false, Ordering::SeqCst);
-                crate::report::send(&Report::Done);
+                self.tell(TurnState::Done);
             }
         }
         if let Some(empty) = effect.line_empty {
             self.line_empty.store(empty, Ordering::SeqCst);
             if !effect.interrupts && self.asking.swap(false, Ordering::SeqCst) {
-                crate::report::send(&Report::Working);
+                self.tell(TurnState::Working);
             }
         }
     }
 
     /// Notes what the agent's hook reported, with the `payload` it read.
     pub(crate) fn saw(&self, kind: HookKind, payload: &[u8]) {
+        let Ok(_changing) = self.changing.lock() else {
+            return;
+        };
         match kind {
             HookKind::Prompt => {
                 self.turn_open.store(true, Ordering::SeqCst);
                 self.turn_ended.store(false, Ordering::SeqCst);
                 self.asking.store(false, Ordering::SeqCst);
-                crate::report::send(&Report::Working);
+                self.tell(TurnState::Working);
             }
             HookKind::TurnEnd => {
                 self.turn_open.store(false, Ordering::SeqCst);
                 self.turn_ended.store(true, Ordering::SeqCst);
                 self.asking.store(false, Ordering::SeqCst);
-                crate::report::send(&Report::Done);
+                self.tell(TurnState::Done);
             }
             HookKind::Tool => {
                 if self.asking.swap(false, Ordering::SeqCst) {
-                    crate::report::send(&Report::Working);
+                    self.tell(TurnState::Working);
                 }
             }
             HookKind::Asks => {
                 if asks_user(payload) && !self.asking.swap(true, Ordering::SeqCst) {
-                    crate::report::send(&Report::Asks);
+                    self.tell(TurnState::Asks);
                 }
             }
         }

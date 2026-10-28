@@ -60,6 +60,7 @@ use mahi_live::{
     LiveTopic,
     Peers,
     Relays,
+    StateEntry,
     Ticket,
     TurnEnd,
 };
@@ -270,7 +271,8 @@ impl View {
             | Body::Output { slot, .. }
             | Body::Resize { slot, .. }
             | Body::Heartbeat { slot }
-            | Body::TurnEnded(TurnEnd { slot, .. }) => self.seen(slot),
+            | Body::TurnEnded(TurnEnd { slot, .. })
+            | Body::State(StateEntry { slot, .. }) => self.seen(slot),
             Body::ScreenRequest { .. } | Body::Claims { .. } => {}
         }
         match body {
@@ -320,7 +322,8 @@ impl View {
             Body::ScreenRequest { .. }
             | Body::Heartbeat { .. }
             | Body::Claims { .. }
-            | Body::TurnEnded(_) => {}
+            | Body::TurnEnded(_)
+            | Body::State(_) => {}
         }
     }
 

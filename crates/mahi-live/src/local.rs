@@ -18,6 +18,7 @@ use crate::frame::{
     MAX_ROWS,
     MIN_COLUMNS,
     MIN_ROWS,
+    TurnState,
     claim_fits,
 };
 
@@ -31,6 +32,7 @@ const OUTPUT: u8 = 3;
 const RESIZE: u8 = 4;
 const WELCOME: u8 = 6;
 const CLAIMS: u8 = 8;
+const STATE: u8 = 9;
 
 /// The most claims one local message carries.
 pub const MAX_LOCAL_CLAIMS: usize = 512;
@@ -72,6 +74,8 @@ pub enum LocalMessage {
     /// Claims: the ones a mahi's agent holds, sent to the host, or every claim the host knows,
     /// sent to the user's other mahis; at most [`MAX_LOCAL_CLAIMS`].
     Claims(Vec<ClaimEntry>),
+    /// The state of a mahi's agent, sent to the host when it changes.
+    State(TurnState),
 }
 
 /// A frame that cannot be read as a [`LocalMessage`].
@@ -159,6 +163,10 @@ impl LocalMessage {
                     out.extend_from_slice(&claim.age_secs.to_be_bytes());
                 }
             }
+            Self::State(state) => {
+                out.push(STATE);
+                out.push(state.code());
+            }
         }
         let length = out.len() - start - 4;
         if length > MAX_LOCAL_FRAME_BYTES {
@@ -205,6 +213,9 @@ impl LocalMessage {
             }
             WELCOME => Self::Welcome,
             CLAIMS => Self::Claims(reader.claims()?),
+            STATE => {
+                Self::State(TurnState::from_code(reader.byte()?).ok_or(LocalError::Malformed)?)
+            }
             _ => return Err(LocalError::Malformed),
         };
         reader.finish()?;
@@ -414,9 +425,23 @@ mod tests {
                 columns: MAX_COLUMNS,
             },
             LocalMessage::Welcome,
+            LocalMessage::State(TurnState::Working),
+            LocalMessage::State(TurnState::Done),
+            LocalMessage::State(TurnState::Asks),
         ] {
             assert_eq!(round_trip(&message), message);
         }
+    }
+
+    #[test]
+    fn a_state_is_one_known_byte() {
+        assert!(LocalMessage::decode(&[STATE]).is_err());
+        assert!(LocalMessage::decode(&[STATE, 3]).is_err());
+        assert!(LocalMessage::decode(&[STATE, 0, 0]).is_err());
+        assert_eq!(
+            LocalMessage::decode(&[STATE, 2]).unwrap(),
+            LocalMessage::State(TurnState::Asks)
+        );
     }
 
     #[test]

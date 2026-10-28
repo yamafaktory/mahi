@@ -71,7 +71,9 @@ use mahi_live::{
     Relays,
     SnapshotsAnswer,
     SnapshotsRequest,
+    StateEntry,
     TurnEnd,
+    TurnState,
 };
 use mahi_sandbox::WindowSize;
 use mahi_store::{
@@ -408,6 +410,7 @@ pub(crate) struct HostTap {
     screen: Arc<Mutex<Screen>>,
     queue: SyncSender<Tapped>,
     dropped: Arc<AtomicBool>,
+    registry: Arc<Mutex<Registry>>,
 }
 
 impl std::fmt::Debug for HostTap {
@@ -459,6 +462,16 @@ impl HostTap {
         self.dropped.store(true, Ordering::SeqCst);
     }
 
+    /// Takes the agent's new state, which the host tells teammates.
+    pub(crate) fn turn(&self, state: TurnState) {
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(hosted) = registry.get(self.agent)
+            && hosted.state.is_none_or(|told| told.state != state)
+        {
+            hosted.state = Some(Told { state, sent: false });
+        }
+    }
+
     fn enqueue(&self, tapped: Tapped) {
         if self.queue.try_send(tapped).is_err() {
             self.dropped.store(true, Ordering::SeqCst);
@@ -471,6 +484,14 @@ struct Hosted {
     slot: AgentSlot,
     screen: Arc<Mutex<Screen>>,
     held_through: u64,
+    state: Option<Told>,
+}
+
+/// An agent's latest state, and whether a frame told it yet.
+#[derive(Debug, Clone, Copy)]
+struct Told {
+    state: TurnState,
+    sent: bool,
 }
 
 /// The agents a host serves: its own, and those of the user's other mahis in the thread.
@@ -496,6 +517,7 @@ impl Registry {
             slot,
             screen: Arc::clone(&screen),
             held_through: 0,
+            state: None,
         });
         Some((id, screen))
     }
@@ -809,6 +831,7 @@ impl LiveHost {
                 screen,
                 queue: queue.clone(),
                 dropped: Arc::clone(&dropped),
+                registry: Arc::clone(&registry),
             }),
             stop,
             stop_broadcast,
@@ -1109,6 +1132,14 @@ impl HostHandle {
         Some(screen.parser.screen().contents())
     }
 
+    /// Returns the state the agent `slot` this handle serves told last, for tests.
+    #[cfg(test)]
+    pub(crate) fn state_of(&self, slot: &AgentSlot) -> Option<TurnState> {
+        let registry = self.registry.lock().ok()?;
+        let hosted = registry.agents.iter().find(|hosted| &hosted.slot == slot)?;
+        Some(hosted.state?.state)
+    }
+
     /// Returns how many agents this handle serves, for tests.
     #[cfg(test)]
     pub(crate) fn served(&self) -> usize {
@@ -1145,6 +1176,7 @@ impl HostHandle {
                 screen,
                 queue: self.queue.clone(),
                 dropped: Arc::clone(&self.dropped),
+                registry: Arc::clone(&self.registry),
             },
         })
     }
@@ -1254,6 +1286,7 @@ impl Broadcaster {
             self.send_screens_if_needed();
             self.send_request_if_any();
             self.send_turn_ends_if_any(store.as_ref());
+            self.send_states_if_changed();
             self.send_claims_if_needed();
             if self.sent_at.elapsed() >= HEARTBEAT_EVERY {
                 for slot in self.slots() {
@@ -1292,7 +1325,64 @@ impl Broadcaster {
         self.send(&Body::Claims {
             claims: Vec::new(),
             turn_ends: self.turn_ends.latest.known(),
+            states: Vec::new(),
         });
+    }
+
+    /// Tells each state of the agents this host serves that no frame told yet; one whose
+    /// frame was not sent is told again on the next pass.
+    fn send_states_if_changed(&mut self) {
+        let changed: Vec<StateEntry> = self
+            .registry
+            .lock()
+            .map(|registry| {
+                registry
+                    .agents
+                    .iter()
+                    .filter_map(|hosted| {
+                        let told = hosted.state.filter(|told| !told.sent)?;
+                        Some(StateEntry {
+                            slot: hosted.slot.clone(),
+                            state: told.state,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for entry in changed {
+            if !self.send(&Body::State(entry.clone())) {
+                continue;
+            }
+            if let Ok(mut registry) = self.registry.lock()
+                && let Some(told) = registry
+                    .agents
+                    .iter_mut()
+                    .find(|hosted| hosted.slot == entry.slot)
+                    .and_then(|hosted| hosted.state.as_mut())
+                && told.state == entry.state
+            {
+                told.sent = true;
+            }
+        }
+    }
+
+    /// Returns the state of each agent this host serves that told one.
+    fn states(&self) -> Vec<StateEntry> {
+        self.registry
+            .lock()
+            .map(|registry| {
+                registry
+                    .agents
+                    .iter()
+                    .filter_map(|hosted| {
+                        Some(StateEntry {
+                            slot: hosted.slot.clone(),
+                            state: hosted.state?.state,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Announces each turn-end snapshot new among the agents this host serves, reading their
@@ -1327,6 +1417,7 @@ impl Broadcaster {
         let body = Body::Claims {
             claims: claims.hosted(me.as_ref()),
             turn_ends: self.turn_ends.latest.known(),
+            states: self.states(),
         };
         if self.send(&body) {
             self.claims.2 = Some(Instant::now());
@@ -1392,6 +1483,9 @@ impl Broadcaster {
                     }
                 }
                 hosted.held_through = taken;
+                if let Some(told) = &mut hosted.state {
+                    told.sent = false;
+                }
             }
         }
         for parts in &screens {
@@ -1466,7 +1560,11 @@ impl Listener {
             };
             let challenge = match received.body {
                 Body::ScreenRequest { challenge } => challenge,
-                Body::Claims { claims, turn_ends } => {
+                Body::Claims {
+                    claims,
+                    turn_ends,
+                    states: _,
+                } => {
                     self.claims.hear(received.sender, claims);
                     self.hear_turn_ends(&received.participant, received.sender, &turn_ends);
                     continue;
@@ -1475,7 +1573,11 @@ impl Listener {
                     self.hear_turn_ends(&received.participant, received.sender, &[ended]);
                     continue;
                 }
-                _ => continue,
+                Body::Output { .. }
+                | Body::Resize { .. }
+                | Body::Heartbeat { .. }
+                | Body::Screen { .. }
+                | Body::State(_) => continue,
             };
             answered.retain(|_, at| at.elapsed() < SCREEN_EVERY);
             if answered.contains_key(&received.sender) {
@@ -2167,9 +2269,20 @@ mod tests {
         alice.stop();
     }
 
-    #[test]
-    fn a_host_announces_its_agents_new_turn_end_snapshot() {
-        let hosted = hosted();
+    /// Bob, a participant of `hosted`, hosting his agent `bob.claude`, and Alice's node in
+    /// the thread's topic, with her sender and receiver.
+    struct BobHosting {
+        _dir: TempDir,
+        _shared: SharedNode,
+        host: LiveHost,
+        slot: AgentSlot,
+        _alice: LiveNode,
+        topic: LiveTopic,
+        sender: FrameSender,
+        receiver: FrameReceiver,
+    }
+
+    fn bob_hosting(hosted: &Hosted) -> BobHosting {
         let bob_node = NodeKey::generate().unwrap();
         let bob_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let bob = Participant::new(
@@ -2200,7 +2313,7 @@ mod tests {
             drawn: b"bob's agent",
         };
         let (bob_shared, bob_host) = host_on(
-            &hosted,
+            hosted,
             &bob_dir,
             &bob_key_file,
             (Vec::new(), HostRole::Agent(own)),
@@ -2210,15 +2323,32 @@ mod tests {
         let alice = LiveNode::bind_live(
             alice_key.secret(),
             Relays::Disabled,
-            Arc::new(peers(&hosted, REREAD_EVERY)),
+            Arc::new(peers(hosted, REREAD_EVERY)),
         )
         .unwrap();
         let keys = LiveKeys::derive(&hosted.thread_key, hosted.thread).unwrap();
         let topic = alice
             .join(keys.topic(), &[address], Some(Duration::from_secs(20)))
             .unwrap();
-        let mut sender = FrameSender::new(keys.clone(), alice_key.secret()).unwrap();
-        let mut receiver = FrameReceiver::new(keys, peers(&hosted, REREAD_EVERY).participants());
+        let sender = FrameSender::new(keys.clone(), alice_key.secret()).unwrap();
+        let receiver = FrameReceiver::new(keys, peers(hosted, REREAD_EVERY).participants());
+        BobHosting {
+            _dir: bob_dir,
+            _shared: bob_shared,
+            host: bob_host,
+            slot,
+            _alice: alice,
+            topic,
+            sender,
+            receiver,
+        }
+    }
+
+    #[test]
+    fn a_host_announces_its_agents_new_turn_end_snapshot() {
+        let hosted = hosted();
+        let mut bob = bob_hosting(&hosted);
+        let slot = bob.slot.clone();
 
         let snapshots = ThreadRef::new(hosted.thread, RefKind::Snapshots(slot.clone()));
         let tree = hosted.store.write_tree(&[]).unwrap();
@@ -2229,13 +2359,15 @@ mod tests {
         while announced.is_none() {
             assert!(Instant::now() < deadline, "no turn end was announced");
             if !anchored {
-                let request = receiver.request_screen().unwrap();
-                topic.broadcast(sender.seal(&request).unwrap()).unwrap();
+                let request = bob.receiver.request_screen().unwrap();
+                bob.topic
+                    .broadcast(bob.sender.seal(&request).unwrap())
+                    .unwrap();
             }
-            let Ok(Some(frame)) = topic.receive(Duration::from_millis(200)) else {
+            let Ok(Some(frame)) = bob.topic.receive(Duration::from_millis(200)) else {
                 continue;
             };
-            let Ok(opened) = receiver.open(&frame) else {
+            let Ok(opened) = bob.receiver.open(&frame) else {
                 continue;
             };
             match opened.body {
@@ -2255,7 +2387,103 @@ mod tests {
         let announced = announced.unwrap();
         assert_eq!(announced.slot, slot);
         assert_eq!(announced.commit.as_slice(), ended.unwrap().as_bytes());
-        bob_host.stop();
+        bob.host.stop();
+    }
+
+    #[test]
+    fn a_host_tells_its_agents_new_state_once_again_with_its_screens_and_in_its_claims() {
+        let hosted = hosted();
+        let mut bob = bob_hosting(&hosted);
+        let told = StateEntry {
+            slot: bob.slot.clone(),
+            state: TurnState::Working,
+        };
+        let mut asked = None;
+        let mut frames_told = 0;
+        let mut claimed = false;
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while !claimed {
+            assert!(Instant::now() < deadline, "no claims frame told the state");
+            let ask_again = frames_told == 1
+                && asked.is_some_and(|at: Instant| at.elapsed() > SCREEN_EVERY * 2);
+            if asked.is_none() || ask_again {
+                let request = bob.receiver.request_screen().unwrap();
+                bob.topic
+                    .broadcast(bob.sender.seal(&request).unwrap())
+                    .unwrap();
+                asked = Some(Instant::now());
+            }
+            let Ok(Some(frame)) = bob.topic.receive(Duration::from_millis(200)) else {
+                continue;
+            };
+            let Ok(opened) = bob.receiver.open(&frame) else {
+                continue;
+            };
+            match opened.body {
+                Body::Screen { .. } if frames_told == 0 => {
+                    bob.host.tap().unwrap().turn(TurnState::Working);
+                }
+                Body::State(state) => {
+                    assert_eq!(state, told);
+                    frames_told += 1;
+                }
+                Body::Claims { states, .. } if frames_told == 2 => {
+                    assert_eq!(states, std::slice::from_ref(&told));
+                    claimed = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(frames_told, 2);
+        bob.host.stop();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "no last claims frame");
+            let Ok(Some(frame)) = bob.topic.receive(Duration::from_millis(200)) else {
+                continue;
+            };
+            if let Ok(Received {
+                body: Body::Claims { claims, states, .. },
+                ..
+            }) = bob.receiver.open(&frame)
+                && claims.is_empty()
+            {
+                assert!(states.is_empty());
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_state_told_again_unchanged_is_not_sent_again() {
+        let (handle, _tapped) = HostHandle::for_tests(ParticipantName::new("alice").unwrap());
+        let codex = AgentSlot::new(
+            ParticipantName::new("alice").unwrap(),
+            AgentName::new("codex").unwrap(),
+        );
+        let guest = handle
+            .serve(codex, WindowSize { rows: 24, cols: 80 })
+            .unwrap();
+        let sent = || {
+            handle.registry.lock().unwrap().agents[0]
+                .state
+                .unwrap()
+                .sent
+        };
+        let mark_sent = || {
+            handle.registry.lock().unwrap().agents[0]
+                .state
+                .as_mut()
+                .unwrap()
+                .sent = true;
+        };
+        guest.tap.turn(TurnState::Working);
+        assert!(!sent());
+        mark_sent();
+        guest.tap.turn(TurnState::Working);
+        assert!(sent());
+        guest.tap.turn(TurnState::Done);
+        assert!(!sent());
     }
 
     fn list(hosted: &Hosted, name: &str, node: &NodeKey, role: Role) -> Participant {
@@ -2731,6 +2959,7 @@ mod tests {
             })),
             queue,
             dropped: Arc::new(AtomicBool::new(false)),
+            registry: Arc::default(),
         };
         tap.output(b"hello");
         tap.resize(WindowSize {

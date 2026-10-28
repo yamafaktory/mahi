@@ -72,6 +72,8 @@ pub const MAX_CLAIM_NOTE_BYTES: usize = 200;
 pub const COMMIT_BYTES: usize = 20;
 /// The most turn-end snapshots one claims frame names.
 pub const MAX_FRAME_TURN_ENDS: usize = 64;
+/// The most agents' states one claims frame tells.
+pub const MAX_FRAME_STATES: usize = 64;
 
 /// The keys of a thread's live stream, derived from its thread key: the gossip topic, which
 /// only participants can find, and the key frames are sealed with.
@@ -129,15 +131,59 @@ pub enum Body {
         bytes: Vec<u8>,
     },
     /// A host's whole list of the claims its agents hold, at most [`MAX_FRAME_CLAIMS`], with
-    /// the latest turn-end snapshot of each of its agents, at most [`MAX_FRAME_TURN_ENDS`].
+    /// the latest turn-end snapshot of each of its agents, at most [`MAX_FRAME_TURN_ENDS`],
+    /// and the state of each, at most [`MAX_FRAME_STATES`].
     Claims {
         /// The claims, each of an agent of the sender.
         claims: Vec<ClaimEntry>,
         /// The latest turn-end snapshots, each of an agent of the sender, one per agent.
         turn_ends: Vec<TurnEnd>,
+        /// The states, each of an agent of the sender, one per agent.
+        states: Vec<StateEntry>,
     },
     /// The agent's turn ended, and this is its turn-end snapshot.
     TurnEnded(TurnEnd),
+    /// The agent's state changed, and this is the new one.
+    State(StateEntry),
+}
+
+/// What an agent does, as its host tells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnState {
+    /// A turn is open.
+    Working,
+    /// Its turn ended: it waits for its next prompt.
+    Done,
+    /// It waits on a question of its own for its user.
+    Asks,
+}
+
+impl TurnState {
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            Self::Working => 0,
+            Self::Done => 1,
+            Self::Asks => 2,
+        }
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Working),
+            1 => Some(Self::Done),
+            2 => Some(Self::Asks),
+            _ => None,
+        }
+    }
+}
+
+/// The state of an agent, as its host tells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateEntry {
+    /// The agent.
+    pub slot: AgentSlot,
+    /// What it does.
+    pub state: TurnState,
 }
 
 /// The latest turn-end snapshot of an agent, as its host names it.
@@ -259,8 +305,17 @@ enum WireBody<'a> {
         claims: Vec<WireClaim<'a>>,
         #[serde(borrow)]
         turn_ends: Vec<WireTurnEnd<'a>>,
+        #[serde(borrow)]
+        states: Vec<WireState<'a>>,
     },
     TurnEnded(#[serde(borrow)] WireTurnEnd<'a>),
+    State(#[serde(borrow)] WireState<'a>),
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireState<'a> {
+    slot: &'a str,
+    state: u8,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -470,12 +525,23 @@ impl FrameSender {
                     bytes,
                 }
             }
-            Body::Claims { claims, turn_ends } => return self.seal_claims(claims, turn_ends),
+            Body::Claims {
+                claims,
+                turn_ends,
+                states,
+            } => return self.seal_claims(claims, turn_ends, states),
             Body::TurnEnded(ended) => {
                 slot = ended.slot.to_string();
                 WireBody::TurnEnded(WireTurnEnd {
                     slot: &slot,
                     commit: ended.commit,
+                })
+            }
+            Body::State(told) => {
+                slot = told.slot.to_string();
+                WireBody::State(WireState {
+                    slot: &slot,
+                    state: told.state.code(),
                 })
             }
         };
@@ -486,6 +552,7 @@ impl FrameSender {
         &mut self,
         claims: &[ClaimEntry],
         turn_ends: &[TurnEnd],
+        states: &[StateEntry],
     ) -> Result<Vec<u8>, FrameError> {
         check_claims(
             claims.len(),
@@ -493,14 +560,20 @@ impl FrameSender {
                 .iter()
                 .map(|claim| (claim.what.as_str(), claim.note.as_deref())),
         )?;
-        check_turn_ends(turn_ends.iter().map(|ended| &ended.slot))?;
+        check_once_each(
+            turn_ends.iter().map(|ended| &ended.slot),
+            MAX_FRAME_TURN_ENDS,
+        )?;
+        check_once_each(states.iter().map(|told| &told.slot), MAX_FRAME_STATES)?;
         let slots: Vec<String> = claims
             .iter()
             .map(|claim| &claim.slot)
             .chain(turn_ends.iter().map(|ended| &ended.slot))
+            .chain(states.iter().map(|told| &told.slot))
             .map(ToString::to_string)
             .collect();
-        let (claim_slots, ended_slots) = slots.split_at(claims.len());
+        let (claim_slots, rest) = slots.split_at(claims.len());
+        let (ended_slots, state_slots) = rest.split_at(turn_ends.len());
         self.seal_wire(WireBody::Claims {
             claims: claims
                 .iter()
@@ -518,6 +591,14 @@ impl FrameSender {
                 .map(|(ended, slot)| WireTurnEnd {
                     slot,
                     commit: ended.commit,
+                })
+                .collect(),
+            states: states
+                .iter()
+                .zip(state_slots)
+                .map(|(told, slot)| WireState {
+                    slot,
+                    state: told.state.code(),
                 })
                 .collect(),
         })
@@ -685,11 +766,16 @@ impl FrameReceiver {
         if drawn_slot(&body).is_some_and(|slot| slot.participant() != &participant) {
             return Err(FrameError::NotTheirSlot);
         }
-        if let Body::Claims { claims, turn_ends } = &body
+        if let Body::Claims {
+            claims,
+            turn_ends,
+            states,
+        } = &body
             && claims
                 .iter()
                 .map(|claim| &claim.slot)
                 .chain(turn_ends.iter().map(|ended| &ended.slot))
+                .chain(states.iter().map(|told| &told.slot))
                 .any(|slot| slot.participant() != &participant)
         {
             return Err(FrameError::NotTheirSlot);
@@ -825,10 +911,11 @@ pub(crate) fn claim_fits(what: &str, note: Option<&str>) -> bool {
         && note.is_none_or(|note| plain(note, MAX_CLAIM_NOTE_BYTES))
 }
 
-fn check_turn_ends<'a>(
+fn check_once_each<'a>(
     slots: impl ExactSizeIterator<Item = &'a AgentSlot>,
+    most: usize,
 ) -> Result<(), FrameError> {
-    if slots.len() > MAX_FRAME_TURN_ENDS {
+    if slots.len() > most {
         return Err(FrameError::TooLarge);
     }
     let mut seen = Vec::with_capacity(slots.len());
@@ -854,7 +941,8 @@ fn drawn_slot(body: &Body) -> Option<&AgentSlot> {
         | Body::Resize { slot, .. }
         | Body::Screen { slot, .. }
         | Body::Heartbeat { slot }
-        | Body::TurnEnded(TurnEnd { slot, .. }) => Some(slot),
+        | Body::TurnEnded(TurnEnd { slot, .. })
+        | Body::State(StateEntry { slot, .. }) => Some(slot),
         Body::ScreenRequest { .. } | Body::Claims { .. } => None,
     }
 }
@@ -916,7 +1004,8 @@ fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
         WireBody::Claims {
             ref claims,
             ref turn_ends,
-        } => parse_claims(claims, turn_ends)?,
+            ref states,
+        } => parse_claims(claims, turn_ends, states)?,
         WireBody::TurnEnded(WireTurnEnd {
             slot: owner,
             commit,
@@ -924,19 +1013,28 @@ fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
             slot: slot(owner)?,
             commit,
         }),
+        WireBody::State(ref told) => Body::State(parse_state(told)?),
+    })
+}
+
+fn parse_state(told: &WireState<'_>) -> Result<StateEntry, FrameError> {
+    Ok(StateEntry {
+        slot: told.slot.parse().map_err(|_| FrameError::Malformed)?,
+        state: TurnState::from_code(told.state).ok_or(FrameError::Malformed)?,
     })
 }
 
 fn parse_claims(
     claims: &[WireClaim<'_>],
     turn_ends: &[WireTurnEnd<'_>],
+    states: &[WireState<'_>],
 ) -> Result<Body, FrameError> {
     let slot = |text: &str| text.parse::<AgentSlot>().map_err(|_| FrameError::Malformed);
     check_claims(
         claims.len(),
         claims.iter().map(|claim| (claim.what, claim.note)),
     )?;
-    if turn_ends.len() > MAX_FRAME_TURN_ENDS {
+    if turn_ends.len() > MAX_FRAME_TURN_ENDS || states.len() > MAX_FRAME_STATES {
         return Err(FrameError::TooLarge);
     }
     let turn_ends = turn_ends
@@ -948,7 +1046,15 @@ fn parse_claims(
             })
         })
         .collect::<Result<Vec<_>, FrameError>>()?;
-    check_turn_ends(turn_ends.iter().map(|ended| &ended.slot))?;
+    check_once_each(
+        turn_ends.iter().map(|ended| &ended.slot),
+        MAX_FRAME_TURN_ENDS,
+    )?;
+    let states = states
+        .iter()
+        .map(parse_state)
+        .collect::<Result<Vec<_>, FrameError>>()?;
+    check_once_each(states.iter().map(|told| &told.slot), MAX_FRAME_STATES)?;
     Ok(Body::Claims {
         claims: claims
             .iter()
@@ -962,6 +1068,7 @@ fn parse_claims(
             })
             .collect::<Result<_, FrameError>>()?,
         turn_ends,
+        states,
     })
 }
 
@@ -1416,12 +1523,146 @@ mod tests {
         );
     }
 
+    fn state(participant: &str, state: TurnState) -> StateEntry {
+        StateEntry {
+            slot: slot(participant),
+            state,
+        }
+    }
+
+    #[test]
+    fn a_state_follows_the_senders_run_and_only_its_owner_tells_it() {
+        let thread = Thread::new();
+        let mut viewer = thread.receiver();
+        let mut host = thread.sender(1);
+        let working = Body::State(state("alice", TurnState::Working));
+        assert_eq!(
+            viewer.open(&host.seal(&working).unwrap()),
+            Err(FrameError::Unanchored)
+        );
+        let request = viewer.request_screen().unwrap();
+        viewer
+            .open(&host.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
+        let frame = host.seal(&working).unwrap();
+        assert_eq!(viewer.open(&frame).unwrap().body, working);
+        assert_eq!(viewer.open(&frame), Err(FrameError::Replayed));
+        let asks = Body::State(state("alice", TurnState::Asks));
+        assert_eq!(viewer.open(&host.seal(&asks).unwrap()).unwrap().body, asks);
+        let mut mallory = thread.sender(3);
+        assert_eq!(
+            viewer.open(&mallory.seal(&working).unwrap()),
+            Err(FrameError::NotTheirSlot)
+        );
+    }
+
+    #[test]
+    fn a_state_of_an_unknown_code_is_refused() {
+        let thread = Thread::new();
+        let mut receiver = thread.receiver();
+        let mut alice = thread.sender(1);
+        let unknown = alice
+            .seal_wire(WireBody::State(WireState {
+                slot: "alice.claude",
+                state: 3,
+            }))
+            .unwrap();
+        assert_eq!(receiver.open(&unknown), Err(FrameError::Malformed));
+        for state in [TurnState::Working, TurnState::Done, TurnState::Asks] {
+            assert_eq!(TurnState::from_code(state.code()), Some(state));
+        }
+    }
+
+    #[test]
+    fn claims_carry_only_the_senders_states_one_per_agent_and_a_bounded_number() {
+        let thread = Thread::new();
+        let mut alice = thread.sender(1);
+        let mut receiver = thread.receiver();
+        let listed = Body::Claims {
+            claims: Vec::new(),
+            turn_ends: Vec::new(),
+            states: vec![state("alice", TurnState::Done)],
+        };
+        assert_eq!(
+            receiver.open(&alice.seal(&listed).unwrap()).unwrap().body,
+            listed
+        );
+        let mut mallory = thread.sender(3);
+        let forged = mallory
+            .seal(&Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+                states: vec![
+                    state("mallory", TurnState::Done),
+                    state("alice", TurnState::Asks),
+                ],
+            })
+            .unwrap();
+        assert_eq!(receiver.open(&forged), Err(FrameError::NotTheirSlot));
+        let twice = Body::Claims {
+            claims: Vec::new(),
+            turn_ends: Vec::new(),
+            states: vec![
+                state("alice", TurnState::Working),
+                state("alice", TurnState::Done),
+            ],
+        };
+        assert_eq!(alice.seal(&twice), Err(FrameError::Malformed));
+        let wire_twice = alice
+            .seal_wire(WireBody::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+                states: vec![
+                    WireState {
+                        slot: "alice.claude",
+                        state: 0,
+                    },
+                    WireState {
+                        slot: "alice.claude",
+                        state: 1,
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(receiver.open(&wire_twice), Err(FrameError::Malformed));
+        let names: Vec<String> = (0..=MAX_FRAME_STATES)
+            .map(|index| format!("alice.agent{index}"))
+            .collect();
+        let too_many = alice
+            .seal_wire(WireBody::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+                states: names
+                    .iter()
+                    .map(|name| WireState {
+                        slot: name,
+                        state: 0,
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        assert_eq!(receiver.open(&too_many), Err(FrameError::TooLarge));
+        let sealed_too_many = Body::Claims {
+            claims: Vec::new(),
+            turn_ends: Vec::new(),
+            states: names
+                .iter()
+                .map(|name| StateEntry {
+                    slot: name.parse().unwrap(),
+                    state: TurnState::Done,
+                })
+                .collect(),
+        };
+        assert_eq!(alice.seal(&sealed_too_many), Err(FrameError::TooLarge));
+    }
+
     #[test]
     fn claims_carry_only_the_senders_turn_ends_one_per_agent_and_a_bounded_number() {
         let thread = Thread::new();
         let mut alice = thread.sender(1);
         let mut receiver = thread.receiver();
         let listed = Body::Claims {
+            states: Vec::new(),
             claims: Vec::new(),
             turn_ends: vec![turn_end("alice", 1)],
         };
@@ -1432,18 +1673,21 @@ mod tests {
         let mut mallory = thread.sender(3);
         let forged = mallory
             .seal(&Body::Claims {
+                states: Vec::new(),
                 claims: Vec::new(),
                 turn_ends: vec![turn_end("mallory", 1), turn_end("alice", 2)],
             })
             .unwrap();
         assert_eq!(receiver.open(&forged), Err(FrameError::NotTheirSlot));
         let twice = Body::Claims {
+            states: Vec::new(),
             claims: Vec::new(),
             turn_ends: vec![turn_end("alice", 1), turn_end("alice", 2)],
         };
         assert_eq!(alice.seal(&twice), Err(FrameError::Malformed));
         let wire_twice = alice
             .seal_wire(WireBody::Claims {
+                states: Vec::new(),
                 claims: Vec::new(),
                 turn_ends: vec![
                     WireTurnEnd {
@@ -1463,6 +1707,7 @@ mod tests {
             .collect();
         let too_many = alice
             .seal_wire(WireBody::Claims {
+                states: Vec::new(),
                 claims: Vec::new(),
                 turn_ends: names
                     .iter()
@@ -1491,12 +1736,14 @@ mod tests {
         let mut alice = thread.sender(1);
         let mut receiver = thread.receiver();
         let first = Body::Claims {
+            states: Vec::new(),
             turn_ends: Vec::new(),
             claims: vec![claim("alice", "src/parser.rs")],
         };
         let older = alice.seal(&first).unwrap();
         let newer = alice
             .seal(&Body::Claims {
+                states: Vec::new(),
                 claims: Vec::new(),
                 turn_ends: Vec::new(),
             })
@@ -1504,6 +1751,7 @@ mod tests {
         assert_eq!(
             receiver.open(&newer).unwrap().body,
             Body::Claims {
+                states: Vec::new(),
                 claims: Vec::new(),
                 turn_ends: Vec::new(),
             }
@@ -1515,6 +1763,7 @@ mod tests {
         assert_eq!(receiver.open(&again).unwrap().body, first);
         let later = restarted
             .seal(&Body::Claims {
+                states: Vec::new(),
                 claims: Vec::new(),
                 turn_ends: Vec::new(),
             })
@@ -1531,6 +1780,7 @@ mod tests {
         let mut receiver = thread.receiver();
         let forged = mallory
             .seal(&Body::Claims {
+                states: Vec::new(),
                 turn_ends: Vec::new(),
                 claims: vec![claim("mallory", "a"), claim("alice", "b")],
             })
@@ -1540,6 +1790,7 @@ mod tests {
             Err(FrameError::NotTheirSlot)
         ));
         let many = Body::Claims {
+            states: Vec::new(),
             turn_ends: Vec::new(),
             claims: (0..=MAX_FRAME_CLAIMS)
                 .map(|index| claim("mallory", &index.to_string()))
@@ -1554,6 +1805,7 @@ mod tests {
             &"x".repeat(MAX_CLAIM_BYTES + 1),
         ] {
             let odd = Body::Claims {
+                states: Vec::new(),
                 turn_ends: Vec::new(),
                 claims: vec![claim("mallory", what)],
             };
@@ -1563,6 +1815,7 @@ mod tests {
             );
             let wire = mallory
                 .seal_wire(WireBody::Claims {
+                    states: Vec::new(),
                     turn_ends: Vec::new(),
                     claims: vec![WireClaim {
                         slot: "mallory.claude",
@@ -1586,6 +1839,7 @@ mod tests {
         let mut earlier = thread.sender(1);
         let late = earlier
             .seal(&Body::Claims {
+                states: Vec::new(),
                 claims: Vec::new(),
                 turn_ends: Vec::new(),
             })
@@ -1593,12 +1847,14 @@ mod tests {
         let mut current = thread.sender(1);
         let first = current
             .seal(&Body::Claims {
+                states: Vec::new(),
                 claims: Vec::new(),
                 turn_ends: Vec::new(),
             })
             .unwrap();
         let next = current
             .seal(&Body::Claims {
+                states: Vec::new(),
                 turn_ends: Vec::new(),
                 claims: vec![claim("alice", "docs")],
             })

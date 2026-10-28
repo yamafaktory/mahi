@@ -1525,7 +1525,7 @@ impl Prepared {
         let pusher = self
             .sync
             .map(|setup| start_pusher(setup, &self.git_dir, &started));
-        let activity = Arc::new(Activity::default());
+        let activity = Arc::new(Activity::telling(live.as_ref().map(Link::tap)));
         let key = started.key.take().map(Arc::new);
         let (recorder, turns) = start_background(
             &mut started,
