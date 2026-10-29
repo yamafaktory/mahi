@@ -1417,7 +1417,7 @@ cat parser.rs
     }
 
     #[test]
-    fn an_agent_started_from_the_home_screen_runs_in_a_threads_tab_beside_its_agents() {
+    fn an_agent_started_from_the_home_screen_runs_in_a_threads_tab_at_full_size() {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho agent-ready $(stty size)\nread line\n";
         let claude = script(&fixture, "pane-agents", "claude", agent);
@@ -1451,11 +1451,11 @@ cat parser.rs
         assert!(rows[1].starts_with("╭ claude "), "{rows:#?}");
         assert!(
             rows.iter()
-                .any(|row| row.starts_with("│agent-ready 20 174")),
+                .any(|row| row.starts_with("│agent-ready 19 198")),
             "{rows:#?}"
         );
-        assert!(rows[3].contains("✓ claude"), "{rows:#?}");
-        assert!(rows[22].starts_with("╰──"), "{rows:#?}");
+        assert!(rows[21].starts_with("╰──"), "{rows:#?}");
+        assert!(rows[22].trim().is_empty(), "{rows:#?}");
         assert!(rows[23].contains("Ctrl-Space palette"), "{rows:#?}");
         assert_eq!(screen.cursor_position().1, 1);
     }
@@ -1690,7 +1690,7 @@ cat parser.rs
         let claude = script(&fixture, "palette-action", "claude", agent);
         script(&fixture, "palette-action", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_end = [b"\x1b[B".repeat(10), b"\r".to_vec()].concat();
+        let to_end = [b"\x1b[B".repeat(9), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
@@ -1754,7 +1754,7 @@ cat parser.rs
             .unwrap();
         std::os::unix::fs::symlink(sleep, tools.join("sleep")).unwrap();
         let path = format!("{}:{}", claude.parent().unwrap().display(), tools.display());
-        let to_add = [b"\x1b[B".repeat(6), b"\r".to_vec()].concat();
+        let to_add = [b"\x1b[B".repeat(5), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
@@ -1797,7 +1797,7 @@ cat parser.rs
         let claude = script(&fixture, name, "claude", agent);
         script(&fixture, name, "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_add = [b"\x1b[B".repeat(6), b"\r".to_vec()].concat();
+        let to_add = [b"\x1b[B".repeat(5), b"\r".to_vec()].concat();
         let mut typed: Vec<(&str, &[u8])> = vec![
             ("Threads", b"n"),
             ("Which agent should start the thread?", b"1"),
@@ -1841,7 +1841,7 @@ cat parser.rs
         let claude = script(&fixture, "palette-declined", "claude", agent);
         script(&fixture, "palette-declined", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_end = [b"\x1b[B".repeat(10), b"\r".to_vec()].concat();
+        let to_end = [b"\x1b[B".repeat(9), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
@@ -1922,7 +1922,7 @@ cat parser.rs
             &[
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
-                ("● claude", b"\x000"),
+                ("claude (● working)", b"\x000"),
                 ("Menu", b"q"),
                 ("stop it and quit?", b"y"),
             ],
@@ -1974,7 +1974,7 @@ cat parser.rs
             })
             .unwrap();
         assert!(screen.contains("broken-agent"), "{screen}");
-        assert!(screen.contains("│ ✗ claude"), "{screen}");
+        assert!(screen.contains("claude (✗ failed)"), "{screen}");
     }
 
     #[test]
@@ -2236,7 +2236,7 @@ cat parser.rs
     }
 
     #[test]
-    fn a_resumed_agent_is_listed_by_its_name_in_the_thread() {
+    fn a_resumed_agent_is_named_by_its_name_over_its_pane() {
         let fixture = fixture();
         let (thread, _) = worked_thread(&fixture);
         let agent = "#!/bin/sh\necho agent-ready\nwhile :; do sleep 1; done\n";
@@ -2263,13 +2263,8 @@ cat parser.rs
                 screen.contains("agent-ready").then_some(screen)
             })
             .unwrap();
-        let listed = |name: &str| {
-            ["●", "✓", "!", "◉", "○", "✗"]
-                .iter()
-                .any(|mark| screen.contains(&format!("│ {mark} {name}")))
-        };
-        assert!(listed("claude"), "{screen}");
-        assert!(!listed("agent"), "{screen}");
+        assert!(screen.contains("╭ claude ("), "{screen}");
+        assert!(!screen.contains("╭ agent ("), "{screen}");
     }
 
     #[test]
@@ -5851,7 +5846,7 @@ exit 3
             assert!(bob_listed(&fixture, &pairing.thread));
             let short: String = pairing.thread.chars().take(8).collect();
             pairing.joiner.wait_for(&format!("⌂ threads   {short}"));
-            pairing.joiner.wait_for("tester's");
+            pairing.joiner.wait_for("tester.claude");
             let screen = {
                 let mut parser = vt100::Parser::new(24, 200, 0);
                 parser.process(pairing.joiner.text().as_bytes());

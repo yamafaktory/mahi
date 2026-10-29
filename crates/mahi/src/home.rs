@@ -345,7 +345,7 @@ fn choose(
             dirty = true;
         }
         workspace.set_screen(size, false);
-        workspace.resize(agents_size(size, workspace));
+        workspace.resize(agents_size(size));
         if dirty && !workspace.waits_for_redraw(Instant::now()) {
             let view = home_view(place, &remote, &rows, &activity);
             draw(&mut terminal, home, &view, status, workspace)?;
@@ -478,11 +478,9 @@ fn key_wait(workspace: &Workspace) -> Duration {
     }
 }
 
-/// Returns the size of an agent's terminal in a thread's tab on a terminal of `size`, with
-/// the list where the workspace has it.
-fn agents_size(size: WindowSize, workspace: &Workspace) -> WindowSize {
-    let (rows, cols) =
-        ThreadView::agent_size(size.rows, size.cols, workspace.list_place(size.cols));
+/// Returns the size of an agent's terminal in a thread's tab on a terminal of `size`.
+fn agents_size(size: WindowSize) -> WindowSize {
+    let (rows, cols) = ThreadView::agent_size(size.rows, size.cols);
     WindowSize { rows, cols }
 }
 

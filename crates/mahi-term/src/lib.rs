@@ -78,8 +78,6 @@ pub use view::{
 pub use workspace::{
     AgentState,
     Header,
-    ListHit,
-    ListPlace,
     StatusAgent,
     StatusConflicts,
     StatusLine,

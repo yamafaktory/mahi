@@ -74,8 +74,6 @@ impl Theme {
     pub const WARN: Color = Color::Yellow;
     /// Something that failed.
     pub const ERROR: Color = Color::LightRed;
-    /// Something that worked.
-    pub const OK: Color = Color::Green;
 
     /// Returns the style of a selected row.
     #[must_use]

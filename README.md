@@ -101,8 +101,8 @@ chose. Cards and tickets still work without it: `mahi id` prints the card a thre
 needs, `mahi invite --collaborator <thread> <card>` turns it into a ticket, and `mahi join <ticket>` uses it.
 `mahi handoff` and `mahi agent` move work between agents.
 
-On the home screen, an agent you start, resume or add runs in its thread's tab, beside the list
-of the thread's agents and their state (working, done, asks you). The palette key
+On the home screen, an agent you start, resume or add runs in its thread's tab at full size. A
+line under it names each teammate's agent and its state (working, done, asks, live or offline). The palette key
 (`Ctrl-Space`) followed by `0` to `9` or the arrows moves between tabs and agents, followed by
 `Space` jumps to the next agent waiting for you. Pressed twice, the palette key is sent to
 the agent.

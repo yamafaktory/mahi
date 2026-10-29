@@ -1802,7 +1802,7 @@ mod tests {
         GlobalPatterns,
         TakeLimits,
     };
-    use mahi_term::AgentState;
+    use mahi_term::TeammateState;
     use mahi_thread::{
         Participant,
         VerifiedMeta,
@@ -2303,7 +2303,7 @@ mod tests {
         assert!(shown.contains("bob's agent works"), "{shown:?}");
         bob.tap().unwrap().turn(TurnState::Asks);
         let deadline = Instant::now() + Duration::from_secs(30);
-        while teammates.agents().next().map(|(_, state)| state) != Some(AgentState::Asks) {
+        while teammates.agents().next().map(|(_, state)| state) != Some(TeammateState::Asks) {
             assert!(Instant::now() < deadline, "the state never showed");
             watch.update(&mut teammates, Instant::now());
             thread::sleep(Duration::from_millis(50));
@@ -2331,7 +2331,7 @@ mod tests {
                 .agents()
                 .map(|(slot, state)| (slot.to_string(), state))
                 .collect::<Vec<_>>(),
-            [("bob.claude".to_owned(), AgentState::Done)]
+            [("bob.claude".to_owned(), TeammateState::Done)]
         );
     }
 

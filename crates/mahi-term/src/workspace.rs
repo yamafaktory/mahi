@@ -18,7 +18,6 @@ use ratatui_core::{
 use ratatui_widgets::{
     block::Block,
     borders::BorderType,
-    clear::Clear,
 };
 
 use crate::{
@@ -28,8 +27,6 @@ use crate::{
     pane::draw_screen,
 };
 
-const LIST_COLUMNS: u16 = 24;
-const NARROW_COLUMNS: u16 = 100;
 const TOP_ROWS: u16 = 1;
 const HINT_ROWS: u16 = 1;
 const STATUS_ROWS: u16 = 1;
@@ -37,7 +34,7 @@ const STATUS_GAP: &str = "  ";
 const BORDER: u16 = 2;
 const SMALLEST: u16 = 2;
 
-/// What an agent in a thread's tab is doing, as the workspace's list shows it.
+/// What an agent in a thread's tab is doing, as the workspace shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
     /// A turn is open.
@@ -58,7 +55,7 @@ pub enum AgentState {
 }
 
 impl AgentState {
-    /// Returns how the list shows the state, such as `✓ done`.
+    /// Returns how the workspace shows the state, such as `✓ done`.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -71,31 +68,9 @@ impl AgentState {
             Self::Failed => "✗ failed",
         }
     }
-
-    fn mark(self) -> Span<'static> {
-        let style = match self {
-            Self::Working | Self::Asks | Self::Live => Style::new().fg(Theme::ACCENT),
-            Self::Done => Style::new().fg(Theme::OK),
-            Self::AsksYou => Theme::code(),
-            Self::Offline => Theme::muted(),
-            Self::Failed => Style::new().fg(Theme::ERROR),
-        };
-        Span::styled(self.symbol(), style)
-    }
-
-    fn symbol(self) -> &'static str {
-        match self {
-            Self::Working => "●",
-            Self::Done => "✓",
-            Self::AsksYou | Self::Asks => "!",
-            Self::Live => "◉",
-            Self::Offline => "○",
-            Self::Failed => "✗",
-        }
-    }
 }
 
-/// An agent of a thread, as the workspace's list shows it.
+/// An agent of a thread, as the workspace shows it.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkspaceAgent<'a> {
     /// Whose agent it is: `None` for the user's own, otherwise the participant's name.
@@ -113,32 +88,6 @@ pub struct WorkspaceTab<'a> {
     pub title: &'a str,
     /// Whether one of its agents asks the user something.
     pub asks: bool,
-}
-
-/// Where the list of a thread's agents is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListPlace {
-    /// Beside the agent's pane, which is narrower for it.
-    Beside,
-    /// Over the right of the agent's pane, which keeps its size.
-    Over,
-    /// Not shown.
-    Hidden,
-    /// Not shown: a status line under the pane names the teammates' agents instead.
-    StatusLine,
-}
-
-impl ListPlace {
-    /// Returns where the list goes on a terminal `columns` wide when the user has it shown:
-    /// beside the pane, or over it when the terminal is narrower than 100 columns.
-    #[must_use]
-    pub fn shown_at(columns: u16) -> Self {
-        if columns < NARROW_COLUMNS {
-            Self::Over
-        } else {
-            Self::Beside
-        }
-    }
 }
 
 /// What a teammate's agent is doing, as the status line names it.
@@ -166,6 +115,18 @@ impl TeammateState {
             Self::Asks => "asks",
             Self::Live => "live",
             Self::Offline => "offline",
+        }
+    }
+}
+
+impl From<TeammateState> for AgentState {
+    fn from(state: TeammateState) -> Self {
+        match state {
+            TeammateState::Working => Self::Working,
+            TeammateState::Done => Self::Done,
+            TeammateState::Asks => Self::Asks,
+            TeammateState::Live => Self::Live,
+            TeammateState::Offline => Self::Offline,
         }
     }
 }
@@ -379,15 +340,6 @@ pub enum TabHit {
     Nothing,
 }
 
-/// What a click on the list of a thread's agents is on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListHit {
-    /// An agent's line, as its index in the thread's agents.
-    Agent(usize),
-    /// Its border, a line naming whose agents follow, or a line without an agent.
-    Elsewhere,
-}
-
 /// What the top row says on its right: the repository, the remote threads are pushed to and
 /// the user.
 #[derive(Debug, Clone, Copy)]
@@ -544,62 +496,44 @@ fn badge() -> Span<'static> {
     Span::styled(" mahi ", Theme::selected())
 }
 
-/// A thread's tab: one of its agents at full size, the list of its agents, and the keys that
-/// reach mahi.
+/// A thread's tab: one of its agents at full size, the status line under it, and the keys
+/// that reach mahi.
 #[derive(Debug, Clone, Copy)]
 pub struct ThreadView<'a> {
-    /// The thread's agents: the user's own first, then each teammate's.
-    pub agents: &'a [WorkspaceAgent<'a>],
-    /// The agent shown at full size, as an index in `agents`.
-    pub selected: usize,
-    /// Where the list goes.
-    pub list: ListPlace,
+    /// The agent shown at full size, when there is one.
+    pub shown: Option<WorkspaceAgent<'a>>,
     /// The keys that reach mahi, and what they do.
     pub hints: &'a [(&'a str, &'a str)],
     /// The spinner's frame and what the pane waits for, drawn in its middle while it has no
     /// screen.
     pub waiting: Option<(&'a str, &'a str)>,
-    /// What the status line says, drawn under the pane when `list` is
-    /// [`ListPlace::StatusLine`].
+    /// What the status line under the pane says.
     pub status: StatusLine<'a>,
 }
 
-impl<'a> ThreadView<'a> {
+impl ThreadView<'_> {
     /// Returns the rows and columns of an agent's terminal in a thread's tab on a terminal of
-    /// `rows` and `columns`, at least two of each, with the list `list`.
+    /// `rows` and `columns`, at least two of each.
     #[must_use]
-    pub fn agent_size(rows: u16, columns: u16, list: ListPlace) -> (u16, u16) {
-        let beside = if list == ListPlace::Beside {
-            LIST_COLUMNS
-        } else {
-            0
-        };
-        let status = if list == ListPlace::StatusLine {
-            STATUS_ROWS
-        } else {
-            0
-        };
+    pub fn agent_size(rows: u16, columns: u16) -> (u16, u16) {
         (
-            rows.saturating_sub(TOP_ROWS + HINT_ROWS + BORDER + status)
+            rows.saturating_sub(TOP_ROWS + HINT_ROWS + BORDER + STATUS_ROWS)
                 .max(SMALLEST),
-            columns.saturating_sub(BORDER + beside).max(SMALLEST),
+            columns.saturating_sub(BORDER).max(SMALLEST),
         )
     }
 
-    /// Draws the tab into `area`, below the top row, with the selected agent's `screen`
-    /// in its pane; returns where the agent's cursor is when it shows it and nothing lies over
-    /// it.
+    /// Draws the tab into `area`, below the top row, with the shown agent's `screen` in its
+    /// pane; returns where the agent's cursor is when it shows it.
     pub fn render(
         &self,
         screen: Option<&vt100::Screen>,
         area: Rect,
         buffer: &mut Buffer,
     ) -> Option<Position> {
-        let (body, status, footer) = self.rows(area);
-        let (pane, list) = self.areas(body);
+        let (pane, status, footer) = Self::rows(area);
         let title = self
-            .agents
-            .get(self.selected)
+            .shown
             .map_or_else(String::new, |agent| format!(" {} ", agent.label()));
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -619,50 +553,20 @@ impl<'a> ThreadView<'a> {
                 .centered()
                 .render(middle, buffer);
         }
-        if let Some(list) = list {
-            Clear.render(list, buffer);
-            self.render_list(list, buffer);
-        }
-        if let Some(status) = status {
-            self.status.line(status.width).render(status, buffer);
-        }
+        self.status.line(status.width).render(status, buffer);
         Line::from(key_hints(self.hints)).render(footer, buffer);
         let screen = screen?;
         let (row, column) = screen.cursor_position();
         let cursor = Position::new(inner.x.saturating_add(column), inner.y.saturating_add(row));
-        let covered = list.is_some_and(|list| list.contains(cursor));
-        (!screen.hide_cursor() && inner.contains(cursor) && !covered).then_some(cursor)
-    }
-
-    /// Returns what of the list is at `position`, when the tab is drawn in `area`, below the
-    /// top row: nothing when the list is not there, so the click is the agent's.
-    #[must_use]
-    pub fn list_at(&self, area: Rect, position: Position) -> Option<ListHit> {
-        let (body, _, _) = self.rows(area);
-        let (_, list) = self.areas(body);
-        let list = list?;
-        if !list.contains(position) {
-            return None;
-        }
-        let inner = Block::bordered().inner(list);
-        let agent = inner
-            .contains(position)
-            .then(|| self.lines().nth(usize::from(position.y - inner.y)))
-            .flatten()
-            .and_then(|row| match row {
-                ListRow::Agent(index) => Some(index),
-                ListRow::Blank | ListRow::Group(_) => None,
-            });
-        Some(agent.map_or(ListHit::Elsewhere, ListHit::Agent))
+        (!screen.hide_cursor() && inner.contains(cursor)).then_some(cursor)
     }
 
     /// Returns the cell of the agent's screen at `position`, when the tab is drawn in `area`,
     /// below the top row; a position past the pane gives its nearest cell when `clamp`,
     /// as a drag that leaves it does, and nothing otherwise.
     #[must_use]
-    pub fn pane_point(&self, area: Rect, position: Position, clamp: bool) -> Option<(u16, u16)> {
-        let (body, _, _) = self.rows(area);
-        let (pane, _) = self.areas(body);
+    pub fn pane_point(area: Rect, position: Position, clamp: bool) -> Option<(u16, u16)> {
+        let (pane, _, _) = Self::rows(area);
         let inner = Block::bordered().inner(pane);
         if inner.is_empty() || (!clamp && !inner.contains(position)) {
             return None;
@@ -672,115 +576,27 @@ impl<'a> ThreadView<'a> {
         Some((column, row))
     }
 
-    /// Splits `area` into the pane's and the list's body, the status line's row when the
-    /// view has one, and the hints' row.
-    fn rows(&self, area: Rect) -> (Rect, Option<Rect>, Rect) {
-        let shown = self.list == ListPlace::StatusLine;
-        let [body, status, footer] = Layout::vertical([
+    /// Splits `area` into the pane, the status line's row and the hints' row.
+    fn rows(area: Rect) -> (Rect, Rect, Rect) {
+        let [pane, status, footer] = Layout::vertical([
             Constraint::Fill(1),
-            Constraint::Length(if shown { STATUS_ROWS } else { 0 }),
+            Constraint::Length(STATUS_ROWS),
             Constraint::Length(HINT_ROWS),
         ])
         .areas(area);
-        (body, shown.then_some(status), footer)
+        (pane, status, footer)
     }
-
-    fn areas(&self, body: Rect) -> (Rect, Option<Rect>) {
-        match self.list {
-            ListPlace::Beside => {
-                let [pane, list] =
-                    Layout::horizontal([Constraint::Fill(1), Constraint::Length(LIST_COLUMNS)])
-                        .areas(body);
-                (pane, Some(list))
-            }
-            ListPlace::Over => {
-                let width = LIST_COLUMNS.min(body.width);
-                let list = Rect::new(body.right() - width, body.y, width, body.height);
-                (body, Some(list))
-            }
-            ListPlace::Hidden | ListPlace::StatusLine => (body, None),
-        }
-    }
-
-    /// Returns the rows of the list's agents: each group's heading, after a blank row but for
-    /// the first, then its agents.
-    fn lines(&self) -> impl Iterator<Item = ListRow<'a>> + '_ {
-        self.agents.iter().enumerate().flat_map(|(index, agent)| {
-            let starts_group = index == 0
-                || self
-                    .agents
-                    .get(index - 1)
-                    .is_some_and(|before| before.owner != agent.owner);
-            let blank = (starts_group && index > 0).then_some(ListRow::Blank);
-            let group = starts_group.then_some(ListRow::Group(agent.owner));
-            blank
-                .into_iter()
-                .chain(group)
-                .chain(std::iter::once(ListRow::Agent(index)))
-        })
-    }
-
-    fn agent_line(&self, index: usize) -> Line<'a> {
-        let Some(agent) = self.agents.get(index) else {
-            return Line::default();
-        };
-        if index != self.selected {
-            return Line::from(vec![
-                Span::raw(" "),
-                agent.state.mark(),
-                Span::raw(" "),
-                Span::raw(shown(agent.name)),
-            ]);
-        }
-        Line::from(vec![
-            Span::raw(" "),
-            Span::raw(agent.state.symbol()),
-            Span::raw(" "),
-            Span::raw(shown(agent.name)),
-        ])
-        .style(Theme::selected())
-    }
-
-    fn render_list(&self, area: Rect, buffer: &mut Buffer) {
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Theme::ACCENT))
-            .title(Span::styled(" Agents ", Theme::title()));
-        let inner = block.inner(area);
-        block.render(area, buffer);
-        let mut lines = Vec::with_capacity(self.agents.len() * 3 + 2);
-        for row in self.lines() {
-            lines.push(match row {
-                ListRow::Blank => Line::default(),
-                ListRow::Group(None) => Line::from(Span::styled("Yours", Theme::muted())),
-                ListRow::Group(Some(owner)) => Line::from(vec![
-                    Span::styled(shown(owner), Theme::muted()),
-                    Span::styled("'s", Theme::muted()),
-                ]),
-                ListRow::Agent(index) => self.agent_line(index),
-            });
-        }
-        for (line, row) in lines.into_iter().zip(inner.rows()) {
-            line.render(row, buffer);
-        }
-    }
-}
-
-/// A row of the agents' list.
-#[derive(Debug, Clone, Copy)]
-enum ListRow<'a> {
-    Blank,
-    Group(Option<&'a str>),
-    Agent(usize),
 }
 
 impl WorkspaceAgent<'_> {
-    /// Returns how the list names the agent: its name, or a teammate's slot marked read-only.
+    /// Returns how the pane's title names the agent: its name and state, or a teammate's slot
+    /// marked read-only, then its state.
     #[must_use]
     pub fn label(&self) -> String {
+        let state = self.state.as_str();
         match self.owner {
-            Some(owner) => format!("{}.{} (read-only)", shown(owner), shown(self.name)),
-            None => shown(self.name).into_owned(),
+            Some(owner) => format!("{}.{} (read-only, {state})", shown(owner), shown(self.name)),
+            None => format!("{} ({state})", shown(self.name)),
         }
     }
 
@@ -968,111 +784,41 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_shows_its_agents_grouped_by_owner_beside_the_selected_one() {
+    fn a_thread_shows_its_agent_with_the_status_line_and_the_hints_under_it() {
         let mut parser = vt100::Parser::new(5, 20, 0);
         parser.process(b"hello from claude");
+        let agents = [StatusAgent {
+            slot: "bob.codex",
+            state: TeammateState::Offline,
+            waits: None,
+            brought: &[],
+        }];
         let area = Rect::new(0, 0, 100, 14);
         let mut buffer = Buffer::empty(area);
         let cursor = ThreadView {
-            agents: &AGENTS,
-            selected: 0,
-            list: ListPlace::Beside,
+            shown: Some(AGENTS[0]),
             hints: &[("ctrl-space", "workspace")],
             waiting: None,
-            status: StatusLine::default(),
+            status: StatusLine {
+                conflicts: &[],
+                agents: &agents,
+            },
         }
         .render(Some(parser.screen()), area, &mut buffer);
         let rows = rows(&buffer);
+        assert!(rows[0].contains(" claude (● working) "), "{rows:#?}");
         assert!(rows[1].contains("hello from claude"), "{rows:#?}");
-        let list: Vec<String> = rows
-            .iter()
-            .map(|row| row.chars().skip(76).collect())
-            .collect();
-        let shown = list.join("\n");
-        let in_list: Vec<String> = list
-            .iter()
-            .skip(1)
-            .take(10)
-            .map(|row| {
-                row.trim_start_matches('│')
-                    .trim_end_matches([' ', '│'])
-                    .to_owned()
-            })
-            .collect();
-        assert_eq!(
-            in_list,
-            [
-                "Yours",
-                " ● claude",
-                "",
-                "alice's",
-                " ✓ claude",
-                "",
-                "bob's",
-                " ○ codex",
-                "",
-                "",
-            ],
-            "{shown}"
-        );
-        let selected = Theme::selected().bg;
-        let claude_row = 2;
-        assert!(
-            (77..99).all(|x| buffer[(x, claude_row)].style().bg == selected),
-            "{shown}"
-        );
-        assert_ne!(buffer[(78, 5)].style().bg, selected);
-        assert_eq!(buffer[(78, claude_row)].symbol(), "●");
-        assert_eq!(buffer[(78, claude_row)].style().fg, Theme::selected().fg);
-        assert_eq!(buffer[(78, 5)].symbol(), "✓");
-        assert_eq!(buffer[(78, 5)].style().fg, Some(Theme::OK));
+        assert!(rows[11].starts_with('╰'), "{rows:#?}");
+        assert!(rows[12].starts_with("bob.codex offline"), "{rows:#?}");
         assert!(rows[13].contains("ctrl-space workspace"), "{rows:#?}");
         assert_eq!(cursor, Some(Position::new(18, 1)));
     }
 
     #[test]
-    fn a_list_of_teammates_agents_only_starts_with_the_first_owners_group() {
-        let agents = [AGENTS[1], AGENTS[2]];
-        let view = ThreadView {
-            agents: &agents,
-            selected: 1,
-            list: ListPlace::Beside,
-            hints: &[],
-            waiting: None,
-            status: StatusLine::default(),
-        };
-        let area = Rect::new(0, 0, 100, 10);
-        let mut buffer = Buffer::empty(area);
-        view.render(None, area, &mut buffer);
-        let in_list: Vec<String> = rows(&buffer)
-            .iter()
-            .skip(1)
-            .take(5)
-            .map(|row| {
-                row.chars()
-                    .skip(76)
-                    .collect::<String>()
-                    .trim_start_matches('│')
-                    .trim_end_matches([' ', '│'])
-                    .to_owned()
-            })
-            .collect();
-        assert_eq!(in_list, ["alice's", " ✓ claude", "", "bob's", " ○ codex"]);
-        let at = |y| view.list_at(area, Position::new(80, y));
-        assert_eq!(at(1), Some(ListHit::Elsewhere));
-        assert_eq!(at(2), Some(ListHit::Agent(0)));
-        assert_eq!(at(3), Some(ListHit::Elsewhere));
-        assert_eq!(at(4), Some(ListHit::Elsewhere));
-        assert_eq!(at(5), Some(ListHit::Agent(1)));
-    }
-
-    #[test]
     fn a_pane_without_a_screen_shows_what_it_waits_for_in_its_middle() {
-        let area = Rect::new(0, 0, 80, 12);
+        let area = Rect::new(0, 0, 80, 13);
         let view = ThreadView {
-            agents: &[],
-            selected: 0,
-            list: ListPlace::Hidden,
+            shown: None,
             hints: &[],
             waiting: Some(("⠋", "waiting for the thread's host")),
             status: StatusLine::default(),
@@ -1094,34 +840,23 @@ mod tests {
     }
 
     #[test]
-    fn a_teammates_agent_is_named_read_only_and_the_list_over_the_pane_hides_the_cursor() {
+    fn a_teammates_agent_is_named_read_only() {
         let mut parser = vt100::Parser::new(5, 78, 0);
         parser.process("\x1b[1;70Hx".as_bytes());
         let area = Rect::new(0, 0, 80, 10);
         let mut buffer = Buffer::empty(area);
         let cursor = ThreadView {
-            agents: &AGENTS,
-            selected: 1,
-            list: ListPlace::Over,
+            shown: Some(AGENTS[1]),
             hints: &[],
             waiting: None,
             status: StatusLine::default(),
         }
         .render(Some(parser.screen()), area, &mut buffer);
         let rows = rows(&buffer);
-        assert!(rows[0].contains("alice.claude (read-only)"), "{rows:#?}");
-        assert!(!rows.iter().any(|row| row.contains("waiting")), "{rows:#?}");
-        assert_eq!(cursor, None);
-        let mut buffer = Buffer::empty(area);
-        let cursor = ThreadView {
-            agents: &AGENTS,
-            selected: 1,
-            list: ListPlace::Hidden,
-            hints: &[],
-            waiting: None,
-            status: StatusLine::default(),
-        }
-        .render(Some(parser.screen()), area, &mut buffer);
+        assert!(
+            rows[0].contains("alice.claude (read-only, ✓ done)"),
+            "{rows:#?}"
+        );
         assert_eq!(cursor, Some(Position::new(71, 1)));
     }
 
@@ -1228,75 +963,29 @@ mod tests {
     }
 
     #[test]
-    fn the_one_view_draws_the_status_line_between_the_pane_and_the_hints() {
-        let (rows, columns) = ThreadView::agent_size(30, 120, ListPlace::StatusLine);
-        assert_eq!(
-            (rows + 1, columns),
-            ThreadView::agent_size(30, 120, ListPlace::Hidden)
-        );
-        let agents = [StatusAgent {
-            slot: "bob.claude",
-            state: TeammateState::Working,
-            waits: None,
-            brought: &[],
-        }];
+    fn a_screen_of_the_agents_size_fills_the_pane_exactly() {
+        let (rows, columns) = ThreadView::agent_size(30, 120);
+        let mut parser = vt100::Parser::new(rows, columns, 0);
+        let corner = format!("\x1b[{rows};{columns}H#");
+        parser.process(corner.as_bytes());
         let screen = Rect::new(0, 0, 120, 30);
         let (_, body) = TopBar::split(screen);
         let mut buffer = Buffer::empty(screen);
         ThreadView {
-            agents: &AGENTS,
-            selected: 0,
-            list: ListPlace::StatusLine,
-            hints: &[("q", "quit")],
+            shown: Some(AGENTS[0]),
+            hints: &[],
             waiting: None,
-            status: StatusLine {
-                conflicts: &[],
-                agents: &agents,
-            },
+            status: StatusLine::default(),
         }
-        .render(None, body, &mut buffer);
-        let row = |y: u16| -> String {
-            (0..120)
-                .map(|x| buffer[(x, y)].symbol().to_owned())
-                .collect::<String>()
-        };
-        assert!(row(28).starts_with("bob.claude working"), "{:?}", row(28));
-        assert!(row(29).contains("quit"), "{:?}", row(29));
-        assert!(row(27).starts_with('╰'), "{:?}", row(27));
+        .render(Some(parser.screen()), body, &mut buffer);
+        let bottom = rows + 1;
+        assert_eq!(buffer[(columns, bottom)].symbol(), "#");
+        assert_eq!(buffer[(columns + 1, bottom)].symbol(), "│");
+        assert_eq!(buffer[(columns, bottom + 1)].symbol(), "─");
     }
 
     #[test]
-    fn a_screen_of_the_agents_size_fills_the_pane_exactly() {
-        assert_eq!(
-            ThreadView::agent_size(30, 120, ListPlace::Over),
-            ThreadView::agent_size(30, 120, ListPlace::Hidden)
-        );
-        for list in [ListPlace::Beside, ListPlace::Hidden] {
-            let (rows, columns) = ThreadView::agent_size(30, 120, list);
-            let mut parser = vt100::Parser::new(rows, columns, 0);
-            let corner = format!("\x1b[{rows};{columns}H#");
-            parser.process(corner.as_bytes());
-            let screen = Rect::new(0, 0, 120, 30);
-            let (_, body) = TopBar::split(screen);
-            let mut buffer = Buffer::empty(screen);
-            ThreadView {
-                agents: &AGENTS,
-                selected: 0,
-                list,
-                hints: &[],
-                waiting: None,
-                status: StatusLine::default(),
-            }
-            .render(Some(parser.screen()), body, &mut buffer);
-            let bottom = rows + 1;
-            assert_eq!(buffer[(columns, bottom)].symbol(), "#", "{list:?}");
-            assert_eq!(buffer[(columns + 1, bottom)].symbol(), "│", "{list:?}");
-            assert_eq!(buffer[(columns, bottom + 1)].symbol(), "─", "{list:?}");
-        }
-    }
-
-    #[test]
-    fn a_click_finds_the_tab_and_the_agent_drawn_under_it() {
+    fn a_click_finds_the_tab_drawn_under_it() {
         let tabs = [
             WorkspaceTab {
                 title: "7f3a",
@@ -1321,67 +1010,17 @@ mod tests {
         assert_eq!(bar.tab_at(34), TabHit::Nothing);
         assert_eq!(bar.tab_at(35), TabHit::New);
         assert_eq!(bar.tab_at(47), TabHit::Nothing);
-        let view = ThreadView {
-            agents: &AGENTS,
-            selected: 0,
-            list: ListPlace::Beside,
-            hints: &[],
-            waiting: None,
-            status: StatusLine::default(),
-        };
-        let area = Rect::new(0, 1, 100, 12);
-        let at = |view: &ThreadView<'_>, x, y| view.list_at(area, Position::new(x, y));
-        assert_eq!(at(&view, 80, 1), Some(ListHit::Elsewhere));
-        assert_eq!(at(&view, 80, 2), Some(ListHit::Elsewhere));
-        assert_eq!(at(&view, 80, 3), Some(ListHit::Agent(0)));
-        assert_eq!(at(&view, 80, 4), Some(ListHit::Elsewhere));
-        assert_eq!(at(&view, 80, 5), Some(ListHit::Elsewhere));
-        assert_eq!(at(&view, 80, 6), Some(ListHit::Agent(1)));
-        assert_eq!(at(&view, 80, 9), Some(ListHit::Agent(2)));
-        assert_eq!(at(&view, 80, 10), Some(ListHit::Elsewhere));
-        assert_eq!(at(&view, 10, 3), None);
-        let over = ThreadView {
-            list: ListPlace::Over,
-            ..view
-        };
-        assert_eq!(at(&over, 90, 3), Some(ListHit::Agent(0)));
-        assert_eq!(at(&over, 99, 3), Some(ListHit::Elsewhere));
-        assert_eq!(at(&over, 50, 3), None);
-        let hidden = ThreadView {
-            list: ListPlace::Hidden,
-            ..view
-        };
-        assert_eq!(at(&hidden, 80, 3), None);
     }
 
     #[test]
     fn a_position_in_the_pane_is_a_cell_of_the_agents_screen() {
-        let view = ThreadView {
-            agents: &AGENTS,
-            selected: 0,
-            list: ListPlace::Beside,
-            hints: &[],
-            waiting: None,
-            status: StatusLine::default(),
-        };
-        let area = Rect::new(0, 1, 100, 12);
-        assert_eq!(
-            view.pane_point(area, Position::new(1, 2), false),
-            Some((0, 0))
-        );
-        assert_eq!(
-            view.pane_point(area, Position::new(5, 4), false),
-            Some((4, 2))
-        );
-        assert_eq!(view.pane_point(area, Position::new(0, 2), false), None);
-        assert_eq!(
-            view.pane_point(area, Position::new(90, 30), true),
-            Some((73, 8))
-        );
-        assert_eq!(
-            view.pane_point(area, Position::new(0, 0), true),
-            Some((0, 0))
-        );
+        let area = Rect::new(0, 1, 100, 13);
+        let at = |x, y, clamp| ThreadView::pane_point(area, Position::new(x, y), clamp);
+        assert_eq!(at(1, 2, false), Some((0, 0)));
+        assert_eq!(at(5, 4, false), Some((4, 2)));
+        assert_eq!(at(0, 2, false), None);
+        assert_eq!(at(90, 30, true), Some((89, 8)));
+        assert_eq!(at(0, 0, true), Some((0, 0)));
     }
 
     #[test]
@@ -1390,17 +1029,13 @@ mod tests {
         for (width, height) in [(0, 0), (1, 1), (3, 2)] {
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
-            for list in [ListPlace::Beside, ListPlace::Over, ListPlace::Hidden] {
-                ThreadView {
-                    agents: &AGENTS,
-                    selected: 5,
-                    list,
-                    hints: &[("q", "quit")],
-                    waiting: None,
-                    status: StatusLine::default(),
-                }
-                .render(Some(parser.screen()), area, &mut buffer);
+            ThreadView {
+                shown: Some(AGENTS[2]),
+                hints: &[("q", "quit")],
+                waiting: None,
+                status: StatusLine::default(),
             }
+            .render(Some(parser.screen()), area, &mut buffer);
             TopBar {
                 tabs: Some(TabBar {
                     tabs: &[],
@@ -1413,15 +1048,8 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_gets_what_the_tab_bar_the_borders_the_hints_and_the_list_leave() {
-        assert_eq!(ThreadView::agent_size(40, 120, ListPlace::Beside), (36, 94));
-        assert_eq!(ThreadView::agent_size(40, 120, ListPlace::Over), (36, 118));
-        assert_eq!(
-            ThreadView::agent_size(40, 120, ListPlace::Hidden),
-            (36, 118)
-        );
-        assert_eq!(ThreadView::agent_size(3, 10, ListPlace::Beside), (2, 2));
-        assert_eq!(ListPlace::shown_at(99), ListPlace::Over);
-        assert_eq!(ListPlace::shown_at(100), ListPlace::Beside);
+    fn the_agent_gets_what_the_tab_bar_the_borders_the_status_line_and_the_hints_leave() {
+        assert_eq!(ThreadView::agent_size(40, 120), (35, 118));
+        assert_eq!(ThreadView::agent_size(3, 10), (2, 8));
     }
 }

@@ -43,8 +43,6 @@ use mahi_term::{
     Dialog,
     Header,
     KeyScanner,
-    ListHit,
-    ListPlace,
     MouseEvent,
     Notice,
     PaletteInput,
@@ -53,9 +51,11 @@ use mahi_term::{
     Report,
     ReportReader,
     Segment,
+    StatusAgent,
     StatusLine,
     TabBar,
     TabHit,
+    TeammateState,
     ThreadChoice,
     ThreadView,
     TopBar,
@@ -364,7 +364,6 @@ pub(crate) struct Workspace {
     palette: Option<Palette>,
     told: Option<Told>,
     chosen: Option<Moved>,
-    list_shown: bool,
     redraw: Option<RedrawWait>,
     palette_name: String,
     size: WindowSize,
@@ -426,19 +425,26 @@ impl Tab {
         self.agents.is_empty() && !self.watch_only
     }
 
-    /// Returns the agents the list shows: the user's own, then the teammates' the workspace
-    /// watches, from `teammates`.
+    /// Returns the tab's agents: the user's own, then the teammates' the workspace watches,
+    /// from `teammates`.
     fn listed<'a>(&'a self, teammates: Option<&'a Teammates>) -> Vec<WorkspaceAgent<'a>> {
         let watched = teammates.into_iter().flat_map(Teammates::agents);
         let count = teammates.map_or(0, |teammates| teammates.agents().len());
         let mut listed = Vec::with_capacity(self.agents.len() + count);
         listed.extend(self.agents.iter().map(Running::shown_as));
-        listed.extend(watched.map(|(slot, state)| WorkspaceAgent {
-            owner: Some(slot.participant().as_str()),
-            name: slot.agent().as_str(),
-            state,
-        }));
+        listed.extend(watched.map(|(slot, state)| teammates_agent(slot, state)));
         listed
+    }
+
+    /// Returns the agent shown at full size: the user's own selected one, or the teammate's of
+    /// `teammates` the tab watches.
+    fn shown_agent<'a>(&'a self, teammates: Option<&Teammates>) -> Option<WorkspaceAgent<'a>> {
+        if let Some(running) = self.agents.get(self.selected) {
+            return Some(running.shown_as());
+        }
+        let slot = self.watching.as_ref()?;
+        let (_, state) = teammates?.agents().find(|(watched, _)| *watched == slot)?;
+        Some(teammates_agent(slot, state))
     }
 
     /// Returns the screen of the selected agent: the user's own child's, or the teammate's of
@@ -451,8 +457,8 @@ impl Tab {
         }
     }
 
-    /// Selects the agent at `index` of the list, the user's own or, past them, the teammate's
-    /// of `teammates` at that place, which stays selected when the list changes.
+    /// Selects the agent at `index` of the tab's agents, the user's own or, past them, the
+    /// teammate's of `teammates` at that place, which stays selected when they change.
     fn select(&mut self, index: usize, teammates: Option<&Teammates>) {
         self.selected = index;
         self.watching = index
@@ -461,8 +467,8 @@ impl Tab {
             .map(|(slot, _)| slot.clone());
     }
 
-    /// Selects again the teammate's agent selected before the list of `teammates` changed,
-    /// or the user's last agent when it is no longer listed.
+    /// Selects again the teammate's agent selected before `teammates` changed, or the user's
+    /// last agent when it is gone.
     fn select_teammate(&mut self, slot: &AgentSlot, teammates: Option<&Teammates>) {
         let Some(at) =
             teammates.and_then(|watched| watched.agents().position(|(listed, _)| listed == slot))
@@ -504,6 +510,15 @@ fn teammates_of(live: Option<&WorkspaceLive>, thread: Option<ThreadId>) -> Optio
     live?.teammates(thread?)
 }
 
+/// Returns the teammate's agent in `slot`, doing `state`, as the workspace shows it.
+fn teammates_agent(slot: &AgentSlot, state: TeammateState) -> WorkspaceAgent<'_> {
+    WorkspaceAgent {
+        owner: Some(slot.participant().as_str()),
+        name: slot.agent().as_str(),
+        state: state.into(),
+    }
+}
+
 /// An agent the workspace runs, as the mahi command that runs it.
 #[derive(Debug)]
 struct Running {
@@ -519,7 +534,7 @@ struct Running {
 }
 
 impl Running {
-    /// Returns the agent as the list of a thread's agents shows it.
+    /// Returns the agent as the workspace shows it.
     fn shown_as(&self) -> WorkspaceAgent<'_> {
         WorkspaceAgent {
             owner: None,
@@ -548,7 +563,7 @@ enum Ending {
 pub(crate) enum Moved {
     /// Nothing the screen shows changed.
     Nothing,
-    /// Another tab or agent is shown, the list was hidden or shown, or the palette changed.
+    /// Another tab or agent is shown, or the palette changed.
     Shown,
     /// `+` was clicked, to open another thread.
     New,
@@ -605,7 +620,6 @@ impl Workspace {
             palette: None,
             told: None,
             chosen: None,
-            list_shown: true,
             redraw: None,
             palette_name: palette_key.to_string(),
             size: WindowSize { rows: 2, cols: 2 },
@@ -719,12 +733,8 @@ impl Workspace {
         Ok(())
     }
 
-    /// Adds a tab titled `title` and returns its index; the first tab starts with the list
-    /// hidden on a terminal too narrow to show it beside the pane.
+    /// Adds a tab titled `title` and returns its index.
     fn add_tab(&mut self, title: &str) -> usize {
-        if self.tabs.is_empty() {
-            self.list_shown = ListPlace::shown_at(self.screen.cols) == ListPlace::Beside;
-        }
         self.tabs.push(Tab {
             thread: None,
             title: title.to_owned(),
@@ -776,8 +786,7 @@ impl Workspace {
     }
 
     /// Takes what the teammates' hosts sent, keeping each tab's selected teammate selected;
-    /// returns whether the list or a teammate's screen changed in the thread whose tab is
-    /// shown.
+    /// returns whether a teammate's agent or screen changed in the thread whose tab is shown.
     fn watch_teammates(&mut self) -> bool {
         let shown = self
             .selected
@@ -1252,7 +1261,6 @@ impl Workspace {
         (
             self.shown_place(),
             self.shown_id(),
-            self.list_shown,
             self.palette
                 .as_ref()
                 .and_then(|palette| palette.menu.selected()),
@@ -1294,10 +1302,10 @@ impl Workspace {
         }
     }
 
-    /// Acts on a mouse event: a click on the row of tabs or the list of agents is the
-    /// workspace's, and the rest of a thread's tab is the shown agent's, when it asked for the
-    /// mouse, as is all of a drag that began in its pane, even once the palette opened over it,
-    /// which takes no other mouse event; returns whether `+` was clicked.
+    /// Acts on a mouse event: a click on the row of tabs is the workspace's, and the rest of a
+    /// thread's tab is the shown agent's, when it asked for the mouse, as is all of a drag that
+    /// began in its pane, even once the palette opened over it, which takes no other mouse
+    /// event; returns whether `+` was clicked.
     fn click(&mut self, event: MouseEvent) -> bool {
         let position = Position::new(event.column, event.row);
         let area = Rect::new(0, 0, self.screen.cols, self.screen.rows);
@@ -1330,34 +1338,6 @@ impl Workspace {
             }
             return false;
         }
-        let list = self.list_place(body.width);
-        let Some(tab) = self
-            .selected
-            .checked_sub(1)
-            .and_then(|index| self.tabs.get_mut(index))
-        else {
-            return false;
-        };
-        let teammates = teammates_of(self.live.as_ref(), tab.thread);
-        let agents = tab.listed(teammates);
-        let hit = ThreadView {
-            agents: &agents,
-            selected: tab.selected,
-            list,
-            hints: &[],
-            waiting: None,
-            status: StatusLine::default(),
-        }
-        .list_at(body, position);
-        drop(agents);
-        match hit {
-            Some(ListHit::Agent(index)) if event.is_left_click() => {
-                tab.select(index, teammates);
-                return false;
-            }
-            Some(_) => return false,
-            None => {}
-        }
         let reached = self.give_agent(event, body, position, !event.pressed || event.is_motion());
         if reached && event.pressed && !event.is_motion() {
             self.mouse.dragging = true;
@@ -1375,7 +1355,6 @@ impl Workspace {
         position: Position,
         clamp: bool,
     ) -> bool {
-        let list = self.list_place(body.width);
         let Some(tab) = self
             .selected
             .checked_sub(1)
@@ -1383,15 +1362,7 @@ impl Workspace {
         else {
             return false;
         };
-        let point = ThreadView {
-            agents: &[],
-            selected: 0,
-            list,
-            hints: &[],
-            waiting: None,
-            status: StatusLine::default(),
-        }
-        .pane_point(body, position, clamp);
+        let point = ThreadView::pane_point(body, position, clamp);
         let (Some(point), Some(running)) = (point, tab.agents.get_mut(tab.selected)) else {
             return false;
         };
@@ -1429,7 +1400,7 @@ impl Workspace {
 
     /// Opens the palette, which the palette key `key` opened, with the entries for what is
     /// shown: the thread list and the tabs, the shown tab's other agents, the next agent waiting,
-    /// the list, the palette key itself for the shown agent, and quitting.
+    /// the palette key itself for the shown agent, and quitting.
     fn open_palette(&mut self, key: &[u8]) {
         let mut items = Vec::new();
         let mut entries = Vec::new();
@@ -1485,12 +1456,6 @@ impl Workspace {
             "Space".to_owned(),
             Entry::Step(Step::Waiting),
         );
-        let list = if self.list_shown { "Hide" } else { "Show" };
-        add(
-            format!("{list} the agents' list"),
-            "b".to_owned(),
-            Entry::Step(Step::List),
-        );
         if self.shows_running() {
             add(
                 "Show this agent's held turns".to_owned(),
@@ -1535,7 +1500,6 @@ impl Workspace {
                     .to_digit(10)
                     .and_then(|digit| usize::try_from(digit).ok())
                     .map(|place| Entry::Step(Step::To(place))),
-                PaletteInput::Text('b') => Some(Entry::Step(Step::List)),
                 PaletteInput::Text(' ') => Some(Entry::Step(Step::Waiting)),
                 PaletteInput::Text('q') => Some(Entry::Quit),
                 PaletteInput::Text('p') => Some(Entry::AgentPalette),
@@ -1695,17 +1659,7 @@ impl Workspace {
             Step::To(_) => {}
             Step::Next => self.selected = (self.selected + 1) % (last + 1),
             Step::Previous => self.selected = (self.selected + last) % (last + 1),
-            Step::List => self.list_shown = !self.list_shown,
             Step::Waiting => self.show_next_waiting(),
-        }
-    }
-
-    /// Returns where the list of a thread's agents goes on a terminal `columns` wide.
-    pub(crate) fn list_place(&self, columns: u16) -> ListPlace {
-        if self.list_shown {
-            ListPlace::shown_at(columns)
-        } else {
-            ListPlace::Hidden
         }
     }
 
@@ -1728,8 +1682,25 @@ impl Workspace {
         }
         .render(bar, buffer);
         let tab = self.tabs.get(self.selected.checked_sub(1)?)?;
-        let teammates = teammates_of(self.live.as_ref(), tab.thread);
-        let agents = tab.listed(teammates);
+        self.draw_tab(
+            tab,
+            teammates_of(self.live.as_ref(), tab.thread),
+            body,
+            buffer,
+        )
+    }
+
+    /// Draws `tab`, whose thread's teammates are `teammates`, into `body`; returns where the
+    /// shown agent's cursor is.
+    fn draw_tab(
+        &self,
+        tab: &Tab,
+        teammates: Option<&Teammates>,
+        body: Rect,
+        buffer: &mut Buffer,
+    ) -> Option<Position> {
+        let status: Vec<StatusAgent<'_>> =
+            teammates.into_iter().flat_map(Teammates::status).collect();
         let shown = tab.agents.get(tab.selected);
         let failed = shown.is_some_and(|running| running.ending == Ending::Failed);
         let screen = tab.screen(teammates);
@@ -1744,16 +1715,17 @@ impl Workspace {
             .filter(|told| told.at.elapsed() < TOLD_FOR && tab.thread == Some(told.thread))
             .map(|told| [(told.label, told.text.as_str())]);
         let cursor = ThreadView {
-            agents: &agents,
-            selected: tab.selected,
-            list: self.list_place(body.width),
+            shown: tab.shown_agent(teammates),
             hints: match &told {
                 _ if failed => &failed_hints,
                 Some(told) => told,
                 None => &hints,
             },
             waiting: self.waiting(),
-            status: StatusLine::default(),
+            status: StatusLine {
+                conflicts: &[],
+                agents: &status,
+            },
         }
         .render(screen, body, buffer);
         cursor.filter(|_| shown.is_some())
@@ -1895,8 +1867,8 @@ impl Workspace {
         }
     }
 
-    /// Returns the tab shown and, on a thread's tab, the place of its shown agent in its
-    /// list, the user's own or a teammate's.
+    /// Returns the tab shown and, on a thread's tab, the place of its shown agent among its
+    /// agents, the user's own or a teammate's.
     fn shown_place(&self) -> (usize, Option<usize>) {
         let agent = self
             .selected
@@ -1924,9 +1896,9 @@ impl Workspace {
     }
 }
 
-/// What decides whether the screen changed: the place shown, the agent shown, whether the
-/// list is shown, and the palette's selection while it is open.
-type ViewState = ((usize, Option<usize>), Option<usize>, bool, Option<usize>);
+/// What decides whether the screen changed: the place shown, the agent shown, and the
+/// palette's selection while it is open.
+type ViewState = ((usize, Option<usize>), Option<usize>, Option<usize>);
 
 /// A move the workspace's keys make between tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1935,7 +1907,6 @@ enum Step {
     To(usize),
     Next,
     Previous,
-    List,
 }
 
 /// Returns the read end of a pipe holding `key`'s secret, its write end closed; both ends are
@@ -2196,7 +2167,6 @@ mod tests {
                 Entry::Step(Step::To(1)),
                 Entry::Agent(1),
                 Entry::Step(Step::Waiting),
-                Entry::Step(Step::List),
                 Entry::AgentPalette,
                 Entry::SendKey,
                 Entry::Quit,
@@ -2214,7 +2184,6 @@ mod tests {
             "Go to thread a (shown)",
             "Show agent agent (✓ done)",
             "Go to the next agent waiting for you",
-            "Hide the agents' list",
             "Show this agent's held turns",
             "Pass Ctrl-Space through to the agent",
             "Quit mahi",
@@ -2228,11 +2197,6 @@ mod tests {
         assert_eq!(workspace.type_keys(b"\r", &mut threads), Moved::Shown);
         assert!(!workspace.palette_open());
         assert_eq!(workspace.shown_id(), Some(second_id));
-        assert_eq!(workspace.list_place(120), ListPlace::Beside);
-        assert_eq!(workspace.type_keys(b"\x00b", &mut threads), Moved::Shown);
-        assert_eq!(workspace.list_place(120), ListPlace::Hidden);
-        workspace.type_keys(b"\x00b", &mut threads);
-        assert_eq!(workspace.list_place(80), ListPlace::Over);
         workspace.type_keys(b"\x00", &mut threads);
         assert_eq!(workspace.type_keys(b"\x1b", &mut threads), Moved::Shown);
         assert!(!workspace.palette_open());
@@ -2582,6 +2546,44 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_names_its_agent_and_state_over_the_pane_and_its_teammates_under_it() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let own = running(&mut workspace, "sleep 5");
+        let tab = tab("a", vec![own]);
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        heard(&mut teammates, "bob.claude");
+        heard(&mut teammates, "carol.codex");
+        let area = Rect::new(0, 0, 100, 12);
+        let mut buffer = Buffer::empty(area);
+        workspace.draw_tab(&tab, Some(&teammates), area, &mut buffer);
+        let row = |y: u16| -> String {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect()
+        };
+        assert!(row(0).starts_with("╭ agent (✓ done) "), "{:?}", row(0));
+        assert!(
+            row(10).starts_with("bob.claude live  carol.codex live"),
+            "{:?}",
+            row(10)
+        );
+        let mut watching = tab;
+        watching.select(1, Some(&teammates));
+        let mut buffer = Buffer::empty(area);
+        workspace.draw_tab(&watching, Some(&teammates), area, &mut buffer);
+        let title: String = (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_owned())
+            .collect();
+        assert!(
+            title.starts_with("╭ bob.claude (read-only, ◉ live) "),
+            "{title:?}"
+        );
+    }
+
+    #[test]
     fn a_teammates_agent_chosen_by_its_slot_is_found_wherever_the_list_moved_it() {
         let mut both = Teammates::new("alice".parse().unwrap());
         heard(&mut both, "bob.claude");
@@ -2616,7 +2618,7 @@ mod tests {
         let mut threads = Vec::new();
         workspace.type_keys(b"\x00\x00x", &mut threads);
         assert!(!workspace.palette_open());
-        workspace.type_keys(b"\x00\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r", &mut threads);
+        workspace.type_keys(b"\x00\x1b[B\x1b[B\x1b[B\x1b[B\r", &mut threads);
         workspace.type_keys(b"\x00\x1b[32;5u\x1b[32;5u", &mut threads);
         let mut out = Vec::new();
         settle(&mut workspace, &mut out, |workspace| {
@@ -2836,8 +2838,7 @@ mod tests {
         assert!(shown.contains("033[<0;1;1M"), "{shown}");
         let deaf = workspace.tabs[0].agents[1].child.screen().contents();
         assert!(!deaf.contains("[<"), "{deaf}");
-        workspace.type_keys(b"\x1b[<0;80;5M", &mut threads);
-        assert_eq!(workspace.tabs[0].selected, 1);
+        workspace.tabs[0].select(1, None);
         assert_eq!(
             workspace.type_keys(b"\x1b[<0;2;3M", &mut threads),
             Moved::Nothing
@@ -2891,7 +2892,7 @@ mod tests {
                 .contains("end")
         });
         let shown = workspace.tabs[0].agents[0].child.screen().contents();
-        assert!(shown.contains("033[<0;1;1M033[<0;74;3m"), "{shown}");
+        assert!(shown.contains("033[<0;1;1M033[<0;89;3m"), "{shown}");
         assert!(!workspace.mouse.dragging);
     }
 
@@ -2990,32 +2991,6 @@ mod tests {
         );
         workspace.tabs[1].agents[0].ending = Ending::Failed;
         assert_eq!(workspace.room_for_agent(), Ok(()));
-    }
-
-    #[test]
-    fn the_list_starts_hidden_on_a_terminal_narrower_than_100_columns() {
-        let mut workspace = Workspace::new(
-            PaletteKey::default(),
-            Notice::for_terminal(TerminalHints::default()),
-        );
-        workspace.set_screen(WindowSize { rows: 24, cols: 99 }, false);
-        assert_eq!(workspace.add_tab("a"), 0);
-        assert_eq!(workspace.list_place(99), ListPlace::Hidden);
-        workspace.step(Step::List);
-        assert_eq!(workspace.list_place(99), ListPlace::Over);
-        assert_eq!(workspace.add_tab("b"), 1);
-        assert_eq!(workspace.list_place(99), ListPlace::Over);
-        workspace.tabs.clear();
-        workspace.set_screen(
-            WindowSize {
-                rows: 24,
-                cols: 100,
-            },
-            false,
-        );
-        workspace.step(Step::List);
-        workspace.add_tab("c");
-        assert_eq!(workspace.list_place(100), ListPlace::Beside);
     }
 
     #[test]
