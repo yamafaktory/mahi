@@ -115,4 +115,5 @@ pub use transcript::{
     read_tip,
     read_turns,
     walk_turns,
+    walk_turns_while,
 };

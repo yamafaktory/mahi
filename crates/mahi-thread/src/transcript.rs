@@ -1,6 +1,7 @@
 use std::{
     fmt,
     marker::PhantomData,
+    ops::ControlFlow,
 };
 
 use mahi_core::{
@@ -422,6 +423,25 @@ pub fn walk_turns(
     limit: usize,
     mut visit: impl FnMut(TurnRecord),
 ) -> Result<(), TranscriptError> {
+    walk_turns_while(store, thread_key, thread, slot, limit, |turn| {
+        visit(turn);
+        ControlFlow::Continue(())
+    })
+}
+
+/// Visits turns as [`walk_turns`] does, and stops once `visit` breaks, reading no older turn.
+///
+/// # Errors
+///
+/// Returns the errors of [`walk_turns`].
+pub fn walk_turns_while(
+    store: &Store,
+    thread_key: &ThreadKey,
+    thread: ThreadId,
+    slot: &AgentSlot,
+    limit: usize,
+    mut visit: impl FnMut(TurnRecord) -> ControlFlow<()>,
+) -> Result<(), TranscriptError> {
     let transcript = ThreadRef::new(thread, RefKind::Transcript(slot.clone()));
     let mut next = store.head(&transcript)?;
     let mut newer: Option<Link> = None;
@@ -442,7 +462,9 @@ pub fn walk_turns(
             first_seq: decoded.record.first_seq(),
             last_seq: decoded.last_seq,
         });
-        visit(decoded.record);
+        if visit(decoded.record).is_break() {
+            break;
+        }
     }
     Ok(())
 }
@@ -621,6 +643,34 @@ mod tests {
         assert_eq!(read(&setup, 10).unwrap(), turns);
         assert_eq!(read(&setup, 2).unwrap(), turns[1..]);
         assert!(read(&setup, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_walk_stops_at_the_turn_its_visitor_breaks_on() {
+        let setup = setup();
+        let turns = [turn(0, &[1]), turn(1, &[2]), turn(2, &[3])];
+        let mut tip = None;
+        for record in &turns {
+            tip = Some(append(&setup, tip.as_ref(), record));
+        }
+        let mut visited = Vec::new();
+        walk_turns_while(
+            &setup.store,
+            &setup.key,
+            setup.thread,
+            &setup.slot,
+            10,
+            |turn| {
+                visited.push(turn.turn());
+                if turn.turn() == 1 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, [2, 1]);
     }
 
     #[test]

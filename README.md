@@ -206,6 +206,7 @@ Some things stay out of them:
 | `mahi run <agent> [args…]` | Runs an agent in a sandbox, in a new thread and worktree |
 | `mahi resume <thread>` | Runs the thread's agent again, continuing its latest session |
 | `mahi threads [--json]` | Lists the repository's threads and their agents, as JSON with `--json` |
+| `mahi threads search <text> [--json]` | Finds the turns whose prompts or tool calls hold the text, in every thread |
 | `mahi agent add <thread> -- <agent>` | Runs another of your agents in a thread |
 | `mahi handoff <thread> --from <p.agent> -- <agent>` | Starts an agent on another agent's work, with a briefing |
 | `mahi land <thread>` | Brings the thread's work back as a branch to curate into commits |

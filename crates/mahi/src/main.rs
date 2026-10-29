@@ -39,6 +39,7 @@ mod recorder;
 mod remote;
 mod report;
 mod run;
+mod search;
 mod session;
 mod session_sync;
 mod settings;
@@ -76,6 +77,8 @@ use crate::{
         Cli,
         Command,
         CredentialCommand,
+        ThreadsCommand,
+        ThreadsSearch,
     },
     environment::Environment,
     init::InitError,
@@ -245,10 +248,7 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
             )
         })),
         Command::Apparmor => apparmor(environment),
-        Command::Threads(command) => exit_code(
-            threads::threads(environment, command.format())
-                .map(|listing| print_out(&listing, "Threads", "", false)),
-        ),
+        Command::Threads(command) => listed_threads(&command, environment),
         Command::Hook(hook) => {
             if let Some(socket) = &environment.hook_socket {
                 if hook.context {
@@ -272,6 +272,24 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
         Command::Resume(command) => outcome_code(run::resume(&command, environment)),
         Command::Run(command) => outcome_code(run::run(&command, environment)),
     }
+}
+
+/// Runs `mahi threads` or `mahi threads search`, prints what it found, and returns its exit
+/// code.
+fn listed_threads(command: &ThreadsCommand, environment: &Environment) -> i32 {
+    if let Some(ThreadsSearch::Search(search)) = &command.search {
+        return exit_code(
+            search::search(&search.text, search.format(), environment).map(|searched| {
+                let code = print_out(&searched.found, "Search", "", false);
+                eprint!("{}", searched.unread);
+                code
+            }),
+        );
+    }
+    exit_code(
+        threads::threads(environment, command.format())
+            .map(|listing| print_out(&listing, "Threads", "", false)),
+    )
 }
 
 /// Sets mahi up before a command that needs it, when it is not set up; returns `false` when

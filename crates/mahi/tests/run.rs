@@ -869,6 +869,67 @@ content = '{{"bin": "{mahi_bin}"}}'
 
     const PASSPHRASE: &str = "correct horse battery";
 
+    #[test]
+    fn threads_search_asks_the_passphrase_once_and_prints_the_matching_turns() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let (code, output) = in_terminal(&fixture, &["threads", "search", "login"], None);
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("no turn matches"), "{output}");
+        assert!(!output.contains("Passphrase"), "{output}");
+        let script = "printf 'Fix the Login page' | \"$MAHI_BIN\" hook prompt; \
+                      \"$MAHI_BIN\" hook turn-end < /dev/null; \
+                      printf 'add a test' | \"$MAHI_BIN\" hook prompt; \
+                      printf '{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"cargo test login\"}}' \
+                      | \"$MAHI_BIN\" hook tool";
+        let run = fixture.mahi(&["run", "sh", "-c", script]);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(0), "{stderr}");
+        let thread = thread_of(&worktree_of(&stderr));
+
+        let (code, output) =
+            in_terminal(&fixture, &["threads", "search", "LOGIN"], Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        assert_eq!(output.matches("Passphrase").count(), 1, "{output}");
+        let used = output
+            .find(&format!(
+                "{thread}  tester.sh  turn 1  used: Bash cargo test login"
+            ))
+            .unwrap_or_else(|| panic!("{output}"));
+        let asked = output
+            .find(&format!(
+                "{thread}  tester.sh  turn 0  asked: Fix the Login page"
+            ))
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(used < asked, "{output}");
+        assert!(!output.contains("add a test"), "{output}");
+
+        let (code, output) = in_terminal(
+            &fixture,
+            &["threads", "search", "--json", "login page"],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains(&format!(
+                "[{{\"thread\":\"{thread}\",\"agent\":\"tester.sh\",\"turn\":0,\
+                 \"kind\":\"asked\",\"text\":\"Fix the Login page\"}}]"
+            )),
+            "{output}"
+        );
+
+        let (code, output) = in_terminal(
+            &fixture,
+            &["threads", "search", "nowhere"],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("no turn matches"), "{output}");
+        let (code, output) = in_terminal(&fixture, &["threads", "search", "login"], Some("wrong"));
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("cannot unlock your mahi key"), "{output}");
+    }
+
     fn save_identity(fixture: &Fixture) {
         fixture
             .identity

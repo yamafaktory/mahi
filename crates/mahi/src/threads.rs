@@ -62,19 +62,21 @@ pub(crate) enum Format {
     Json,
 }
 
+impl Format {
+    /// Returns JSON when `--json` was given, and text otherwise.
+    pub(crate) fn chosen(json: bool) -> Self {
+        if json { Self::Json } else { Self::Text }
+    }
+}
+
 /// One thread as `mahi threads --json` prints it.
 #[derive(Debug, Serialize)]
 struct ListedThread<'summary> {
-    #[serde(serialize_with = "as_text")]
-    id: ThreadId,
+    id: AsText<'summary, ThreadId>,
     agents: Slots<'summary>,
     worktree: bool,
     purged: bool,
     gone_branch: Option<String>,
-}
-
-fn as_text<S: Serializer>(value: &impl Display, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.collect_str(value)
 }
 
 #[derive(Debug)]
@@ -86,8 +88,9 @@ impl Serialize for Slots<'_> {
     }
 }
 
+/// A value serialized as the text its `Display` writes.
 #[derive(Debug)]
-struct AsText<'value, T>(&'value T);
+pub(crate) struct AsText<'value, T>(pub(crate) &'value T);
 
 impl<T: Display> Serialize for AsText<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -171,6 +174,19 @@ pub(crate) fn threads(environment: &Environment, format: Format) -> Result<Strin
     }
 }
 
+/// Returns the repository's threads a search reads, each with its agents, leaving out a thread
+/// its owner purged.
+pub(crate) fn searchable(
+    store: &Store,
+    own: Option<&ParticipantKey>,
+) -> Result<Vec<(ThreadId, BTreeSet<AgentSlot>)>, StoreError> {
+    Ok(summarise(store, own)?
+        .into_iter()
+        .filter(|(_, summary)| !summary.purged)
+        .map(|(thread, summary)| (thread, summary.agents))
+        .collect())
+}
+
 fn gone_branch(store: &Store, thread: ThreadId) -> Option<String> {
     BranchRecord::read(store, thread)
         .filter(|record| record.gone)
@@ -209,12 +225,12 @@ fn listing_json(
 ) -> Result<String, ThreadsError> {
     let listed: Vec<ListedThread<'_>> = summaries
         .iter()
-        .map(|(&thread, summary)| ListedThread {
-            id: thread,
+        .map(|(thread, summary)| ListedThread {
+            id: AsText(thread),
             agents: Slots(&summary.agents),
             worktree: summary.worktree,
             purged: summary.purged,
-            gone_branch: gone_branch(store, thread),
+            gone_branch: gone_branch(store, *thread),
         })
         .collect();
     let mut listing = serde_json::to_string(&listed).map_err(ThreadsError::Json)?;

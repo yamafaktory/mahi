@@ -2,6 +2,9 @@
 //! prompt's `prompt`, a tool call's `tool_name` and `tool_input`, and Claude Code's
 //! notification's `notification_type`.
 
+use std::borrow::Cow;
+
+use serde::Deserialize;
 use serde_json::Value;
 
 const MAX_KEPT_CHARS: usize = 4000;
@@ -16,6 +19,29 @@ const TOOL_DETAILS: [&str; 7] = [
     "query",
     "description",
 ];
+
+/// The fields of a prompt's or a tool call's hook payload, read whole and without the others,
+/// such as a tool's response.
+#[derive(Debug, Default, Deserialize)]
+pub struct HookFields<'payload> {
+    /// A prompt's text.
+    #[serde(borrow, default)]
+    pub prompt: Option<Cow<'payload, str>>,
+    /// The name of the tool a tool call used.
+    #[serde(borrow, default)]
+    pub tool_name: Option<Cow<'payload, str>>,
+    /// The input a tool call gave its tool.
+    #[serde(default)]
+    pub tool_input: Option<Value>,
+}
+
+impl<'payload> HookFields<'payload> {
+    /// Reads the fields of `payload`, or `None` when it is not a JSON object.
+    #[must_use]
+    pub fn parse(payload: &'payload [u8]) -> Option<Self> {
+        serde_json::from_slice(payload).ok()
+    }
+}
 
 /// Returns the prompt a `UserPromptSubmit` hook payload holds, at most 4000 characters: its
 /// `prompt`, a note when it has none, or the payload itself when it is not JSON.
@@ -113,6 +139,27 @@ mod tests {
         );
         assert_eq!(tool_text(long.as_bytes()).chars().count(), MAX_KEPT_CHARS);
         assert_eq!(prompt_text(&[b'x'; 10_000]).chars().count(), MAX_KEPT_CHARS);
+    }
+
+    #[test]
+    fn hook_fields_are_read_whole_and_the_others_are_skipped() {
+        let long = "x".repeat(MAX_KEPT_CHARS + 10);
+        let payload = format!(
+            "{{\"prompt\":\"{long}\",\"tool_response\":{{\"stdout\":\"big\"}},\"tool_input\":[1]}}"
+        );
+        let fields = HookFields::parse(payload.as_bytes()).unwrap();
+        assert_eq!(fields.prompt.as_deref(), Some(long.as_str()));
+        assert_eq!(fields.tool_name, None);
+        assert_eq!(fields.tool_input, Some(serde_json::json!([1])));
+        assert!(
+            HookFields::parse(br#"{"tool_name":"Bash"}"#)
+                .unwrap()
+                .prompt
+                .is_none()
+        );
+        assert!(HookFields::parse(b"plain text").is_none());
+        assert!(HookFields::parse(br#""a string""#).is_none());
+        assert!(HookFields::parse(br#"{"prompt":7}"#).is_none());
     }
 
     #[test]

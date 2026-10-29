@@ -393,7 +393,10 @@ pub(crate) struct EndCommand {
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
+#[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct ThreadsCommand {
+    #[command(subcommand)]
+    pub(crate) search: Option<ThreadsSearch>,
     /// Prints the threads as one JSON array, each thread an object with its id, agents,
     /// worktree, purged and `gone_branch`.
     #[arg(long)]
@@ -403,11 +406,32 @@ pub(crate) struct ThreadsCommand {
 impl ThreadsCommand {
     /// Returns how the threads are printed.
     pub(crate) fn format(&self) -> Format {
-        if self.json {
-            Format::Json
-        } else {
-            Format::Text
-        }
+        Format::chosen(self.json)
+    }
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub(crate) enum ThreadsSearch {
+    /// Prints the turns of this repository's threads whose prompts or tool calls hold a text,
+    /// ignoring case, newest turn first for each agent. Asks once for your passphrase.
+    Search(SearchCommand),
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct SearchCommand {
+    /// The text to look for.
+    #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub(crate) text: String,
+    /// Prints the matches as one JSON array, each match an object with its thread, agent,
+    /// turn, kind (asked or used) and text.
+    #[arg(long)]
+    json: bool,
+}
+
+impl SearchCommand {
+    /// Returns how the matches are printed.
+    pub(crate) fn format(&self) -> Format {
+        Format::chosen(self.json)
     }
 }
 
@@ -780,6 +804,54 @@ mod tests {
         assert_eq!(
             parse(&["hook", "reboot"]).unwrap_err().kind(),
             ErrorKind::InvalidValue
+        );
+    }
+
+    #[test]
+    fn threads_lists_or_searches_each_with_its_own_json_flag() {
+        let threads = |arguments: &[&str]| match parse(arguments).map(|cli| cli.command) {
+            Ok(Command::Threads(command)) => Ok(command),
+            Ok(other) => panic!("{other:?}"),
+            Err(error) => Err(error.kind()),
+        };
+        let listed = threads(&["threads"]).unwrap();
+        assert_eq!((listed.format(), listed.search), (Format::Text, None));
+        assert_eq!(
+            threads(&["threads", "--json"]).unwrap().format(),
+            Format::Json
+        );
+        let Some(ThreadsSearch::Search(search)) =
+            threads(&["threads", "search", "--json", "log in"])
+                .unwrap()
+                .search
+        else {
+            panic!("no search");
+        };
+        assert_eq!(
+            (search.text.as_str(), search.format()),
+            ("log in", Format::Json)
+        );
+        let Some(ThreadsSearch::Search(search)) = threads(&["threads", "search", "--", "--json"])
+            .unwrap()
+            .search
+        else {
+            panic!("no search");
+        };
+        assert_eq!(
+            (search.text.as_str(), search.format()),
+            ("--json", Format::Text)
+        );
+        assert_eq!(
+            threads(&["threads", "--json", "search", "x"]).unwrap_err(),
+            ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            threads(&["threads", "search", ""]).unwrap_err(),
+            ErrorKind::InvalidValue
+        );
+        assert_eq!(
+            threads(&["threads", "search"]).unwrap_err(),
+            ErrorKind::MissingRequiredArgument
         );
     }
 
