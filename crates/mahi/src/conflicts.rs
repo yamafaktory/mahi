@@ -74,6 +74,16 @@ impl KeptConflicts {
         })
     }
 
+    /// Returns the teammate's agent whose merge left the markers.
+    pub(crate) fn from(&self) -> &AgentSlot {
+        &self.from
+    }
+
+    /// Returns the paths still holding the merge's markers.
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &[u8]> {
+        self.paths.iter().map(Vec::as_slice)
+    }
+
     #[cfg(test)]
     pub(crate) fn before(&self) -> ObjectId {
         self.before

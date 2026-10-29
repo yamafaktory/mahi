@@ -46,6 +46,7 @@ mod settings;
 mod settings_links;
 mod sync;
 mod sync_state;
+mod sync_view;
 mod teammates;
 mod terminal;
 mod thread_lock;

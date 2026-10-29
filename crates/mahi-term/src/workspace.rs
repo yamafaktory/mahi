@@ -142,7 +142,7 @@ pub struct StatusAgent<'a> {
     /// settings`.
     pub waits: Option<&'a str>,
     /// The files the last merge of its work into the user's worktree brought.
-    pub brought: &'a [&'a str],
+    pub brought: &'a [String],
 }
 
 /// The paths a merge of a teammate's agent's work left with conflict markers.
@@ -150,8 +150,10 @@ pub struct StatusAgent<'a> {
 pub struct StatusConflicts<'a> {
     /// The slot of the teammate's agent, such as `bob.claude`.
     pub from: &'a str,
-    /// The paths still holding its markers.
-    pub paths: &'a [&'a str],
+    /// The first paths kept with its markers.
+    pub paths: &'a [String],
+    /// How many more paths are kept with its markers.
+    pub more: usize,
 }
 
 /// The row under the pane in the one view: the conflicts to resolve first, then each
@@ -306,14 +308,14 @@ fn conflicts_item<'a>(conflicts: &StatusConflicts<'a>, listed: usize) -> Item<'a
         conflicts.paths.get(..listed).unwrap_or_default(),
         warn,
     );
-    let left = conflicts.paths.len() - listed;
+    let left = conflicts.paths.len() - listed + conflicts.more;
     if left > 0 {
         spans.push(Span::styled(format!(" and {left} more"), warn));
     }
     Item::new(spans)
 }
 
-fn push_paths<'a>(spans: &mut Vec<Span<'a>>, paths: &[&'a str], style: Style) {
+fn push_paths<'a>(spans: &mut Vec<Span<'a>>, paths: &'a [String], style: Style) {
     for (index, path) in paths.iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(", ", style));
@@ -879,6 +881,10 @@ mod tests {
         );
     }
 
+    fn owned(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
     fn status_text(status: &StatusLine<'_>, width: u16) -> String {
         status
             .line(width)
@@ -892,7 +898,8 @@ mod tests {
     fn the_status_line_names_conflicts_first_then_each_teammates_agent() {
         let conflicts = [StatusConflicts {
             from: "bob.claude",
-            paths: &["src/a.rs", "src/b.rs"],
+            paths: &owned(&["src/a.rs", "src/b.rs"]),
+            more: 0,
         }];
         let agents = [
             StatusAgent {
@@ -905,7 +912,7 @@ mod tests {
                 slot: "carol.codex",
                 state: TeammateState::Working,
                 waits: None,
-                brought: &["src/client.rs", "src/lib.rs"],
+                brought: &owned(&["src/client.rs", "src/lib.rs"]),
             },
             StatusAgent {
                 slot: "dan.claude",
@@ -942,6 +949,19 @@ mod tests {
             "conflicts from bob.claude: src/a.rs and 1 more  +3 more"
         );
         assert_eq!(status_text(&StatusLine::default(), 80), "");
+        let counted = [StatusConflicts {
+            from: "bob.claude",
+            paths: &owned(&["src/a.rs"]),
+            more: 5,
+        }];
+        let status = StatusLine {
+            conflicts: &counted,
+            agents: &[],
+        };
+        assert_eq!(
+            status_text(&status, 80),
+            "conflicts from bob.claude: src/a.rs and 5 more"
+        );
     }
 
     #[test]
@@ -950,7 +970,7 @@ mod tests {
             slot: "bob\x1b[2J.claude",
             state: TeammateState::Live,
             waits: None,
-            brought: &["src/\u{202e}evil.rs"],
+            brought: &owned(&["src/\u{202e}evil.rs"]),
         }];
         let status = StatusLine {
             conflicts: &[],

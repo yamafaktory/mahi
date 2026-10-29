@@ -52,6 +52,7 @@ use mahi_term::{
     ReportReader,
     Segment,
     StatusAgent,
+    StatusConflicts,
     StatusLine,
     TabBar,
     TabHit,
@@ -82,6 +83,7 @@ use crate::{
         REPORT_FD,
     },
     join::WAITING_FOR_HOST,
+    sync_view::SyncView,
     teammates::Teammates,
     ui::{
         SPIN_EVERY,
@@ -93,6 +95,7 @@ use crate::{
 const READ_CHUNK: usize = 16 * 1024;
 const STOP_POLL: Duration = Duration::from_millis(20);
 const TOLD_FOR: Duration = Duration::from_secs(6);
+const SYNC_EVERY: Duration = Duration::from_secs(1);
 const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h";
 pub(crate) const MOUSE_OFF: &[u8] = b"\x1b[?1002l\x1b[?1006l";
 const QUEUED_WRITES: usize = 64;
@@ -416,6 +419,8 @@ struct Tab {
     selected: usize,
     watching: Option<AgentSlot>,
     watch_only: bool,
+    sync: SyncView,
+    synced: Option<(Instant, String)>,
 }
 
 impl Tab {
@@ -434,6 +439,42 @@ impl Tab {
         listed.extend(self.agents.iter().map(Running::shown_as));
         listed.extend(watched.map(|(slot, state)| teammates_agent(slot, state)));
         listed
+    }
+
+    /// Reads again, at most every [`SYNC_EVERY`] at `now` and at once for another agent, what
+    /// the sync state of the tab's agent holds for the status line, through `read`, which
+    /// gives `None` while the thread is not hosted: the user's own selected agent, or else
+    /// their first. Returns whether it changed.
+    fn read_sync(
+        &mut self,
+        now: Instant,
+        read: impl FnOnce(ThreadId, &str) -> Option<SyncView>,
+    ) -> bool {
+        let own = self
+            .agents
+            .get(self.selected)
+            .or_else(|| self.agents.first());
+        let (Some(thread), Some(running)) = (self.thread, own) else {
+            return self.take_sync(SyncView::default());
+        };
+        let fresh = self.synced.as_ref().is_some_and(|(at, agent)| {
+            *agent == running.name && now.saturating_duration_since(*at) < SYNC_EVERY
+        });
+        if fresh {
+            return false;
+        }
+        let Some(view) = read(thread, &running.name) else {
+            self.synced = None;
+            return self.take_sync(SyncView::default());
+        };
+        self.synced = Some((now, running.name.clone()));
+        self.take_sync(view)
+    }
+
+    fn take_sync(&mut self, view: SyncView) -> bool {
+        let changed = view != self.sync;
+        self.sync = view;
+        changed
     }
 
     /// Returns the agent shown at full size: the user's own selected one, or the teammate's of
@@ -742,6 +783,8 @@ impl Workspace {
             selected: 0,
             watching: None,
             watch_only: false,
+            sync: SyncView::default(),
+            synced: None,
         });
         self.tabs.len() - 1
     }
@@ -798,9 +841,17 @@ impl Workspace {
         let Some(live) = self.live.as_mut() else {
             return false;
         };
-        let mut changed = live.watch(Instant::now(), thread);
+        let now = Instant::now();
+        let mut changed = live.watch(now, thread);
         if let Some((thread, slot)) = watching {
             changed |= live.show_record(thread, &slot, size);
+        }
+        if let Some(tab) = self
+            .selected
+            .checked_sub(1)
+            .and_then(|index| self.tabs.get_mut(index))
+        {
+            changed |= tab.read_sync(now, |thread, agent| live.sync_view(thread, agent));
         }
         for tab in &mut self.tabs {
             tab.reselect(teammates_of(self.live.as_ref(), tab.thread));
@@ -1699,8 +1750,11 @@ impl Workspace {
         body: Rect,
         buffer: &mut Buffer,
     ) -> Option<Position> {
-        let status: Vec<StatusAgent<'_>> =
-            teammates.into_iter().flat_map(Teammates::status).collect();
+        let status: Vec<StatusAgent<'_>> = teammates
+            .into_iter()
+            .flat_map(|teammates| teammates.status(&tab.sync))
+            .collect();
+        let conflicts: Vec<StatusConflicts<'_>> = tab.sync.conflicts().into_iter().collect();
         let shown = tab.agents.get(tab.selected);
         let failed = shown.is_some_and(|running| running.ending == Ending::Failed);
         let screen = tab.screen(teammates);
@@ -1723,7 +1777,7 @@ impl Workspace {
             },
             waiting: self.waiting(),
             status: StatusLine {
-                conflicts: &[],
+                conflicts: &conflicts,
                 agents: &status,
             },
         }
@@ -1992,6 +2046,8 @@ mod tests {
             selected: 0,
             watching: None,
             watch_only: false,
+            sync: SyncView::default(),
+            synced: None,
         }
     }
 
@@ -2581,6 +2637,38 @@ mod tests {
             title.starts_with("╭ bob.claude (read-only, ◉ live) "),
             "{title:?}"
         );
+    }
+
+    #[test]
+    fn a_tabs_sync_state_is_read_at_most_every_second_and_at_once_for_another_agent() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let first = running(&mut workspace, "sleep 5");
+        let mut second = running(&mut workspace, "sleep 5");
+        second.name = "codex".to_owned();
+        let mut tab = tab("a", vec![first, second]);
+        let read = std::cell::RefCell::new(Vec::new());
+        let reader = |hosted: bool| {
+            let read = &read;
+            move |_: ThreadId, agent: &str| {
+                read.borrow_mut().push(agent.to_owned());
+                hosted.then(SyncView::default)
+            }
+        };
+        let now = Instant::now();
+        assert!(!tab.read_sync(now, reader(true)));
+        assert!(read.borrow().is_empty());
+        tab.thread = Some(ThreadId::random().unwrap());
+        tab.read_sync(now, reader(false));
+        tab.read_sync(now, reader(true));
+        tab.read_sync(now + Duration::from_millis(500), reader(true));
+        tab.select(1, None);
+        tab.read_sync(now + Duration::from_millis(600), reader(true));
+        tab.read_sync(now + Duration::from_millis(700), reader(true));
+        tab.read_sync(now + Duration::from_millis(1700), reader(true));
+        assert_eq!(*read.borrow(), ["agent", "agent", "codex", "codex"]);
     }
 
     #[test]

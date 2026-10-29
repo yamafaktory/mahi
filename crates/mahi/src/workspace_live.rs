@@ -26,6 +26,7 @@ use std::{
 };
 
 use mahi_core::{
+    AgentName,
     AgentSlot,
     RefKind,
     ThreadId,
@@ -80,6 +81,7 @@ use crate::{
         self as remote_sync,
         Reach,
     },
+    sync_view::SyncView,
     teammates::Teammates,
     thread_lock::{
         LiveLock,
@@ -275,6 +277,17 @@ impl WorkspaceLive {
             }
         }
         changed
+    }
+
+    /// Reads what the sync state of the user's agent `agent` in `thread` holds for the status
+    /// line, while the workspace hosts the thread; `None` when it does not or the repository
+    /// cannot be opened.
+    pub(crate) fn sync_view(&self, thread: ThreadId, agent: &str) -> Option<SyncView> {
+        let hosted = self.hosted.get(&thread)?;
+        let agent = AgentName::new(agent).ok()?;
+        let own = AgentSlot::new(hosted.teammates.own().clone(), agent);
+        let store = Store::open(&self.git_dir).ok()?;
+        Some(SyncView::read(&store, thread, &own))
     }
 
     /// Returns the teammates' agents the workspace watches in `thread`, while it hosts it.
@@ -808,6 +821,30 @@ pub(crate) mod tests {
             .map(|(slot, state)| (slot.to_string(), state))
             .collect();
         assert_eq!(listed, [("bob.codex".to_owned(), TeammateState::Offline)]);
+    }
+
+    #[test]
+    fn the_sync_state_of_the_users_agent_is_read_only_while_its_thread_is_hosted() {
+        let setup = setup();
+        let mut live =
+            WorkspaceLive::new(&setup.environment, &setup.config, setup.store.common_dir())
+                .unwrap();
+        assert_eq!(live.sync_view(setup.thread, "claude"), None);
+        live.host_unlocked(setup.thread, &setup.identity).unwrap();
+        let own: AgentSlot = "alice.claude".parse().unwrap();
+        let bob: AgentSlot = "bob.codex".parse().unwrap();
+        crate::held::HeldSettings::new(ObjectId::from_bytes_or_panic(&[1; 20]), &[])
+            .keep(&crate::held::file(&setup.store, setup.thread, (&own, &bob)))
+            .unwrap();
+        let view = live.sync_view(setup.thread, "claude").unwrap();
+        assert!(view.waits("bob.codex"));
+        assert!(
+            !live
+                .sync_view(setup.thread, "codex")
+                .unwrap()
+                .waits("bob.codex")
+        );
+        assert_eq!(live.sync_view(setup.thread, "not a name"), None);
     }
 
     #[test]

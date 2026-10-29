@@ -247,6 +247,13 @@ impl Note {
         holds.then_some(note).ok_or_else(malformed)
     }
 
+    /// Returns each teammate's agent the note names, with the first files its merges brought.
+    pub(crate) fn brought(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.came
+            .iter()
+            .map(|came| (came.from.as_str(), came.brought.paths.as_slice()))
+    }
+
     fn save(&self, file: &Path) -> Result<(), NoteError> {
         let bytes =
             serde_json::to_vec(self).map_err(|_| NoteError::Malformed(file.to_path_buf()))?;

@@ -21,10 +21,12 @@ use crate::{
         HOST_SILENCE,
         STUCK_SCREEN,
     },
+    palette::HELD_DETAIL,
     rebuilding::{
         Part,
         Rebuilding,
     },
+    sync_view::SyncView,
 };
 
 const MOST_WATCHED: usize = 16;
@@ -358,14 +360,37 @@ impl Teammates {
             .map(|teammate| (&teammate.slot, teammate.shown_state()))
     }
 
-    /// Returns the agents watched as the status line names them, in slot order.
-    pub(crate) fn status(&self) -> impl ExactSizeIterator<Item = StatusAgent<'_>> {
-        self.agents.iter().map(|teammate| StatusAgent {
-            slot: &teammate.slot_text,
-            state: teammate.shown_state(),
-            waits: None,
-            brought: &[],
+    /// Returns the agents watched as the status line names them, in slot order, with what the
+    /// sync state of the user's agent, `sync`, holds of each, then the agents `sync` names that
+    /// are not watched, as offline.
+    pub(crate) fn status<'a>(
+        &'a self,
+        sync: &'a SyncView,
+    ) -> impl Iterator<Item = StatusAgent<'a>> {
+        let watched = self
+            .agents
+            .iter()
+            .map(|teammate| (teammate.slot_text.as_str(), teammate.shown_state()));
+        let unwatched = sync
+            .named()
+            .filter(|slot| {
+                !self
+                    .agents
+                    .iter()
+                    .any(|teammate| teammate.slot_text == *slot)
+            })
+            .map(|slot| (slot, TeammateState::Offline));
+        watched.chain(unwatched).map(|(slot, state)| StatusAgent {
+            slot,
+            state,
+            waits: sync.waits(slot).then_some(HELD_DETAIL),
+            brought: sync.brought(slot),
         })
+    }
+
+    /// Returns the user's own name, whose agents are not watched.
+    pub(crate) fn own(&self) -> &ParticipantName {
+        &self.own
     }
 
     /// Returns the screen of `slot`'s agent, once one arrived and while it is online.
