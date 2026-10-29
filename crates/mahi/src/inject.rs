@@ -74,13 +74,21 @@ impl Default for Activity {
 }
 
 impl Activity {
-    /// Starts with nothing done yet, telling each change of the agent's state to `tap` too,
-    /// when there is one, for the teammates.
-    pub(crate) fn telling(tap: Option<OutputTap>) -> Self {
-        Self {
+    /// Starts in the state `first`, when it is known, telling it at once, as each later
+    /// change is told: to the workspace, and to `tap` too, when there is one, for the
+    /// teammates. A run that starts working has its first turn open from the start.
+    pub(crate) fn telling(tap: Option<OutputTap>, first: Option<TurnState>) -> Self {
+        let working = first == Some(TurnState::Working);
+        let activity = Self {
+            turn_open: AtomicBool::new(working),
+            turn_ended: AtomicBool::new(!working),
             tap,
             ..Self::default()
+        };
+        if let Some(first) = first {
+            activity.tell(first);
         }
+        activity
     }
 
     fn tell(&self, state: TurnState) {
@@ -136,10 +144,12 @@ impl Activity {
         };
         match kind {
             HookKind::Prompt => {
-                self.turn_open.store(true, Ordering::SeqCst);
+                let was_open = self.turn_open.swap(true, Ordering::SeqCst);
                 self.turn_ended.store(false, Ordering::SeqCst);
-                self.asking.store(false, Ordering::SeqCst);
-                self.tell(TurnState::Working);
+                let was_asking = self.asking.swap(false, Ordering::SeqCst);
+                if !was_open || was_asking {
+                    self.tell(TurnState::Working);
+                }
             }
             HookKind::TurnEnd => {
                 self.turn_open.store(false, Ordering::SeqCst);
@@ -401,6 +411,34 @@ mod tests {
         activity.keys(b"\x1b");
         thread::sleep(pace.quiet);
         assert!(activity.is_idle_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn a_run_that_starts_on_a_prompt_is_busy_until_its_turn_ends() {
+        let pace = fast();
+        let activity = Activity::telling(None, Some(TurnState::Working));
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+        activity.saw(HookKind::TurnEnd, b"");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_after_turn_end(&pace));
+        let waiting = Activity::telling(None, Some(TurnState::Done));
+        thread::sleep(pace.quiet);
+        assert!(waiting.is_idle_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn the_first_state_reaches_the_workspace_as_later_ones_do() {
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        crate::report::connect(std::os::fd::IntoRawFd::into_raw_fd(writer));
+        let activity = Activity::telling(None, Some(TurnState::Working));
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(HookKind::TurnEnd, b"");
+        let mut read = [0_u8; 64];
+        let length = rustix::io::read(&reader, &mut read).unwrap();
+        let mut reports = Vec::new();
+        mahi_term::ReportReader::default().feed(&read[..length], |report| reports.push(report));
+        assert_eq!(reports, [Report::Working, Report::Done]);
     }
 
     #[test]

@@ -323,9 +323,7 @@ impl WorkspaceLive {
             let Some(hosted) = self.hosted.get(&thread) else {
                 continue;
             };
-            if hosted.teammates.agents().any(|(_, online)| online)
-                || !self.purge_checks.due(now, thread)
-            {
+            if hosted.teammates.any_online() || !self.purge_checks.due(now, thread) {
                 continue;
             }
             let (git_dir, reach, owner) = (
@@ -536,6 +534,7 @@ pub(crate) mod tests {
     use mahi_core::ParticipantName;
     use mahi_identity::PublicIdentity;
     use mahi_store::GlobalPatterns;
+    use mahi_term::AgentState;
     use mahi_thread::{
         Participant,
         Role,
@@ -802,13 +801,13 @@ pub(crate) mod tests {
             WorkspaceLive::new(&setup.environment, &setup.config, setup.store.common_dir())
                 .unwrap();
         live.host_unlocked(setup.thread, &setup.identity).unwrap();
-        let listed: Vec<(String, bool)> = live
+        let listed: Vec<(String, AgentState)> = live
             .teammates(setup.thread)
             .unwrap()
             .agents()
-            .map(|(slot, online)| (slot.to_string(), online))
+            .map(|(slot, state)| (slot.to_string(), state))
             .collect();
-        assert_eq!(listed, [("bob.codex".to_owned(), false)]);
+        assert_eq!(listed, [("bob.codex".to_owned(), AgentState::Offline)]);
     }
 
     #[test]

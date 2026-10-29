@@ -44,7 +44,10 @@ pub enum AgentState {
     Done,
     /// It waits on a question of its own for the user.
     AsksYou,
-    /// A teammate's agent whose host is connected; its frames say nothing of its turns.
+    /// A teammate's agent waits on a question for its own user.
+    Asks,
+    /// A teammate's agent whose host is connected but tells no state, or has not told one
+    /// yet.
     Live,
     /// A teammate's agent whose host is not connected.
     Offline,
@@ -60,6 +63,7 @@ impl AgentState {
             Self::Working => "● working",
             Self::Done => "✓ done",
             Self::AsksYou => "! asks you",
+            Self::Asks => "! asks",
             Self::Live => "◉ live",
             Self::Offline => "○ offline",
             Self::Failed => "✗ failed",
@@ -68,7 +72,7 @@ impl AgentState {
 
     fn mark(self) -> Span<'static> {
         let style = match self {
-            Self::Working | Self::Live => Style::new().fg(Theme::ACCENT),
+            Self::Working | Self::Asks | Self::Live => Style::new().fg(Theme::ACCENT),
             Self::Done => Style::new().fg(Theme::OK),
             Self::AsksYou => Theme::code(),
             Self::Offline => Theme::muted(),
@@ -81,7 +85,7 @@ impl AgentState {
         match self {
             Self::Working => "●",
             Self::Done => "✓",
-            Self::AsksYou => "!",
+            Self::AsksYou | Self::Asks => "!",
             Self::Live => "◉",
             Self::Offline => "○",
             Self::Failed => "✗",

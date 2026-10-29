@@ -829,7 +829,8 @@ mod tests {
         let guest = handle.serve(codex.clone(), size).unwrap();
         let tap = OutputTap::new(size);
         tap.attach(guest.tap.clone());
-        let activity = Activity::telling(Some(tap));
+        let activity = Activity::telling(Some(tap), None);
+        assert_eq!(handle.state_of(&codex), None);
         activity.saw(HookKind::Prompt, b"");
         assert_eq!(handle.state_of(&codex), Some(TurnState::Working));
         activity.saw(
@@ -838,6 +839,18 @@ mod tests {
         );
         assert_eq!(handle.state_of(&codex), Some(TurnState::Asks));
         activity.keys(b"\x03");
+        assert_eq!(handle.state_of(&codex), Some(TurnState::Done));
+    }
+
+    #[test]
+    fn an_agent_whose_hooks_report_turns_tells_its_host_it_waits_from_the_start() {
+        let (handle, _tapped) = HostHandle::for_tests(ParticipantName::new("alice").unwrap());
+        let codex = slot("alice", "codex");
+        let size = WindowSize { rows: 24, cols: 80 };
+        let guest = handle.serve(codex.clone(), size).unwrap();
+        let tap = OutputTap::new(size);
+        tap.attach(guest.tap.clone());
+        let _activity = Activity::telling(Some(tap), Some(TurnState::Done));
         assert_eq!(handle.state_of(&codex), Some(TurnState::Done));
     }
 

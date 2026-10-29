@@ -666,9 +666,32 @@ struct Watching {
 }
 
 impl Watching {
-    /// Takes `received` when it draws an agent, passing it on when the agent is a
-    /// participant's other than `owner`, and noting that frames were lost when there is no
-    /// room for it; returns any other frame.
+    /// Passes on the whole list of `states` a claims frame from `participant`'s node `sender`
+    /// told, as one claims frame that holds only them, when the participant is not `owner`.
+    fn pass_states(
+        &self,
+        (sender, participant): (NodeId, &ParticipantName),
+        states: Vec<StateEntry>,
+        owner: &ParticipantName,
+    ) {
+        if participant == owner {
+            return;
+        }
+        self.queue(Received {
+            sender,
+            participant: participant.clone(),
+            body: Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+                states,
+            },
+            told_states: true,
+        });
+    }
+
+    /// Takes `received` when it draws an agent or tells its state, passing it on when the
+    /// agent is a participant's other than `owner`, and noting that frames were lost when
+    /// there is no room for it; returns any other frame.
     fn pass(&self, received: Received, owner: &ParticipantName) -> Option<Received> {
         if !matches!(
             received.body,
@@ -676,19 +699,25 @@ impl Watching {
                 | Body::Output { .. }
                 | Body::Resize { .. }
                 | Body::Heartbeat { .. }
+                | Body::State(_)
         ) {
             return Some(received);
         }
-        if &received.participant == owner {
-            return None;
+        if &received.participant != owner {
+            self.queue(received);
         }
+        None
+    }
+
+    /// Queues `received` for the workspace, or notes that frames were lost when there is no
+    /// room for it.
+    fn queue(&self, received: Received) {
         let bytes = drawn_bytes(&received.body);
         let held = self.queued.fetch_add(bytes, Ordering::SeqCst) + bytes;
         if held > WATCH_BYTES || self.frames.try_send(received).is_err() {
             self.queued.fetch_sub(bytes, Ordering::SeqCst);
             self.lost.store(true, Ordering::SeqCst);
         }
-        None
     }
 
     /// Notes that frames were lost when the topic's count of frames it dropped, `dropped`,
@@ -1563,8 +1592,14 @@ impl Listener {
                 Body::Claims {
                     claims,
                     turn_ends,
-                    states: _,
+                    states,
                 } => {
+                    if received.told_states
+                        && let Some(watching) = &self.watching
+                    {
+                        let teller = (received.sender, &received.participant);
+                        watching.pass_states(teller, states, &self.owner);
+                    }
                     self.claims.hear(received.sender, claims);
                     self.hear_turn_ends(&received.participant, received.sender, &turn_ends);
                     continue;
@@ -1767,6 +1802,7 @@ mod tests {
         GlobalPatterns,
         TakeLimits,
     };
+    use mahi_term::AgentState;
     use mahi_thread::{
         Participant,
         VerifiedMeta,
@@ -2265,8 +2301,38 @@ mod tests {
         bob.tap().unwrap().output(b" works");
         let shown = watched_until(watch, &mut teammates, &slot, "bob's agent works");
         assert!(shown.contains("bob's agent works"), "{shown:?}");
+        bob.tap().unwrap().turn(TurnState::Asks);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while teammates.agents().next().map(|(_, state)| state) != Some(AgentState::Asks) {
+            assert!(Instant::now() < deadline, "the state never showed");
+            watch.update(&mut teammates, Instant::now());
+            thread::sleep(Duration::from_millis(50));
+        }
         bob.stop();
         alice.stop();
+    }
+
+    #[test]
+    fn the_states_a_claims_frame_tells_reach_the_workspace_but_not_the_users_own() {
+        let (watch, watching) = Watch::open(&Arc::default());
+        let node = NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap();
+        let alice = ParticipantName::new("alice").unwrap();
+        let bob = ParticipantName::new("bob").unwrap();
+        let entry = |participant: &ParticipantName| StateEntry {
+            slot: AgentSlot::new(participant.clone(), AgentName::new("claude").unwrap()),
+            state: TurnState::Done,
+        };
+        watching.pass_states((node, &alice), vec![entry(&alice)], &alice);
+        watching.pass_states((node, &bob), vec![entry(&bob)], &alice);
+        let mut teammates = Teammates::new(alice.clone());
+        assert!(watch.update(&mut teammates, Instant::now()));
+        assert_eq!(
+            teammates
+                .agents()
+                .map(|(slot, state)| (slot.to_string(), state))
+                .collect::<Vec<_>>(),
+            [("bob.claude".to_owned(), AgentState::Done)]
+        );
     }
 
     /// Bob, a participant of `hosted`, hosting his agent `bob.claude`, and Alice's node in
@@ -2755,6 +2821,7 @@ mod tests {
             sender: NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
             participant: ParticipantName::new(participant).unwrap(),
             body,
+            told_states: false,
         }
     }
 

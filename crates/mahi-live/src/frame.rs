@@ -132,7 +132,9 @@ pub enum Body {
     },
     /// A host's whole list of the claims its agents hold, at most [`MAX_FRAME_CLAIMS`], with
     /// the latest turn-end snapshot of each of its agents, at most [`MAX_FRAME_TURN_ENDS`],
-    /// and the state of each, at most [`MAX_FRAME_STATES`].
+    /// and the state of each, at most [`MAX_FRAME_STATES`], which a receiver keeps only from
+    /// a run it anchored, when the frame is newer than the last states it took from that run,
+    /// as the whole list of the states that run tells.
     Claims {
         /// The claims, each of an agent of the sender.
         claims: Vec<ClaimEntry>,
@@ -220,6 +222,9 @@ pub struct Received {
     pub participant: ParticipantName,
     /// What it carries.
     pub body: Body,
+    /// Whether it is a claims frame whose states are the whole list its sender's anchored
+    /// run tells: from that run, and newer than the last states taken from it.
+    pub told_states: bool,
 }
 
 /// A frame that was not sent or not accepted.
@@ -651,6 +656,7 @@ struct SenderState {
     epoch: [u8; EPOCH_BYTES],
     sequence: u64,
     anchored_with: [u8; CHALLENGE_BYTES],
+    told_through: u64,
 }
 
 /// Checks and opens the frames one viewer or host receives, and keeps what replay protection
@@ -762,7 +768,7 @@ impl FrameReceiver {
                 .map_err(|_| FrameError::Unreadable)?,
         );
         let plain: WirePlain<'_> = decode_exact(&plain)?;
-        let body = parse_body(&plain.body)?;
+        let mut body = parse_body(&plain.body)?;
         if drawn_slot(&body).is_some_and(|slot| slot.participant() != &participant) {
             return Err(FrameError::NotTheirSlot);
         }
@@ -780,12 +786,47 @@ impl FrameReceiver {
         {
             return Err(FrameError::NotTheirSlot);
         }
+        let after_told = self.after_told(sender, &plain);
+        let told_states = match &mut body {
+            Body::Claims { states, .. } if after_told != Some(true) => {
+                states.clear();
+                false
+            }
+            Body::Claims { .. } | Body::State(_) => {
+                if after_told == Some(false) {
+                    return Err(FrameError::Replayed);
+                }
+                true
+            }
+            Body::Output { .. }
+            | Body::Resize { .. }
+            | Body::Heartbeat { .. }
+            | Body::ScreenRequest { .. }
+            | Body::Screen { .. }
+            | Body::TurnEnded(_) => false,
+        };
         self.check_order(sender, &plain, &body)?;
+        if told_states && let Some(state) = self.senders.get_mut(&sender) {
+            state.told_through = plain.sequence;
+        }
         Ok(Received {
             sender,
             participant,
+            told_states: told_states && matches!(body, Body::Claims { .. }),
             body,
         })
+    }
+
+    /// Says whether `plain` comes after the last states this receiver took from the run of
+    /// `sender` it anchored, or `None` when `plain` is not from that run. A state frame and
+    /// a claims frame's states are taken only after them, since claims are not anchored and
+    /// each may arrive after a newer state; other frames tell no state, so they do not order
+    /// states.
+    fn after_told(&self, sender: NodeId, plain: &WirePlain<'_>) -> Option<bool> {
+        self.senders
+            .get(&sender)
+            .filter(|state| state.epoch == plain.epoch)
+            .map(|state| plain.sequence > state.told_through)
     }
 
     fn check_order(
@@ -802,6 +843,9 @@ impl FrameReceiver {
         }
         let state = self.senders.get(&sender).copied();
         if let Some(state) = state.filter(|state| state.epoch == plain.epoch) {
+            if let Body::State(_) = body {
+                return Ok(());
+            }
             if plain.sequence <= state.sequence {
                 return Err(FrameError::Replayed);
             }
@@ -822,6 +866,7 @@ impl FrameReceiver {
                         epoch: plain.epoch,
                         sequence: plain.sequence,
                         anchored_with: *challenge,
+                        told_through: plain.sequence,
                     },
                 );
                 Ok(())
@@ -1523,7 +1568,7 @@ mod tests {
         );
     }
 
-    fn state(participant: &str, state: TurnState) -> StateEntry {
+    fn state_entry(participant: &str, state: TurnState) -> StateEntry {
         StateEntry {
             slot: slot(participant),
             state,
@@ -1535,7 +1580,7 @@ mod tests {
         let thread = Thread::new();
         let mut viewer = thread.receiver();
         let mut host = thread.sender(1);
-        let working = Body::State(state("alice", TurnState::Working));
+        let working = Body::State(state_entry("alice", TurnState::Working));
         assert_eq!(
             viewer.open(&host.seal(&working).unwrap()),
             Err(FrameError::Unanchored)
@@ -1547,7 +1592,7 @@ mod tests {
         let frame = host.seal(&working).unwrap();
         assert_eq!(viewer.open(&frame).unwrap().body, working);
         assert_eq!(viewer.open(&frame), Err(FrameError::Replayed));
-        let asks = Body::State(state("alice", TurnState::Asks));
+        let asks = Body::State(state_entry("alice", TurnState::Asks));
         assert_eq!(viewer.open(&host.seal(&asks).unwrap()).unwrap().body, asks);
         let mut mallory = thread.sender(3);
         assert_eq!(
@@ -1574,14 +1619,175 @@ mod tests {
     }
 
     #[test]
+    fn claims_tell_states_only_from_the_anchored_run_and_after_its_last_states() {
+        let thread = Thread::new();
+        let mut receiver = thread.receiver();
+        let mut alice = thread.sender(1);
+        let claims = |state: TurnState| Body::Claims {
+            claims: vec![claim("alice", "src/parser.rs")],
+            turn_ends: vec![turn_end("alice", 1)],
+            states: vec![state_entry("alice", state)],
+        };
+        let states_of = |received: Received| match received.body {
+            Body::Claims {
+                claims,
+                turn_ends,
+                states,
+            } => {
+                assert_eq!(claims.len(), 1);
+                assert_eq!(turn_ends.len(), 1);
+                states
+            }
+            body => panic!("not claims: {body:?}"),
+        };
+        let unanchored = alice.seal(&claims(TurnState::Asks)).unwrap();
+        assert!(states_of(receiver.open(&unanchored).unwrap()).is_empty());
+
+        let request = receiver.request_screen().unwrap();
+        receiver
+            .open(&alice.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
+        let older = alice.seal(&claims(TurnState::Working)).unwrap();
+        let state_frame = alice
+            .seal(&Body::State(state_entry("alice", TurnState::Done)))
+            .unwrap();
+        receiver.open(&state_frame).unwrap();
+        assert!(states_of(receiver.open(&older).unwrap()).is_empty());
+        let newer = alice.seal(&claims(TurnState::Done)).unwrap();
+        assert_eq!(
+            states_of(receiver.open(&newer).unwrap()),
+            [state_entry("alice", TurnState::Done)]
+        );
+
+        let late_state = alice
+            .seal(&Body::State(state_entry("alice", TurnState::Working)))
+            .unwrap();
+        let newest = alice.seal(&claims(TurnState::Asks)).unwrap();
+        assert_eq!(
+            states_of(receiver.open(&newest).unwrap()),
+            [state_entry("alice", TurnState::Asks)]
+        );
+        assert_eq!(receiver.open(&late_state), Err(FrameError::Replayed));
+
+        let mut restarted = thread.sender(1);
+        let other_run = restarted.seal(&claims(TurnState::Asks)).unwrap();
+        assert!(states_of(receiver.open(&other_run).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn a_state_sent_before_the_screen_that_anchors_its_run_is_not_taken() {
+        let thread = Thread::new();
+        let mut receiver = thread.receiver();
+        let mut alice = thread.sender(1);
+        let request = receiver.request_screen().unwrap();
+        let state = alice
+            .seal(&Body::State(state_entry("alice", TurnState::Asks)))
+            .unwrap();
+        let claims = alice
+            .seal(&Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+                states: vec![state_entry("alice", TurnState::Asks)],
+            })
+            .unwrap();
+        receiver
+            .open(&alice.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
+        assert_eq!(receiver.open(&state), Err(FrameError::Replayed));
+        let late = receiver.open(&claims).unwrap();
+        assert!(!late.told_states);
+        assert!(matches!(late.body, Body::Claims { states, .. } if states.is_empty()));
+    }
+
+    #[test]
+    fn a_state_frame_overtaken_by_newer_output_is_still_taken_once() {
+        let thread = Thread::new();
+        let mut receiver = thread.receiver();
+        let mut alice = thread.sender(1);
+        let request = receiver.request_screen().unwrap();
+        receiver
+            .open(&alice.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
+        let asks = Body::State(state_entry("alice", TurnState::Asks));
+        let state = alice.seal(&asks).unwrap();
+        receiver
+            .open(&alice.seal(&output("alice", "more")).unwrap())
+            .unwrap();
+        assert_eq!(receiver.open(&state).unwrap().body, asks);
+        assert_eq!(receiver.open(&state), Err(FrameError::Replayed));
+        let mut stranger = thread.sender(1);
+        assert_eq!(
+            receiver.open(&stranger.seal(&asks).unwrap()),
+            Err(FrameError::Unanchored)
+        );
+    }
+
+    #[test]
+    fn a_claims_frame_tells_its_whole_list_of_states_only_from_the_anchored_run() {
+        let thread = Thread::new();
+        let mut receiver = thread.receiver();
+        let mut alice = thread.sender(1);
+        let none = Body::Claims {
+            claims: Vec::new(),
+            turn_ends: Vec::new(),
+            states: Vec::new(),
+        };
+        assert!(
+            !receiver
+                .open(&alice.seal(&none).unwrap())
+                .unwrap()
+                .told_states
+        );
+        let request = receiver.request_screen().unwrap();
+        receiver
+            .open(&alice.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
+        let told = receiver.open(&alice.seal(&none).unwrap()).unwrap();
+        assert!(told.told_states);
+        let output = receiver
+            .open(&alice.seal(&output("alice", "x")).unwrap())
+            .unwrap();
+        assert!(!output.told_states);
+    }
+
+    #[test]
+    fn a_claims_frame_overtaken_by_newer_output_still_tells_its_states() {
+        let thread = Thread::new();
+        let mut receiver = thread.receiver();
+        let mut alice = thread.sender(1);
+        let request = receiver.request_screen().unwrap();
+        receiver
+            .open(&alice.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
+        let claims = alice
+            .seal(&Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+                states: vec![state_entry("alice", TurnState::Working)],
+            })
+            .unwrap();
+        receiver
+            .open(&alice.seal(&output("alice", "more")).unwrap())
+            .unwrap();
+        let Body::Claims { states, .. } = receiver.open(&claims).unwrap().body else {
+            panic!("not claims");
+        };
+        assert_eq!(states, [state_entry("alice", TurnState::Working)]);
+    }
+
+    #[test]
     fn claims_carry_only_the_senders_states_one_per_agent_and_a_bounded_number() {
         let thread = Thread::new();
         let mut alice = thread.sender(1);
         let mut receiver = thread.receiver();
+        let request = receiver.request_screen().unwrap();
+        receiver
+            .open(&alice.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
         let listed = Body::Claims {
             claims: Vec::new(),
             turn_ends: Vec::new(),
-            states: vec![state("alice", TurnState::Done)],
+            states: vec![state_entry("alice", TurnState::Done)],
         };
         assert_eq!(
             receiver.open(&alice.seal(&listed).unwrap()).unwrap().body,
@@ -1593,8 +1799,8 @@ mod tests {
                 claims: Vec::new(),
                 turn_ends: Vec::new(),
                 states: vec![
-                    state("mallory", TurnState::Done),
-                    state("alice", TurnState::Asks),
+                    state_entry("mallory", TurnState::Done),
+                    state_entry("alice", TurnState::Asks),
                 ],
             })
             .unwrap();
@@ -1603,8 +1809,8 @@ mod tests {
             claims: Vec::new(),
             turn_ends: Vec::new(),
             states: vec![
-                state("alice", TurnState::Working),
-                state("alice", TurnState::Done),
+                state_entry("alice", TurnState::Working),
+                state_entry("alice", TurnState::Done),
             ],
         };
         assert_eq!(alice.seal(&twice), Err(FrameError::Malformed));

@@ -94,6 +94,7 @@ use mahi_live::{
     HostAddress,
     LiveKeys,
     Relays,
+    TurnState,
 };
 use mahi_proxy::HostName;
 use mahi_sandbox::{
@@ -1466,6 +1467,21 @@ impl Prepared {
         }
     }
 
+    /// Returns the state the agent starts in, when its profile's hooks report its turns:
+    /// working when a handoff gives it its first prompt, and otherwise done, waiting for one.
+    fn first_state(&self) -> Option<TurnState> {
+        let profile = self.profile.filter(|profile| profile.reports_turn_ends())?;
+        let prompted = self
+            .handoff
+            .as_deref()
+            .is_some_and(|notes| gives_first_prompt(Some(profile), notes));
+        Some(if prompted {
+            TurnState::Working
+        } else {
+            TurnState::Done
+        })
+    }
+
     fn launch(
         mut self,
         environment: &Environment,
@@ -1487,6 +1503,7 @@ impl Prepared {
                 },
                 dir: &source.dir,
             });
+        let first = self.first_state();
         let state = self.state_dir(&started);
         let launch = Launch {
             restore,
@@ -1525,7 +1542,7 @@ impl Prepared {
         let pusher = self
             .sync
             .map(|setup| start_pusher(setup, &self.git_dir, &started));
-        let activity = Arc::new(Activity::telling(live.as_ref().map(Link::tap)));
+        let activity = Arc::new(Activity::telling(live.as_ref().map(Link::tap), first));
         let key = started.key.take().map(Arc::new);
         let (recorder, turns) = start_background(
             &mut started,
@@ -1566,6 +1583,12 @@ impl Prepared {
         keep_hook_trust(self.profile, state, config.path());
         outcome
     }
+}
+
+/// Says whether an agent run with `profile` gets, as its first prompt, the request to read
+/// the handoff `notes`: its profile takes one, and the notes' path is text.
+fn gives_first_prompt(profile: Option<&Profile>, notes: &Path) -> bool {
+    profile.is_some_and(|profile| profile.takes_prompt) && notes.to_str().is_some()
 }
 
 /// Keeps in the user's configuration directory, for their later threads, the approvals of
@@ -2236,8 +2259,7 @@ impl Launch<'_> {
     /// profile takes one, or else tells the user to give it.
     fn ask_to_read(&self, pty: PtyCommand, notes: &Path) -> PtyCommand {
         let prompt = (self.first_prompt)(&notes.display().to_string());
-        let takes_prompt = self.profile.is_some_and(|profile| profile.takes_prompt);
-        if takes_prompt && notes.to_str().is_some() {
+        if gives_first_prompt(self.profile, notes) {
             return pty.arg("--").arg(&prompt);
         }
         eprintln!("mahi: tell the agent: {prompt}");
@@ -3383,6 +3405,16 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_handoff_starts_on_its_prompt_only_when_the_profile_takes_one_and_the_path_is_text() {
+        let claude = Profile::for_agent(OsStr::new("claude"));
+        let notes = Path::new("/tmp/notes.md");
+        assert!(gives_first_prompt(claude, notes));
+        assert!(!gives_first_prompt(None, notes));
+        let unreadable = Path::new(OsStr::from_bytes(b"/tmp/\xff.md"));
+        assert!(!gives_first_prompt(claude, unreadable));
     }
 
     #[test]

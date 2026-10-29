@@ -432,14 +432,10 @@ impl Tab {
         let count = teammates.map_or(0, |teammates| teammates.agents().len());
         let mut listed = Vec::with_capacity(self.agents.len() + count);
         listed.extend(self.agents.iter().map(Running::shown_as));
-        listed.extend(watched.map(|(slot, online)| WorkspaceAgent {
+        listed.extend(watched.map(|(slot, state)| WorkspaceAgent {
             owner: Some(slot.participant().as_str()),
             name: slot.agent().as_str(),
-            state: if online {
-                AgentState::Live
-            } else {
-                AgentState::Offline
-            },
+            state,
         }));
         listed
     }

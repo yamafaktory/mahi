@@ -4,7 +4,12 @@ use mahi_core::{
     AgentSlot,
     ParticipantName,
 };
-use mahi_live::Body;
+use mahi_live::{
+    Body,
+    StateEntry,
+    TurnState,
+};
+use mahi_term::AgentState;
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
@@ -42,6 +47,7 @@ struct Teammate {
     presence: Presence,
     screen: Watched,
     rebuilding: Option<Rebuilding>,
+    state: Option<TurnState>,
 }
 
 impl Teammate {
@@ -185,10 +191,16 @@ impl Teammates {
                 teammate.screen = Watched::Drawn(Box::new(screen));
                 true
             }
-            Body::ScreenRequest { .. }
-            | Body::Claims { .. }
-            | Body::TurnEnded(_)
-            | Body::State(_) => false,
+            Body::State(StateEntry { slot, state }) => {
+                let Some((teammate, new)) = self.seen(&slot, now) else {
+                    return false;
+                };
+                let changed = teammate.state != Some(state);
+                teammate.state = Some(state);
+                changed || new
+            }
+            Body::Claims { states, .. } => self.told(participant, states, now),
+            Body::ScreenRequest { .. } | Body::TurnEnded(_) => false,
         }
     }
 
@@ -233,6 +245,39 @@ impl Teammates {
         wanted
     }
 
+    /// Takes `states`, the whole list of the states `participant`'s run tells, which a
+    /// claims frame carries once its run is anchored: each agent listed gets its state, and
+    /// each other agent of theirs has none. Returns whether what is shown changed.
+    fn told(
+        &mut self,
+        participant: &ParticipantName,
+        states: Vec<StateEntry>,
+        now: Instant,
+    ) -> bool {
+        let mut changed = false;
+        let unlisted = self.agents.iter_mut().filter(|teammate| {
+            teammate.slot.participant() == participant
+                && !states.iter().any(|entry| entry.slot == teammate.slot)
+        });
+        for teammate in unlisted {
+            changed |= teammate.state.take().is_some();
+        }
+        for StateEntry { slot, state } in states {
+            if let Some((teammate, new)) = self.seen(&slot, now) {
+                changed |= new || teammate.state != Some(state);
+                teammate.state = Some(state);
+            }
+        }
+        changed
+    }
+
+    /// Says whether any teammate's agent is online.
+    pub(crate) fn any_online(&self) -> bool {
+        self.agents
+            .iter()
+            .any(|teammate| teammate.presence.is_online())
+    }
+
     /// Lists the agents not heard from for [`HOST_SILENCE`] at `now` as offline, and forgets
     /// their screens; returns whether one went offline.
     pub(crate) fn expire(&mut self, now: Instant) -> bool {
@@ -244,6 +289,7 @@ impl Teammates {
                 teammate.presence = Presence::Offline(Some(heard));
                 teammate.screen = Watched::Waiting;
                 teammate.rebuilding = None;
+                teammate.state = None;
                 changed = true;
             }
         }
@@ -276,6 +322,7 @@ impl Teammates {
                         presence: Presence::Offline(None),
                         screen: Watched::Waiting,
                         rebuilding: None,
+                        state: None,
                     },
                 );
                 added = true;
@@ -284,11 +331,22 @@ impl Teammates {
         added
     }
 
-    /// Returns the agents watched, in slot order, and whether each is online.
-    pub(crate) fn agents(&self) -> impl ExactSizeIterator<Item = (&AgentSlot, bool)> {
-        self.agents
-            .iter()
-            .map(|teammate| (&teammate.slot, teammate.presence.is_online()))
+    /// Returns the agents watched, in slot order, each with what it does: offline, live
+    /// until its host tells its state, then that state.
+    pub(crate) fn agents(&self) -> impl ExactSizeIterator<Item = (&AgentSlot, AgentState)> {
+        self.agents.iter().map(|teammate| {
+            let shown = if teammate.presence.is_online() {
+                match teammate.state {
+                    None => AgentState::Live,
+                    Some(TurnState::Working) => AgentState::Working,
+                    Some(TurnState::Done) => AgentState::Done,
+                    Some(TurnState::Asks) => AgentState::Asks,
+                }
+            } else {
+                AgentState::Offline
+            };
+            (&teammate.slot, shown)
+        })
     }
 
     /// Returns the screen of `slot`'s agent, once one arrived and while it is online.
@@ -376,6 +434,7 @@ impl Teammates {
                 presence: Presence::Online(now),
                 screen: Watched::Waiting,
                 rebuilding: None,
+                state: None,
             },
         );
         Some((self.agents.get_mut(index)?, true))
@@ -455,6 +514,10 @@ mod tests {
         "bob".parse().unwrap()
     }
 
+    fn carol() -> ParticipantName {
+        "carol".parse().unwrap()
+    }
+
     fn slot(slot: &str) -> AgentSlot {
         slot.parse().unwrap()
     }
@@ -504,9 +567,104 @@ mod tests {
         assert_eq!(
             teammates
                 .agents()
-                .map(|(slot, online)| (slot.to_string(), online))
+                .map(|(slot, state)| (slot.to_string(), state))
                 .collect::<Vec<_>>(),
-            [("bob.claude".to_owned(), true)]
+            [("bob.claude".to_owned(), AgentState::Live)]
+        );
+    }
+
+    fn told(slot_name: &str, state: TurnState) -> Body {
+        Body::State(StateEntry {
+            slot: slot(slot_name),
+            state,
+        })
+    }
+
+    #[test]
+    fn a_teammates_state_shows_once_told_and_is_forgotten_while_offline() {
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let shown = |teammates: &Teammates| teammates.agents().next().map(|(_, state)| state);
+        let now = Instant::now();
+        let beat = || Body::Heartbeat {
+            slot: slot("bob.claude"),
+        };
+        assert!(teammates.apply(&bob(), beat(), now));
+        assert_eq!(shown(&teammates), Some(AgentState::Live));
+        assert!(teammates.apply(&bob(), told("bob.claude", TurnState::Working), now));
+        assert_eq!(shown(&teammates), Some(AgentState::Working));
+        assert!(!teammates.apply(&bob(), told("bob.claude", TurnState::Working), now));
+        assert!(teammates.apply(&bob(), told("bob.claude", TurnState::Asks), now));
+        assert_eq!(shown(&teammates), Some(AgentState::Asks));
+        assert!(teammates.apply(&bob(), told("bob.claude", TurnState::Done), now));
+        assert_eq!(shown(&teammates), Some(AgentState::Done));
+        let later = now + HOST_SILENCE + Duration::from_secs(1);
+        assert!(teammates.expire(later));
+        assert_eq!(shown(&teammates), Some(AgentState::Offline));
+        assert!(teammates.apply(&bob(), beat(), later));
+        assert_eq!(shown(&teammates), Some(AgentState::Live));
+        assert!(!teammates.apply(
+            &"alice".parse().unwrap(),
+            told("alice.claude", TurnState::Working),
+            later
+        ));
+        assert_eq!(teammates.agents().count(), 1);
+    }
+
+    #[test]
+    fn a_teammate_is_online_while_any_of_their_agents_is() {
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        assert!(!teammates.any_online());
+        let known = [slot("bob.codex")];
+        teammates.add_offline(&known);
+        assert!(!teammates.any_online());
+        let now = Instant::now();
+        teammates.apply(&bob(), told("bob.codex", TurnState::Done), now);
+        assert!(teammates.any_online());
+        teammates.expire(now + HOST_SILENCE + Duration::from_secs(1));
+        assert!(!teammates.any_online());
+    }
+
+    #[test]
+    fn a_claims_frames_states_replace_those_of_the_participants_agents() {
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let now = Instant::now();
+        assert!(teammates.apply(&bob(), told("bob.claude", TurnState::Working), now));
+        assert!(teammates.apply(&carol(), told("carol.claude", TurnState::Asks), now));
+        let claims = |states: Vec<StateEntry>| Body::Claims {
+            claims: Vec::new(),
+            turn_ends: Vec::new(),
+            states,
+        };
+        let codex_done = StateEntry {
+            slot: slot("bob.codex"),
+            state: TurnState::Done,
+        };
+        assert!(teammates.apply(&bob(), claims(vec![codex_done.clone()]), now));
+        assert!(!teammates.apply(&bob(), claims(vec![codex_done]), now));
+        let listed: Vec<(String, AgentState)> = teammates
+            .agents()
+            .map(|(slot, state)| (slot.to_string(), state))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("bob.claude".to_owned(), AgentState::Live),
+                ("bob.codex".to_owned(), AgentState::Done),
+                ("carol.claude".to_owned(), AgentState::Asks),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_state_lists_a_teammates_agent_not_heard_from_yet() {
+        let mut teammates = Teammates::new("alice".parse().unwrap());
+        assert!(teammates.apply(&bob(), told("bob.codex", TurnState::Done), Instant::now()));
+        assert_eq!(
+            teammates
+                .agents()
+                .map(|(slot, state)| (slot.to_string(), state))
+                .collect::<Vec<_>>(),
+            [("bob.codex".to_owned(), AgentState::Done)]
         );
     }
 
@@ -553,8 +711,8 @@ mod tests {
         assert!(teammates.screen(&slot("bob.claude")).is_none());
         assert!(!clock.asks(&mut teammates));
         assert_eq!(
-            teammates.agents().next().map(|(_, online)| online),
-            Some(false)
+            teammates.agents().next().map(|(_, state)| state),
+            Some(AgentState::Offline)
         );
         assert!(teammates.apply(
             &bob(),
@@ -707,15 +865,15 @@ mod tests {
         ];
         assert!(teammates.add_offline(&known));
         assert!(!teammates.add_offline(&known));
-        let listed: Vec<(String, bool)> = teammates
+        let listed: Vec<(String, AgentState)> = teammates
             .agents()
-            .map(|(slot, online)| (slot.to_string(), online))
+            .map(|(slot, state)| (slot.to_string(), state))
             .collect();
         assert_eq!(
             listed,
             [
-                ("bob.codex".to_owned(), false),
-                ("carol.claude".to_owned(), false)
+                ("bob.codex".to_owned(), AgentState::Offline),
+                ("carol.claude".to_owned(), AgentState::Offline)
             ]
         );
         let mut clock = Clock::new();
