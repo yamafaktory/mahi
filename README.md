@@ -174,6 +174,30 @@ are recorded, and give it `mahi mcp`, so it gets the thread's tools. A profile f
 `state-env`, keeps mahi reading its sessions. Every field is described in
 [DESIGN.md](DESIGN.md#adapters-agent-specific); `mahi run --no-profile` runs an agent bare.
 
+## What a thread keeps
+
+A thread keeps three records of each agent. Snapshots hold its worktree, the transcript holds
+the prompts and tool calls of its turns, and the session holds the agent's own session files.
+Some things stay out of them:
+
+- **Ignored files.** A snapshot records what `git add -A` would. Untracked files that
+  `.gitignore` excludes, such as build output, stay out. `mahi end` removes them with the
+  worktree.
+- **Files a snapshot cannot record.** Examples are files over 256 MiB, unreadable files, and
+  names git refuses, such as `.GIT` or `git~1`. Once a snapshot adds 512 MiB of new content, it
+  also leaves out the other files with new content. The run counts the paths it left out when
+  it ends. `mahi end` lists them and refuses, unless you give `--force`.
+- **The agent's commits.** A snapshot keeps the files of a commit the agent made, not the
+  commit. A file the agent added to git although it is ignored stays out of later snapshots.
+- **Questions to you.** The transcript does not keep an agent's questions, such as a
+  permission prompt.
+- **Snapshots on a public remote.** Snapshots are not encrypted, so mahi never pushes them to
+  a remote that `mahi remote <name> --public` chose. Collaborators then get turn-end snapshots
+  only over the live layer, while the host is online. The encrypted transcripts and sessions
+  still go to the remote, and so does the owner's `meta`.
+- **Anything on the remote, until you choose one.** mahi pushes nothing until `mahi remote`
+  chooses a remote. Teammates still watch live and get turn-end snapshots over the live layer.
+
 ## Commands
 
 | Command | What it does |
