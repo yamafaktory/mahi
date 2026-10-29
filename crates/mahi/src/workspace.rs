@@ -421,6 +421,16 @@ struct Tab {
     watch_only: bool,
     sync: SyncView,
     synced: Option<(Instant, String)>,
+    picked: Picked,
+}
+
+/// Who chose the teammate's agent a tab without an agent of the user's shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Picked {
+    /// mahi did, showing the thread's owner's agent first, so it moves to theirs once heard.
+    ByMahi,
+    /// The user did, in the palette, so it stays.
+    ByUser,
 }
 
 impl Tab {
@@ -520,10 +530,13 @@ impl Tab {
     }
 
     fn reselect(&mut self, teammates: Option<&Teammates>) {
+        let picked_by_mahi = self.agents.is_empty() && self.picked == Picked::ByMahi;
+        if picked_by_mahi || (self.watching.is_none() && self.agents.is_empty()) {
+            let first = teammates.map_or(0, Teammates::first_shown);
+            self.select(first, teammates);
+            return;
+        }
         let Some(slot) = &self.watching else {
-            if self.agents.is_empty() {
-                self.select(0, teammates);
-            }
             return;
         };
         let place = teammates
@@ -785,6 +798,7 @@ impl Workspace {
             watch_only: false,
             sync: SyncView::default(),
             synced: None,
+            picked: Picked::ByMahi,
         });
         self.tabs.len() - 1
     }
@@ -1632,6 +1646,7 @@ impl Workspace {
         {
             let teammates = teammates_of(self.live.as_ref(), tab.thread);
             tab.select(index, teammates);
+            tab.picked = Picked::ByUser;
         }
     }
 
@@ -1643,6 +1658,7 @@ impl Workspace {
         {
             let teammates = teammates_of(self.live.as_ref(), tab.thread);
             tab.select_teammate(slot, teammates);
+            tab.picked = Picked::ByUser;
         }
     }
 
@@ -2048,6 +2064,7 @@ mod tests {
             watch_only: false,
             sync: SyncView::default(),
             synced: None,
+            picked: Picked::ByMahi,
         }
     }
 
@@ -2609,7 +2626,7 @@ mod tests {
         );
         let own = running(&mut workspace, "sleep 5");
         let tab = tab("a", vec![own]);
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         heard(&mut teammates, "bob.claude");
         heard(&mut teammates, "carol.codex");
         let area = Rect::new(0, 0, 100, 12);
@@ -2672,8 +2689,30 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_without_an_agent_of_the_users_shows_the_owners_agent_once_heard_until_one_is_chosen() {
+        let mut teammates = Teammates::new("carol".parse().unwrap(), "alice".parse().unwrap());
+        let mut watching = tab("a", Vec::new());
+        heard(&mut teammates, "bob.codex");
+        watching.reselect(Some(&teammates));
+        assert_eq!(watching.watching, Some("bob.codex".parse().unwrap()));
+        heard(&mut teammates, "alice.claude");
+        watching.reselect(Some(&teammates));
+        assert_eq!(watching.watching, Some("alice.claude".parse().unwrap()));
+        assert_eq!(watching.selected, 0);
+        watching.select_teammate(&"bob.codex".parse().unwrap(), Some(&teammates));
+        watching.picked = Picked::ByUser;
+        watching.reselect(Some(&teammates));
+        assert_eq!(watching.watching, Some("bob.codex".parse().unwrap()));
+        let mut without_owner = Teammates::new("carol".parse().unwrap(), "carol".parse().unwrap());
+        heard(&mut without_owner, "bob.codex");
+        let mut first = tab("b", Vec::new());
+        first.reselect(Some(&without_owner));
+        assert_eq!(first.watching, Some("bob.codex".parse().unwrap()));
+    }
+
+    #[test]
     fn a_teammates_agent_chosen_by_its_slot_is_found_wherever_the_list_moved_it() {
-        let mut both = Teammates::new("alice".parse().unwrap());
+        let mut both = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         heard(&mut both, "bob.claude");
         heard(&mut both, "bob.codex");
         let mut workspace = Workspace::new(
@@ -2685,7 +2724,7 @@ mod tests {
         let codex: AgentSlot = "bob.codex".parse().unwrap();
         tab.select_teammate(&codex, Some(&both));
         assert_eq!((tab.selected, tab.watching.as_ref()), (2, Some(&codex)));
-        let mut one = Teammates::new("alice".parse().unwrap());
+        let mut one = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         heard(&mut one, "bob.codex");
         tab.select(0, Some(&one));
         tab.select_teammate(&codex, Some(&one));
@@ -2737,7 +2776,7 @@ mod tests {
         );
         let own = running(&mut workspace, "sleep 5");
         let mut tab = tab("a", vec![own]);
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         heard(&mut teammates, "bob.claude");
         let listed: Vec<(Option<&str>, &str, AgentState)> = tab
             .listed(Some(&teammates))
@@ -2785,7 +2824,7 @@ mod tests {
             PaletteKey::default(),
             Notice::for_terminal(TerminalHints::default()),
         );
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         heard(&mut teammates, "bob.claude");
         heard(&mut teammates, "bob.codex");
         let first = running(&mut workspace, "sleep 5");
@@ -2811,7 +2850,7 @@ mod tests {
         );
         let own = running(&mut workspace, "read line; echo \"got $line\"; sleep 5");
         let mut tab = tab("a", vec![own]);
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         heard(&mut teammates, "bob.claude");
         tab.select(1, Some(&teammates));
         workspace.tabs.push(tab);

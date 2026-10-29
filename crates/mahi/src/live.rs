@@ -2295,7 +2295,10 @@ mod tests {
         );
         assert!(bob.watch().is_none());
         let watch = alice.watch().unwrap();
-        let mut teammates = Teammates::new(ParticipantName::new("alice").unwrap());
+        let mut teammates = Teammates::new(
+            ParticipantName::new("alice").unwrap(),
+            ParticipantName::new("alice").unwrap(),
+        );
         let shown = watched_until(watch, &mut teammates, &slot, "bob's agent");
         assert!(shown.contains("bob's agent"), "{shown:?}");
         bob.tap().unwrap().output(b" works");
@@ -2324,7 +2327,7 @@ mod tests {
         };
         watching.pass_states((node, &alice), vec![entry(&alice)], &alice);
         watching.pass_states((node, &bob), vec![entry(&bob)], &alice);
-        let mut teammates = Teammates::new(alice.clone());
+        let mut teammates = Teammates::new(alice.clone(), alice.clone());
         assert!(watch.update(&mut teammates, Instant::now()));
         assert_eq!(
             teammates

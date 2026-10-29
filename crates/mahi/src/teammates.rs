@@ -39,6 +39,7 @@ const TAB_STOP: usize = 8;
 #[derive(Debug)]
 pub(crate) struct Teammates {
     own: ParticipantName,
+    owner: ParticipantName,
     agents: Vec<Teammate>,
     lost: bool,
     asked_at: Option<Instant>,
@@ -122,10 +123,12 @@ impl std::fmt::Debug for Watched {
 }
 
 impl Teammates {
-    /// Starts watching the agents of every participant of a thread but `own`, the user.
-    pub(crate) fn new(own: ParticipantName) -> Self {
+    /// Starts watching the agents of every participant of a thread but `own`, the user, in a
+    /// thread `owner` owns.
+    pub(crate) fn new(own: ParticipantName, owner: ParticipantName) -> Self {
         Self {
             own,
+            owner,
             agents: Vec::new(),
             lost: false,
             asked_at: None,
@@ -388,6 +391,15 @@ impl Teammates {
         })
     }
 
+    /// Returns the place of the agent a tab without an agent of the user's shows first: the
+    /// thread's owner's first, or else the first watched.
+    pub(crate) fn first_shown(&self) -> usize {
+        self.agents
+            .iter()
+            .position(|teammate| teammate.slot.participant() == &self.owner)
+            .unwrap_or(0)
+    }
+
     /// Returns the user's own name, whose agents are not watched.
     pub(crate) fn own(&self) -> &ParticipantName {
         &self.own
@@ -459,6 +471,7 @@ impl Teammates {
                     .agents
                     .iter()
                     .enumerate()
+                    .filter(|(_, teammate)| teammate.slot.participant() != &self.owner)
                     .filter_map(|(index, teammate)| match teammate.presence {
                         Presence::Offline(heard) => Some((index, heard)),
                         Presence::Online(_) => None,
@@ -588,7 +601,7 @@ mod tests {
 
     #[test]
     fn a_teammates_agent_is_listed_asked_for_and_drawn_from_its_screen_and_output() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let mut clock = Clock::new();
         let now = Instant::now();
         assert!(clock.asks(&mut teammates));
@@ -627,7 +640,7 @@ mod tests {
 
     #[test]
     fn a_teammates_state_shows_once_told_and_is_forgotten_while_offline() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let shown = |teammates: &Teammates| teammates.agents().next().map(|(_, state)| state);
         let now = Instant::now();
         let beat = || Body::Heartbeat {
@@ -657,7 +670,7 @@ mod tests {
 
     #[test]
     fn a_teammate_is_online_while_any_of_their_agents_is() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         assert!(!teammates.any_online());
         let known = [slot("bob.codex")];
         teammates.add_offline(&known);
@@ -671,7 +684,7 @@ mod tests {
 
     #[test]
     fn a_claims_frames_states_replace_those_of_the_participants_agents() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let now = Instant::now();
         assert!(teammates.apply(&bob(), told("bob.claude", TurnState::Working), now));
         assert!(teammates.apply(&carol(), told("carol.claude", TurnState::Asks), now));
@@ -701,8 +714,34 @@ mod tests {
     }
 
     #[test]
+    fn the_owners_agent_stays_listed_when_a_full_list_makes_room() {
+        let mut teammates = Teammates::new(carol(), bob());
+        let mut known = vec![slot("bob.claude")];
+        known.extend((1..MOST_WATCHED).map(|index| slot(&format!("dan{index}.claude"))));
+        assert!(teammates.add_offline(&known));
+        assert_eq!(teammates.agents().len(), MOST_WATCHED);
+        let zed: ParticipantName = "zed".parse().unwrap();
+        let beat = Body::Heartbeat {
+            slot: slot("zed.claude"),
+        };
+        assert!(teammates.apply(&zed, beat, Instant::now()));
+        assert_eq!(teammates.agents().len(), MOST_WATCHED);
+        assert!(
+            teammates
+                .agents()
+                .any(|(slot, _)| slot.to_string() == "bob.claude")
+        );
+        assert!(
+            teammates
+                .agents()
+                .any(|(slot, _)| slot.to_string() == "zed.claude")
+        );
+        assert_eq!(teammates.first_shown(), 0);
+    }
+
+    #[test]
     fn a_state_lists_a_teammates_agent_not_heard_from_yet() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         assert!(teammates.apply(&bob(), told("bob.codex", TurnState::Done), Instant::now()));
         assert_eq!(
             teammates
@@ -716,7 +755,7 @@ mod tests {
     #[test]
     fn a_new_watcher_asks_until_it_hears_an_agent_for_at_most_the_host_silence() {
         let start = Instant::now();
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         assert!(teammates.take_wants_screen(start));
         assert!(!teammates.take_wants_screen(start + ASK_EVERY));
         assert!(teammates.take_wants_screen(start + STUCK_SCREEN));
@@ -725,14 +764,14 @@ mod tests {
         assert!(teammates.take_wants_screen(later));
         assert!(teammates.apply(&bob(), screen("bob.claude", (2, 20), b"hi"), later));
         assert!(!teammates.take_wants_screen(start + STUCK_SCREEN * 3));
-        let mut unanswered = Teammates::new("alice".parse().unwrap());
+        let mut unanswered = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         assert!(unanswered.take_wants_screen(start));
         assert!(!unanswered.take_wants_screen(start + HOST_SILENCE));
     }
 
     #[test]
     fn the_users_own_agents_are_not_watched_and_a_lost_frame_asks_again_once() {
-        let mut teammates = Teammates::new(bob());
+        let mut teammates = Teammates::new(bob(), bob());
         let mut clock = Clock::new();
         assert!(!teammates.apply(&bob(), screen("bob.claude", (2, 20), b"me"), Instant::now()));
         assert_eq!(teammates.agents().count(), 0);
@@ -745,7 +784,7 @@ mod tests {
 
     #[test]
     fn a_silent_agent_goes_offline_without_its_screen_and_comes_back_when_heard() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let mut clock = Clock::new();
         let then = Instant::now();
         teammates.apply(&bob(), screen("bob.claude", (2, 20), b"hi"), then);
@@ -771,7 +810,7 @@ mod tests {
 
     #[test]
     fn a_screen_too_large_is_not_kept_nor_asked_for_again() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let mut clock = Clock::new();
         let now = Instant::now();
         assert!(teammates.apply(&bob(), screen("bob.claude", (1000, 1000), b"big"), now));
@@ -798,7 +837,7 @@ mod tests {
 
     #[test]
     fn the_parts_of_two_agents_screens_may_interleave() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let now = Instant::now();
         let part = |slot: &str, index: u16, bytes: &[u8]| Body::Screen {
             slot: self::slot(slot),
@@ -825,7 +864,7 @@ mod tests {
 
     #[test]
     fn a_new_agent_takes_the_place_of_the_longest_silent_one_when_the_list_is_full() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let then = Instant::now();
         for agent in 0..MOST_WATCHED {
             let heartbeat = Body::Heartbeat {
@@ -854,7 +893,7 @@ mod tests {
 
     #[test]
     fn screens_are_asked_for_at_most_once_a_second_and_again_for_one_stuck() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let then = Instant::now();
         let first = Body::Screen {
             slot: slot("bob.claude"),
@@ -878,7 +917,7 @@ mod tests {
 
     #[test]
     fn a_screen_on_its_way_when_the_agent_grew_too_large_is_not_drawn() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let now = Instant::now();
         let part = |index: u16| Body::Screen {
             slot: slot("bob.claude"),
@@ -902,7 +941,7 @@ mod tests {
 
     #[test]
     fn agents_of_the_threads_refs_are_listed_offline_until_heard_and_go_first_when_full() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let known = [
             slot("alice.claude"),
             slot("bob.codex"),
@@ -957,7 +996,7 @@ mod tests {
 
     #[test]
     fn a_record_of_an_offline_agents_work_shows_only_until_its_host_is_heard() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let codex = slot("bob.codex");
         teammates.add_offline([&codex]);
         assert!(teammates.wants_record(&codex));
@@ -986,7 +1025,7 @@ mod tests {
 
     #[test]
     fn a_record_shows_from_its_top_with_long_lines_wrapped_and_no_control_characters() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let codex = slot("bob.codex");
         teammates.add_offline([&codex]);
         teammates.set_record(&codex, "first\n123456789\nthird\nfourth\nfifth", (4, 5));
@@ -1024,7 +1063,7 @@ mod tests {
 
     #[test]
     fn a_teammates_screen_narrowed_past_a_wide_character_or_one_row_high_still_draws() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let now = Instant::now();
         let claude = slot("bob.claude");
         assert!(teammates.apply(
@@ -1049,7 +1088,7 @@ mod tests {
 
     #[test]
     fn at_most_sixteen_agents_are_watched() {
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         let now = Instant::now();
         for agent in 0..20 {
             let heartbeat = Body::Heartbeat {

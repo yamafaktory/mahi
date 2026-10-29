@@ -239,7 +239,7 @@ impl WorkspaceLive {
             .and_then(|socket| Hub::start(socket, host.handle()));
         match hub {
             Ok(hub) => {
-                let mut teammates = Teammates::new(participant);
+                let mut teammates = Teammates::new(participant, meta.owner().clone());
                 teammates.add_offline(&known_agents(&store, &meta));
                 self.hosted.insert(
                     thread,

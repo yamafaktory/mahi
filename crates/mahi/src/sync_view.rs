@@ -179,7 +179,7 @@ mod tests {
             ["bob.claude", "carol.codex", "dan.claude"]
         );
 
-        let mut teammates = Teammates::new("alice".parse().unwrap());
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         for slot in [&bob, &carol] {
             teammates.apply(
                 slot.participant(),
