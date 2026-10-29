@@ -716,6 +716,12 @@ impl FrameReceiver {
             .retain(|node, _| participants.contains_key(node));
     }
 
+    /// Says whether this receiver anchored a run of any sender.
+    #[must_use]
+    pub fn anchored_any(&self) -> bool {
+        !self.senders.is_empty()
+    }
+
     /// Returns a request for the agents' screens, with a new challenge that anchors the runs
     /// of the senders that answer it.
     ///
@@ -1748,6 +1754,19 @@ mod tests {
             .open(&alice.seal(&output("alice", "x")).unwrap())
             .unwrap();
         assert!(!output.told_states);
+    }
+
+    #[test]
+    fn a_receiver_says_once_it_anchored_a_run() {
+        let thread = Thread::new();
+        let mut receiver = thread.receiver();
+        let mut alice = thread.sender(1);
+        assert!(!receiver.anchored_any());
+        let request = receiver.request_screen().unwrap();
+        receiver
+            .open(&alice.seal(&screen("alice", &request)).unwrap())
+            .unwrap();
+        assert!(receiver.anchored_any());
     }
 
     #[test]

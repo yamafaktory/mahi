@@ -162,6 +162,7 @@ const PENDING_SCREENS: usize = 8;
 const LISTEN_PAUSE: Duration = Duration::from_millis(200);
 const UNASKED: [u8; 16] = [0; 16];
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+const ANCHOR_EVERY: Duration = Duration::from_secs(3);
 /// How often a host sends its claims again when they did not change.
 const CLAIMS_EVERY: Duration = Duration::from_secs(10);
 
@@ -572,6 +573,8 @@ pub(crate) struct LiveHost {
     queue: SyncSender<Tapped>,
     dropped: Arc<AtomicBool>,
     watch: Option<Watch>,
+    #[cfg(test)]
+    anchored: Arc<AtomicBool>,
 }
 
 /// What a host serves besides the agents the user's other mahis hand it.
@@ -693,14 +696,7 @@ impl Watching {
     /// agent is a participant's other than `owner`, and noting that frames were lost when
     /// there is no room for it; returns any other frame.
     fn pass(&self, received: Received, owner: &ParticipantName) -> Option<Received> {
-        if !matches!(
-            received.body,
-            Body::Screen { .. }
-                | Body::Output { .. }
-                | Body::Resize { .. }
-                | Body::Heartbeat { .. }
-                | Body::State(_)
-        ) {
+        if shown_slot(&received.body).is_none() {
             return Some(received);
         }
         if &received.participant != owner {
@@ -732,11 +728,8 @@ impl Watching {
     /// Hands the broadcaster a request for the agents' screens, made by `receiver` so that it
     /// anchors the runs that answer, when the workspace asked for one.
     fn ask_if_wanted(&self, receiver: &mut FrameReceiver) {
-        if !self.ask.swap(false, Ordering::SeqCst) {
-            return;
-        }
-        if let (Ok(request), Ok(mut queue)) = (receiver.request_screen(), self.request.lock()) {
-            queue.push(request);
+        if self.ask.swap(false, Ordering::SeqCst) {
+            queue_request(receiver, &self.request);
         }
     }
 }
@@ -759,6 +752,12 @@ impl std::fmt::Debug for Registry {
 }
 
 impl LiveHost {
+    /// Says whether this host anchored a teammate's run, for tests.
+    #[cfg(test)]
+    pub(crate) fn anchored(&self) -> bool {
+        self.anchored.load(Ordering::SeqCst)
+    }
+
     /// Opens the live layer for `slot`'s agent in `thread`, whose `meta` is read from
     /// `git_dir`, with the agent's terminal at `size`.
     pub(crate) fn start(
@@ -822,6 +821,7 @@ impl LiveHost {
         let wanted = Arc::new(Mutex::new(VecDeque::with_capacity(PENDING_SCREENS)));
         let stop_broadcast = Arc::new(AtomicBool::new(false));
         let request = Arc::new(Mutex::new(Vec::new()));
+        let anchored = Arc::new(AtomicBool::new(false));
         let (watch, watching) = watches.then(|| Watch::open(&request)).unzip();
         let broadcaster = Broadcaster {
             topic: Arc::clone(&topic),
@@ -831,9 +831,10 @@ impl LiveHost {
             dropped: Arc::clone(&dropped),
             wanted: Arc::clone(&wanted),
             stop: Arc::clone(&stop_broadcast),
-            sent_at: Instant::now(),
+            shown_at: HashMap::new(),
+            heartbeats_at: None,
             claims: (Arc::clone(&claims), me.clone(), None),
-            request,
+            request: Arc::clone(&request),
             turn_ends: TurnEnds::new(git_dir, thread),
         };
         let listener = Listener {
@@ -846,6 +847,9 @@ impl LiveHost {
             stop: Arc::clone(&stop),
             claims: Arc::clone(&claims),
             heard,
+            request,
+            anchoring_at: None,
+            anchored: Arc::clone(&anchored),
         };
         let publisher = {
             let (node, stop, config) = (Arc::clone(&node), Arc::clone(&stop), setup.config.clone());
@@ -877,6 +881,8 @@ impl LiveHost {
             queue,
             dropped,
             watch,
+            #[cfg(test)]
+            anchored,
         })
     }
 
@@ -1284,7 +1290,8 @@ struct Broadcaster {
     dropped: Arc<AtomicBool>,
     wanted: Arc<Mutex<VecDeque<[u8; 16]>>>,
     stop: Arc<AtomicBool>,
-    sent_at: Instant,
+    shown_at: HashMap<AgentSlot, Instant>,
+    heartbeats_at: Option<Instant>,
     claims: (Arc<Claims>, Option<AgentSlot>, Option<Instant>),
     request: Arc<Mutex<Vec<Body>>>,
     turn_ends: TurnEnds,
@@ -1317,12 +1324,7 @@ impl Broadcaster {
             self.send_turn_ends_if_any(store.as_ref());
             self.send_states_if_changed();
             self.send_claims_if_needed();
-            if self.sent_at.elapsed() >= HEARTBEAT_EVERY {
-                for slot in self.slots() {
-                    self.send(&Body::Heartbeat { slot });
-                }
-                self.sent_at = Instant::now();
-            }
+            self.send_heartbeats_if_due();
             let Ok(tapped) = self.tapped.recv_timeout(LISTEN_PAUSE) else {
                 continue;
             };
@@ -1527,15 +1529,70 @@ impl Broadcaster {
         }
     }
 
+    /// Sends `body`, and notes when it shows an agent, which keeps that agent online for its
+    /// viewers; returns whether it was sent.
     fn send(&mut self, body: &Body) -> bool {
         let sent = self
             .sender
             .seal(body)
             .is_ok_and(|frame| self.topic.broadcast(frame).is_ok());
-        if sent {
-            self.sent_at = Instant::now();
+        if sent && let Some(slot) = shown_slot(body) {
+            match self.shown_at.get_mut(slot) {
+                Some(at) => *at = Instant::now(),
+                None => {
+                    self.shown_at.insert(slot.clone(), Instant::now());
+                }
+            }
         }
         sent
+    }
+
+    /// Sends a heartbeat for each agent served that no frame showed for [`HEARTBEAT_EVERY`],
+    /// looking at most every [`LISTEN_PAUSE`] times five.
+    fn send_heartbeats_if_due(&mut self) {
+        if self
+            .heartbeats_at
+            .is_some_and(|at| at.elapsed() < LISTEN_PAUSE * 5)
+        {
+            return;
+        }
+        let now = Instant::now();
+        self.heartbeats_at = Some(now);
+        let mut slots = self.slots();
+        self.shown_at.retain(|slot, _| slots.contains(slot));
+        slots.retain(|slot| heartbeat_due(&self.shown_at, slot, now));
+        for slot in slots {
+            self.send(&Body::Heartbeat { slot });
+        }
+    }
+}
+
+/// Returns the agent `body` shows, when it draws the agent or tells its state, which a viewer
+/// takes as a sign that the agent is online.
+fn shown_slot(body: &Body) -> Option<&AgentSlot> {
+    match body {
+        Body::Output { slot, .. }
+        | Body::Resize { slot, .. }
+        | Body::Heartbeat { slot }
+        | Body::Screen { slot, .. } => Some(slot),
+        Body::State(entry) => Some(&entry.slot),
+        Body::ScreenRequest { .. } | Body::Claims { .. } | Body::TurnEnded(_) => None,
+    }
+}
+
+/// Says whether the agent `slot` needs a heartbeat at `now`: no frame showed it, as
+/// `shown_at` notes, for [`HEARTBEAT_EVERY`].
+fn heartbeat_due(shown_at: &HashMap<AgentSlot, Instant>, slot: &AgentSlot, now: Instant) -> bool {
+    shown_at
+        .get(slot)
+        .is_none_or(|at| now.saturating_duration_since(*at) >= HEARTBEAT_EVERY)
+}
+
+/// Queues a request for the agents' screens, made by `receiver` so that it anchors the runs
+/// that answer, for the broadcaster to send through `request`.
+fn queue_request(receiver: &mut FrameReceiver, request: &Mutex<Vec<Body>>) {
+    if let (Ok(made), Ok(mut queue)) = (receiver.request_screen(), request.lock()) {
+        queue.push(made);
     }
 }
 
@@ -1551,6 +1608,9 @@ struct Listener {
     stop: Arc<AtomicBool>,
     claims: Arc<Claims>,
     heard: Arc<Heard>,
+    request: Arc<Mutex<Vec<Body>>>,
+    anchoring_at: Option<Instant>,
+    anchored: Arc<AtomicBool>,
 }
 
 impl Listener {
@@ -1566,15 +1626,20 @@ impl Listener {
             if let Some(watching) = &self.watching {
                 watching.note_dropped(self.topic.dropped(), &mut dropped);
                 watching.ask_if_wanted(&mut self.receiver);
+            } else if !self.receiver.anchored_any() {
+                self.anchor();
             }
+            self.anchored
+                .store(self.receiver.anchored_any(), Ordering::SeqCst);
             let Ok(Some(frame)) = self.topic.receive(LISTEN_PAUSE) else {
                 continue;
             };
             let received = match self.receiver.open(&frame) {
                 Ok(received) => received,
                 Err(FrameError::Unanchored) => {
-                    if let Some(watching) = &self.watching {
-                        watching.lost.store(true, Ordering::SeqCst);
+                    match &self.watching {
+                        Some(watching) => watching.lost.store(true, Ordering::SeqCst),
+                        None => self.anchor(),
                     }
                     continue;
                 }
@@ -1625,6 +1690,22 @@ impl Listener {
                 answered.insert(received.sender, Instant::now());
             }
         }
+    }
+
+    /// Asks for the agents' screens, at most every [`ANCHOR_EVERY`] and only while `meta`
+    /// lists another collaborator, until a run is anchored and whenever a run's frames arrive
+    /// unanchored, so the runs answer and are anchored, and their states and turn ends are
+    /// taken; a host without a watch keeps no screen it gets.
+    fn anchor(&mut self) {
+        if self
+            .anchoring_at
+            .is_some_and(|at| at.elapsed() < ANCHOR_EVERY)
+            || !self.peers.has_other_collaborator(&self.owner)
+        {
+            return;
+        }
+        self.anchoring_at = Some(Instant::now());
+        queue_request(&mut self.receiver, &self.request);
     }
 
     fn hear_turn_ends(&self, participant: &ParticipantName, sender: NodeId, turn_ends: &[TurnEnd]) {
@@ -1686,6 +1767,17 @@ impl HostPeers {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Says whether the host's `meta` lists a collaborator other than `own`, the user.
+    fn has_other_collaborator(&self, own: &ParticipantName) -> bool {
+        self.reread_if_due();
+        self.cache.lock().is_ok_and(|cache| {
+            cache
+                .collaborators
+                .iter()
+                .any(|node| cache.participants.get(node).is_some_and(|name| name != own))
+        })
     }
 
     /// Says whether `node` is a collaborator's, as the host's `meta` lists it now.
@@ -1899,6 +1991,55 @@ mod tests {
             reread_every,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn each_agent_gets_a_heartbeat_once_no_frame_showed_it_for_five_seconds() {
+        let (busy, quiet) = (agent("alice"), agent("bob"));
+        let now = Instant::now();
+        let mut shown_at = HashMap::new();
+        assert!(heartbeat_due(&shown_at, &busy, now));
+        shown_at.insert(busy.clone(), now);
+        shown_at.insert(quiet.clone(), now);
+        let later = now + HEARTBEAT_EVERY;
+        shown_at.insert(busy.clone(), now + Duration::from_secs(1));
+        assert!(!heartbeat_due(&shown_at, &busy, later));
+        assert!(heartbeat_due(&shown_at, &quiet, later));
+        assert_eq!(
+            shown_slot(&Body::Heartbeat {
+                slot: quiet.clone()
+            }),
+            Some(&quiet)
+        );
+        assert_eq!(
+            shown_slot(&Body::ScreenRequest { challenge: [1; 16] }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_host_asks_to_anchor_runs_only_while_meta_lists_another_collaborator() {
+        let hosted = hosted();
+        let peers = peers(&hosted, Duration::ZERO);
+        let owner = ParticipantName::new("alice").unwrap();
+        assert!(!peers.has_other_collaborator(&owner));
+        let bob = Participant::new(
+            ParticipantName::new("bob").unwrap(),
+            ParticipantKey::from_public_key(
+                PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+                    .unwrap()
+                    .public_key(),
+            )
+            .unwrap(),
+            age::x25519::Identity::generate().to_public(),
+            NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
+        )
+        .unwrap();
+        relist(&hosted, &bob, Role::Watcher);
+        assert!(!peers.has_other_collaborator(&owner));
+        relist(&hosted, &bob, Role::Collaborator);
+        assert!(peers.has_other_collaborator(&owner));
+        assert!(peers.has_other_collaborator(&ParticipantName::new("bob").unwrap()));
     }
 
     #[test]
@@ -2222,6 +2363,88 @@ mod tests {
                 .as_deref(),
             Some(b"bob's work".as_slice())
         );
+        alice_host.stop();
+        bob_host.stop();
+    }
+
+    #[test]
+    fn a_collaborators_host_anchors_a_teammates_run_and_takes_its_turn_end_at_once() {
+        let hosted = hosted();
+        let bob_signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let bob_node = NodeKey::generate().unwrap();
+        let bob = Participant::new(
+            ParticipantName::new("bob").unwrap(),
+            ParticipantKey::from_public_key(bob_signer.public_key()).unwrap(),
+            age::x25519::Identity::generate().to_public(),
+            NodeId::from_bytes(bob_node.public()).unwrap(),
+        )
+        .unwrap();
+        relist(&hosted, &bob, Role::Collaborator);
+        let bobs_clone = TempDir::new().unwrap();
+        copy_dir(hosted.repo.path(), bobs_clone.path());
+        let bob_store = Store::open(bobs_clone.path()).unwrap();
+        let slot = agent("bob");
+        let snapshots = ThreadRef::new(hosted.thread, RefKind::Snapshots(slot.clone()));
+        let (bob_dir, alice_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let bob_key_file = bob_dir.path().join("node.key");
+        bob_node.save(&bob_key_file).unwrap();
+        let (bob_shared, bob_host) = host_in(
+            &hosted,
+            bob_store.common_dir(),
+            (&bob_dir, &bob_key_file),
+            (
+                Vec::new(),
+                HostRole::Agent(OwnAgent {
+                    slot: slot.clone(),
+                    size: WindowSize { rows: 4, cols: 40 },
+                    drawn: b"bob's agent",
+                }),
+            ),
+        );
+        let address = bob_shared.node.address(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        let (_alice_shared, alice_host) = host_on(
+            &hosted,
+            &alice_dir,
+            &hosted.node_keys.path().join("node.key"),
+            (
+                vec![address],
+                HostRole::Agent(OwnAgent {
+                    slot: agent("alice"),
+                    size: WindowSize { rows: 4, cols: 40 },
+                    drawn: b"alice's agent",
+                }),
+            ),
+        );
+        while !alice_host.anchored() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "alice never anchored bob's run"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        let work = bob_store.write_blob(b"bob's work").unwrap();
+        let tree = bob_store
+            .write_tree(&[("work", EntryKind::Blob, work)])
+            .unwrap();
+        let commits = CommitKey::new(bob_signer).unwrap();
+        let ended = bob_store
+            .append_signed(
+                &snapshots,
+                None,
+                tree,
+                &turn_end::message(&slot),
+                commits.signer(),
+            )
+            .unwrap();
+        let before_claims = started + CLAIMS_EVERY.saturating_sub(Duration::from_millis(500));
+        while hosted.store.head(&snapshots).unwrap() != Some(ended) {
+            assert!(
+                Instant::now() < before_claims,
+                "bob's turn end did not reach alice before his next claims frame"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
         alice_host.stop();
         bob_host.stop();
     }
