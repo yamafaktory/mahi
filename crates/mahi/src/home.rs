@@ -6,7 +6,10 @@ use std::{
         Write,
     },
     os::fd::AsFd,
-    path::Path,
+    path::{
+        Path,
+        PathBuf,
+    },
     process,
     time::{
         Duration,
@@ -82,6 +85,7 @@ use crate::{
     run_command,
     session,
     settings::Settings,
+    sync_state,
     terminal::{
         self,
         RawMode,
@@ -111,6 +115,7 @@ const KEY_WAIT: Duration = Duration::from_millis(200);
 const SEQUENCE_WAIT: Duration = Duration::from_millis(30);
 const ESC: u8 = 0x1b;
 const MAX_READ: usize = 1024;
+const MAX_AGENT_BYTES: u64 = 256;
 const AFTER_ESCAPE: Duration = Duration::from_millis(500);
 const CHILD_WAIT: Duration = Duration::from_millis(15);
 const STOP_WITHIN: Duration = Duration::from_secs(30);
@@ -748,7 +753,7 @@ fn join_in_tab(
             let agent = agent_to_run(
                 environment,
                 ("Join a thread", "Which agent should work in this thread?"),
-                &[],
+                (&[], LastAgent::Kept),
             )
             .map_err(|told| match told.split_once("; run mahi run") {
                 Some((none, _)) => none.to_owned(),
@@ -956,7 +961,7 @@ fn command_words(
             agent_to_run(
                 environment,
                 ("New thread", "Which agent should start the thread?"),
-                &[],
+                (&[], LastAgent::Kept),
             )?,
         ],
         HomeAction::Resume(thread) => vec!["resume".to_owned(), thread],
@@ -1085,7 +1090,7 @@ fn credential_words(environment: &Environment) -> Result<Vec<String>, String> {
 fn agent_to_run(
     environment: &Environment,
     (title, question): (&str, &str),
-    taken: &[&AgentSlot],
+    (taken, last): (&[&AgentSlot], LastAgent),
 ) -> Result<String, String> {
     let found: Vec<&str> = programs_on_path(environment)
         .filter(|program| {
@@ -1100,7 +1105,11 @@ fn agent_to_run(
         [] => Err("each agent mahi has a profile for on PATH is already yours here".to_owned()),
         [only] => Ok((*only).to_owned()),
         several => {
-            let dialog = Dialog::choose(
+            let last = match last {
+                LastAgent::Kept => last_agent_file(environment),
+                LastAgent::Ignored => None,
+            };
+            let mut dialog = Dialog::choose(
                 title,
                 vec![question.to_owned()],
                 several
@@ -1108,16 +1117,59 @@ fn agent_to_run(
                     .map(|program| (*program).to_owned())
                     .collect(),
             );
+            dialog.select(chosen_last(several, last.as_deref()));
             match DialogPrompt::default().ask(dialog) {
-                Ok(Answer::Choice(index)) => several
-                    .get(index)
-                    .map(|program| (*program).to_owned())
-                    .ok_or_else(|| "no agent was chosen".to_owned()),
+                Ok(Answer::Choice(index)) => {
+                    let chosen = several
+                        .get(index)
+                        .map(|program| (*program).to_owned())
+                        .ok_or_else(|| "no agent was chosen".to_owned())?;
+                    if let Some(file) = &last
+                        && let Err(error) = sync_state::write(file, chosen.as_bytes())
+                    {
+                        eprintln!(
+                            "mahi: cannot remember {chosen} as the agent chosen last: {error}"
+                        );
+                    }
+                    Ok(chosen)
+                }
                 Ok(_) => Err(String::new()),
                 Err(error) => Err(format!("cannot ask which agent: {error}")),
             }
         }
     }
+}
+
+/// Whether an agent dialog starts on the agent the user chose last, and keeps the one chosen:
+/// the dialogs that start the user's first agent in a thread do, those that add one beside
+/// it do not, since they list only the agents the user does not run there yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastAgent {
+    Kept,
+    Ignored,
+}
+
+/// Returns where the agent the user chose last in an agent dialog is kept, the same for every
+/// repository.
+fn last_agent_file(environment: &Environment) -> Option<PathBuf> {
+    ConfigDir::resolve(
+        environment.home.as_deref(),
+        environment.xdg_config_home.as_deref(),
+    )
+    .ok()
+    .map(|config| config.last_agent_file())
+}
+
+/// Returns the place among `several` agents of the one the user chose last, as `file` keeps
+/// it, or the first's when it is not among them or cannot be read.
+fn chosen_last(several: &[&str], file: Option<&Path>) -> usize {
+    let last = file.and_then(|file| sync_state::read(file, MAX_AGENT_BYTES).ok().flatten());
+    last.and_then(|last| {
+        several
+            .iter()
+            .position(|program| program.as_bytes() == last)
+    })
+    .unwrap_or(0)
 }
 
 /// Returns the agents the thread named `thread` has work of here.
@@ -1182,7 +1234,7 @@ fn agent_add_words(
             "Add an agent",
             "Which of your agents should join the thread?",
         ),
-        &mine,
+        (&mine, LastAgent::Ignored),
     )?;
     let from = if slots.is_empty() {
         None
@@ -1229,7 +1281,7 @@ fn handoff_words(
     let program = agent_to_run(
         environment,
         ("Hand off", "Which of your agents should take it over?"),
-        &own_agents(&slots, &me),
+        (&own_agents(&slots, &me), LastAgent::Ignored),
     )?;
     Ok(vec![
         "handoff".to_owned(),
@@ -1440,6 +1492,20 @@ fn add_remote(store: &mut Store) -> Result<Added, remote::RemoteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_chosen_last_is_selected_first_while_it_is_among_those_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mahi").join("last-agent");
+        let several = ["claude", "codex"];
+        assert_eq!(chosen_last(&several, None), 0);
+        assert_eq!(chosen_last(&several, Some(&file)), 0);
+        sync_state::write(&file, b"codex").unwrap();
+        assert_eq!(chosen_last(&several, Some(&file)), 1);
+        assert_eq!(chosen_last(&["claude", "gemini"], Some(&file)), 0);
+        sync_state::write(&file, b"codex\n").unwrap();
+        assert_eq!(chosen_last(&several, Some(&file)), 0);
+    }
 
     #[test]
     fn the_home_screen_wakes_for_each_turn_of_a_waiting_tabs_spinner() {

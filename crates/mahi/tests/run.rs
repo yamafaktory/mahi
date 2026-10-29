@@ -1947,6 +1947,37 @@ cat parser.rs
     }
 
     #[test]
+    fn the_agent_dialog_starts_on_the_agent_chosen_last() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\necho started-$(basename $0)\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "chosen-agents", "claude", agent);
+        script(&fixture, "chosen-agents", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let first = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"2"),
+                ("started-codex", b"\x00q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(first.0, 0, "{}", first.1);
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"\r"),
+                ("started-", b"\x00q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("started-codex"), "{output}");
+        assert!(!output.contains("started-claude"), "{output}");
+    }
+
+    #[test]
     fn a_command_that_fails_in_a_tab_stays_until_a_key_closes_it() {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho broken-agent\nexit 3\n";

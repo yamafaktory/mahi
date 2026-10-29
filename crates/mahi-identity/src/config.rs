@@ -16,6 +16,7 @@ use rustix::{
 use thiserror::Error;
 
 const APP: &str = "mahi";
+const LAST_AGENT_FILE: &str = "last-agent";
 const IDENTITY_FILE: &str = "identity.age";
 const RECIPIENT_FILE: &str = "identity.pub";
 const SIGNING_KEY_FILE: &str = "signing-key.pub";
@@ -85,6 +86,12 @@ impl ConfigDir {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.0
+    }
+
+    /// Returns where the agent the user chose last in the home screen's agent dialog is kept.
+    #[must_use]
+    pub fn last_agent_file(&self) -> PathBuf {
+        self.0.join(LAST_AGENT_FILE)
     }
 
     /// Returns the path of the encrypted identity file.

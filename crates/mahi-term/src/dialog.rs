@@ -286,6 +286,15 @@ impl Dialog {
         }
     }
 
+    /// Selects the choice at `index`, when there is one there.
+    pub fn select(&mut self, index: usize) {
+        if let Kind::Choose { items, selected } = &mut self.kind
+            && index < items.len()
+        {
+            *selected = index;
+        }
+    }
+
     /// Adds a line above the question, as the commands that ask say things first.
     pub fn push_line(&mut self, line: &str) {
         self.lines.push(line.to_owned());
@@ -777,6 +786,16 @@ mod tests {
                     + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn a_choice_can_start_on_any_item_but_one_past_the_end() {
+        let items = vec!["claude".to_owned(), "codex".to_owned()];
+        let mut dialog = Dialog::choose("Join a thread", vec![], items);
+        dialog.select(1);
+        assert_eq!(dialog.selected(), Some(1));
+        dialog.select(2);
+        assert_eq!(dialog.selected(), Some(1));
     }
 
     #[test]
