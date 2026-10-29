@@ -32,6 +32,8 @@ const LIST_COLUMNS: u16 = 24;
 const NARROW_COLUMNS: u16 = 100;
 const TOP_ROWS: u16 = 1;
 const HINT_ROWS: u16 = 1;
+const STATUS_ROWS: u16 = 1;
+const STATUS_GAP: &str = "  ";
 const BORDER: u16 = 2;
 const SMALLEST: u16 = 2;
 
@@ -122,6 +124,8 @@ pub enum ListPlace {
     Over,
     /// Not shown.
     Hidden,
+    /// Not shown: a status line under the pane names the teammates' agents instead.
+    StatusLine,
 }
 
 impl ListPlace {
@@ -135,6 +139,233 @@ impl ListPlace {
             Self::Beside
         }
     }
+}
+
+/// What a teammate's agent is doing, as the status line names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeammateState {
+    /// A turn is open.
+    Working,
+    /// Its turn ended.
+    Done,
+    /// It waits on a question for its own user.
+    Asks,
+    /// Its host is connected but tells no state, or has not told one yet.
+    Live,
+    /// Its host is not connected.
+    Offline,
+}
+
+impl TeammateState {
+    /// Returns the state's name, such as `done`.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Asks => "asks",
+            Self::Live => "live",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+/// A teammate's agent as the status line names it.
+#[derive(Debug, Clone, Copy)]
+pub struct StatusAgent<'a> {
+    /// Its slot, such as `bob.claude`.
+    pub slot: &'a str,
+    /// What it is doing.
+    pub state: TeammateState,
+    /// What a turn of it that waits for the user's keypress changes, such as `changes agent
+    /// settings`.
+    pub waits: Option<&'a str>,
+    /// The files the last merge of its work into the user's worktree brought.
+    pub brought: &'a [&'a str],
+}
+
+/// The paths a merge of a teammate's agent's work left with conflict markers.
+#[derive(Debug, Clone, Copy)]
+pub struct StatusConflicts<'a> {
+    /// The slot of the teammate's agent, such as `bob.claude`.
+    pub from: &'a str,
+    /// The paths still holding its markers.
+    pub paths: &'a [&'a str],
+}
+
+/// The row under the pane in the one view: the conflicts to resolve first, then each
+/// teammate's agent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatusLine<'a> {
+    /// The conflicts left in the user's worktree, by the agent they came from.
+    pub conflicts: &'a [StatusConflicts<'a>],
+    /// The teammates' agents.
+    pub agents: &'a [StatusAgent<'a>],
+}
+
+/// One item of the status line, and how wide it is.
+#[derive(Debug, Clone)]
+struct Item<'a> {
+    spans: Vec<Span<'a>>,
+    width: usize,
+}
+
+impl<'a> Item<'a> {
+    fn new(spans: Vec<Span<'a>>) -> Self {
+        let width = spans.iter().map(Span::width).sum();
+        Self { spans, width }
+    }
+}
+
+impl<'a> StatusLine<'a> {
+    /// Returns the line for a row `width` columns wide: whole when it fits, otherwise
+    /// without the files merges brought, then with the last agents left out and counted as
+    /// `+N more`, then with the conflicts' paths cut short, each list ending with `and N
+    /// more`.
+    #[must_use]
+    pub fn line(&self, width: u16) -> Line<'a> {
+        let width = usize::from(width);
+        let whole: Vec<Item<'a>> = self
+            .agents
+            .iter()
+            .map(|agent| agent_item(agent, Brought::Shown))
+            .collect();
+        let short: Vec<Item<'a>> = self
+            .agents
+            .iter()
+            .map(|agent| agent_item(agent, Brought::Left))
+            .collect();
+        let most_paths = self
+            .conflicts
+            .iter()
+            .map(|conflicts| conflicts.paths.len())
+            .max()
+            .unwrap_or(0);
+        let mut listed = most_paths;
+        loop {
+            let conflicts: Vec<Item<'a>> = self
+                .conflicts
+                .iter()
+                .map(|conflicts| conflicts_item(conflicts, listed))
+                .collect();
+            if let Some(line) = fitting(&conflicts, (&whole, &short), width) {
+                return line;
+            }
+            if listed <= 1 {
+                return joined(conflicts.iter().chain(&more(self.agents.len())));
+            }
+            listed -= 1;
+        }
+    }
+}
+
+/// Returns the line of the `conflicts` and the agents, `whole` or `short`, that fits in
+/// `width`, as the line leaves things out; `None` when even the conflicts and the count of
+/// every agent do not fit.
+fn fitting<'a>(
+    conflicts: &[Item<'a>],
+    (whole, short): (&[Item<'a>], &[Item<'a>]),
+    width: usize,
+) -> Option<Line<'a>> {
+    let wide = |items: &[&Item<'_>]| -> usize {
+        let gaps = items.len().saturating_sub(1) * STATUS_GAP.len();
+        items.iter().map(|item| item.width).sum::<usize>() + gaps
+    };
+    for agents in [whole, short] {
+        let items: Vec<&Item<'a>> = conflicts.iter().chain(agents).collect();
+        if wide(&items) <= width {
+            return Some(joined(items));
+        }
+    }
+    let shown = (0..short.len()).rev();
+    for kept in shown {
+        let more = more(short.len() - kept);
+        let items: Vec<&Item<'a>> = conflicts
+            .iter()
+            .chain(short.iter().take(kept))
+            .chain(&more)
+            .collect();
+        if wide(&items) <= width {
+            return Some(joined(items));
+        }
+    }
+    None
+}
+
+/// Joins `items` into one line, two spaces apart.
+fn joined<'a, 'item>(items: impl IntoIterator<Item = &'item Item<'a>>) -> Line<'a>
+where
+    'a: 'item,
+{
+    let mut spans = Vec::new();
+    for item in items {
+        if !spans.is_empty() {
+            spans.push(Span::raw(STATUS_GAP));
+        }
+        spans.extend(item.spans.iter().cloned());
+    }
+    Line::from(spans)
+}
+
+/// Returns the count of `left` agents left out, as `+N more`, or nothing when none is.
+fn more(left: usize) -> Option<Item<'static>> {
+    (left > 0).then(|| Item::new(vec![Span::styled(format!("+{left} more"), Theme::muted())]))
+}
+
+fn agent_item<'a>(agent: &StatusAgent<'a>, brought: Brought) -> Item<'a> {
+    let mut spans = vec![
+        Span::styled(shown(agent.slot), Theme::title()),
+        Span::raw(" "),
+        Span::raw(agent.state.word()),
+    ];
+    if let Some(waits) = agent.waits {
+        let warn = Style::new().fg(Theme::WARN);
+        spans.push(Span::styled(" · ", Theme::muted()));
+        spans.push(Span::styled("a turn waits for you: ", warn));
+        spans.push(Span::styled(shown(waits), warn));
+    }
+    if brought == Brought::Shown && !agent.brought.is_empty() {
+        spans.push(Span::styled(" · ", Theme::muted()));
+        push_paths(&mut spans, agent.brought, Style::new());
+    }
+    Item::new(spans)
+}
+
+/// Returns the item of `conflicts`, listing at most `listed` of its paths, at least one.
+fn conflicts_item<'a>(conflicts: &StatusConflicts<'a>, listed: usize) -> Item<'a> {
+    let warn = Style::new().fg(Theme::WARN);
+    let mut spans = vec![
+        Span::styled("conflicts from ", warn),
+        Span::styled(shown(conflicts.from), warn),
+        Span::styled(": ", warn),
+    ];
+    let listed = listed.max(1).min(conflicts.paths.len());
+    push_paths(
+        &mut spans,
+        conflicts.paths.get(..listed).unwrap_or_default(),
+        warn,
+    );
+    let left = conflicts.paths.len() - listed;
+    if left > 0 {
+        spans.push(Span::styled(format!(" and {left} more"), warn));
+    }
+    Item::new(spans)
+}
+
+fn push_paths<'a>(spans: &mut Vec<Span<'a>>, paths: &[&'a str], style: Style) {
+    for (index, path) in paths.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(", ", style));
+        }
+        spans.push(Span::styled(shown(path), style));
+    }
+}
+
+/// Whether the status line names the files merges brought.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Brought {
+    Shown,
+    Left,
 }
 
 /// What a click on the top row is on.
@@ -328,6 +559,9 @@ pub struct ThreadView<'a> {
     /// The spinner's frame and what the pane waits for, drawn in its middle while it has no
     /// screen.
     pub waiting: Option<(&'a str, &'a str)>,
+    /// What the status line says, drawn under the pane when `list` is
+    /// [`ListPlace::StatusLine`].
+    pub status: StatusLine<'a>,
 }
 
 impl<'a> ThreadView<'a> {
@@ -340,8 +574,13 @@ impl<'a> ThreadView<'a> {
         } else {
             0
         };
+        let status = if list == ListPlace::StatusLine {
+            STATUS_ROWS
+        } else {
+            0
+        };
         (
-            rows.saturating_sub(TOP_ROWS + HINT_ROWS + BORDER)
+            rows.saturating_sub(TOP_ROWS + HINT_ROWS + BORDER + status)
                 .max(SMALLEST),
             columns.saturating_sub(BORDER + beside).max(SMALLEST),
         )
@@ -356,8 +595,7 @@ impl<'a> ThreadView<'a> {
         area: Rect,
         buffer: &mut Buffer,
     ) -> Option<Position> {
-        let [body, footer] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(HINT_ROWS)]).areas(area);
+        let (body, status, footer) = self.rows(area);
         let (pane, list) = self.areas(body);
         let title = self
             .agents
@@ -385,6 +623,9 @@ impl<'a> ThreadView<'a> {
             Clear.render(list, buffer);
             self.render_list(list, buffer);
         }
+        if let Some(status) = status {
+            self.status.line(status.width).render(status, buffer);
+        }
         Line::from(key_hints(self.hints)).render(footer, buffer);
         let screen = screen?;
         let (row, column) = screen.cursor_position();
@@ -397,8 +638,7 @@ impl<'a> ThreadView<'a> {
     /// top row: nothing when the list is not there, so the click is the agent's.
     #[must_use]
     pub fn list_at(&self, area: Rect, position: Position) -> Option<ListHit> {
-        let [body, _] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(HINT_ROWS)]).areas(area);
+        let (body, _, _) = self.rows(area);
         let (_, list) = self.areas(body);
         let list = list?;
         if !list.contains(position) {
@@ -421,8 +661,7 @@ impl<'a> ThreadView<'a> {
     /// as a drag that leaves it does, and nothing otherwise.
     #[must_use]
     pub fn pane_point(&self, area: Rect, position: Position, clamp: bool) -> Option<(u16, u16)> {
-        let [body, _] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(HINT_ROWS)]).areas(area);
+        let (body, _, _) = self.rows(area);
         let (pane, _) = self.areas(body);
         let inner = Block::bordered().inner(pane);
         if inner.is_empty() || (!clamp && !inner.contains(position)) {
@@ -431,6 +670,19 @@ impl<'a> ThreadView<'a> {
         let column = position.x.clamp(inner.x, inner.right() - 1) - inner.x;
         let row = position.y.clamp(inner.y, inner.bottom() - 1) - inner.y;
         Some((column, row))
+    }
+
+    /// Splits `area` into the pane's and the list's body, the status line's row when the
+    /// view has one, and the hints' row.
+    fn rows(&self, area: Rect) -> (Rect, Option<Rect>, Rect) {
+        let shown = self.list == ListPlace::StatusLine;
+        let [body, status, footer] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(if shown { STATUS_ROWS } else { 0 }),
+            Constraint::Length(HINT_ROWS),
+        ])
+        .areas(area);
+        (body, shown.then_some(status), footer)
     }
 
     fn areas(&self, body: Rect) -> (Rect, Option<Rect>) {
@@ -446,7 +698,7 @@ impl<'a> ThreadView<'a> {
                 let list = Rect::new(body.right() - width, body.y, width, body.height);
                 (body, Some(list))
             }
-            ListPlace::Hidden => (body, None),
+            ListPlace::Hidden | ListPlace::StatusLine => (body, None),
         }
     }
 
@@ -727,6 +979,7 @@ mod tests {
             list: ListPlace::Beside,
             hints: &[("ctrl-space", "workspace")],
             waiting: None,
+            status: StatusLine::default(),
         }
         .render(Some(parser.screen()), area, &mut buffer);
         let rows = rows(&buffer);
@@ -786,6 +1039,7 @@ mod tests {
             list: ListPlace::Beside,
             hints: &[],
             waiting: None,
+            status: StatusLine::default(),
         };
         let area = Rect::new(0, 0, 100, 10);
         let mut buffer = Buffer::empty(area);
@@ -821,6 +1075,7 @@ mod tests {
             list: ListPlace::Hidden,
             hints: &[],
             waiting: Some(("⠋", "waiting for the thread's host")),
+            status: StatusLine::default(),
         };
         let mut buffer = Buffer::empty(area);
         view.render(None, area, &mut buffer);
@@ -850,6 +1105,7 @@ mod tests {
             list: ListPlace::Over,
             hints: &[],
             waiting: None,
+            status: StatusLine::default(),
         }
         .render(Some(parser.screen()), area, &mut buffer);
         let rows = rows(&buffer);
@@ -863,6 +1119,7 @@ mod tests {
             list: ListPlace::Hidden,
             hints: &[],
             waiting: None,
+            status: StatusLine::default(),
         }
         .render(Some(parser.screen()), area, &mut buffer);
         assert_eq!(cursor, Some(Position::new(71, 1)));
@@ -887,6 +1144,127 @@ mod tests {
         );
     }
 
+    fn status_text(status: &StatusLine<'_>, width: u16) -> String {
+        status
+            .line(width)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn the_status_line_names_conflicts_first_then_each_teammates_agent() {
+        let conflicts = [StatusConflicts {
+            from: "bob.claude",
+            paths: &["src/a.rs", "src/b.rs"],
+        }];
+        let agents = [
+            StatusAgent {
+                slot: "bob.claude",
+                state: TeammateState::Done,
+                waits: Some("changes agent settings"),
+                brought: &[],
+            },
+            StatusAgent {
+                slot: "carol.codex",
+                state: TeammateState::Working,
+                waits: None,
+                brought: &["src/client.rs", "src/lib.rs"],
+            },
+            StatusAgent {
+                slot: "dan.claude",
+                state: TeammateState::Asks,
+                waits: None,
+                brought: &[],
+            },
+        ];
+        let status = StatusLine {
+            conflicts: &conflicts,
+            agents: &agents,
+        };
+        let whole = "conflicts from bob.claude: src/a.rs, src/b.rs  bob.claude done · a turn \
+                     waits for you: changes agent settings  carol.codex working · src/client.rs, \
+                     src/lib.rs  dan.claude asks";
+        assert_eq!(status_text(&status, 200), whole);
+        let narrower = u16::try_from(whole.chars().count() - 1).unwrap();
+        assert_eq!(
+            status_text(&status, narrower),
+            "conflicts from bob.claude: src/a.rs, src/b.rs  bob.claude done · a turn waits for \
+             you: changes agent settings  carol.codex working  dan.claude asks"
+        );
+        assert_eq!(
+            status_text(&status, 120),
+            "conflicts from bob.claude: src/a.rs, src/b.rs  bob.claude done · a turn waits for \
+             you: changes agent settings  +2 more"
+        );
+        assert_eq!(
+            status_text(&status, 50),
+            "conflicts from bob.claude: src/a.rs and 1 more  +3 more"
+        );
+        assert_eq!(
+            status_text(&status, 10),
+            "conflicts from bob.claude: src/a.rs and 1 more  +3 more"
+        );
+        assert_eq!(status_text(&StatusLine::default(), 80), "");
+    }
+
+    #[test]
+    fn the_status_line_shows_a_teammates_text_without_control_characters() {
+        let agents = [StatusAgent {
+            slot: "bob\x1b[2J.claude",
+            state: TeammateState::Live,
+            waits: None,
+            brought: &["src/\u{202e}evil.rs"],
+        }];
+        let status = StatusLine {
+            conflicts: &[],
+            agents: &agents,
+        };
+        assert_eq!(
+            status_text(&status, 80),
+            "bob?[2J.claude live · src/?evil.rs"
+        );
+    }
+
+    #[test]
+    fn the_one_view_draws_the_status_line_between_the_pane_and_the_hints() {
+        let (rows, columns) = ThreadView::agent_size(30, 120, ListPlace::StatusLine);
+        assert_eq!(
+            (rows + 1, columns),
+            ThreadView::agent_size(30, 120, ListPlace::Hidden)
+        );
+        let agents = [StatusAgent {
+            slot: "bob.claude",
+            state: TeammateState::Working,
+            waits: None,
+            brought: &[],
+        }];
+        let screen = Rect::new(0, 0, 120, 30);
+        let (_, body) = TopBar::split(screen);
+        let mut buffer = Buffer::empty(screen);
+        ThreadView {
+            agents: &AGENTS,
+            selected: 0,
+            list: ListPlace::StatusLine,
+            hints: &[("q", "quit")],
+            waiting: None,
+            status: StatusLine {
+                conflicts: &[],
+                agents: &agents,
+            },
+        }
+        .render(None, body, &mut buffer);
+        let row = |y: u16| -> String {
+            (0..120)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect::<String>()
+        };
+        assert!(row(28).starts_with("bob.claude working"), "{:?}", row(28));
+        assert!(row(29).contains("quit"), "{:?}", row(29));
+        assert!(row(27).starts_with('╰'), "{:?}", row(27));
+    }
+
     #[test]
     fn a_screen_of_the_agents_size_fills_the_pane_exactly() {
         assert_eq!(
@@ -907,6 +1285,7 @@ mod tests {
                 list,
                 hints: &[],
                 waiting: None,
+                status: StatusLine::default(),
             }
             .render(Some(parser.screen()), body, &mut buffer);
             let bottom = rows + 1;
@@ -948,6 +1327,7 @@ mod tests {
             list: ListPlace::Beside,
             hints: &[],
             waiting: None,
+            status: StatusLine::default(),
         };
         let area = Rect::new(0, 1, 100, 12);
         let at = |view: &ThreadView<'_>, x, y| view.list_at(area, Position::new(x, y));
@@ -982,6 +1362,7 @@ mod tests {
             list: ListPlace::Beside,
             hints: &[],
             waiting: None,
+            status: StatusLine::default(),
         };
         let area = Rect::new(0, 1, 100, 12);
         assert_eq!(
@@ -1016,6 +1397,7 @@ mod tests {
                     list,
                     hints: &[("q", "quit")],
                     waiting: None,
+                    status: StatusLine::default(),
                 }
                 .render(Some(parser.screen()), area, &mut buffer);
             }

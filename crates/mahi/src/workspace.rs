@@ -53,6 +53,7 @@ use mahi_term::{
     Report,
     ReportReader,
     Segment,
+    StatusLine,
     TabBar,
     TabHit,
     ThreadChoice,
@@ -1345,6 +1346,7 @@ impl Workspace {
             list,
             hints: &[],
             waiting: None,
+            status: StatusLine::default(),
         }
         .list_at(body, position);
         drop(agents);
@@ -1387,6 +1389,7 @@ impl Workspace {
             list,
             hints: &[],
             waiting: None,
+            status: StatusLine::default(),
         }
         .pane_point(body, position, clamp);
         let (Some(point), Some(running)) = (point, tab.agents.get_mut(tab.selected)) else {
@@ -1750,6 +1753,7 @@ impl Workspace {
                 None => &hints,
             },
             waiting: self.waiting(),
+            status: StatusLine::default(),
         }
         .render(screen, body, buffer);
         cursor.filter(|_| shown.is_some())
