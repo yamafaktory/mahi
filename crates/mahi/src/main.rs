@@ -245,8 +245,9 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
             )
         })),
         Command::Apparmor => apparmor(environment),
-        Command::Threads => exit_code(
-            threads::threads(environment).map(|listing| print_out(&listing, "Threads", "", false)),
+        Command::Threads(command) => exit_code(
+            threads::threads(environment, command.format())
+                .map(|listing| print_out(&listing, "Threads", "", false)),
         ),
         Command::Hook(hook) => {
             if let Some(socket) = &environment.hook_socket {

@@ -847,6 +847,26 @@ content = '{{"bin": "{mahi_bin}"}}'
         );
     }
 
+    #[test]
+    fn threads_json_prints_each_thread_as_an_object_in_one_array() {
+        let fixture = fixture();
+        let empty = fixture.mahi(&["threads", "--json"]);
+        assert_eq!(empty.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&empty.stdout), "[]\n");
+        let run = fixture.mahi(&["run", "true"]);
+        let worktree = worktree_of(&String::from_utf8_lossy(&run.stderr));
+        let thread = thread_of(&worktree);
+        let listed = fixture.mahi(&["threads", "--json"]);
+        assert_eq!(listed.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8_lossy(&listed.stdout),
+            format!(
+                "[{{\"id\":\"{thread}\",\"agents\":[\"tester.true\"],\"worktree\":true,\
+                 \"purged\":false,\"gone_branch\":null}}]\n"
+            )
+        );
+    }
+
     const PASSPHRASE: &str = "correct horse battery";
 
     fn save_identity(fixture: &Fixture) {

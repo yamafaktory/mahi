@@ -32,6 +32,7 @@ use crate::{
     },
     profile::Profile,
     remote::RemoteName,
+    threads::Format,
 };
 
 const EXIT_CODES: &str = "\
@@ -74,7 +75,7 @@ pub(crate) enum Command {
     Purge(PurgeCommand),
     /// Lists the threads of this repository, with their agents and whether their worktree is
     /// still there.
-    Threads,
+    Threads(ThreadsCommand),
     /// Prints your participant card: the line a thread's owner needs to invite you.
     Id,
     /// Prints an AppArmor profile that lets this mahi create the user namespaces its sandbox
@@ -389,6 +390,25 @@ pub(crate) struct EndCommand {
     /// such as files too large or unreadable, which are then lost.
     #[arg(long)]
     pub(crate) force: bool,
+}
+
+#[derive(Debug, Args, PartialEq, Eq)]
+pub(crate) struct ThreadsCommand {
+    /// Prints the threads as one JSON array, each thread an object with its id, agents,
+    /// worktree, purged and `gone_branch`.
+    #[arg(long)]
+    json: bool,
+}
+
+impl ThreadsCommand {
+    /// Returns how the threads are printed.
+    pub(crate) fn format(&self) -> Format {
+        if self.json {
+            Format::Json
+        } else {
+            Format::Text
+        }
+    }
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]

@@ -4,7 +4,10 @@ use std::{
         BTreeSet,
     },
     env,
-    fmt::Write as _,
+    fmt::{
+        Display,
+        Write as _,
+    },
     fs,
     io,
 };
@@ -27,6 +30,10 @@ use mahi_thread::{
     ParticipantKey,
     remembered_owner,
 };
+use serde::{
+    Serialize,
+    Serializer,
+};
 use thiserror::Error;
 
 use crate::{
@@ -42,6 +49,50 @@ pub(crate) enum ThreadsError {
     CurrentDirectory(#[source] io::Error),
     #[error("cannot read the repository's threads")]
     Store(#[from] StoreError),
+    #[error("cannot write the threads as JSON")]
+    Json(#[source] serde_json::Error),
+}
+
+/// How `mahi threads` prints the threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Format {
+    /// One line per thread, for a person.
+    Text,
+    /// One JSON array, for a script.
+    Json,
+}
+
+/// One thread as `mahi threads --json` prints it.
+#[derive(Debug, Serialize)]
+struct ListedThread<'summary> {
+    #[serde(serialize_with = "as_text")]
+    id: ThreadId,
+    agents: Slots<'summary>,
+    worktree: bool,
+    purged: bool,
+    gone_branch: Option<String>,
+}
+
+fn as_text<S: Serializer>(value: &impl Display, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(value)
+}
+
+#[derive(Debug)]
+struct Slots<'summary>(&'summary BTreeSet<AgentSlot>);
+
+impl Serialize for Slots<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(AsText))
+    }
+}
+
+#[derive(Debug)]
+struct AsText<'value, T>(&'value T);
+
+impl<T: Display> Serialize for AsText<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self.0)
+    }
 }
 
 /// One thread of the repository, as its refs show it.
@@ -105,37 +156,69 @@ fn agents_of(summary: &ThreadSummary, thread: Option<ThreadId>) -> String {
     listed
 }
 
-/// Lists the threads of the repository around the current directory, with their agents and
-/// whether their worktree is still there, leaving out a thread purged here. Reads no encrypted
-/// content.
-pub(crate) fn threads(environment: &Environment) -> Result<String, ThreadsError> {
+/// Lists the threads of the repository around the current directory in `format`, with their
+/// agents and whether their worktree is still there, leaving out a thread purged here. Reads no
+/// encrypted content.
+pub(crate) fn threads(environment: &Environment, format: Format) -> Result<String, ThreadsError> {
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(ThreadsError::CurrentDirectory)?;
     let store = Store::discover(&cwd)?;
     let summaries = summarise(&store, own_key(environment).as_ref())?;
+    match format {
+        Format::Text => Ok(listing_text(&store, &summaries)),
+        Format::Json => listing_json(&store, &summaries),
+    }
+}
+
+fn gone_branch(store: &Store, thread: ThreadId) -> Option<String> {
+    BranchRecord::read(store, thread)
+        .filter(|record| record.gone)
+        .map(|record| record.branch)
+}
+
+fn listing_text(store: &Store, summaries: &BTreeMap<ThreadId, ThreadSummary>) -> String {
     if summaries.is_empty() {
-        return Ok("no threads in this repository\n".to_owned());
+        return "no threads in this repository\n".to_owned();
     }
     let mut listing = String::new();
-    for (thread, summary) in summaries {
-        let agents = agents_of(&summary, Some(thread));
+    for (&thread, summary) in summaries {
+        let agents = agents_of(summary, Some(thread));
         let worktree = if summary.worktree {
             "worktree"
         } else {
             "no worktree"
         };
         let _ = write!(listing, "{thread}  {agents}  {worktree}");
-        if let Some(record) = BranchRecord::read(&store, thread).filter(|record| record.gone) {
+        if let Some(branch) = gone_branch(store, thread) {
+            let branch = BranchRecord::shown(&branch);
             let _ = write!(
                 listing,
-                "  branch {} gone from the remote, merged or closed; mahi purge {thread} removes \
-                 the thread",
-                BranchRecord::shown(&record.branch)
+                "  branch {branch} gone from the remote, merged or closed; mahi purge {thread} \
+                 removes the thread"
             );
         }
         listing.push('\n');
     }
+    listing
+}
+
+fn listing_json(
+    store: &Store,
+    summaries: &BTreeMap<ThreadId, ThreadSummary>,
+) -> Result<String, ThreadsError> {
+    let listed: Vec<ListedThread<'_>> = summaries
+        .iter()
+        .map(|(&thread, summary)| ListedThread {
+            id: thread,
+            agents: Slots(&summary.agents),
+            worktree: summary.worktree,
+            purged: summary.purged,
+            gone_branch: gone_branch(store, thread),
+        })
+        .collect();
+    let mut listing = serde_json::to_string(&listed).map_err(ThreadsError::Json)?;
+    listing.push('\n');
     Ok(listing)
 }
 
@@ -218,6 +301,7 @@ mod tests {
         ParticipantName,
         ThreadRef,
     };
+    use mahi_store::ObjectId;
 
     use super::*;
 
@@ -279,5 +363,41 @@ mod tests {
         let summary = &summaries[&listed];
         assert_eq!(summary.agents.iter().collect::<Vec<_>>(), [&alice, &bob]);
         assert!(!summary.worktree);
+    }
+
+    #[test]
+    fn json_names_a_branch_the_forge_deleted_as_it_is_and_text_shows_it_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let tree = store.write_tree(&[]).unwrap();
+        let thread = ThreadId::random().unwrap();
+        let alice = slot("alice", "claude");
+        for thread_ref in [
+            ThreadRef::new(thread, RefKind::Meta),
+            ThreadRef::new(thread, RefKind::Snapshots(alice)),
+        ] {
+            store.append(&thread_ref, None, tree, "test").unwrap();
+        }
+        BranchRecord {
+            remote: "up".to_owned(),
+            branch: "mahi/\"x\"\u{200b}".to_owned(),
+            tip: ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
+            landing: "main".to_owned(),
+            gone: true,
+        }
+        .write(&store, thread)
+        .unwrap();
+        let summaries = summarise(&store, None).unwrap();
+        assert_eq!(
+            listing_json(&store, &summaries).unwrap(),
+            format!(
+                "[{{\"id\":\"{thread}\",\"agents\":[\"alice.claude\"],\"worktree\":false,\
+                 \"purged\":false,\"gone_branch\":\"mahi/\\\"x\\\"\u{200b}\"}}]\n"
+            )
+        );
+        assert!(
+            listing_text(&store, &summaries).contains("branch mahi/\"x\" gone from the remote"),
+        );
     }
 }
