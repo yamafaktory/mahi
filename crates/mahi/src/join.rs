@@ -529,6 +529,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
             return Err(error);
         }
     };
+    tell_added(command, &meta, own);
     if let Some(signer) = signer {
         let _ = node.close();
         return join_with_agent(
@@ -561,10 +562,7 @@ fn join_with_agent(
         .map(|(program, _)| session::agent_from(Path::new(program)))
         .ok_or(JoinError::OptionsNeedAgent)?;
     let lock = AgentLock::acquire(config, ticket.thread(), &agent).map_err(JoinError::Busy)?;
-    let me = meta
-        .participants()
-        .find(|listed| listed.node() == &own)
-        .map(|listed| listed.name().clone());
+    let me = own_entry(&meta, own).map(|listed| listed.name().clone());
     let meta = match me {
         Some(me) => {
             let stopped = sync::fetch_until_stopped(
@@ -625,22 +623,39 @@ fn recorded_meta(ticket: &Ticket, store: &Store, own: NodeId) -> Result<Verified
 
 /// Accepts `ticket` in the repository around the current directory as `mahi join` does,
 /// recording the thread's `meta`, its owner and its host, without watching it or running an
-/// agent; returns the thread and the role the owner gave the user in it.
+/// agent; returns the thread, its owner and the role the owner gave the user in it.
 pub(crate) fn record(
     ticket: &Ticket,
     environment: &Environment,
-) -> Result<(ThreadId, Role), JoinError> {
+) -> Result<(ThreadId, ParticipantName, Role), JoinError> {
     let relays = relays_for(environment.live)?;
     let (cwd, _, node_key, own) = invitee(ticket, environment)?;
     let store = Store::discover(&cwd)?;
     let node = LiveNode::bind_live(node_key.secret(), relays, host_peers(ticket))?;
     let joined = joined_meta(&node, ticket, &store, own);
     let _ = node.close();
-    let role = joined?
-        .participants()
-        .find(|listed| listed.node() == &own)
-        .map_or(Role::Watcher, Participant::role);
-    Ok((ticket.thread(), role))
+    let meta = joined?;
+    let role = role_of(&meta, own);
+    Ok((ticket.thread(), meta.owner().clone(), role))
+}
+
+/// Returns the participant whose node is `own` in `meta`, when it lists them.
+fn own_entry(meta: &VerifiedMeta, own: NodeId) -> Option<&Participant> {
+    meta.participants().find(|listed| listed.node() == &own)
+}
+
+/// Returns the role `meta` gives the participant whose node is `own`.
+fn role_of(meta: &VerifiedMeta, own: NodeId) -> Role {
+    own_entry(meta, own).map_or(Role::Watcher, Participant::role)
+}
+
+/// Tells the user who added them to the thread of `meta` and as what, when they joined
+/// through a pairing code rather than a ticket.
+fn tell_added(command: &JoinCommand, meta: &VerifiedMeta, own: NodeId) {
+    if command.ticket.is_none() {
+        let told = pair::added(meta.owner(), meta.thread(), role_of(meta, own));
+        eprintln!("mahi: {told}");
+    }
 }
 
 /// Returns the current directory, the configuration, the node key and the node id of the
@@ -680,10 +695,7 @@ fn unlock(
     signing_key: Option<&ParticipantKey>,
     config: &ConfigDir,
 ) -> Result<(ParticipantName, ThreadKey), JoinError> {
-    let me = meta
-        .participants()
-        .find(|participant| participant.node() == &own)
-        .ok_or(JoinError::NotListed)?;
+    let me = own_entry(meta, own).ok_or(JoinError::NotListed)?;
     if signing_key.is_some_and(|key| me.key() != key) {
         return Err(JoinError::KeyChanged);
     }

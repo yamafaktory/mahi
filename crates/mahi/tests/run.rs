@@ -4895,6 +4895,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         keys.write_all(b"q").unwrap();
         assert_eq!(exit_of(&mut join), 0);
         assert!(String::from_utf8_lossy(&watched.lock().unwrap()).contains("left thread"));
+        assert!(!String::from_utf8_lossy(&watched.lock().unwrap()).contains("added you to thread"));
     }
 
     #[test]
@@ -5770,13 +5771,37 @@ exit 3
             _running: Option<Driven>,
         }
 
-        fn pair_until_asked(fixture: &Fixture, from_home: bool) -> Pairing {
-            pair_as(fixture, from_home, ("--collaborator", "/usr/bin:/bin:/usr"))
+        /// Where bob types the pairing code: on the home screen, or in a `mahi` command.
+        enum JoinFrom<'args> {
+            Home,
+            Command(&'args [&'args str]),
+        }
+
+        fn pair_until_asked(fixture: &Fixture) -> Pairing {
+            pair_as(
+                fixture,
+                &JoinFrom::Command(&["join"]),
+                ("--collaborator", "/usr/bin:/bin:/usr"),
+            )
+        }
+
+        fn owner_env<'env>(
+            fixture: &'env Fixture,
+            config: &'env Path,
+        ) -> [(&'static str, &'env OsStr); 6] {
+            [
+                ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
+                ("HOME", fixture.home.as_os_str()),
+                ("XDG_CONFIG_HOME", config.as_os_str()),
+                ("SSH_AUTH_SOCK", fixture.socket.as_os_str()),
+                ("USER", OsStr::new("tester")),
+                ("MAHI_LIVE", OsStr::new("local")),
+            ]
         }
 
         /// Pairs bob as `role` with the thread's owner, bob's mahi running with `path` as its
         /// `PATH`, until the owner is asked whether to add bob.
-        fn pair_as(fixture: &Fixture, from_home: bool, (role, path): (&str, &str)) -> Pairing {
+        fn pair_as(fixture: &Fixture, from: &JoinFrom<'_>, (role, path): (&str, &str)) -> Pairing {
             let (thread, _claude) = worked_thread(fixture);
             let (server, remote) = serve_remote(fixture);
             let bob = teammate(fixture, "bob");
@@ -5802,15 +5827,9 @@ exit 3
             fs::write(&config, text).unwrap();
 
             let owner_config = fixture.home.join(".config");
-            let owner_env: [(&str, &OsStr); 6] = [
-                ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
-                ("HOME", fixture.home.as_os_str()),
-                ("XDG_CONFIG_HOME", owner_config.as_os_str()),
-                ("SSH_AUTH_SOCK", fixture.socket.as_os_str()),
-                ("USER", OsStr::new("tester")),
-                ("MAHI_LIVE", OsStr::new("local")),
-            ];
-            let running = from_home.then(|| run_thread(fixture, &thread, &owner_env));
+            let owner_env = owner_env(fixture, &owner_config);
+            let running =
+                matches!(from, JoinFrom::Home).then(|| run_thread(fixture, &thread, &owner_env));
             let owner = Driven::start(mahi_in_terminal(
                 &fixture.repo,
                 &["invite", role, &thread],
@@ -5833,7 +5852,11 @@ exit 3
                 ("USER", OsStr::new("bob")),
                 ("MAHI_LIVE", OsStr::new("local")),
             ];
-            let mut joiner = if from_home {
+            let mut joiner = if let JoinFrom::Command(args) = from {
+                let joiner = Driven::start(mahi_in_terminal(&bob.repo, args, &bob_env));
+                joiner.wait_for("Pairing code: ");
+                joiner
+            } else {
                 let mut home = Driven::start(mahi_in_terminal(&bob.repo, &[], &bob_env));
                 home.wait_for("Threads");
                 home.terminal.write_all(b"c").unwrap();
@@ -5841,10 +5864,6 @@ exit 3
                 home.type_line(PASSPHRASE);
                 home.wait_for("Pairing code");
                 home
-            } else {
-                let joiner = Driven::start(mahi_in_terminal(&bob.repo, &["join"], &bob_env));
-                joiner.wait_for("Pairing code: ");
-                joiner
             };
             joiner.type_line(&code);
             joiner.wait_for("The code matched");
@@ -5852,7 +5871,7 @@ exit 3
             assert!(asked.contains("Add bob (SHA256:"), "{asked}");
             let named = format!("to thread {thread} as a {}? [y/N]", &role[2..]);
             assert!(asked.contains(&named), "{asked}");
-            if !from_home {
+            if let JoinFrom::Command(_) = from {
                 assert!(!joiner.text().contains(&code), "{}", joiner.text());
             }
             Pairing {
@@ -5868,7 +5887,11 @@ exit 3
         #[test]
         fn a_teammate_who_joins_from_the_home_screen_lands_in_a_tab_on_the_thread() {
             let fixture = fixture();
-            let mut pairing = pair_as(&fixture, true, ("--watcher", "/usr/bin:/bin:/usr"));
+            let mut pairing = pair_as(
+                &fixture,
+                &JoinFrom::Home,
+                ("--watcher", "/usr/bin:/bin:/usr"),
+            );
             pairing.owner.type_line("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
@@ -5877,6 +5900,9 @@ exit 3
             assert!(bob_listed(&fixture, &pairing.thread));
             let short: String = pairing.thread.chars().take(8).collect();
             pairing.joiner.wait_for(&format!("⌂ threads   {short}"));
+            pairing
+                .joiner
+                .wait_for(&format!("tester added you to thread {short} as a watcher."));
             pairing.joiner.wait_for("tester.claude");
             let screen = {
                 let mut parser = vt100::Parser::new(24, 200, 0);
@@ -5902,13 +5928,16 @@ exit 3
                 "#!/bin/sh\necho bob-agent-ready\nexec /bin/sleep 60\n",
             );
             let tools = codex.parent().unwrap().to_str().unwrap().to_owned();
-            let mut pairing = pair_as(&fixture, true, ("--collaborator", &tools));
+            let mut pairing = pair_as(&fixture, &JoinFrom::Home, ("--collaborator", &tools));
             pairing.owner.type_line("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
             assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
 
             let short: String = pairing.thread.chars().take(8).collect();
+            pairing.joiner.wait_for(&format!(
+                "tester added you to thread {short} as a collaborator."
+            ));
             pairing.joiner.wait_for("bob-agent-ready");
             let screen = {
                 let mut parser = vt100::Parser::new(24, 200, 0);
@@ -5926,6 +5955,41 @@ exit 3
                 .wait_for("1 agent is running: stop it and quit?");
             pairing.joiner.terminal.write_all(b"y").unwrap();
             assert_eq!(pairing.joiner.exit_code(), 0, "{}", pairing.joiner.text());
+        }
+
+        #[test]
+        fn a_collaborator_who_starts_no_agent_after_joining_from_the_home_screen_is_still_told_their_role()
+         {
+            let fixture = fixture();
+            let codex = script(
+                &fixture,
+                "bob-tools",
+                "codex",
+                "#!/bin/sh\nexec /bin/sleep 60\n",
+            );
+            script(
+                &fixture,
+                "bob-tools",
+                "claude",
+                "#!/bin/sh\nexec /bin/sleep 60\n",
+            );
+            let tools = codex.parent().unwrap().to_str().unwrap().to_owned();
+            let mut pairing = pair_as(&fixture, &JoinFrom::Home, ("--collaborator", &tools));
+            pairing.owner.type_line("y");
+            pairing.owner.wait_for("Passphrase");
+            pairing.owner.type_line(PASSPHRASE);
+            assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
+
+            pairing
+                .joiner
+                .wait_for("Which agent should work in this thread?");
+            pairing.joiner.terminal.write_all(b"\x1b").unwrap();
+            let short: String = pairing.thread.chars().take(8).collect();
+            pairing.joiner.wait_for(&format!(
+                "tester added you to thread {short} as a collaborator."
+            ));
+            let _ = pairing.joiner.child.kill();
+            let _ = pairing.joiner.child.wait();
         }
 
         /// Resumes `thread` with an agent that waits, so its host serves the thread, and waits
@@ -5967,7 +6031,7 @@ exit 3
         #[test]
         fn a_teammate_who_types_the_pairing_code_is_added_and_nothing_is_left_on_the_remote() {
             let fixture = fixture();
-            let mut pairing = pair_until_asked(&fixture, false);
+            let mut pairing = pair_until_asked(&fixture);
             pairing.owner.type_line("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
@@ -5990,9 +6054,70 @@ exit 3
         }
 
         #[test]
+        fn a_teammate_who_joins_with_a_code_is_told_the_role_the_owner_gave_them() {
+            let fixture = fixture();
+            let mut pairing = pair_as(
+                &fixture,
+                &JoinFrom::Command(&["join"]),
+                ("--watcher", "/usr/bin:/bin:/usr"),
+            );
+            let owner_config = fixture.home.join(".config");
+            let _running = run_thread(
+                &fixture,
+                &pairing.thread,
+                &owner_env(&fixture, &owner_config),
+            );
+            pairing.owner.type_line("y");
+            pairing.owner.wait_for("Passphrase");
+            pairing.owner.type_line(PASSPHRASE);
+            assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
+
+            pairing.joiner.wait_for(&format!(
+                "mahi: tester added you to thread {} as a watcher.",
+                pairing.thread
+            ));
+            let _ = pairing.joiner.child.kill();
+            let _ = pairing.joiner.child.wait();
+        }
+
+        #[test]
+        fn a_collaborator_who_joins_with_a_code_and_an_agent_is_told_their_role() {
+            let fixture = fixture();
+            let codex = script(
+                &fixture,
+                "bob-tools",
+                "codex",
+                "#!/bin/sh\necho bob-agent-ready\nexec /bin/sleep 60\n",
+            );
+            let tools = codex.parent().unwrap().to_str().unwrap().to_owned();
+            let mut pairing = pair_as(
+                &fixture,
+                &JoinFrom::Command(&["join", "--", "codex"]),
+                ("--collaborator", &tools),
+            );
+            let owner_config = fixture.home.join(".config");
+            let _running = run_thread(
+                &fixture,
+                &pairing.thread,
+                &owner_env(&fixture, &owner_config),
+            );
+            pairing.owner.type_line("y");
+            pairing.owner.wait_for("Passphrase");
+            pairing.owner.type_line(PASSPHRASE);
+            assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
+
+            pairing.joiner.wait_for(&format!(
+                "mahi: tester added you to thread {} as a collaborator.",
+                pairing.thread
+            ));
+            let _ = pairing.joiner.child.kill();
+            let _ = pairing.joiner.child.wait();
+        }
+
+        #[test]
         fn a_teammate_the_owner_does_not_add_is_told_and_nothing_is_left_on_the_remote() {
             let fixture = fixture();
-            let mut pairing = pair_until_asked(&fixture, false);
+            let mut pairing = pair_until_asked(&fixture);
             pairing.owner.type_line("n");
             assert_eq!(pairing.owner.exit_code(), 1, "{}", pairing.owner.text());
             assert!(pairing.owner.text().contains("you did not add bob"));

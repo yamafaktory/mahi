@@ -33,6 +33,7 @@ use mahi_identity::{
     LocalIdentity,
     credential_names,
 };
+use mahi_live::Ticket;
 use mahi_sandbox::{
     InputWait,
     Termination,
@@ -120,6 +121,7 @@ const AFTER_ESCAPE: Duration = Duration::from_millis(500);
 const CHILD_WAIT: Duration = Duration::from_millis(15);
 const STOP_WITHIN: Duration = Duration::from_secs(30);
 const INVITED: (&str, &str) = ("invite", "done");
+const JOINED: &str = "join";
 const INVITE_ROLES: [(&str, &str); 2] = [
     (
         "--collaborator",
@@ -739,7 +741,7 @@ fn join_in_tab(
         });
     drop(busy);
     ui::keys_make_signals(false);
-    let (ticket, (thread, role)) = match joined {
+    let (ticket, (thread, owner, role)) = match joined {
         Ok(joined) => joined,
         Err(error) => {
             crate::report(&*error);
@@ -747,34 +749,47 @@ fn join_in_tab(
         }
     };
     workspace.watch_thread(thread);
-    match role {
+    let opened = match role {
         Role::Watcher => Ok(()),
-        Role::Collaborator => {
-            let agent = agent_to_run(
-                environment,
-                ("Join a thread", "Which agent should work in this thread?"),
-                (&[], LastAgent::Kept),
-            )
-            .map_err(|told| match told.split_once("; run mahi run") {
-                Some((none, _)) => none.to_owned(),
-                None => told,
-            })?;
-            let words = vec![
-                "join".to_owned(),
-                ticket.to_string(),
-                "--".to_owned(),
-                agent.clone(),
-            ];
-            let shown = format!("mahi join -- {agent}");
-            let key = identity_file.and_then(unlocked::current);
-            workspace.open(
-                environment,
-                (&short(&thread.to_string()), &agent, &shown),
-                (&words, false),
-                key.as_ref(),
-            )
-        }
-    }
+        Role::Collaborator => start_joined_agent(environment, workspace, &ticket, identity_file),
+    };
+    let told = pair::added(&owner, short(&thread.to_string()), role);
+    workspace.show_thread(thread, (JOINED, &told));
+    opened
+}
+
+/// Asks a collaborator who joined the thread of `ticket` for their agent and starts it in the
+/// thread's tab, as `mahi join` with an agent does; returns what to tell the user when it
+/// does not start.
+fn start_joined_agent(
+    environment: &Environment,
+    workspace: &mut Workspace,
+    ticket: &Ticket,
+    identity_file: Option<&Path>,
+) -> Result<(), String> {
+    let agent = agent_to_run(
+        environment,
+        ("Join a thread", "Which agent should work in this thread?"),
+        (&[], LastAgent::Kept),
+    )
+    .map_err(|told| match told.split_once("; run mahi run") {
+        Some((none, _)) => none.to_owned(),
+        None => told,
+    })?;
+    let words = vec![
+        "join".to_owned(),
+        ticket.to_string(),
+        "--".to_owned(),
+        agent.clone(),
+    ];
+    let shown = format!("mahi join -- {agent}");
+    let key = identity_file.and_then(unlocked::current);
+    workspace.open(
+        environment,
+        (&short(&ticket.thread().to_string()), &agent, &shown),
+        (&words, false),
+        key.as_ref(),
+    )
 }
 
 /// Before an action that ends or purges a thread whose agents run in the workspace's tabs,

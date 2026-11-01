@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     fs::File,
     io::{
         self,
@@ -18,6 +19,7 @@ use std::{
 
 use age::secrecy::ExposeSecret;
 use mahi_core::{
+    ParticipantName,
     ReadBudget,
     ThreadId,
 };
@@ -414,6 +416,19 @@ fn owner_pairs(
     Ok(name)
 }
 
+/// Returns what the joiner's mahi tells them once the `meta` they were added to is verified,
+/// worded as the owner's pairing confirmation, naming the thread as `thread` shows it.
+pub(crate) fn added(
+    owner: &ParticipantName,
+    thread: impl fmt::Display,
+    role: mahi_thread::Role,
+) -> String {
+    format!(
+        "{owner} added you to thread {thread} as a {}.",
+        role_name(role)
+    )
+}
+
 fn role_name(role: mahi_thread::Role) -> &'static str {
     match role {
         mahi_thread::Role::Collaborator => "collaborator",
@@ -589,6 +604,20 @@ mod tests {
         gix::init(dir.path()).unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn the_joiner_is_told_the_role_as_the_owner_was_asked_it() {
+        let owner: ParticipantName = "alice".parse().unwrap();
+        let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        assert_eq!(
+            added(&owner, thread, mahi_thread::Role::Collaborator),
+            "alice added you to thread 0123456789abcdef0123456789abcdef as a collaborator."
+        );
+        assert_eq!(
+            added(&owner, thread, mahi_thread::Role::Watcher),
+            "alice added you to thread 0123456789abcdef0123456789abcdef as a watcher."
+        );
     }
 
     #[test]
