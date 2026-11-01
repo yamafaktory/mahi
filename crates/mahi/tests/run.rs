@@ -2258,6 +2258,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         terminal.write_all(b"\x1b").unwrap();
         seen.clear();
         read_until(&mut reader, &mut seen, "actions");
+        drain(reader);
         terminal.write_all(b"[200~ey\r\x1b[201~").unwrap();
         thread::sleep(Duration::from_millis(800));
         terminal.write_all(b"q").unwrap();
@@ -2318,6 +2319,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         assert!(palette.contains("End this thread"), "{palette}");
         terminal.write_all(b"q").unwrap();
         read_until(&mut reader, &mut seen, "stop it and quit?");
+        drain(reader);
         terminal.write_all(b"y").unwrap();
         let mut mahi = mahi;
         assert_eq!(exit_within(&mut mahi, Duration::from_secs(20)), 0);
@@ -2357,6 +2359,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         assert!(screen.contains("Threads ·"), "{screen}");
         terminal.write_all(b"q").unwrap();
         read_until(&mut reader, &mut seen, "stop it and quit?");
+        drain(reader);
         terminal.write_all(b"y").unwrap();
         let mut mahi = mahi;
         assert_eq!(exit_within(&mut mahi, Duration::from_secs(20)), 0);
@@ -2452,6 +2455,12 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
             assert_ne!(read, 0);
             seen.extend_from_slice(&chunk[..read]);
         }
+    }
+
+    fn drain(mut reader: impl Read + Send + 'static) {
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+        });
     }
 
     fn read_until_screen(
@@ -5029,10 +5038,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
                 .local_modes
                 .contains(LocalModes::ICANON)
         };
-        let mut reader = mahi.reader().unwrap();
-        thread::spawn(move || {
-            let _ = std::io::copy(&mut reader, &mut std::io::sink());
-        });
+        drain(mahi.reader().unwrap());
         wait_until("raw mode", || !canonical(&terminal));
         let pid = rustix::process::Pid::from_raw(i32::try_from(mahi.id()).unwrap()).unwrap();
         rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
