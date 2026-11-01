@@ -54,7 +54,7 @@ just try-reset  # remove the scratch repos, config and data of try and try-teamm
 just test-git   # the tests that run the git program (not part of just test)
 just test-wsl   # the tests that need WSL 2 (not part of just test; CI runs them on Windows)
 just release v  # check, bump every crate to version v, commit, tag v<v> and push (dry run without --execute)
-just dogfood    # the real Claude Code and Codex end to end, with your sign-ins (not in CI)
+just dogfood    # the real Claude Code end to end, with your sign-in (not in CI)
 just apparmor-parse # parse mahi apparmor's profile (needs apparmor_parser and sudo)
 just deb        # build the .deb (cargo-deb) into target/debian/
 just deb-check  # CI only: install the .deb on Ubuntu 24.04 and run mahi from /usr/bin

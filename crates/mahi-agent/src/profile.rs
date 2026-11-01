@@ -177,7 +177,8 @@ pub struct UserProfile {
     pub args: Vec<String>,
     /// The stored credential the agent gets.
     pub credential: Option<ProfileCredential>,
-    /// Whether a handoff's first prompt is given as the agent's last argument, after `--`.
+    /// Whether the first prompt asking the agent to read its notes is given as its last
+    /// argument, after `--`.
     pub first_prompt_arg: bool,
     /// The reader mahi has built in for the agent's sessions.
     pub reader: Option<Reader>,

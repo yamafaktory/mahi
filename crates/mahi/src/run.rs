@@ -65,13 +65,10 @@ use age::secrecy::{
 };
 use mahi_agent::profile::ProfileCredential;
 use mahi_core::{
-    AgentName,
     AgentSlot,
     NameError,
     ParticipantName,
-    RefKind,
     ThreadId,
-    ThreadRef,
 };
 use mahi_crypto::ThreadKey;
 use mahi_identity::{
@@ -156,8 +153,6 @@ use crate::{
     auto_merge::AutoMerge,
     claims::Claims,
     cli::{
-        AgentAddCommand,
-        HandoffCommand,
         JoinCommand,
         LaunchOptions,
         ResumeCommand,
@@ -173,10 +168,6 @@ use crate::{
         PASSED_ON,
         PROXY_VARIABLES,
         Passed,
-    },
-    handoff::{
-        self,
-        HandoffError,
     },
     held_queue::HeldQueue,
     hook,
@@ -199,7 +190,6 @@ use crate::{
         ThreadTools,
         Toolbox,
     },
-    merged::MergedFrom,
     network::{
         Network,
         NetworkError,
@@ -266,7 +256,6 @@ use crate::{
     thread_lock::{
         AgentLock,
         LockError,
-        RunningLock,
         ThreadLock,
     },
     turns::{
@@ -446,20 +435,8 @@ pub(crate) enum RunError {
         "this clone has a worktree for thread {0}, whose files would hide what is taken from the remote; record and remove it with mahi end, or resume without --take-remote"
     )]
     WorktreeHere(ThreadId),
-    #[error(
-        "you already have an agent called {1} in thread {0}; resume it with mahi resume --agent {1}"
-    )]
-    AgentThere(ThreadId, AgentName),
-    #[error("thread {0} does not list a participant called {1}")]
-    SourceNotListed(ThreadId, ParticipantName),
-    #[error(
-        "{0} has no snapshot here; fetch the thread first, or check the name with mahi threads"
-    )]
-    NoSourceSnapshot(AgentSlot),
-    #[error("cannot read the previous agent's work")]
-    Handoff(#[from] HandoffError),
-    #[error("cannot write the handoff notes")]
-    HandoffNotes(#[source] io::Error),
+    #[error("cannot write the agent's notes")]
+    Notes(#[source] io::Error),
     #[error("cannot give the agent the pull request draft")]
     Draft(#[source] io::Error),
 }
@@ -574,7 +551,7 @@ pub(crate) fn run(command: &RunCommand, environment: &Environment) -> Result<Out
             return Err(error.into());
         }
     };
-    prepared.launch(environment, started, termination)
+    prepared.launch((environment, &config), started, termination)
 }
 
 pub(crate) fn resume(
@@ -671,7 +648,7 @@ pub(crate) fn resume(
     if let Some(signal) = caught {
         return Ok(Outcome::Stopped(signal));
     }
-    prepared.launch(environment, started?, termination)
+    prepared.launch((environment, &config), started?, termination)
 }
 
 /// Checks that the thread's `meta` lists the user's key `own` under the name `participant`,
@@ -707,241 +684,6 @@ pub(crate) fn listed_and_fetched(
             .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
     }
     Ok(Ok(CommitKey::new(signer).map_err(RunError::OwnerKey)?))
-}
-
-/// Starts the user's new agent on the work of `command.from` in `command.thread`: in a
-/// worktree holding that agent's latest snapshot, with a briefing of what it was asked and did.
-pub(crate) fn handoff(
-    command: &HandoffCommand,
-    environment: &Environment,
-) -> Result<Outcome, RunError> {
-    start_new_agent(
-        command.thread,
-        (&command.command, &command.options),
-        Start::Handoff(&command.from),
-        environment,
-    )
-}
-
-/// Starts another of the user's agents in `command.thread`, next to the ones already running,
-/// in its own worktree: from the thread's base, or from `command.from`'s latest snapshot.
-pub(crate) fn agent_add(
-    command: &AgentAddCommand,
-    environment: &Environment,
-) -> Result<Outcome, RunError> {
-    start_new_agent(
-        command.thread,
-        (&command.command, &command.options),
-        Start::Fresh(command.from.as_ref()),
-        environment,
-    )
-}
-
-/// Where a new agent of the user's starts in a thread.
-#[derive(Clone, Copy, Debug)]
-enum Start<'a> {
-    /// From this agent's latest snapshot, with a briefing of its work.
-    Handoff(&'a AgentSlot),
-    /// From this agent's latest snapshot, or else the thread's base, without a briefing.
-    Fresh(Option<&'a AgentSlot>),
-}
-
-fn start_new_agent(
-    thread: ThreadId,
-    (command, options): (&[OsString], &LaunchOptions),
-    start: Start<'_>,
-    environment: &Environment,
-) -> Result<Outcome, RunError> {
-    let (program, arguments) = command.split_first().ok_or(RunError::NoAgent)?;
-    let cwd = env::current_dir()
-        .and_then(fs::canonicalize)
-        .map_err(RunError::CurrentDirectory)?;
-    let host = Host::from_environment(environment)?;
-    let config = ConfigDir::resolve(
-        environment.home.as_deref(),
-        environment.xdg_config_home.as_deref(),
-    )?;
-    let signing = SigningKey::load(&config.signing_key_file()).map_err(RunError::NotInitialised)?;
-    let own = ParticipantKey::from_public_key(signing.public_key()).map_err(RunError::OwnerKey)?;
-    let participant = session::participant_from(environment.user.as_deref())
-        .map_err(RunError::ParticipantName)?;
-    let store = Store::discover(&cwd)?;
-    let owner = session::thread_owner(&store, thread, own.clone())
-        .map_err(|error| RunError::ThreadOwner(thread, error))?;
-    let bootstrap: Vec<HostAddress> = live::bootstrap(&store, thread);
-    let agent_name = session::agent_from(Path::new(program));
-    let _lock = AgentLock::acquire(&config, thread, &agent_name)?;
-    let slot = AgentSlot::new(participant.clone(), agent_name.clone());
-    if store
-        .head(&ThreadRef::new(thread, RefKind::Snapshots(slot.clone())))?
-        .is_some()
-    {
-        return Err(RunError::AgentThere(thread, agent_name));
-    }
-    let profile = options.profile_for(program);
-    let hosts = allowed_hosts(options.allow_hosts(), profile);
-    let settings = Settings::load(&config)?;
-    let credentials = gather_credentials(&config, options, profile, environment)?;
-    let mut prepared = Prepared::new(
-        environment,
-        host,
-        &cwd,
-        store,
-        &AgentRequest {
-            program,
-            arguments,
-            profile,
-            hosts: &hosts,
-        },
-        credentials,
-    )?;
-    prepared.apply(&settings);
-    prepared.join_thread(environment, &config, owner.clone(), bootstrap)?;
-    prepared.sync = SyncSetup::gather(&prepared.store, environment, owner == own);
-    let commits = match listed_and_fetched(
-        &prepared.store,
-        environment,
-        (thread, true),
-        &owner,
-        (&own, &participant),
-        &signing,
-        None,
-    )? {
-        Ok(commits) => commits,
-        Err(signal) => return Ok(Outcome::Stopped(signal)),
-    };
-    let meta = load_meta(&prepared.store, thread, &owner, 0)
-        .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
-    let (key, contents, merged) = starting_point(
-        start,
-        &mut prepared,
-        &meta,
-        &participant,
-        &config,
-        &agent_name,
-    )?;
-    let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
-    let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
-    let (started, caught) = until_stopped(&termination, |interrupt| {
-        session::hand_over(
-            &prepared.store,
-            session::HandOver {
-                thread,
-                base: meta.base(),
-                key,
-                slot,
-                contents,
-                merged,
-                worktrees: &worktrees,
-                commits: &commits,
-            },
-            &prepared.globals,
-            interrupt,
-        )
-    });
-    if let Some(signal) = caught {
-        return Ok(Outcome::Stopped(signal));
-    }
-    let started = started
-        .inspect_err(|_| {
-            let _ = fs::remove_dir(&worktrees);
-        })
-        .map_err(|error| RunError::Enter(Box::new(error)))?;
-    if let Err(error) = keep_private(&worktrees) {
-        started.discard_or_report(&prepared.store);
-        return Err(error);
-    }
-    prepared.launch(environment, started, termination)
-}
-
-/// Returns the thread key, the tree a new agent's worktree starts from and the snapshot it
-/// takes from another agent, if any, writing its briefing first for a handoff.
-fn starting_point(
-    start: Start<'_>,
-    prepared: &mut Prepared,
-    meta: &VerifiedMeta,
-    participant: &ParticipantName,
-    config: &ConfigDir,
-    agent_name: &AgentName,
-) -> Result<(ThreadKey, ObjectId, MergedFrom), RunError> {
-    let mut merged = MergedFrom::default();
-    match start {
-        Start::Handoff(from) => {
-            let (key, (commit, contents)) = brief(prepared, meta, from, participant, config)?;
-            eprintln!("mahi: handing {from}'s work over to {agent_name}");
-            merged.absorb(
-                &prepared.store,
-                (
-                    &crate::merge::merged_by(&prepared.store, commit),
-                    meta.thread(),
-                ),
-                Some(&AgentSlot::new(participant.clone(), agent_name.clone())),
-            );
-            merged.record(from.clone(), commit);
-            Ok((key, contents, merged))
-        }
-        Start::Fresh(Some(from)) => {
-            let (commit, contents) = source_snapshot(&prepared.store, meta, from)?;
-            let key = unlock_thread_key(meta, participant, config)?;
-            eprintln!("mahi: starting {agent_name} from {from}'s latest snapshot");
-            merged.absorb(
-                &prepared.store,
-                (
-                    &crate::merge::merged_by(&prepared.store, commit),
-                    meta.thread(),
-                ),
-                Some(&AgentSlot::new(participant.clone(), agent_name.clone())),
-            );
-            merged.record(from.clone(), commit);
-            Ok((key, contents, merged))
-        }
-        Start::Fresh(None) => {
-            let contents = prepared.store.commit_tree(meta.base())?;
-            let key = unlock_thread_key(meta, participant, config)?;
-            eprintln!("mahi: starting {agent_name} from the thread's base");
-            Ok((key, contents, merged))
-        }
-    }
-}
-
-/// Checks that `meta` lists `from`'s participant and that `from` has a snapshot, then asks for
-/// the passphrase and writes the briefing of `from`'s work for the agent. Returns the thread
-/// key, and `from`'s latest snapshot with its tree.
-fn brief(
-    prepared: &mut Prepared,
-    meta: &VerifiedMeta,
-    from: &AgentSlot,
-    participant: &ParticipantName,
-    config: &ConfigDir,
-) -> Result<(ThreadKey, (ObjectId, ObjectId)), RunError> {
-    let (commit, contents) = source_snapshot(&prepared.store, meta, from)?;
-    let key = unlock_thread_key(meta, participant, config)?;
-    let notes =
-        handoff::briefing(&prepared.store, &key, meta, from, (meta.base(), contents))?.render();
-    prepared.write_handoff(&notes)?;
-    Ok((key, (commit, contents)))
-}
-
-/// Returns `from`'s latest snapshot and its tree, once `meta` lists `from`'s participant.
-fn source_snapshot(
-    store: &Store,
-    meta: &VerifiedMeta,
-    from: &AgentSlot,
-) -> Result<(ObjectId, ObjectId), RunError> {
-    let thread = meta.thread();
-    if !meta
-        .participants()
-        .any(|listed| listed.name() == from.participant())
-    {
-        return Err(RunError::SourceNotListed(
-            thread,
-            from.participant().clone(),
-        ));
-    }
-    let source = store
-        .head(&ThreadRef::new(thread, RefKind::Snapshots(from.clone())))?
-        .ok_or_else(|| RunError::NoSourceSnapshot(from.clone()))?;
-    Ok((source, store.commit_tree(source)?))
 }
 
 /// Asks for the passphrase of the user's mahi key on the terminal.
@@ -1085,7 +827,7 @@ pub(crate) fn join_run(
     }
     let started = started.map_err(|error| RunError::Enter(Box::new(error)))?;
     keep_private(&worktrees)?;
-    prepared.launch(environment, started, termination)
+    prepared.launch((environment, &config), started, termination)
 }
 
 /// Returns what `mahi resume` runs: the command after `--`, or the program named after the
@@ -1303,7 +1045,6 @@ struct Prepared {
     credentials: Vec<Handed>,
     live: Option<LiveSetup>,
     sync: Option<SyncSetup>,
-    handoff: Option<PathBuf>,
     palette_key: PaletteKey,
     approvals: AgentApprovals,
 }
@@ -1336,20 +1077,18 @@ impl Prepared {
         Ok(())
     }
 
-    /// Writes the handoff notes into the agent's private temporary directory, readable by the
-    /// user only, and hands them to the agent when it starts.
-    fn write_handoff(&mut self, notes: &str) -> Result<(), RunError> {
+    /// Writes the notes the agent reads first into its private temporary directory, readable
+    /// by the user only, and returns their path.
+    fn write_notes(&self, notes: &str) -> Result<PathBuf, RunError> {
         let path = self.scratch.join(TMP).join(HANDOFF_NOTES);
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&path)
-            .map_err(RunError::HandoffNotes)?;
-        file.write_all(notes.as_bytes())
-            .map_err(RunError::HandoffNotes)?;
-        self.handoff = Some(path);
-        Ok(())
+            .map_err(RunError::Notes)?;
+        file.write_all(notes.as_bytes()).map_err(RunError::Notes)?;
+        Ok(path)
     }
 
     fn new(
@@ -1410,7 +1149,6 @@ impl Prepared {
             credentials,
             live: None,
             sync: None,
-            handoff: None,
             palette_key: PaletteKey::default(),
             approvals: AgentApprovals::default(),
         })
@@ -1467,24 +1205,17 @@ impl Prepared {
         }
     }
 
-    /// Returns the state the agent starts in, when its profile's hooks report its turns:
-    /// working when a handoff gives it its first prompt, and otherwise done, waiting for one.
+    /// Returns the state the agent starts in, done and waiting for its first prompt, when its
+    /// profile's hooks report its turns.
     fn first_state(&self) -> Option<TurnState> {
-        let profile = self.profile.filter(|profile| profile.reports_turn_ends())?;
-        let prompted = self
-            .handoff
-            .as_deref()
-            .is_some_and(|notes| gives_first_prompt(Some(profile), notes));
-        Some(if prompted {
-            TurnState::Working
-        } else {
-            TurnState::Done
-        })
+        self.profile
+            .filter(|profile| profile.reports_turn_ends())
+            .map(|_| TurnState::Done)
     }
 
     fn launch(
         mut self,
-        environment: &Environment,
+        (environment, config): (&Environment, &ConfigDir),
         mut started: Started,
         termination: TerminationSignals,
     ) -> Result<Outcome, RunError> {
@@ -1507,10 +1238,9 @@ impl Prepared {
         let state = self.state_dir(&started);
         let launch = Launch {
             restore,
-            handoff: self.handoff.as_deref(),
+            notes: None,
             worktree_access: Access::ReadWrite,
             tools: true,
-            first_prompt: handoff::first_prompt,
             arguments: &self.arguments,
             environment,
             agent: &self.agent,
@@ -1526,8 +1256,6 @@ impl Prepared {
             approvals: self.approvals,
         };
         let (sandbox, network) = (self.sandbox, self.network);
-        let (config, _running) = mark_running(environment, &started)
-            .inspect_err(|_| started.discard_or_report(&self.store))?;
         let live = start_live(self.live.take(), &self.git_dir, &started);
         let launched = started.launch(&self.store, || launch.spawn(sandbox, network));
         let (child, raw, proxy) = match launched {
@@ -1558,7 +1286,7 @@ impl Prepared {
         let tools = serve_tools(
             self.mcp,
             (self.owner, key, live.as_ref()),
-            (&self.git_dir, config.clone()),
+            &self.git_dir,
             (&started, note_by),
         );
         let outcome = finish_run(
@@ -1586,7 +1314,7 @@ impl Prepared {
 }
 
 /// Says whether an agent run with `profile` gets, as its first prompt, the request to read
-/// the handoff `notes`: its profile takes one, and the notes' path is text.
+/// its `notes`: its profile takes one, and the notes' path is text.
 fn gives_first_prompt(profile: Option<&Profile>, notes: &Path) -> bool {
     profile.is_some_and(|profile| profile.takes_prompt) && notes.to_str().is_some()
 }
@@ -1606,20 +1334,6 @@ fn keep_hook_trust(profile: Option<&Profile>, state: Option<PathBuf>, config: &P
     if let Err(error) = profile.keep_hook_trust(&parent.join(name), config) {
         crate::report_with("the approval of mahi's hooks was not kept", &error);
     }
-}
-
-/// Takes the lock that tells the user's other mahis that `started`'s agent runs here, with the
-/// user's configuration directory it is in.
-fn mark_running(
-    environment: &Environment,
-    started: &Started,
-) -> Result<(ConfigDir, RunningLock), RunError> {
-    let config = ConfigDir::resolve(
-        environment.home.as_deref(),
-        environment.xdg_config_home.as_deref(),
-    )?;
-    let running = RunningLock::acquire(&config, started.thread, started.slot.agent())?;
-    Ok((config, running))
 }
 
 /// Splits the agent's `arguments` before the first `--`, after which the agent takes no
@@ -1642,7 +1356,7 @@ fn serve_tools(
         Option<Arc<ThreadKey>>,
         Option<&Link>,
     ),
-    (git_dir, config): (&Path, ConfigDir),
+    git_dir: &Path,
     (started, note_by): (&Started, NoteBy),
 ) -> Arc<AtomicBool> {
     let serving = Arc::new(AtomicBool::new(true));
@@ -1652,7 +1366,7 @@ fn serve_tools(
         return serving;
     };
     let tools = ThreadTools::new(
-        (git_dir.to_path_buf(), config),
+        git_dir.to_path_buf(),
         (started.thread, owner, key),
         (started.slot.clone(), claims),
     )
@@ -2148,10 +1862,9 @@ struct Restore<'a> {
 
 struct Launch<'a> {
     restore: Option<Restore<'a>>,
-    handoff: Option<&'a Path>,
+    notes: Option<&'a Path>,
     worktree_access: Access,
     tools: bool,
-    first_prompt: fn(&str) -> String,
     credentials: &'a [Handed],
     profile: Option<&'static Profile>,
     approvals: AgentApprovals,
@@ -2188,8 +1901,8 @@ impl Launch<'_> {
     /// that start it asking no permission unless the user chose otherwise, then, when
     /// mahi serves the agent its tools, what its profile adds for them (a flag and the file in
     /// its state directory `state` that tells it where `mahi mcp` is, or the profile's tool
-    /// arguments), then the user's after `--` and the first prompt of a handoff, after those
-    /// so it is not taken as one of their values.
+    /// arguments), then the user's after `--` and the first prompt to read its notes, after
+    /// those so it is not taken as one of their values.
     fn agent_arguments(&self, mut pty: PtyCommand, state: Option<&Path>) -> PtyCommand {
         let arguments = if self.continues_nothing(state) {
             eprintln!(
@@ -2239,7 +1952,7 @@ impl Launch<'_> {
         for argument in after {
             pty = pty.arg(argument);
         }
-        match self.handoff {
+        match self.notes {
             Some(notes) => self.ask_to_read(pty, notes),
             None => pty,
         }
@@ -2255,10 +1968,10 @@ impl Launch<'_> {
         Some((mahi, self.mcp_socket.to_str()?))
     }
 
-    /// Gives the agent the first prompt asking it to read the handoff `notes`, when its
-    /// profile takes one, or else tells the user to give it.
+    /// Gives the agent the first prompt asking it to read the `notes`, when its profile takes
+    /// one, or else tells the user to give it.
     fn ask_to_read(&self, pty: PtyCommand, notes: &Path) -> PtyCommand {
-        let prompt = (self.first_prompt)(&notes.display().to_string());
+        let prompt = draft_prompt(&notes.display().to_string());
         if gives_first_prompt(self.profile, notes) {
             return pty.arg("--").arg(&prompt);
         }
@@ -2421,7 +2134,7 @@ impl Launch<'_> {
         if let Some(mahi) = &self.environment.mahi_exe {
             pty = pty.env(MAHI_BIN, mahi);
         }
-        if let Some(notes) = self.handoff {
+        if let Some(notes) = self.notes {
             pty = pty.env(HANDOFF_ENV, notes);
         }
         let handed = |name: &str| {
@@ -3249,14 +2962,13 @@ impl DraftWriter {
             Mode::empty(),
         )
         .map_err(|error| RunError::Draft(error.into()))?;
-        prepared.write_handoff(&notes(&draft_path))?;
+        let notes_path = prepared.write_notes(&notes(&draft_path))?;
         let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
         let launch = Launch {
             restore: None,
-            handoff: prepared.handoff.as_deref(),
+            notes: Some(&notes_path),
             worktree_access: Access::ReadOnly,
             tools: false,
-            first_prompt: draft_prompt,
             arguments: &prepared.arguments,
             environment,
             agent: &prepared.agent,
@@ -3408,7 +3120,7 @@ mod tests {
     }
 
     #[test]
-    fn a_handoff_starts_on_its_prompt_only_when_the_profile_takes_one_and_the_path_is_text() {
+    fn the_notes_are_the_first_prompt_only_when_the_profile_takes_one_and_the_path_is_text() {
         let claude = Profile::for_agent(OsStr::new("claude"));
         let notes = Path::new("/tmp/notes.md");
         assert!(gives_first_prompt(claude, notes));

@@ -79,3 +79,22 @@ Chosen by the user. Each sub-agent starts cold and reads the design and the code
 parallel agents use several times the tokens of one session. Most of milestone 9's steps also
 build on each other. The user starts the coordinator mode only for issues that touch separate
 code. At most two sub-agents run at once.
+
+## D013 · 2026-11-01 · The list_agents mark of agents running here goes
+
+Chosen by the user. `list_agents` marked the user's other agents in the thread as `(running
+here)`. Only several agents of one person in a thread give the mark a meaning, and one agent
+per person removes them. The running lock that only the mark read goes with it.
+
+## D014 · 2026-11-01 · Landing two agents is tested with a collaborator
+
+Chosen by the user. The test that lands two agents' work used `mahi agent add`. It becomes a
+git test in which bob joins as a collaborator through the test SSH remote, so the second
+agent is a teammate's, as one agent per person has it.
+
+## D015 · 2026-11-01 · The dogfood test keeps Claude Code alone for now
+
+Chosen by the user. The dogfood test handed Claude Code's thread to Codex. Without handoff,
+Codex cannot enter that thread as the same person, and a thread of its own cannot get its
+sign-in before it starts. Claude Code's part stays, and issue 0006 brings Codex back as a
+collaborator, with a second user in the dogfood world.

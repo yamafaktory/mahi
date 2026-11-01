@@ -71,8 +71,6 @@ use sha2::{
 };
 use thiserror::Error;
 
-use crate::merged::MergedFrom;
-
 const STATE: [&str; 2] = ["mahi", "state"];
 const LONGEST_REPOSITORY_NAME: usize = 64;
 pub(crate) const SNAPSHOT_MESSAGE: &str = "snapshot";
@@ -120,15 +118,7 @@ pub(crate) struct Started {
     pub(crate) key: Option<ThreadKey>,
     pub(crate) tip: Option<TranscriptTip>,
     pub(crate) commits: CommitKey,
-    created: Option<Created>,
-}
-
-/// What a run created and removes again if its agent never runs: a whole thread, from its
-/// first `meta` commit, or only a new agent in an existing thread.
-#[derive(Debug, Clone, Copy)]
-enum Created {
-    Thread(ObjectId),
-    Agent,
+    created: Option<ObjectId>,
 }
 
 /// The newest snapshot commit of a worktree, the tree it records, and the cache that took it.
@@ -223,7 +213,7 @@ pub(crate) fn start(
                 key: Some(key),
                 tip: None,
                 commits: commits.clone(),
-                created: Some(Created::Thread(meta)),
+                created: Some(meta),
             };
             let recorded = take_first_snapshot(
                 store,
@@ -450,68 +440,6 @@ pub(crate) fn enter(
     })
 }
 
-/// What `mahi handoff` needs to start the user's new agent on another agent's work.
-#[derive(Debug)]
-pub(crate) struct HandOver<'a> {
-    pub(crate) thread: ThreadId,
-    pub(crate) base: ObjectId,
-    pub(crate) key: ThreadKey,
-    pub(crate) slot: AgentSlot,
-    pub(crate) contents: ObjectId,
-    pub(crate) merged: MergedFrom,
-    pub(crate) worktrees: &'a Path,
-    pub(crate) commits: &'a CommitKey,
-}
-
-/// Starts the user's new agent in `thread` on another agent's work: a worktree at the thread's
-/// base holding `contents`, the other agent's latest snapshot, and the new agent's snapshots
-/// started with it, recording `merged` as what the agent took from others. The thread must
-/// have no worktree here.
-pub(crate) fn hand_over(
-    store: &Store,
-    hand: HandOver<'_>,
-    globals: &GlobalPatterns,
-    interrupt: &AtomicBool,
-) -> Result<Started, EnterError> {
-    let HandOver {
-        thread,
-        base,
-        key,
-        slot,
-        contents,
-        merged,
-        worktrees,
-        commits,
-    } = hand;
-    store
-        .commit_tree(base)
-        .map_err(|error| EnterError::BaseMissing(base, error))?;
-    let name = worktree_name(thread, slot.agent());
-    store.prune_worktree(&name)?;
-    let worktree =
-        store.restore_worktree(&name, &worktrees.join(&name), base, contents, interrupt)?;
-    let snapshots = ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
-    let first = take_first_snapshot(
-        store,
-        (&name, &snapshots),
-        globals,
-        (commits, &merged.message()),
-        interrupt,
-    )
-    .inspect_err(|_| remove_worktree_or_report(store, &name))?;
-    Ok(Started {
-        thread,
-        worktree,
-        snapshots,
-        first_snapshot: Some(first),
-        slot,
-        key: Some(key),
-        tip: None,
-        commits: commits.clone(),
-        created: Some(Created::Agent),
-    })
-}
-
 /// Finds the user's agent in `thread`: the one named `agent`, or the only one.
 /// Returns the agents `participant` has in `thread`, from their refs, in order.
 pub(crate) fn own_slots(
@@ -619,10 +547,10 @@ impl Started {
         }
     }
 
-    /// Removes what this run created, for an agent that never ran: the thread, or the new
-    /// agent's snapshots and state, and the worktree.
+    /// Removes the thread this run created, for an agent that never ran: its snapshots, state
+    /// and worktree.
     pub(crate) fn discard(&self, store: &Store) -> Result<(), DiscardError> {
-        let Some(created) = self.created else {
+        let Some(meta) = self.created else {
             return Ok(());
         };
         let snapshots = match store.head(&self.snapshots) {
@@ -630,18 +558,12 @@ impl Started {
             Ok(None) => Ok(()),
             Err(error) => Err(error),
         };
-        let (thread, state) = match created {
-            Created::Thread(meta) => (
-                discard_thread(store, self.thread, meta),
-                self.state_root(store),
-            ),
-            Created::Agent => (Ok(()), self.state_dir(store)),
-        };
+        let thread = discard_thread(store, self.thread, meta);
         let worktree = store.remove_worktree(&worktree_name(self.thread, self.slot.agent()));
         if let Some(repository) = self.worktree.parent() {
             let _ = fs::remove_dir(repository);
         }
-        let state = match fs::remove_dir_all(state) {
+        let state = match fs::remove_dir_all(self.state_root(store)) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
             _ => Ok(()),
         };
@@ -956,7 +878,7 @@ pub(crate) mod tests {
         );
         let meta = ThreadRef::new(started.thread, RefKind::Meta);
         assert!(
-            matches!(started.created, Some(Created::Thread(first)) if store.head(&meta).unwrap() == Some(first))
+            matches!(started.created, Some(first) if store.head(&meta).unwrap() == Some(first))
         );
         let first = started.first_snapshot.as_ref().unwrap();
         assert_eq!(store.head(&started.snapshots).unwrap(), Some(first.commit));
@@ -1019,7 +941,7 @@ pub(crate) mod tests {
         assert!(started.worktree.join("README").exists());
         let meta = ThreadRef::new(started.thread, RefKind::Meta);
         assert!(
-            matches!(started.created, Some(Created::Thread(first)) if store.head(&meta).unwrap() == Some(first))
+            matches!(started.created, Some(first) if store.head(&meta).unwrap() == Some(first))
         );
     }
 
@@ -1162,52 +1084,6 @@ pub(crate) mod tests {
             result,
             Err(StartError::Store(StoreError::NoCommit))
         ));
-    }
-
-    #[test]
-    fn a_handed_over_agent_that_never_ran_is_removed_but_not_its_thread() {
-        let (_dir, store) = repository_on_main();
-        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        let mut started = start_with(&store, &signer).unwrap();
-        let first = started.first_snapshot.take().unwrap();
-        store
-            .remove_worktree(&worktree_name(started.thread, started.slot.agent()))
-            .unwrap();
-        let slot = AgentSlot::new(
-            ParticipantName::new("alice").unwrap(),
-            AgentName::new("codex").unwrap(),
-        );
-        let mut merged = MergedFrom::default();
-        merged.record(started.slot.clone(), first.commit);
-        let handed = hand_over(
-            &store,
-            HandOver {
-                thread: started.thread,
-                base: store.head_commit().unwrap(),
-                key: ThreadKey::generate(),
-                slot: slot.clone(),
-                contents: first.tree,
-                merged: merged.clone(),
-                worktrees: &worktrees(&store),
-                commits: &started.commits,
-            },
-            &GlobalPatterns::default(),
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-        let snapshots = ThreadRef::new(started.thread, RefKind::Snapshots(slot));
-        assert!(store.head(&snapshots).unwrap().is_some());
-        assert_eq!(MergedFrom::read(&store, &snapshots).unwrap(), merged);
-        assert!(handed.worktree.join("README").exists());
-        let state = handed.state_dir(&store);
-        std::fs::create_dir_all(&state).unwrap();
-        assert_eq!(handed.launch(&store, || Err::<(), _>(())), Err(()));
-        assert_eq!(store.head(&snapshots).unwrap(), None);
-        assert!(!handed.worktree.exists());
-        assert!(!state.exists());
-        assert_eq!(store.head(&started.snapshots).unwrap(), Some(first.commit));
-        let meta = ThreadRef::new(started.thread, RefKind::Meta);
-        assert!(store.head(&meta).unwrap().is_some());
     }
 
     #[test]

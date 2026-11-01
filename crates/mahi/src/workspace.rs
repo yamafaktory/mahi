@@ -650,9 +650,7 @@ enum Entry {
     Quit,
 }
 
-const THREAD_ACTIONS: [(ThreadChoice, &str); 6] = [
-    (ThreadChoice::AddAgent, "Add an agent to this thread"),
-    (ThreadChoice::Handoff, "Hand off to another of your agents"),
+const THREAD_ACTIONS: [(ThreadChoice, &str); 4] = [
     (ThreadChoice::Land, "Land this thread"),
     (ThreadChoice::Push, "Push the landed commits"),
     (ThreadChoice::End, "End this thread"),
@@ -2555,8 +2553,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("{item} missing: {rows:#?}"))
         };
         for item in [
-            "Add an agent to this thread",
-            "Hand off to another of your agents",
             "Land this thread",
             "Push the landed commits",
             "End this thread",
@@ -2564,6 +2560,12 @@ mod tests {
         ] {
             row_of(item);
         }
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("Add an agent") || row.contains("Hand off")),
+            "{rows:#?}"
+        );
         let sent = row_of("Pass Ctrl-Space through to the agent");
         assert_eq!(sent.matches("Ctrl-Space").count(), 2, "{rows:#?}");
         let quit = row_of("Quit mahi").trim_end_matches(['│', '╯', ' ']);

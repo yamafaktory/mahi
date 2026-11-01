@@ -74,7 +74,6 @@ use mahi_identity::ConfigDir;
 
 use crate::{
     cli::{
-        AgentCommand,
         Cli,
         Command,
         CredentialCommand,
@@ -116,10 +115,6 @@ fn main() {
         None => Some(Vec::new()),
         Some(Command::Run(command)) => Some(command.options.pass_env().to_vec()),
         Some(Command::Resume(command)) => Some(command.options.pass_env().to_vec()),
-        Some(Command::Handoff(command)) => Some(command.options.pass_env().to_vec()),
-        Some(Command::Agent(AgentCommand::Add(command))) => {
-            Some(command.options.pass_env().to_vec())
-        }
         Some(Command::Land(command)) => Some(command.options.pass_env().to_vec()),
         Some(Command::Join(command)) if command.agent().is_some() => {
             Some(command.options.pass_env().to_vec())
@@ -266,10 +261,6 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
         }
         Command::Mcp => serve_mcp(environment),
         Command::Land(command) => landed(&command, environment),
-        Command::Handoff(command) => outcome_code(run::handoff(&command, environment)),
-        Command::Agent(AgentCommand::Add(command)) => {
-            outcome_code(run::agent_add(&command, environment))
-        }
         Command::Resume(command) => outcome_code(run::resume(&command, environment)),
         Command::Run(command) => outcome_code(run::run(&command, environment)),
     }

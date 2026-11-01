@@ -99,9 +99,9 @@ short pairing code such as `412-merit-intention`; the teammate runs
 yes, the teammate watches the thread live. Pairing meets through the remote `mahi remote`
 chose. Cards and tickets still work without it: `mahi id` prints the card a thread's owner
 needs, `mahi invite --collaborator <thread> <card>` turns it into a ticket, and `mahi join <ticket>` uses it.
-`mahi handoff` and `mahi agent` move work between agents.
+Each person runs one agent in a thread.
 
-On the home screen, an agent you start, resume or add runs in its thread's tab at full size. A
+On the home screen, an agent you start or resume runs in its thread's tab at full size. A
 line under it names each teammate's agent and its state (working, done, asks, live or offline). The palette key
 (`Ctrl-Space`) followed by `0` to `9` or the arrows moves between tabs and agents, followed by
 `Space` jumps to the next agent waiting for you. Pressed twice, the palette key is sent to
@@ -113,8 +113,8 @@ Any terminal agent runs in mahi. For an agent it has a profile for, mahi also kn
 the agent may reach, gives it a state directory of its own in each thread, records its turns
 through its hooks, and serves it the thread's tools (`mahi mcp`). mahi chooses the profile by
 the agent program's file name and says at start which one it uses. Profiles for Claude Code and
-Codex are built in, and mahi also reads their session logs: a `mahi handoff` briefing quotes
-the agent's latest replies, and `mahi resume` on another machine restores its session.
+Codex are built in, and mahi also reads their session logs: a pull request draft quotes the
+agent's latest replies, and `mahi resume` on another machine restores its session.
 
 The sandbox reaches the network only through mahi's proxy, to the hosts the profile or
 `--allow-host` names. Options for `mahi run` go before the agent; everything after the agent is
@@ -207,8 +207,6 @@ Some things stay out of them:
 | `mahi resume <thread>` | Runs the thread's agent again, continuing its latest session |
 | `mahi threads [--json]` | Lists the repository's threads and their agents, as JSON with `--json` |
 | `mahi threads search <text> [--json]` | Finds the turns whose prompts or tool calls hold the text, in every thread |
-| `mahi agent add <thread> -- <agent>` | Runs another of your agents in a thread |
-| `mahi handoff <thread> --from <p.agent> -- <agent>` | Starts an agent on another agent's work, with a briefing |
 | `mahi land <thread>` | Brings the thread's work back as a branch to curate into commits |
 | `mahi end <thread>` | Ends a thread: records a last snapshot and removes its worktree |
 | `mahi purge <thread>` | Deletes a thread here and on its remote |
@@ -261,7 +259,7 @@ the same time also connect to each other directly. [DESIGN.md](DESIGN.md) specif
   its state lives. Its hooks report each prompt, tool call and turn end to `mahi hook`, and
   `mahi mcp` serves it the thread's tools over the
   [Model Context Protocol](https://modelcontextprotocol.io). Built-in readers parse Claude
-  Code's and Codex's session logs for handoff briefings and pull request drafts.
+  Code's and Codex's session logs for pull request drafts.
 - **Terminal.** The live view and the in-session palette render the agent's screen with
   [vt100](https://crates.io/crates/vt100), on [tokio](https://tokio.rs).
 
@@ -269,7 +267,7 @@ The workspace is split where a part has a clear boundary:
 
 | Crate | What it holds |
 |---|---|
-| `mahi` | The binary: commands, the run loop, profiles, merge, handoff and landing |
+| `mahi` | The binary: commands, the run loop, profiles, merge and landing |
 | `mahi-core` | Thread ids, names and the ref layout |
 | `mahi-crypto` | Thread keys and the sealed blob format |
 | `mahi-identity` | The passphrase-protected age key, ssh-agent signing and stored credentials |
@@ -290,12 +288,11 @@ The workspace is split where a part has a clear boundary:
 The commands are in the `justfile`, and [AGENTS.md](AGENTS.md) describes how the project is
 worked on. `just check` runs formatting, lints, tests and the dependency policy;
 `just test-git` runs the tests that need the `git` program, and `just test-wsl` the ones that
-need WSL 2. `just dogfood` runs the real Claude Code and Codex through mahi end to end (a
-thread, a handoff, a resume and a landing) in a throwaway home, with your own sign-ins:
+need WSL 2. `just dogfood` runs the real Claude Code through mahi end to end (a thread and
+its landing) in a throwaway home, with your own sign-in:
 
 ```sh
-MAHI_DOGFOOD_CLAUDE_TOKEN=path/to/claude-setup-token \
-MAHI_DOGFOOD_CODEX_AUTH=~/.codex/auth.json just dogfood
+MAHI_DOGFOOD_CLAUDE_TOKEN=path/to/claude-setup-token just dogfood
 ```
 
 ## License

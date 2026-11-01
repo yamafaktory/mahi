@@ -57,13 +57,6 @@ pub(crate) enum Command {
     Run(RunCommand),
     /// Resumes a thread you started, in its worktree, with the same agent.
     Resume(ResumeCommand),
-    /// Starts your agent on another agent's work in a thread you are in: its worktree holds
-    /// that agent's latest snapshot, and it gets a briefing of what the user asked and what
-    /// was done.
-    Handoff(HandoffCommand),
-    /// Runs more of your agents in a thread, each in its own terminal.
-    #[command(subcommand)]
-    Agent(AgentCommand),
     /// Merges a thread's agents' work into its landing worktree, on a branch from the
     /// thread's landing branch, for you to curate into commits there with git.
     Land(LandCommand),
@@ -321,43 +314,6 @@ pub(crate) struct ResumeCommand {
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]
-pub(crate) struct HandoffCommand {
-    /// The thread, as `mahi threads` lists it.
-    pub(crate) thread: ThreadId,
-    /// The agent whose work to take over, as `<participant>.<agent>`, such as `alice.claude`.
-    #[arg(long, value_name = "PARTICIPANT.AGENT")]
-    pub(crate) from: AgentSlot,
-    #[command(flatten)]
-    pub(crate) options: LaunchOptions,
-    /// The agent to start, and its arguments, after `--`.
-    #[arg(last = true, required = true, value_name = "COMMAND")]
-    pub(crate) command: Vec<OsString>,
-}
-
-#[derive(Debug, Subcommand, PartialEq, Eq)]
-pub(crate) enum AgentCommand {
-    /// Starts another of your agents in a thread you are in, in this terminal, next to the
-    /// ones already running: in its own worktree, from the thread's base or from another
-    /// agent's latest snapshot.
-    Add(AgentAddCommand),
-}
-
-#[derive(Debug, Args, PartialEq, Eq)]
-pub(crate) struct AgentAddCommand {
-    /// The thread, as `mahi threads` lists it.
-    pub(crate) thread: ThreadId,
-    /// Starts from this agent's latest snapshot, as `<participant>.<agent>`, instead of the
-    /// thread's base.
-    #[arg(long, value_name = "PARTICIPANT.AGENT")]
-    pub(crate) from: Option<AgentSlot>,
-    #[command(flatten)]
-    pub(crate) options: LaunchOptions,
-    /// The agent to start, and its arguments, after `--`.
-    #[arg(last = true, required = true, value_name = "COMMAND")]
-    pub(crate) command: Vec<OsString>,
-}
-
-#[derive(Debug, Args, PartialEq, Eq)]
 pub(crate) struct LandCommand {
     /// The thread, as `mahi threads` lists it.
     pub(crate) thread: ThreadId,
@@ -491,39 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_add_takes_a_thread_an_optional_source_and_the_agent() {
+    fn a_second_agent_of_ones_own_is_no_command() {
         let thread = "0123456789abcdef0123456789abcdef";
-        let Command::Agent(AgentCommand::Add(added)) = parse(&[
-            "agent",
-            "add",
-            thread,
-            "--from",
-            "alice.claude",
-            "--",
-            "codex",
-            "-q",
-        ])
-        .unwrap()
-        .command
-        else {
-            panic!("not agent add");
-        };
-        assert_eq!(added.thread.to_string(), thread);
-        assert_eq!(added.from.unwrap().to_string(), "alice.claude");
-        assert_eq!(
-            added.command,
-            [OsString::from("codex"), OsString::from("-q")]
-        );
-        let Command::Agent(AgentCommand::Add(bare)) =
-            parse(&["agent", "add", thread, "--", "codex"])
-                .unwrap()
-                .command
-        else {
-            panic!("not agent add");
-        };
-        assert_eq!(bare.from, None);
-        assert!(parse(&["agent", "add", thread]).is_err());
-        assert!(parse(&["agent", "add", thread, "--from", "claude", "--", "codex"]).is_err());
+        assert!(parse(&["agent", "add", thread, "--", "codex"]).is_err());
+        assert!(parse(&["handoff", thread, "--from", "alice.claude", "--", "codex"]).is_err());
     }
 
     #[test]

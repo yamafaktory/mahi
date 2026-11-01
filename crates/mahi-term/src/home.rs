@@ -54,7 +54,7 @@ use crate::{
 };
 
 const NO_THREADS: &str = "no threads yet: press n to start one";
-const THREAD_KEYS: &str = "rilepahg";
+const THREAD_KEYS: &str = "rilep";
 const MENU: [(&str, &str); 8] = [
     ("Threads", "t"),
     ("New thread", "n"),
@@ -116,10 +116,6 @@ pub enum HomeAction {
     Invite(String),
     /// Purge the thread here and on the remote; the purge asks first.
     Purge(String),
-    /// Run another of the user's agents in the thread.
-    AddAgent(String),
-    /// Start the user's agent on another agent's work in the thread.
-    Handoff(String),
     /// Push the thread's landed commits, with its trailers.
     Push(String),
     /// Join a thread with a pairing code.
@@ -151,10 +147,6 @@ enum Pending {
 pub enum ThreadChoice {
     /// Start the user's agent again where it stopped.
     Resume,
-    /// Run another of the user's agents in the thread.
-    AddAgent,
-    /// Start the user's agent on another agent's latest work.
-    Handoff,
     /// Land the thread, confirmed.
     Land,
     /// Push the thread's landed commits, with its trailers.
@@ -173,8 +165,6 @@ impl ThreadChoice {
     pub fn label(self) -> &'static str {
         match self {
             Self::Resume => "Resume: start your agent again where it stopped",
-            Self::AddAgent => "Add an agent: run another of yours in it, in its own worktree",
-            Self::Handoff => "Hand off: start your agent on another agent's latest work",
             Self::Land => "Land: merge its agents' work onto a branch to commit",
             Self::Push => "Push: add the thread's trailers to your commits and push the branch",
             Self::End => "End: save its work in a last snapshot and remove its worktrees",
@@ -190,8 +180,6 @@ impl ThreadChoice {
     pub fn action(self, thread: String) -> HomeAction {
         match self {
             Self::Resume => HomeAction::Resume(thread),
-            Self::AddAgent => HomeAction::AddAgent(thread),
-            Self::Handoff => HomeAction::Handoff(thread),
             Self::Land => HomeAction::Land(thread),
             Self::Push => HomeAction::Push(thread),
             Self::End => HomeAction::End(thread),
@@ -325,12 +313,6 @@ impl Home {
             PaletteInput::Text('p') => {
                 return selected.map(|row| HomeAction::Purge(row.thread.clone()));
             }
-            PaletteInput::Text('a') => {
-                return selected.map(|row| HomeAction::AddAgent(row.thread.clone()));
-            }
-            PaletteInput::Text('h') => {
-                return selected.map(|row| HomeAction::Handoff(row.thread.clone()));
-            }
             _ => {}
         }
         None
@@ -373,13 +355,11 @@ impl Home {
             self.note = Some(NO_THREADS);
             return;
         };
-        let mut choices = Vec::with_capacity(8);
+        let mut choices = Vec::with_capacity(6);
         if row.owned {
             choices.push(ThreadChoice::Resume);
         }
         choices.extend([
-            ThreadChoice::AddAgent,
-            ThreadChoice::Handoff,
             ThreadChoice::Land,
             ThreadChoice::Push,
             ThreadChoice::End,
@@ -428,12 +408,6 @@ impl Home {
             ["enter", "open", "open the menu of what is selected"],
             ["n", "new", "start a thread with an agent"],
             ["r", "resume", "start your agent again where it stopped"],
-            ["a", "add agent", "run another of your agents in the thread"],
-            [
-                "h",
-                "hand off",
-                "start your agent on another agent's latest work",
-            ],
             [
                 "l",
                 "land",
@@ -925,15 +899,12 @@ mod tests {
                 ),
             "{menu}"
         );
-        for (digit, action) in [
-            ('2', HomeAction::AddAgent("t1".to_owned())),
-            ('3', HomeAction::Handoff("t1".to_owned())),
-            ('5', HomeAction::Push("t1".to_owned())),
-        ] {
-            assert_eq!(home.key(PaletteInput::Text(digit), &rows), Some(action));
-            home.key(PaletteInput::Enter, &rows);
-        }
-        assert_eq!(home.key(PaletteInput::Text('4'), &rows), None);
+        assert_eq!(
+            home.key(PaletteInput::Text('3'), &rows),
+            Some(HomeAction::Push("t1".to_owned()))
+        );
+        home.key(PaletteInput::Enter, &rows);
+        assert_eq!(home.key(PaletteInput::Text('2'), &rows), None);
         assert!(screen(&home, &rows, "").contains("Land thread t1?"));
         assert_eq!(
             home.key(PaletteInput::Text('y'), &rows),
@@ -944,12 +915,12 @@ mod tests {
         let teammate = screen(&home, &rows, "");
         assert!(!teammate.contains("Resume:"), "{teammate}");
         assert_eq!(
-            home.key(PaletteInput::Text('6'), &rows),
+            home.key(PaletteInput::Text('4'), &rows),
             Some(HomeAction::Invite("t2".to_owned()))
         );
         home.key(PaletteInput::Enter, &rows);
         assert_eq!(
-            home.key(PaletteInput::Text('7'), &rows),
+            home.key(PaletteInput::Text('5'), &rows),
             Some(HomeAction::Purge("t2".to_owned()))
         );
         assert_eq!(
@@ -957,14 +928,7 @@ mod tests {
             Some(HomeAction::Purge("t2".to_owned()))
         );
         assert!(keys(&mut Home::default(), &[], "p").is_empty());
-        assert_eq!(
-            keys(&mut home, &rows, "ahg"),
-            [
-                HomeAction::AddAgent("t2".to_owned()),
-                HomeAction::Handoff("t2".to_owned()),
-            ]
-        );
-        assert!(keys(&mut Home::default(), &[], "ah").is_empty());
+        assert!(keys(&mut home, &rows, "ahg").is_empty());
     }
 
     #[test]
@@ -1158,7 +1122,7 @@ mod tests {
 
     #[test]
     fn a_thread_key_without_threads_says_how_to_start_one() {
-        let thread_keys = "rilepahg".chars().map(PaletteInput::Text);
+        let thread_keys = THREAD_KEYS.chars().map(PaletteInput::Text);
         for input in thread_keys.chain([PaletteInput::Enter]) {
             let mut home = Home::default();
             assert_eq!(home.key(input, &[]), None, "{input:?}");

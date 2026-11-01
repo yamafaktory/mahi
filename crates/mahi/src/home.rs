@@ -21,11 +21,7 @@ use clap::{
     CommandFactory,
     Parser,
 };
-use mahi_core::{
-    AgentSlot,
-    ParticipantName,
-    ThreadId,
-};
+use mahi_core::ThreadId;
 use mahi_identity::{
     ConfigDir,
     CredentialName,
@@ -770,7 +766,6 @@ fn start_joined_agent(
     let agent = agent_to_run(
         environment,
         ("Join a thread", "Which agent should work in this thread?"),
-        (&[], LastAgent::Kept),
     )
     .map_err(|told| match told.split_once("; run mahi run") {
         Some((none, _)) => none.to_owned(),
@@ -858,11 +853,7 @@ fn stop_agents(workspace: &mut Workspace) {
 fn runs_agent(action: &HomeAction) -> bool {
     matches!(
         action,
-        HomeAction::New
-            | HomeAction::Resume(_)
-            | HomeAction::AddAgent(_)
-            | HomeAction::Handoff(_)
-            | HomeAction::Join
+        HomeAction::New | HomeAction::Resume(_) | HomeAction::Join
     )
 }
 
@@ -909,7 +900,6 @@ fn start_agent(
 ) -> Result<(), String> {
     let (title, resumed_thread) = match &action {
         HomeAction::Resume(thread) => (short(thread), Some(thread.as_str())),
-        HomeAction::AddAgent(thread) | HomeAction::Handoff(thread) => (short(thread), None),
         _ => (NEW_TAB.to_owned(), None),
     };
     if resumed_thread.is_some() && workspace.show_running(&title) {
@@ -976,7 +966,6 @@ fn command_words(
             agent_to_run(
                 environment,
                 ("New thread", "Which agent should start the thread?"),
-                (&[], LastAgent::Kept),
             )?,
         ],
         HomeAction::Resume(thread) => vec!["resume".to_owned(), thread],
@@ -984,8 +973,6 @@ fn command_words(
         HomeAction::End(thread) => vec!["end".to_owned(), thread],
         HomeAction::Invite(thread) => invite_words(store, thread)?,
         HomeAction::Purge(thread) => vec!["purge".to_owned(), thread],
-        HomeAction::AddAgent(thread) => agent_add_words(store, thread, environment)?,
-        HomeAction::Handoff(thread) => handoff_words(store, thread, environment)?,
         HomeAction::Push(thread) => push_words(store, thread, environment)?,
         HomeAction::Join => vec!["join".to_owned()],
         HomeAction::Remote => return Err(choose_remote(store, None)),
@@ -1105,25 +1092,13 @@ fn credential_words(environment: &Environment) -> Result<Vec<String>, String> {
 fn agent_to_run(
     environment: &Environment,
     (title, question): (&str, &str),
-    (taken, last): (&[&AgentSlot], LastAgent),
 ) -> Result<String, String> {
-    let found: Vec<&str> = programs_on_path(environment)
-        .filter(|program| {
-            let agent = session::agent_from(Path::new(program));
-            !taken.iter().any(|slot| slot.agent() == &agent)
-        })
-        .collect();
+    let found: Vec<&str> = programs_on_path(environment).collect();
     match found.as_slice() {
-        [] if taken.is_empty() => {
-            Err("no agent mahi has a profile for is on PATH; run mahi run <agent>".to_owned())
-        }
-        [] => Err("each agent mahi has a profile for on PATH is already yours here".to_owned()),
+        [] => Err("no agent mahi has a profile for is on PATH; run mahi run <agent>".to_owned()),
         [only] => Ok((*only).to_owned()),
         several => {
-            let last = match last {
-                LastAgent::Kept => last_agent_file(environment),
-                LastAgent::Ignored => None,
-            };
+            let last = last_agent_file(environment);
             let mut dialog = Dialog::choose(
                 title,
                 vec![question.to_owned()],
@@ -1155,15 +1130,6 @@ fn agent_to_run(
     }
 }
 
-/// Whether an agent dialog starts on the agent the user chose last, and keeps the one chosen:
-/// the dialogs that start the user's first agent in a thread do, those that add one beside
-/// it do not, since they list only the agents the user does not run there yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LastAgent {
-    Kept,
-    Ignored,
-}
-
 /// Returns where the agent the user chose last in an agent dialog is kept, the same for every
 /// repository.
 fn last_agent_file(environment: &Environment) -> Option<PathBuf> {
@@ -1185,127 +1151,6 @@ fn chosen_last(several: &[&str], file: Option<&Path>) -> usize {
             .position(|program| program.as_bytes() == last)
     })
     .unwrap_or(0)
-}
-
-/// Returns the agents the thread named `thread` has work of here.
-fn agents_of(store: &Store, thread: &str) -> Result<Vec<AgentSlot>, String> {
-    let parsed: ThreadId = thread
-        .parse()
-        .map_err(|_| format!("{thread} is not a thread id"))?;
-    threads::thread_agents(store, parsed)
-        .map_err(|error| format!("cannot read thread {thread}'s refs: {error}"))
-}
-
-/// Returns the user's own agents among `slots`.
-fn own_agents<'a>(slots: &'a [AgentSlot], me: &ParticipantName) -> Vec<&'a AgentSlot> {
-    slots
-        .iter()
-        .filter(|slot| slot.participant() == me)
-        .collect()
-}
-
-/// Picks one of `slots` in a dialog, after `first` when it is given, which picks `None`;
-/// returns `Err` with an empty status when the user stopped asking.
-fn pick_agent<'a>(
-    title: &str,
-    question: &str,
-    first: Option<&str>,
-    slots: &[&'a AgentSlot],
-    item: impl Fn(&AgentSlot) -> String,
-) -> Result<Option<&'a AgentSlot>, String> {
-    let mut items = Vec::with_capacity(slots.len() + 1);
-    items.extend(first.map(str::to_owned));
-    items.extend(slots.iter().map(|slot| item(slot)));
-    let dialog = Dialog::choose(title, vec![question.to_owned()], items);
-    let index = match DialogPrompt::default().ask(dialog) {
-        Ok(Answer::Choice(index)) => index,
-        Ok(_) => return Err(String::new()),
-        Err(error) => return Err(format!("cannot ask which agent: {error}")),
-    };
-    Ok(match (first, index) {
-        (Some(_), 0) => None,
-        (Some(_), index) => slots.get(index - 1).copied(),
-        (None, index) => slots.get(index).copied(),
-    })
-}
-
-fn me(environment: &Environment) -> Result<ParticipantName, String> {
-    session::participant_from(environment.user.as_deref())
-        .map_err(|error| format!("USER does not give a participant name: {error}"))
-}
-
-/// Asks which agent to add to the thread and what it starts from, and returns the command.
-fn agent_add_words(
-    store: &Store,
-    thread: String,
-    environment: &Environment,
-) -> Result<Vec<String>, String> {
-    let slots = agents_of(store, &thread)?;
-    let me = me(environment)?;
-    let mine = own_agents(&slots, &me);
-    let program = agent_to_run(
-        environment,
-        (
-            "Add an agent",
-            "Which of your agents should join the thread?",
-        ),
-        (&mine, LastAgent::Ignored),
-    )?;
-    let from = if slots.is_empty() {
-        None
-    } else {
-        let all: Vec<&AgentSlot> = slots.iter().collect();
-        pick_agent(
-            "Add an agent",
-            "What should its worktree start from?",
-            Some("The thread's base, as its first agent started"),
-            &all,
-            |slot| format!("{slot}'s latest snapshot"),
-        )?
-    };
-    let mut words = vec!["agent".to_owned(), "add".to_owned(), thread];
-    if let Some(slot) = from {
-        words.extend(["--from".to_owned(), slot.to_string()]);
-    }
-    words.extend(["--".to_owned(), program]);
-    Ok(words)
-}
-
-/// Asks whose work the user's agent takes over and which agent that is, and returns the
-/// command.
-fn handoff_words(
-    store: &Store,
-    thread: String,
-    environment: &Environment,
-) -> Result<Vec<String>, String> {
-    let slots = agents_of(store, &thread)?;
-    if slots.is_empty() {
-        return Err(format!("thread {thread} has no agent's work to take over"));
-    }
-    let me = me(environment)?;
-    let all: Vec<&AgentSlot> = slots.iter().collect();
-    let from = pick_agent(
-        "Hand off",
-        "Whose work should your agent take over?",
-        None,
-        &all,
-        ToString::to_string,
-    )?
-    .ok_or_else(|| "no agent was chosen".to_owned())?
-    .to_string();
-    let program = agent_to_run(
-        environment,
-        ("Hand off", "Which of your agents should take it over?"),
-        (&own_agents(&slots, &me), LastAgent::Ignored),
-    )?;
-    Ok(vec![
-        "handoff".to_owned(),
-        thread,
-        "--from".to_owned(),
-        from,
-        "--".to_owned(),
-        program,
-    ])
 }
 
 /// Returns the programs mahi has a profile for that are on `PATH`.

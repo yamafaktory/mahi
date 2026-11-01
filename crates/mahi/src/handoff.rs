@@ -45,11 +45,6 @@ const MAX_LOG_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_CHANGED_FILES: usize = 1000;
 const RECENT_TOOLS: usize = 20;
 
-/// The prompt a new agent is started with to read its briefing at `path`.
-pub(crate) fn first_prompt(path: &str) -> String {
-    format!("Read the handoff notes at {path} and continue the work they describe.")
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum HandoffError {
     #[error("cannot read the thread's title")]

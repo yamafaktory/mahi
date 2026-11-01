@@ -486,8 +486,74 @@ fn list<'a, T: std::fmt::Debug + 'a>(
 #[cfg(test)]
 mod tests {
     use gix::bstr::BString;
+    use mahi_core::{
+        RefKind,
+        ThreadId,
+    };
 
     use super::*;
+
+    #[test]
+    fn a_merge_starts_from_the_snapshot_the_sources_trailers_share_with_the_target() {
+        let (_repo, store) = crate::session::tests::repository_on_main();
+        let thread = ThreadId::random().unwrap();
+        let base = store.head_commit().unwrap();
+        let alice: AgentSlot = "alice.claude".parse().unwrap();
+        let bob: AgentSlot = "bob.codex".parse().unwrap();
+        let tree = store.write_tree(&[]).unwrap();
+        let snapshots = |slot: &AgentSlot| ThreadRef::new(thread, RefKind::Snapshots(slot.clone()));
+        let alices = store
+            .append(
+                &snapshots(&alice),
+                None,
+                tree,
+                crate::session::SNAPSHOT_MESSAGE,
+            )
+            .unwrap();
+        let mut took = MergedFrom::default();
+        took.record(alice.clone(), alices);
+        let bobs = store
+            .append(&snapshots(&bob), None, tree, &took.message())
+            .unwrap();
+        let from_bob = MergeRequest {
+            from: bob.clone(),
+            commit: bobs,
+            thread_base: base,
+        };
+        let mut holds_alice = MergedFrom::default();
+        holds_alice.record(alice.clone(), alices);
+        let bobs_record = merged_by(&store, bobs);
+        assert_eq!(
+            merge_base(&store, (&holds_alice, None), (&from_bob, &bobs_record)).unwrap(),
+            alices
+        );
+        assert_eq!(
+            merge_base(
+                &store,
+                (&MergedFrom::default(), None),
+                (&from_bob, &bobs_record)
+            )
+            .unwrap(),
+            base
+        );
+        let mut holds_bob = MergedFrom::default();
+        holds_bob.record(bob, bobs);
+        holds_bob.absorb(&store, (&bobs_record, thread), None);
+        let from_alice = MergeRequest {
+            from: alice,
+            commit: alices,
+            thread_base: base,
+        };
+        assert_eq!(
+            merge_base(
+                &store,
+                (&holds_bob, None),
+                (&from_alice, &merged_by(&store, alices))
+            )
+            .unwrap(),
+            alices
+        );
+    }
 
     #[test]
     fn agent_settings_are_named_at_any_depth_in_any_case_and_nothing_else_is() {

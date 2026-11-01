@@ -1,5 +1,5 @@
-//! Runs the real Claude Code and Codex through mahi end to end: a thread, a handoff, a resume
-//! and a landing, with the user's own sign-ins. `just dogfood` runs it; see the justfile.
+//! Runs the real Claude Code through mahi end to end: a thread and its landing, with the user's
+//! own sign-in. `just dogfood` runs it; see the justfile.
 
 #![cfg(unix)]
 
@@ -12,7 +12,6 @@ mod tests {
             Read,
             Write,
         },
-        os::unix::fs::PermissionsExt,
         path::{
             Path,
             PathBuf,
@@ -46,8 +45,6 @@ mod tests {
     const CLAUDE_TASK: &str = "Add a subtract(a, b) function to calc.py, and a test_calc.py that \
                                checks add and subtract with plain asserts. Run it with python3 \
                                test_calc.py, then say in one sentence what you did.";
-    const CODEX_TASK: &str = "Now add multiply(a, b) to calc.py with asserts for it in \
-                              test_calc.py, and run python3 test_calc.py.";
     const KEY_GAP: Duration = Duration::from_secs(2);
 
     struct World {
@@ -101,13 +98,6 @@ mod tests {
                 .unwrap()
                 .path();
             repository.join(format!("{thread}{agent}"))
-        }
-
-        fn state(&self, thread: &str, agent: &str) -> PathBuf {
-            self.repo()
-                .join(".git/mahi/state")
-                .join(thread)
-                .join(format!("tester.{agent}"))
         }
     }
 
@@ -347,25 +337,6 @@ mod tests {
         fs::read_to_string(path).is_ok_and(|text| text.contains(needle))
     }
 
-    fn rollout_text(state: &Path) -> String {
-        let mut text = String::new();
-        let mut dirs = vec![state.join("sessions")];
-        while let Some(dir) = dirs.pop() {
-            for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    dirs.push(path);
-                } else if path
-                    .extension()
-                    .is_some_and(|extension| extension == "jsonl")
-                {
-                    text.push_str(&fs::read_to_string(&path).unwrap_or_default());
-                }
-            }
-        }
-        text
-    }
-
     fn init_with_claude_token(world: &World, token: &[u8]) {
         let mut init = Terminal::start(world.command(&["init"]));
         let mut answered = 0;
@@ -414,57 +385,7 @@ mod tests {
         thread
     }
 
-    fn codex_takes_over_and_extends(world: &World, thread: &str, codex_auth: &Path) {
-        let state = world.state(thread, "codex");
-        fs::create_dir_all(&state).unwrap();
-        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::copy(codex_auth, state.join("auth.json")).unwrap();
-        fs::set_permissions(state.join("auth.json"), fs::Permissions::from_mode(0o600)).unwrap();
-        let tree = world.worktree(thread, ".codex");
-        let mut codex = Terminal::start(world.command(&[
-            "handoff",
-            thread,
-            "--from",
-            "tester.claude",
-            "--",
-            "codex",
-        ]));
-        let started = Instant::now();
-        let mut asked = false;
-        codex.drive(Duration::from_mins(15), |terminal| {
-            let idle = terminal.screen().contains("Ask Codex to do anything")
-                && terminal.quiet_for(Duration::from_secs(8))
-                && started.elapsed() > Duration::from_secs(20);
-            if !asked && idle {
-                terminal.send_now(CODEX_TASK);
-                thread::sleep(Duration::from_secs(1));
-                terminal.send_now("\r");
-                asked = true;
-                return false;
-            }
-            asked && idle && contains(&tree.join("calc.py"), "multiply")
-        });
-        codex.quit(&["\x03", "\x03"]);
-        assert!(
-            rollout_text(&state).contains("The previous agent's latest replies"),
-            "Codex read a briefing that quotes Claude's replies"
-        );
-    }
-
-    fn codex_resumes_without_asking_about_hooks(world: &World, thread: &str) {
-        let mut again = Terminal::start(world.command(&["resume", thread, "--agent", "codex"]));
-        again.drive(Duration::from_mins(2), |terminal| {
-            terminal.screen().contains("Ask Codex to do anything")
-                && terminal.quiet_for(Duration::from_secs(5))
-        });
-        assert!(
-            !again.raw_text().contains("Hooks need review"),
-            "the hooks were approved once, so a resume does not ask again"
-        );
-        again.quit(&["\x03", "\x03"]);
-    }
-
-    fn both_land_cleanly(world: &World, thread: &str) {
+    fn lands_cleanly(world: &World, thread: &str) {
         let output = Terminal::start(world.command(&["land", thread])).quit(&[]);
         assert!(!output.contains("conflict"), "{output}");
         let landing = world.worktree(thread, "@land");
@@ -474,7 +395,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(tested.success(), "the landed tests pass");
-        for name in ["add", "subtract", "multiply"] {
+        for name in ["add", "subtract"] {
             assert!(
                 contains(&landing.join("calc.py"), &format!("def {name}(")),
                 "{name}"
@@ -483,16 +404,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_hands_off_to_codex_which_resumes_and_both_land_cleanly() {
+    fn claude_works_in_a_new_thread_that_lands_cleanly() {
         let token = fs::read(required_env("MAHI_DOGFOOD_CLAUDE_TOKEN"))
             .expect("MAHI_DOGFOOD_CLAUDE_TOKEN names a readable file");
-        let codex_auth = PathBuf::from(required_env("MAHI_DOGFOOD_CODEX_AUTH"));
-        assert!(codex_auth.is_file(), "MAHI_DOGFOOD_CODEX_AUTH names a file");
         let world = world();
         init_with_claude_token(&world, &token);
         let thread = claude_works_in_a_new_thread(&world);
-        codex_takes_over_and_extends(&world, &thread, &codex_auth);
-        codex_resumes_without_asking_about_hooks(&world, &thread);
-        both_land_cleanly(&world, &thread);
+        lands_cleanly(&world, &thread);
     }
 }
