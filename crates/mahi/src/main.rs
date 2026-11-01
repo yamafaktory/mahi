@@ -112,7 +112,7 @@ fn make_config_private(environment: &Environment) {
 fn main() {
     let cli = Cli::parse();
     let required = match &cli.command {
-        None => Some(Vec::new()),
+        None | Some(Command::Invite(_)) => Some(Vec::new()),
         Some(Command::Run(command)) => Some(command.options.pass_env().to_vec()),
         Some(Command::Resume(command)) => Some(command.options.pass_env().to_vec()),
         Some(Command::Land(command)) => Some(command.options.pass_env().to_vec()),

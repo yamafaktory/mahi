@@ -189,6 +189,7 @@ pub(crate) fn invite_by_code(
     environment: &Environment,
 ) -> Result<String, PairingError> {
     invite::with_inviter(environment, |store, inviter| {
+        invite::check_role(store, (thread, role), inviter)?;
         let remote = crate::remote::sync_remote(store)
             .map_err(|error| PairingError::Remote(PairRemoteError::Setup(error.into())))?
             .ok_or(PairingError::NoRemote)?

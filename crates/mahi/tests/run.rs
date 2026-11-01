@@ -4410,7 +4410,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         );
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
-        let ticket = invite_teammate(&fixture, thread, &bob);
+        let ticket = invite_teammate(&fixture, (thread, "--watcher"), &bob);
 
         let bob_config = bob.home.join(".config");
         let bob_env: Vec<(&str, &OsStr)> = vec![
@@ -4472,7 +4472,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         host.wait_for("ready");
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
-        let ticket = invite_teammate(&fixture, thread, &bob);
+        let ticket = invite_teammate(&fixture, (thread, "--watcher"), &bob);
         let bob_config = bob.home.join(".config");
         let bob_env: Vec<(&str, &OsStr)> = vec![
             ("PATH", OsStr::new("/usr/bin:/bin:/usr")),
@@ -4524,7 +4524,77 @@ echo stray > "$CODEX_HOME/history.jsonl"
         }
     }
 
-    fn invite_teammate(fixture: &Fixture, thread: ThreadId, teammate: &Teammate) -> String {
+    #[test]
+    fn a_collaborator_is_refused_while_the_owners_agent_reports_no_turn_ends() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let ran = fixture
+            .command(&["run", "sh", "-c", "true"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&ran.stderr);
+        assert!(ran.status.success(), "{stderr}");
+        let thread = thread_of(&worktree_of(&stderr));
+        let bob = teammate(&fixture, "bob");
+        let mut id = Command::new(mahi_binary());
+        id.arg("id");
+        teammate_env(&mut id, &bob, "bob");
+        let card = String::from_utf8(id.output().unwrap().stdout).unwrap();
+        let with_card = ["invite", "--collaborator", &thread, card.trim()];
+        let by_code = ["invite", "--collaborator", &thread];
+        for arguments in [&with_card[..], &by_code[..]] {
+            let invited = fixture
+                .command(arguments)
+                .env("MAHI_LIVE", "local")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&invited.stderr);
+            assert_eq!(invited.status.code(), Some(1), "{stderr}");
+            assert!(
+                stderr.contains(
+                    "tester.sh does not report when its turns end, so a collaborator's work could \
+                     not be kept in sync with it; run the thread with Claude Code or Codex, or \
+                     invite a --watcher"
+                ),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("Pairing code"), "{stderr}");
+        }
+        let ticket = invite_teammate(&fixture, (thread.parse().unwrap(), "--watcher"), &bob);
+        assert!(ticket.starts_with("mahi1"), "{ticket}");
+    }
+
+    #[test]
+    fn a_users_own_claude_profile_reports_no_turn_ends_so_it_keeps_a_collaborator_out() {
+        let fixture = fixture();
+        write_profile(
+            &fixture,
+            "claude.toml",
+            "name = \"claude\"\nprogram = \"claude\"\n",
+        );
+        let (thread, _claude) = worked_thread(&fixture);
+        let invited = fixture
+            .command(&["invite", "--collaborator", &thread])
+            .env("MAHI_LIVE", "local")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&invited.stderr);
+        assert_eq!(invited.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("tester.claude does not report when its turns end"),
+            "{stderr}"
+        );
+    }
+
+    fn waiting_claude(fixture: &Fixture) -> PathBuf {
+        script(fixture, "hosting", "claude", "#!/bin/sh\nsleep 60\n")
+    }
+
+    fn invite_teammate(
+        fixture: &Fixture,
+        (thread, role): (ThreadId, &str),
+        teammate: &Teammate,
+    ) -> String {
         let mut id = Command::new(mahi_binary());
         id.arg("id");
         teammate_env(&mut id, teammate, "bob");
@@ -4541,7 +4611,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         let thread_text = thread.to_string();
         let mut invite = mahi_in_terminal(
             &fixture.repo,
-            &["invite", "--collaborator", &thread_text, card.trim()],
+            &["invite", role, &thread_text, card.trim()],
             &owner_env,
         );
         let (invited, invite_end) = collect(&invite);
@@ -4589,7 +4659,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
     fn a_teammate_joins_with_their_agent_only_with_the_key_meta_lists() {
         let fixture = fixture();
         save_identity(&fixture);
-        let mut host = fixture.command(&["run", "sh", "-c", "sleep 60"]);
+        let mut host = fixture.command(&["run", waiting_claude(&fixture).to_str().unwrap()]);
         let _host = KillOnDrop(
             host.env("MAHI_LIVE", "local")
                 .stdin(Stdio::null())
@@ -4600,7 +4670,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         );
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
-        let ticket = invite_teammate(&fixture, thread, &bob);
+        let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
         let join = |socket: &Path| {
             let mut command = Command::new(mahi_binary());
             command
@@ -4671,7 +4741,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
     fn a_teammates_claim_reaches_the_owners_agent_through_their_hosts() {
         let fixture = fixture();
         save_identity(&fixture);
-        let watcher = script(&fixture, "watching", "watcher", CLAIM_WATCHER);
+        let watcher = script(&fixture, "watching", "claude", CLAIM_WATCHER);
         let mut owner = fixture.command(&["run", watcher.to_str().unwrap()]);
         let owner = owner
             .env("MAHI_LIVE", "local")
@@ -4682,7 +4752,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             .unwrap();
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
-        let ticket = invite_teammate(&fixture, thread, &bob);
+        let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
         let bob_thread = {
             let bob = Teammate {
                 home: bob.home.clone(),
@@ -4712,7 +4782,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
     fn a_teammate_runs_their_own_agent_in_the_owners_thread() {
         let fixture = fixture();
         save_identity(&fixture);
-        let mut host = fixture.command(&["run", "sh", "-c", "sleep 60"]);
+        let mut host = fixture.command(&["run", waiting_claude(&fixture).to_str().unwrap()]);
         let _host = KillOnDrop(
             host.env("MAHI_LIVE", "local")
                 .stdin(Stdio::null())
@@ -4723,7 +4793,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         );
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
-        let ticket = invite_teammate(&fixture, thread, &bob);
+        let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
         assert_eq!(
             Store::open(&bob.repo).unwrap().head_commit().unwrap(),
             fixture.base,

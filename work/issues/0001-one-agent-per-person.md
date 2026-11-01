@@ -1,6 +1,6 @@
 # 0001 One agent per person
 
-status: in-progress
+status: done
 depends: none
 touches: crates/mahi/src/home.rs, crates/mahi/src/workspace.rs, crates/mahi-term/src/home.rs, crates/mahi/src/handoff.rs, crates/mahi/src/run.rs, crates/mahi-thread/src/handoff.rs, crates/mahi/src/cli.rs, crates/mahi/src/main.rs, crates/mahi/tests/run.rs, DESIGN.md
 design: DESIGN.md "One agent each, kept in sync (milestone 9)": One agent per person, Steps; "Multi-engineer, multi-agent"
@@ -40,9 +40,22 @@ off to another agent go away, with their design text in the same commit.
   start shows why); a unit test of `merge::merge_base` with trailers, which a judge found no
   test covered.
 
+- 2026-11-01: PR #6 merged the removals (1405188, f8406d5). Piece (3): the invite refusal
+  and the join dialog's list (D016, D017, D018).
+
 ## Follow-ups
+- The invite check reads the agent's name in its slot, so an owner's agent run with
+  `--no-profile` passes it although it reports no turn ends. Telling it apart needs the run to
+  record whether it ran with its profile.
+- `mahi join <ticket> -- <agent>` checks neither the user's role nor whether the agent
+  reports its turn ends, so a watcher or an agent without turn ends can still join with an
+  agent from the command line.
 - 0006: bring Codex back into the dogfood test as a collaborator.
 - 0003: the notes file is still named `mahi-handoff.md` and the variable `MAHI_HANDOFF`, though
   only the draft rewrite uses them now.
 
 ## Result
+- `mahi agent add`, `mahi handoff` and their actions are gone (PR #6).
+- A collaborator is refused while the owner's agent reports no turn ends, and the join dialog
+  lists only agents that report them.
+- Known gap: the command line join with an agent (see Follow-ups).

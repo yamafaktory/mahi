@@ -98,3 +98,21 @@ Chosen by the user. The dogfood test handed Claude Code's thread to Codex. Witho
 Codex cannot enter that thread as the same person, and a thread of its own cannot get its
 sign-in before it starts. Claude Code's part stays, and issue 0006 brings Codex back as a
 collaborator, with a second user in the dogfood world.
+
+## D016 · 2026-11-01 · A collaborator needs the owner's agent to report its turn ends
+
+Chosen by the user. `mahi invite --collaborator` refuses while an agent of the owner in the
+thread, running or not, has no built-in profile that reports its turn ends, since a resume
+would bring the same agent back. The check runs before a pairing code is shown.
+
+## D017 · 2026-11-01 · Wording of that refusal
+
+Chosen by the user: `tester.sh does not report when its turns end, so a collaborator's work
+could not be kept in sync with it; run the thread with Claude Code or Codex, or invite a
+--watcher`.
+
+## D018 · 2026-11-01 · The join dialog lists only agents that report their turn ends
+
+Chosen by the user, as DESIGN.md's Joining says. With none on `PATH`, the dialog says
+`neither Claude Code nor Codex, the agents that report when their turns end, is on PATH`.
+That sentence was written by the agent from D017's wording, for the user to check.

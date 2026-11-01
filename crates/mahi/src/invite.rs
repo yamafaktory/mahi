@@ -6,6 +6,7 @@ use std::{
 };
 
 use mahi_core::{
+    AgentSlot,
     ParticipantName,
     ThreadId,
 };
@@ -56,6 +57,7 @@ use crate::{
         LiveMode,
     },
     live,
+    profile::Profile,
     prompt::{
         Prompt,
         TerminalPrompt,
@@ -118,6 +120,10 @@ pub(crate) enum InviteError {
     LiveSetting,
     #[error("no card was given")]
     NoCard,
+    #[error(
+        "{0} does not report when its turns end, so a collaborator's work could not be kept in sync with it; run the thread with Claude Code or Codex, or invite a --watcher"
+    )]
+    NoTurnEnds(AgentSlot),
 }
 
 /// Who invites, with which keys, and how the ticket finds this machine.
@@ -202,13 +208,7 @@ pub(crate) fn invite_to<P: Prompt>(
     inviter: &Inviter<'_>,
     open_prompt: &mut dyn FnMut() -> io::Result<P>,
 ) -> Result<Ticket, InviteError> {
-    let owner = ParticipantKey::from_public_key(inviter.signer.public_key())?;
-    let current = load_meta(store, thread, &owner, 0).map_err(|error| match error {
-        ThreadError::Meta(
-            MetaError::BadSignature | MetaError::Invalid(InvalidMeta::OwnerKeyUntrusted),
-        ) => InviteError::NotOwner(thread, Box::new(error)),
-        other => InviteError::Thread(thread, Box::new(other)),
-    })?;
+    let (owner, current) = owned_meta(store, thread, inviter)?;
     let new = card.into_participant().with_role(role);
     let invitee_node = *new.node();
     if let Some(clash) = current.participants().find(|listed| {
@@ -223,6 +223,7 @@ pub(crate) fn invite_to<P: Prompt>(
     if new.name() == current.owner() && role != Role::Collaborator {
         return Err(InviteError::OwnerStays(new.name().clone()));
     }
+    check_turn_ends(store, thread, (current.owner(), role))?;
     let address = host_address(thread, inviter)?;
     if inviter.relays == Relays::Public && address.relay().is_none() {
         return Err(InviteError::NoRelay);
@@ -244,6 +245,46 @@ pub(crate) fn invite_to<P: Prompt>(
         meta.generation(),
         invitee_node,
     ))
+}
+
+pub(crate) fn check_role(
+    store: &Store,
+    (thread, role): (ThreadId, Role),
+    inviter: &Inviter<'_>,
+) -> Result<(), InviteError> {
+    let (_, current) = owned_meta(store, thread, inviter)?;
+    check_turn_ends(store, thread, (current.owner(), role))
+}
+
+fn owned_meta(
+    store: &Store,
+    thread: ThreadId,
+    inviter: &Inviter<'_>,
+) -> Result<(ParticipantKey, VerifiedMeta), InviteError> {
+    let owner = ParticipantKey::from_public_key(inviter.signer.public_key())?;
+    let current = load_meta(store, thread, &owner, 0).map_err(|error| match error {
+        ThreadError::Meta(
+            MetaError::BadSignature | MetaError::Invalid(InvalidMeta::OwnerKeyUntrusted),
+        ) => InviteError::NotOwner(thread, Box::new(error)),
+        other => InviteError::Thread(thread, Box::new(other)),
+    })?;
+    Ok((owner, current))
+}
+
+fn check_turn_ends(
+    store: &Store,
+    thread: ThreadId,
+    (owner, role): (&ParticipantName, Role),
+) -> Result<(), InviteError> {
+    match role {
+        Role::Watcher => return Ok(()),
+        Role::Collaborator => {}
+    }
+    let agents = crate::threads::thread_agents(store, thread)?;
+    let unsynced = agents.into_iter().find(|slot| {
+        slot.participant() == owner && !Profile::reports_turn_ends_of(slot.agent().as_str())
+    });
+    unsynced.map_or(Ok(()), |slot| Err(InviteError::NoTurnEnds(slot)))
 }
 
 /// Returns where the thread's host is: the address a running host published, since binding
@@ -298,7 +339,11 @@ mod tests {
     };
 
     use age::secrecy::SecretString;
-    use mahi_core::ParticipantName;
+    use mahi_core::{
+        ParticipantName,
+        RefKind,
+        ThreadRef,
+    };
     use mahi_identity::{
         LocalIdentity,
         PublicIdentity,
@@ -402,6 +447,30 @@ mod tests {
                 ..Script::default()
             })
         }
+    }
+
+    #[test]
+    fn only_an_owners_agent_without_turn_ends_keeps_a_collaborator_out() {
+        let (_repo, store) = repository_on_main();
+        let owner = owner_of_a_thread(&store);
+        let alice = ParticipantName::new("alice").unwrap();
+        let tree = store.write_tree(&[]).unwrap();
+        let add_agent = |slot: &str| {
+            let snapshots = ThreadRef::new(owner.thread, RefKind::Snapshots(slot.parse().unwrap()));
+            store
+                .append(&snapshots, None, tree, session::SNAPSHOT_MESSAGE)
+                .unwrap();
+        };
+        let check = |role| check_turn_ends(&store, owner.thread, (&alice, role));
+        assert!(check(Role::Collaborator).is_ok());
+        add_agent("bob.sh");
+        assert!(check(Role::Collaborator).is_ok());
+        add_agent("alice.sh");
+        assert!(matches!(
+            check(Role::Collaborator),
+            Err(InviteError::NoTurnEnds(slot)) if slot.to_string() == "alice.sh"
+        ));
+        assert!(check(Role::Watcher).is_ok());
     }
 
     #[test]

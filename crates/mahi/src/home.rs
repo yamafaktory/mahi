@@ -766,11 +766,8 @@ fn start_joined_agent(
     let agent = agent_to_run(
         environment,
         ("Join a thread", "Which agent should work in this thread?"),
-    )
-    .map_err(|told| match told.split_once("; run mahi run") {
-        Some((none, _)) => none.to_owned(),
-        None => told,
-    })?;
+        Agents::ReportingTurnEnds,
+    )?;
     let words = vec![
         "join".to_owned(),
         ticket.to_string(),
@@ -966,6 +963,7 @@ fn command_words(
             agent_to_run(
                 environment,
                 ("New thread", "Which agent should start the thread?"),
+                Agents::Any,
             )?,
         ],
         HomeAction::Resume(thread) => vec!["resume".to_owned(), thread],
@@ -1092,10 +1090,13 @@ fn credential_words(environment: &Environment) -> Result<Vec<String>, String> {
 fn agent_to_run(
     environment: &Environment,
     (title, question): (&str, &str),
+    agents: Agents,
 ) -> Result<String, String> {
-    let found: Vec<&str> = programs_on_path(environment).collect();
+    let found: Vec<&str> = programs_on_path(environment)
+        .filter(|program| agents.offers(program))
+        .collect();
     match found.as_slice() {
-        [] => Err("no agent mahi has a profile for is on PATH; run mahi run <agent>".to_owned()),
+        [] => Err(agents.none_found().to_owned()),
         [only] => Ok((*only).to_owned()),
         several => {
             let last = last_agent_file(environment);
@@ -1151,6 +1152,31 @@ fn chosen_last(several: &[&str], file: Option<&Path>) -> usize {
             .position(|program| program.as_bytes() == last)
     })
     .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Agents {
+    Any,
+    ReportingTurnEnds,
+}
+
+impl Agents {
+    fn offers(self, program: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::ReportingTurnEnds => Profile::reports_turn_ends_of(program),
+        }
+    }
+
+    fn none_found(self) -> &'static str {
+        match self {
+            Self::Any => "no agent mahi has a profile for is on PATH; run mahi run <agent>",
+            Self::ReportingTurnEnds => {
+                "neither Claude Code nor Codex, the agents that report when their turns end, is \
+                 on PATH"
+            }
+        }
+    }
 }
 
 /// Returns the programs mahi has a profile for that are on `PATH`.
@@ -1352,6 +1378,14 @@ fn add_remote(store: &mut Store) -> Result<Added, remote::RemoteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_joining_collaborator_is_offered_only_agents_that_report_their_turn_ends() {
+        assert!(Agents::ReportingTurnEnds.offers("claude"));
+        assert!(Agents::ReportingTurnEnds.offers("codex"));
+        assert!(!Agents::ReportingTurnEnds.offers("aider"));
+        assert!(Agents::Any.offers("aider"));
+    }
 
     #[test]
     fn the_agent_chosen_last_is_selected_first_while_it_is_among_those_found() {

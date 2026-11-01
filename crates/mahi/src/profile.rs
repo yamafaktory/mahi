@@ -445,6 +445,10 @@ impl Profile {
         profiles().iter().map(|profile| profile.program.as_str())
     }
 
+    pub(crate) fn reports_turn_ends_of(program: &str) -> bool {
+        Self::for_agent(OsStr::new(program)).is_some_and(Self::reports_turn_ends)
+    }
+
     /// Returns the profile for the agent program `program`, found by its file name.
     pub(crate) fn for_agent(program: &OsStr) -> Option<&'static Self> {
         let name = Path::new(program).file_name()?;

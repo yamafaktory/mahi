@@ -5,7 +5,7 @@ its line current.
 
 | Issue | Status | Depends | Note |
 |---|---|---|---|
-| [0001 One agent per person](issues/0001-one-agent-per-person.md) | in-progress | none | add and handoff removed in a PR; the invite refusal is left |
+| [0001 One agent per person](issues/0001-one-agent-per-person.md) | done | none | follow-up: the command line join with an agent |
 | [0002 The land tool and its confirmation](issues/0002-land-tool.md) | blocked | 0001 | needs the user's wording for the confirmation |
 | [0003 Remove mahi land](issues/0003-remove-mahi-land.md) | blocked | 0002 | |
 | [0004 Release through a pull request](issues/0004-release-through-a-pull-request.md) | open | none | `just release` pushes to `main`, which the ruleset now refuses |
