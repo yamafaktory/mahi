@@ -13,7 +13,7 @@ version.workspace = true
 dist = true
 
 [package.metadata.release]
-pre-release-hook = ["cargo", "update", "--workspace", "--offline", "--manifest-path", "../../fuzz/Cargo.toml"]
+pre-release-hook = ["../../scripts/sync-fuzz-lock.sh"]
 
 [package.metadata.deb]
 assets = [

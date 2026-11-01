@@ -106,10 +106,10 @@ WSL 2 distribution on a Windows runner. Change a check in the `justfile`, not in
 workflow, so that CI and local runs stay the same.
 
 Releases are made with [cargo-dist](https://github.com/axodotdev/cargo-dist), configured in
-`dist-workspace.toml`, and started with `just release <version> --execute`, which runs
-`just check`, then `scripts/release.sh`. The version is exact, such as `0.2.0` or
-`0.2.0-rc.1`, never a level such as `patch`, since a tag pushed under `v*` can never be moved
-or deleted. On a branch `release/v<version>` from `origin/main`,
+`dist-workspace.toml`, and started with `just release <version> --execute`, which runs `just
+check`, then `scripts/release.sh`. The version is exact, such as `0.2.0` or `0.2.0-rc.1`, never
+a level such as `patch`, since a tag pushed under `v*` can never be moved or deleted. On a
+branch `release/v<version>` from `origin/main`,
 [cargo-release](https://github.com/crate-ci/cargo-release) (configured in the manifests'
 `[*.metadata.release]`) bumps the shared version and commits and signs `Release mahi
 <version>`, never publishing to crates.io. The script then pushes the branch, opens its pull
@@ -117,13 +117,13 @@ request, waits for its required checks, merges it with `scripts/merge-pr.sh`, an
 pushes the tag `v<version>` on the release commit. It leaves the checkout on that commit,
 detached. When it stops after pushing the branch, such as on a failed check, fix the cause on
 the branch and run it again: it resumes from the branch on `origin`. Without `--execute` it
-shows the bump on the current checkout and makes no commit, but its pre-release hook still
-updates `fuzz/Cargo.lock`, which `git checkout fuzz/Cargo.lock` undoes. Pushing a tag `v<version>` that matches `Cargo.toml` runs
-`.github/workflows/release.yml`: the checks, then the archives, the installer script and the
-`.deb` packages (`.github/workflows/build-deb.yml`), published as a GitHub release.
-`release.yml` is generated: change `dist-workspace.toml` and run `dist generate`, never edit it
-by hand. `dist plan` shows what a release would contain. A tag with a suffix, such as
-`v0.2.0-rc.1`, makes a pre-release, which the README's installer URL (`releases/latest`) skips.
+shows the bump on the current checkout and leaves the checkout clean. Pushing a tag
+`v<version>` that matches `Cargo.toml` runs `.github/workflows/release.yml`: the checks, then
+the archives, the installer script and the `.deb` packages (`.github/workflows/build-deb.yml`),
+published as a GitHub release. `release.yml` is generated: change `dist-workspace.toml` and run
+`dist generate`, never edit it by hand. `dist plan` shows what a release would contain. A tag
+with a suffix, such as `v0.2.0-rc.1`, makes a pre-release, which the README's installer URL
+(`releases/latest`) skips.
 
 ## Testing while iterating
 
