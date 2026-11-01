@@ -88,12 +88,12 @@ gate: check test-git
 merge-pr branch:
     @scripts/merge-pr.sh "$1"
 
-# Make the worktree .worktrees/<issue> on the branch issue/<issue> from origin/main, for a coordinator's sub-agent
+# Make the worktree .worktrees/<number>-<slug> on the branch issue/<number>-<slug> from origin/main, for a coordinator's sub-agent
 [positional-arguments]
 worktree issue:
     @scripts/worktree.sh add "$1"
 
-# Remove the worktree .worktrees/<issue> with its target/ and its branch
+# Remove the worktree .worktrees/<number>-<slug> with its target/ and its branch
 [positional-arguments]
 worktree-remove issue:
     @scripts/worktree.sh remove "$1"

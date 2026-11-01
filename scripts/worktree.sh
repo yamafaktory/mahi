@@ -2,8 +2,8 @@
 set -euo pipefail
 action=${1:-}
 issue=${2:-}
-if ! [[ "$issue" =~ ^[0-9]{4}-[a-z0-9-]+$ ]]; then
-    echo "worktree takes an issue name such as 0001-one-agent-per-person, not '$issue'" >&2
+if ! [[ "$issue" =~ ^[0-9]+-[a-z0-9-]+$ ]]; then
+    echo "worktree takes an issue's number and a slug, such as 12-remove-mahi-land, not '$issue'" >&2
     exit 2
 fi
 cd "$(dirname "$0")/.."

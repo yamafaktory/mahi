@@ -9,17 +9,36 @@ terminal coding agent. Its home is mahi.social, a domain the project owns: use i
 needs a domain or a URL of its own (website, documentation links, contact addresses). Read [DESIGN.md](DESIGN.md) before you make a change. The design is the
 specification. If a change goes against it, update the design in the same commit, or ask first.
 
-Before you start a piece of work, also read:
+## Work tracking
 
-1. [work/README.md](work/README.md): how issues, the board and the log work.
+[GitHub issues](https://github.com/yamafaktory/mahi/issues) track the work, not an agent's
+private memory, so that every agent and every reviewer reads the same context (D019). Before
+you start a piece of work, read:
+
+1. Your issue with its comments (`gh issue view <number> --comments`), and the DESIGN.md
+   sections it names. Read those sections, not the whole of DESIGN.md, unless the issue needs more.
 2. [docs/decisions.md](docs/decisions.md): the decisions made during the work, with the
    user's choices of wording. Append to it, never rewrite an entry.
-3. Your issue in `work/issues/`, and the DESIGN.md sections it names. Read those sections, not
-   the whole of DESIGN.md, unless the issue needs more.
 
-The log of the work lives in the repository, not in an agent's private memory, so that every
-agent and every reviewer reads the same context. Keep your issue's `## Log` current, and
-record each choice the user makes in `docs/decisions.md`.
+While you work:
+
+- An issue's body holds its goal, the DESIGN.md sections to read, what it touches, what it
+  depends on and its acceptance criteria. Each comment is a log entry: what you did, what you
+  found, open questions. The issue's comments are how context survives between sessions.
+- Label the issue `in progress` when you start it. An issue that waits for something, such as
+  the user's wording or another issue, has the label `blocked` and a comment that says what it
+  waits for. Take neither kind unless the user asks.
+- Record each choice the user makes in `docs/decisions.md`, and name its entry in the issue.
+- Open an issue for follow-up work you find, and name it in the issue you work on. In
+  coordinator mode, a sub-agent lists its follow-ups in its report, and the coordinator opens
+  the issues.
+- A pull request names its issue with `Closes #<number>`, so the merge closes it. Once the
+  issue closes, comment on it with the result: what landed, how to use it, and the known gaps.
+- Questions for the user go in an issue labelled `question`.
+- In this repository, you create issues, comment on them and open pull requests without asking
+  the user, on issues and pull requests whose author is the user's account. A comment on one
+  that another person opened, or anywhere outside this repository, needs the user's approval
+  for each comment.
 
 When an issue turns out much bigger than it says, or a step needs a choice that is the
 user's, stop and say so. Do not widen the scope on your own.
@@ -64,7 +83,7 @@ just check      # sweep + fmt-check + clippy + test + deny + shellcheck
 just sweep [g]  # remove target/ or fuzz/target/ once either passes g GiB (40 by default)
 just gate       # check + test-git: the local gate before a pull request
 just merge-pr b # fast-forward origin's main to branch b once its PR's required checks pass
-just worktree i # coordinator mode: the worktree .worktrees/i on the branch issue/i
+just worktree i # coordinator mode: worktree .worktrees/i on branch issue/i, i such as 12-remove-mahi-land
 just worktree-remove i # remove the worktree .worktrees/i with its target/ and its branch
 just fuzz <t> [s] # run one fuzz target (nightly, cargo-fuzz) for s seconds
 just fuzz-all [s]  # run every fuzz target in turn
@@ -119,7 +138,8 @@ pull request.
 - Once before the pull request: `just gate`. A change is not done until `just gate` exits 0.
   Read its exit status, never a grep of its output.
 - Do not silence a failure: fix the cause. Never weaken a check to get it green.
-- Put scratch files, logs and large outputs in `work/scratch/<issue>/`. Git ignores it.
+- Put scratch files, logs and large outputs in `work/scratch/<issue number>/`. Git ignores
+  it.
 
 ## Workspace
 
@@ -289,5 +309,19 @@ checks did not pass, an unsigned commit and a force push. Nobody bypasses it.
 One session that works the issues in order is the default. The coordinator mode, with
 sub-agents in worktrees, is opt-in: the user starts it for issues that touch separate code.
 Each sub-agent starts cold and uses several times the tokens of one session, and most steps
-of a milestone build on each other (D012). At most two sub-agents run at once.
-[work/README.md](work/README.md) says how the coordinator and its sub-agents work.
+of a milestone build on each other (D012).
+
+- At most two sub-agents run at once.
+- The coordinator runs `just worktree <number>-<slug>`, which makes the worktree
+  `.worktrees/<number>-<slug>` on the branch `issue/<number>-<slug>` from `origin/main`. Git
+  ignores `.worktrees/`.
+- A sub-agent's shell starts in the main checkout. It works only under its worktree's path,
+  and passes that path to every review it starts.
+- Each worktree builds into its own `target/`. Never point two checkouts at one
+  `CARGO_TARGET_DIR`, or the main checkout's tests run the worktree's older `mahi` binary.
+- A sub-agent commits on its branch and never pushes. It logs on its issue and reports back
+  what landed, the commits, the follow-ups and anything surprising.
+- The coordinator reviews the branch, pushes it, opens its pull request and merges it with
+  `just merge-pr issue/<number>-<slug>` once its checks pass. Then it runs
+  `just worktree-remove <number>-<slug>`, which removes the worktree with its `target/` and
+  its branch.

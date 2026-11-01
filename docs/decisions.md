@@ -116,3 +116,17 @@ could not be kept in sync with it; run the thread with Claude Code or Codex, or 
 Chosen by the user, as DESIGN.md's Joining says. With none on `PATH`, the dialog says
 `neither Claude Code nor Codex, the agents that report when their turns end, is on PATH`.
 That sentence was written by the agent from D017's wording, for the user to check.
+
+## D019 · 2026-11-01 · GitHub issues hold the work log
+
+Chosen by the user. D011 put the log in `work/`, and D019 replaces that. The issue files in
+`work/issues/` and `work/BOARD.md` moved to GitHub issues #10 to #19 (0001 to 0006 became
+#10 to #15), and new work starts as an issue. An issue's comments are its log, the labels
+`in progress` and `blocked` give its state, and a pull request closes its issue with
+`Closes #<number>`.
+
+In this repository, the agent creates issues, comments on them and opens pull requests
+without asking the user, on issues and pull requests whose author is the user's account, as
+the user already allowed for pull requests. A comment on one that another person opened, or
+outside this repository, needs the user's approval for each comment. This file stays in the
+repository, because the user's choices belong with the design.
