@@ -22,7 +22,7 @@ test-git *args:
 test-wsl *args:
     cargo nextest run --workspace --locked --ignore-default-filter -E 'binary(/^wsl_/)' {{args}}
 
-# The real Claude Code through mahi; needs it signed in, see crates/mahi/tests/dogfood_agents.rs
+# The real Claude Code through mahi, signed in with the token in ~/.config/mahi-test-token or the file MAHI_DOGFOOD_CLAUDE_TOKEN names
 dogfood *args:
     cargo nextest run -p mahi --locked --ignore-default-filter -E 'binary(/^dogfood_/)' --no-capture {{args}}
 

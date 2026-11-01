@@ -405,8 +405,17 @@ mod tests {
 
     #[test]
     fn claude_works_in_a_new_thread_that_lands_cleanly() {
-        let token = fs::read(required_env("MAHI_DOGFOOD_CLAUDE_TOKEN"))
-            .expect("MAHI_DOGFOOD_CLAUDE_TOKEN names a readable file");
+        let file = env::var_os("MAHI_DOGFOOD_CLAUDE_TOKEN").map_or_else(
+            || PathBuf::from(required_env("HOME")).join(".config/mahi-test-token"),
+            PathBuf::from,
+        );
+        let token = fs::read(&file).unwrap_or_else(|error| {
+            panic!(
+                "cannot read a Claude Code setup token at {}: {error}; put one there with \
+                 claude setup-token, or name its file in MAHI_DOGFOOD_CLAUDE_TOKEN",
+                file.display()
+            )
+        });
         let world = world();
         init_with_claude_token(&world, &token);
         let thread = claude_works_in_a_new_thread(&world);

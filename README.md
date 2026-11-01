@@ -289,10 +289,12 @@ The commands are in the `justfile`, and [AGENTS.md](AGENTS.md) describes how the
 worked on. `just check` runs formatting, lints, tests and the dependency policy;
 `just test-git` runs the tests that need the `git` program, and `just test-wsl` the ones that
 need WSL 2. `just dogfood` runs the real Claude Code through mahi end to end (a thread and
-its landing) in a throwaway home, with your own sign-in:
+its landing) in a throwaway home, with your own sign-in. It reads a Claude Code setup token
+from `~/.config/mahi-test-token`, or from the file `MAHI_DOGFOOD_CLAUDE_TOKEN` names:
 
 ```sh
-MAHI_DOGFOOD_CLAUDE_TOKEN=path/to/claude-setup-token just dogfood
+just dogfood
+MAHI_DOGFOOD_CLAUDE_TOKEN=/path/to/claude-setup-token just dogfood
 ```
 
 ## License
