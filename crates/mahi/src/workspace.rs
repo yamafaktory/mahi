@@ -1128,13 +1128,7 @@ impl Workspace {
     /// Says whether another agent can start, since the workspace runs at most 16 at once, or
     /// what to tell the user when none can.
     pub(crate) fn room_for_agent(&self) -> Result<(), String> {
-        if self.running_count() < MAX_CHILDREN {
-            Ok(())
-        } else {
-            Err(format!(
-                "the workspace runs at most {MAX_CHILDREN} agents at once: stop one to start another"
-            ))
-        }
+        room_for(self.running_count())
     }
 
     /// Returns how many agents run in the workspace's tabs.
@@ -2000,6 +1994,16 @@ fn closed_on_exec_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC)?;
     }
     Ok((reader, writer))
+}
+
+fn room_for(running: usize) -> Result<(), String> {
+    if running < MAX_CHILDREN {
+        Ok(())
+    } else {
+        Err(format!(
+            "the workspace runs at most {MAX_CHILDREN} agents at once: stop one to start another"
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -3100,25 +3104,25 @@ mod tests {
 
     #[test]
     fn the_workspace_starts_no_17th_agent_while_16_run() {
-        let mut workspace = Workspace::new(
-            PaletteKey::default(),
-            Notice::for_terminal(TerminalHints::default()),
-        );
-        let agents: Vec<Running> = (0..MAX_CHILDREN - 1)
-            .map(|_| running(&mut workspace, "sleep 5"))
-            .collect();
-        workspace.tabs.push(tab("a", agents));
-        assert_eq!(workspace.room_for_agent(), Ok(()));
-        let last = running(&mut workspace, "sleep 5");
-        workspace.tabs.push(tab("b", vec![last]));
+        assert_eq!(room_for(MAX_CHILDREN - 1), Ok(()));
         assert_eq!(
-            workspace.room_for_agent(),
+            room_for(MAX_CHILDREN),
             Err(
                 "the workspace runs at most 16 agents at once: stop one to start another"
                     .to_owned()
             )
         );
-        workspace.tabs[1].agents[0].ending = Ending::Failed;
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let first = running(&mut workspace, "sleep 5");
+        workspace.tabs.push(tab("a", vec![first]));
+        let second = running(&mut workspace, "sleep 5");
+        let mut failed = running(&mut workspace, "sleep 5");
+        failed.ending = Ending::Failed;
+        workspace.tabs.push(tab("b", vec![second, failed]));
+        assert_eq!(workspace.running_count(), 2);
         assert_eq!(workspace.room_for_agent(), Ok(()));
     }
 
