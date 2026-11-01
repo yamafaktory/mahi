@@ -1,2 +1,4 @@
 /target
 /mutants.out*
+/.worktrees
+/work/scratch

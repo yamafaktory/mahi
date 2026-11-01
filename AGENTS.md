@@ -9,6 +9,21 @@ terminal coding agent. Its home is mahi.social, a domain the project owns: use i
 needs a domain or a URL of its own (website, documentation links, contact addresses). Read [DESIGN.md](DESIGN.md) before you make a change. The design is the
 specification. If a change goes against it, update the design in the same commit, or ask first.
 
+Before you start a piece of work, also read:
+
+1. [work/README.md](work/README.md): how issues, the board and the log work.
+2. [docs/decisions.md](docs/decisions.md): the decisions made during the work, with the
+   user's choices of wording. Append to it, never rewrite an entry.
+3. Your issue in `work/issues/`, and the DESIGN.md sections it names. Read those sections, not
+   the whole of DESIGN.md, unless the issue needs more.
+
+The log of the work lives in the repository, not in an agent's private memory, so that every
+agent and every reviewer reads the same context. Keep your issue's `## Log` current, and
+record each choice the user makes in `docs/decisions.md`.
+
+When an issue turns out much bigger than it says, or a step needs a choice that is the
+user's, stop and say so. Do not widen the scope on your own.
+
 ## Toolchain
 
 - Latest stable Rust, pinned in `rust-toolchain.toml`. `rust-version` in `Cargo.toml` is the
@@ -47,6 +62,10 @@ just deny       # cargo-deny: advisories, licenses, banned crates, unknown sourc
 just shellcheck # shellcheck on scripts/ and the .deb's maintainer scripts
 just check      # sweep + fmt-check + clippy + test + deny + shellcheck
 just sweep [g]  # remove target/ or fuzz/target/ once either passes g GiB (40 by default)
+just gate       # check + test-git: the local gate before a pull request
+just merge-pr b # fast-forward origin's main to branch b once its PR's required checks pass
+just worktree i # coordinator mode: the worktree .worktrees/i on the branch issue/i
+just worktree-remove i # remove the worktree .worktrees/i with its target/ and its branch
 just fuzz <t> [s] # run one fuzz target (nightly, cargo-fuzz) for s seconds
 just fuzz-all [s]  # run every fuzz target in turn
 just fuzz-shard <i> <n> [s] # run shard i of n of the fuzz targets (CI runs 6 in parallel)
@@ -78,9 +97,24 @@ manifests' `[*.metadata.release]`): it bumps the shared version, commits and sig
 `release.yml` is generated: change `dist-workspace.toml` and run `dist generate`, never edit it
 by hand. `dist plan` shows what a release would contain. A tag with a suffix, such as
 `v0.2.0-rc.1`, makes a pre-release, which the README's installer URL (`releases/latest`) skips.
+The ruleset on `main` now refuses the release commit that `just release` pushes, because no
+check ran on it. Do not release until issue 0004 brings the version bump through a pull
+request.
 
-After every change, run `just fmt && just check`. A change is not done until `just check`
-passes. Do not silence a failure: fix the cause.
+## Testing while iterating
+
+While you work, run only what your change can break. The full gate runs once, before the
+pull request.
+
+- One crate or one test: `just test -p mahi-store`, or `just test -p mahi <name filter>`.
+- The git tests your change touches: `just test-git <name filter>`. A change to a command, a
+  flag, a dialog or printed text needs them (invite, join, pairing, the home screen, remote,
+  push, fetch, purge).
+- Before each commit: `just fmt && just check`, and the git tests the change touches.
+- Once before the pull request: `just gate`. A change is not done until `just gate` exits 0.
+  Read its exit status, never a grep of its output.
+- Do not silence a failure: fix the cause. Never weaken a check to get it green.
+- Put scratch files, logs and large outputs in `work/scratch/<issue>/`. Git ignores it.
 
 ## Workspace
 
@@ -224,3 +258,31 @@ Performance and security are both critical. Neither is traded away for convenien
 - Do not commit generated files, `target/` or local paths.
 - Never add a `Co-Authored-By` trailer or any other agent attribution to a commit, and never
   add a "Generated with …" line to a pull request description.
+
+## Pull requests
+
+`main` stays green. The ruleset "Protect main" refuses a commit on `main` whose required CI
+checks did not pass, an unsigned commit and a force push. Nobody bypasses it.
+
+1. Start each pull request on a branch of its own, named for what it changes:
+   `git fetch origin main && git switch -c <branch> origin/main`.
+2. Commit each piece, signed, after its review, as Commits says.
+3. Run `just gate`, push the branch and open a pull request with `gh pr create`. Its
+   description says what changed and why, and which tests cover it. It needs no approval
+   from the user.
+4. Wait for its checks: `gh pr checks <branch> --required --watch`. When one fails, fix the
+   cause on the branch and push again.
+5. Merge with `just merge-pr <branch>`. It refuses a branch that does not hold `origin/main`:
+   rebase it onto `origin/main`, push it and wait for its checks again. It fast-forwards
+   `main` on GitHub, so your signed commits land as they are. Then it deletes the branch on
+   GitHub and fetches. It leaves your checkout and your local branches alone: delete the
+   merged branch with `git branch -D <branch>` once you leave it.
+6. Watch the run on `main` too: the fuzz shards run only there.
+
+## Coordinator mode
+
+One session that works the issues in order is the default. The coordinator mode, with
+sub-agents in worktrees, is opt-in: the user starts it for issues that touch separate code.
+Each sub-agent starts cold and uses several times the tokens of one session, and most steps
+of a milestone build on each other (D012). At most two sub-agents run at once.
+[work/README.md](work/README.md) says how the coordinator and its sub-agents work.

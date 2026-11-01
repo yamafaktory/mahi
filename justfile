@@ -79,6 +79,24 @@ sweep max_gib="40":
 
 check: sweep fmt-check clippy test deny shellcheck
 
+# The local gate before a pull request: just check, then the git tests
+gate: check test-git
+
+# Fast-forward origin's main to a pull request's branch once its required checks pass, then delete the branch on origin
+[positional-arguments]
+merge-pr branch:
+    @scripts/merge-pr.sh "$1"
+
+# Make the worktree .worktrees/<issue> on the branch issue/<issue> from origin/main, for a coordinator's sub-agent
+[positional-arguments]
+worktree issue:
+    @scripts/worktree.sh add "$1"
+
+# Remove the worktree .worktrees/<issue> with its target/ and its branch
+[positional-arguments]
+worktree-remove issue:
+    @scripts/worktree.sh remove "$1"
+
 [positional-arguments]
 mutants crate *args:
     cargo mutants --test-tool nextest --cargo-arg=--locked --package "$1" "${@:2}"
