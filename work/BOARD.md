@@ -8,7 +8,7 @@ its line current.
 | [0001 One agent per person](issues/0001-one-agent-per-person.md) | done | none | follow-up: the command line join with an agent |
 | [0002 The land tool and its confirmation](issues/0002-land-tool.md) | blocked | 0001 | needs the user's wording for the confirmation |
 | [0003 Remove mahi land](issues/0003-remove-mahi-land.md) | blocked | 0002 | |
-| [0004 Release through a pull request](issues/0004-release-through-a-pull-request.md) | open | none | `just release` pushes to `main`, which the ruleset now refuses |
+| [0004 Release through a pull request](issues/0004-release-through-a-pull-request.md) | done | none | not yet run for real; follow-up: the dry run changes `fuzz/Cargo.lock` |
 | [0005 Cut milestone 9's Steps line down](issues/0005-steps-line-to-built-and-next.md) | open | none | the user reviews the cut |
 | [0006 Codex in the dogfood test as a collaborator](issues/0006-dogfood-codex-as-a-collaborator.md) | open | 0001 | the user runs it with their sign-ins |
 

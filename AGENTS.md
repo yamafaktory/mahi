@@ -53,7 +53,7 @@ just try-teammate … # the same as a second user, bob, with a key, config, data
 just try-reset  # remove the scratch repos, config and data of try and try-teammate
 just test-git   # the tests that run the git program (not part of just test)
 just test-wsl   # the tests that need WSL 2 (not part of just test; CI runs them on Windows)
-just release v  # check, bump every crate to version v, commit, tag v<v> and push (dry run without --execute)
+just release v  # check, bump to version v through a pull request, then tag v<v> (dry run without --execute)
 just dogfood    # the real Claude Code end to end, token in ~/.config/mahi-test-token (not in CI)
 just apparmor-parse # parse mahi apparmor's profile (needs apparmor_parser and sudo)
 just deb        # build the .deb (cargo-deb) into target/debian/
@@ -88,18 +88,23 @@ workflow, so that CI and local runs stay the same.
 
 Releases are made with [cargo-dist](https://github.com/axodotdev/cargo-dist), configured in
 `dist-workspace.toml`, and started with `just release <version> --execute`, which runs
-`just check`, then [cargo-release](https://github.com/crate-ci/cargo-release) (configured in the
-manifests' `[*.metadata.release]`): it bumps the shared version, commits and signs
-`Release mahi <version>`, tags `v<version>` and pushes, never publishing to crates.io. Without
-`--execute` it only shows what it would do. Pushing a tag `v<version>` that matches `Cargo.toml` runs
+`just check`, then `scripts/release.sh`. The version is exact, such as `0.2.0` or
+`0.2.0-rc.1`, never a level such as `patch`, since a tag pushed under `v*` can never be moved
+or deleted. On a branch `release/v<version>` from `origin/main`,
+[cargo-release](https://github.com/crate-ci/cargo-release) (configured in the manifests'
+`[*.metadata.release]`) bumps the shared version and commits and signs `Release mahi
+<version>`, never publishing to crates.io. The script then pushes the branch, opens its pull
+request, waits for its required checks, merges it with `scripts/merge-pr.sh`, and signs and
+pushes the tag `v<version>` on the release commit. It leaves the checkout on that commit,
+detached. When it stops after pushing the branch, such as on a failed check, fix the cause on
+the branch and run it again: it resumes from the branch on `origin`. Without `--execute` it
+shows the bump on the current checkout and makes no commit, but its pre-release hook still
+updates `fuzz/Cargo.lock`, which `git checkout fuzz/Cargo.lock` undoes. Pushing a tag `v<version>` that matches `Cargo.toml` runs
 `.github/workflows/release.yml`: the checks, then the archives, the installer script and the
 `.deb` packages (`.github/workflows/build-deb.yml`), published as a GitHub release.
 `release.yml` is generated: change `dist-workspace.toml` and run `dist generate`, never edit it
 by hand. `dist plan` shows what a release would contain. A tag with a suffix, such as
 `v0.2.0-rc.1`, makes a pre-release, which the README's installer URL (`releases/latest`) skips.
-The ruleset on `main` now refuses the release commit that `just release` pushes, because no
-check ran on it. Do not release until issue 0004 brings the version bump through a pull
-request.
 
 ## Testing while iterating
 

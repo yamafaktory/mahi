@@ -12,13 +12,12 @@ rust-version = "1.98"
 version = "0.1.0-rc.1"
 
 [workspace.metadata.release]
-allow-branch = ["main"]
+allow-branch = ["main", "release/*"]
 consolidate-commits = true
 pre-release-commit-message = "Release mahi {{version}}"
 publish = false
 shared-version = true
 sign-commit = true
-sign-tag = true
 tag = false
 
 [workspace.dependencies]
