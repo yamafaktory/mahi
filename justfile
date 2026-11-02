@@ -49,6 +49,11 @@ deb-check:
 
 deny:
     cargo deny --locked check
+    scripts/fuzz-lock.sh check
+
+# Lock fuzz/Cargo.lock's shared crates at the versions Cargo.lock locks
+fuzz-lock-sync:
+    scripts/fuzz-lock.sh sync
 
 # Check every shell script: the ones in scripts/ and the .deb's maintainer scripts
 shellcheck:

@@ -13,7 +13,7 @@ version.workspace = true
 dist = true
 
 [package.metadata.release]
-pre-release-hook = ["../../scripts/sync-fuzz-lock.sh"]
+pre-release-hook = ["../../scripts/fuzz-lock.sh", "sync"]
 
 [package.metadata.deb]
 assets = [

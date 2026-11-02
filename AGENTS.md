@@ -77,7 +77,8 @@ just dogfood    # the real Claude Code end to end, token in ~/.config/mahi-test-
 just apparmor-parse # parse mahi apparmor's profile (needs apparmor_parser and sudo)
 just deb        # build the .deb (cargo-deb) into target/debian/
 just deb-check  # CI only: install the .deb on Ubuntu 24.04 and run mahi from /usr/bin
-just deny       # cargo-deny: advisories, licenses, banned crates, unknown sources
+just deny       # cargo-deny (advisories, licenses, bans, sources), and the fuzz lock's versions
+just fuzz-lock-sync # lock fuzz/Cargo.lock's shared crates at the versions Cargo.lock locks
 just shellcheck # shellcheck on scripts/ and the .deb's maintainer scripts
 just check      # sweep + fmt-check + clippy + test + deny + shellcheck
 just sweep [g]  # remove target/ or fuzz/target/ once either passes g GiB (40 by default)
@@ -149,6 +150,10 @@ pull request.
   features. A crate refers to it with `dep = { workspace = true }`.
 - Every crate has `[lints] workspace = true`. Change lints only in the workspace manifest.
 - `Cargo.lock` is committed. Commands use `--locked`.
+- `fuzz/Cargo.lock` locks each crate it shares with `Cargo.lock` at a version `Cargo.lock` also
+  locks, so the fuzz targets test what mahi ships. `just deny` fails otherwise, or when
+  building the fuzz crate would change its lock. After you change `Cargo.lock` or a version
+  in a manifest, run `just fuzz-lock-sync`.
 - `deny.toml` is the dependency policy. An ignored advisory needs a `reason` that says why
   the vulnerable code cannot run in mahi. A new license needs a line in `allow`. `just deny`
   fetches the advisory database, so it needs network access.
