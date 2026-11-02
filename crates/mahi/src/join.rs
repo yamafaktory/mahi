@@ -723,23 +723,25 @@ fn joined_meta(
     let thread = ticket.thread();
     let deadline = Instant::now() + META_WAIT;
     let mut told = false;
-    let document = loop {
-        match node.fetch_meta(ticket.host(), thread) {
-            Ok(document) => break document,
-            Err(error) if Instant::now() >= deadline => return Err(JoinError::NoMeta(error)),
-            Err(_) => {
-                if !told {
-                    eprintln!("mahi: {WAITING_FOR_HOST}");
-                    told = true;
-                }
-                thread::sleep(RETRY_PAUSE);
+    let mut older = false;
+    let (document, meta) = loop {
+        let refusal = match served(node.fetch_meta(ticket.host(), thread), ticket)? {
+            Served::Meta(document, meta) => break (document, meta),
+            Served::Older => {
+                older = true;
+                JoinError::Rollback
             }
+            Served::Missing(error) => JoinError::NoMeta(error),
+        };
+        if Instant::now() >= deadline {
+            return Err(if older { JoinError::Rollback } else { refusal });
         }
+        if !told {
+            eprintln!("mahi: {WAITING_FOR_HOST}");
+            told = true;
+        }
+        thread::sleep(RETRY_PAUSE);
     };
-    let meta = VerifiedMeta::decode(&document, thread, ticket.owner()).map_err(JoinError::Meta)?;
-    if meta.generation() < ticket.min_generation() {
-        return Err(JoinError::Rollback);
-    }
     let listed = |node: &NodeId| meta.participants().any(|listed| listed.node() == node);
     if !listed(&own) || !listed(ticket.host().node()) {
         return Err(JoinError::NotListed);
@@ -749,6 +751,25 @@ fn joined_meta(
     remember_owner(store, thread, ticket.owner()).map_err(JoinError::Owner)?;
     live::remember_host(store, thread, ticket.host()).map_err(JoinError::Host)?;
     Ok(meta)
+}
+
+enum Served {
+    Meta(Vec<u8>, VerifiedMeta),
+    Older,
+    Missing(LiveError),
+}
+
+fn served(fetched: Result<Vec<u8>, LiveError>, ticket: &Ticket) -> Result<Served, JoinError> {
+    let document = match fetched {
+        Ok(document) => document,
+        Err(error) => return Ok(Served::Missing(error)),
+    };
+    let meta = VerifiedMeta::decode(&document, ticket.thread(), ticket.owner())
+        .map_err(JoinError::Meta)?;
+    if meta.generation() < ticket.min_generation() {
+        return Ok(Served::Older);
+    }
+    Ok(Served::Meta(document, meta))
 }
 
 /// Refuses a thread this repository started: it has a `meta` ref but no remembered owner, so
@@ -1289,6 +1310,60 @@ mod tests {
         assert!(matches!(
             recorded_meta(&ticket(1, stranger), &setup.store, stranger),
             Err(JoinError::NotListed)
+        ));
+    }
+
+    #[test]
+    fn a_served_meta_counts_only_at_the_tickets_generation_or_later() {
+        use mahi_live::HostAddress;
+        use mahi_thread::{
+            Role,
+            load_meta_document,
+        };
+
+        use crate::workspace_live::tests::{
+            add_bob,
+            setup,
+        };
+
+        let setup = setup();
+        let bob = add_bob(&setup, Role::Collaborator);
+        let owner = setup.owner();
+        let (meta, document) = load_meta_document(&setup.store, setup.thread, &owner, 0).unwrap();
+        let alice = *meta.participants().next().unwrap().node();
+        let ticket = |generation| {
+            Ticket::new(
+                setup.thread,
+                HostAddress::new(alice, None, Vec::new()).unwrap(),
+                owner.clone(),
+                generation,
+                *bob.node(),
+            )
+        };
+        let current = meta.generation();
+
+        let Ok(Served::Meta(read, verified)) = served(Ok(document.clone()), &ticket(current))
+        else {
+            panic!("a meta at the ticket's generation is served");
+        };
+        assert_eq!(
+            (read.as_slice(), verified.generation()),
+            (document.as_slice(), current)
+        );
+        assert!(matches!(
+            served(Ok(document.clone()), &ticket(current + 1)),
+            Ok(Served::Older)
+        ));
+        assert!(matches!(
+            served(Err(LiveError::InsideRuntime), &ticket(current)),
+            Ok(Served::Missing(LiveError::InsideRuntime))
+        ));
+        let mut forged = document;
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert!(matches!(
+            served(Ok(forged), &ticket(current)),
+            Err(JoinError::Meta(_))
         ));
     }
 }

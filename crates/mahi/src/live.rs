@@ -1819,9 +1819,7 @@ impl Peers for HostPeers {
         if thread != self.thread {
             return None;
         }
-        if !self.admits(node) {
-            self.reread_if_due();
-        }
+        self.reread_if_due();
         let cache = self.cache.lock().ok()?;
         cache
             .participants
@@ -2061,6 +2059,29 @@ mod tests {
         assert_eq!(
             peers.participants(),
             [(hosted.owner_node, ParticipantName::new("alice").unwrap())]
+        );
+    }
+
+    #[test]
+    fn a_host_serves_an_admitted_participant_the_meta_written_since_it_last_read() {
+        let hosted = hosted();
+        let peers = peers(&hosted, Duration::ZERO);
+        let bob = bob();
+        relist(&hosted, &bob, Role::Watcher);
+        let served = |peers: &HostPeers| {
+            let document = peers.meta_for(hosted.thread, bob.node()).unwrap();
+            VerifiedMeta::decode(&document, hosted.thread, &hosted.owner).unwrap()
+        };
+        let watching = served(&peers);
+        relist(&hosted, &bob, Role::Collaborator);
+        let collaborating = served(&peers);
+        assert!(collaborating.generation() > watching.generation());
+        assert_eq!(
+            collaborating
+                .participants()
+                .find(|listed| listed.node() == bob.node())
+                .map(Participant::role),
+            Some(Role::Collaborator)
         );
     }
 

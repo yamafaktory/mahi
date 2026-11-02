@@ -4590,6 +4590,28 @@ echo stray > "$CODEX_HOME/history.jsonl"
         script(fixture, "hosting", "claude", "#!/bin/sh\nsleep 60\n")
     }
 
+    fn teammate_join(teammate: &Teammate, arguments: &[&str]) -> Command {
+        let mut command = Command::new(mahi_binary());
+        command
+            .arg("join")
+            .args(arguments)
+            .current_dir(&teammate.repo);
+        teammate_env(&mut command, teammate, "bob");
+        command
+    }
+
+    fn spawn_local_host(fixture: &Fixture) -> KillOnDrop {
+        let mut host = fixture.command(&["run", waiting_claude(fixture).to_str().unwrap()]);
+        KillOnDrop(
+            host.env("MAHI_LIVE", "local")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
     fn invite_teammate(
         fixture: &Fixture,
         (thread, role): (ThreadId, &str),
@@ -4659,25 +4681,12 @@ echo stray > "$CODEX_HOME/history.jsonl"
     fn a_teammate_joins_with_their_agent_only_with_the_key_meta_lists() {
         let fixture = fixture();
         save_identity(&fixture);
-        let mut host = fixture.command(&["run", waiting_claude(&fixture).to_str().unwrap()]);
-        let _host = KillOnDrop(
-            host.env("MAHI_LIVE", "local")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
+        let _host = spawn_local_host(&fixture);
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
         let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
         let join = |socket: &Path| {
-            let mut command = Command::new(mahi_binary());
-            command
-                .args(["join", &ticket, "--", "true"])
-                .current_dir(&bob.repo);
-            teammate_env(&mut command, &bob, "bob");
-            let output = command
+            let output = teammate_join(&bob, &[&ticket, "--", "true"])
                 .env("SSH_AUTH_SOCK", socket)
                 .stdin(Stdio::null())
                 .output()
@@ -4715,6 +4724,37 @@ echo stray > "$CODEX_HOME/history.jsonl"
             "{stderr}"
         );
         assert!(!stderr.contains("Passphrase"), "{stderr}");
+    }
+
+    #[test]
+    fn a_reinvited_teammate_joins_once_the_running_host_serves_the_new_meta() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let _host = spawn_local_host(&fixture);
+        let (thread, _key) = running_thread(&fixture);
+        let bob = teammate(&fixture, "bob");
+        let join = |ticket: &str| {
+            let output = teammate_join(&bob, &[ticket, "--", "claude"])
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+
+        let first = invite_teammate(&fixture, (thread, "--watcher"), &bob);
+        let stderr = join(&first);
+        assert!(
+            stderr.contains("cannot ask for your passphrase"),
+            "{stderr}"
+        );
+
+        let second = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
+        let stderr = join(&second);
+        assert!(!stderr.contains("older than the ticket allows"), "{stderr}");
+        assert!(
+            stderr.contains("cannot ask for your passphrase"),
+            "{stderr}"
+        );
     }
 
     const CLAIM_WATCHER: &str = r#"#!/bin/sh
@@ -4782,15 +4822,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
     fn a_teammate_runs_their_own_agent_in_the_owners_thread() {
         let fixture = fixture();
         save_identity(&fixture);
-        let mut host = fixture.command(&["run", waiting_claude(&fixture).to_str().unwrap()]);
-        let _host = KillOnDrop(
-            host.env("MAHI_LIVE", "local")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
+        let _host = spawn_local_host(&fixture);
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
         let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
