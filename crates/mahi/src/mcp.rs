@@ -66,6 +66,7 @@ use mahi_store::{
 };
 use mahi_thread::{
     ParticipantKey,
+    Role,
     load_meta,
     walk_turns,
 };
@@ -83,6 +84,8 @@ use crate::{
         MAX_WHAT_BYTES,
     },
     handoff,
+    land_desk::Lander,
+    landing,
     note::{
         self,
         NoteBy,
@@ -330,6 +333,7 @@ pub(crate) struct ThreadTools {
     claims: Arc<Claims>,
     meta: Mutex<Option<(Instant, MetaView)>>,
     note_by: NoteBy,
+    lander: Option<Arc<Lander>>,
 }
 
 /// What the tools read of `meta`: the participants it lists, with their keys and whether each
@@ -337,6 +341,7 @@ pub(crate) struct ThreadTools {
 #[derive(Debug, Clone)]
 struct MetaView {
     listed: Vec<(ParticipantName, ParticipantKey, bool)>,
+    collaborators: Vec<ParticipantName>,
     base: ObjectId,
 }
 
@@ -361,6 +366,7 @@ impl ThreadTools {
             claims,
             meta: Mutex::new(None),
             note_by: NoteBy::ListAgents,
+            lander: None,
         }
     }
 
@@ -394,10 +400,34 @@ impl ThreadTools {
                     )
                 })
                 .collect(),
+            collaborators: meta
+                .participants()
+                .filter(|listed| listed.role() == Role::Collaborator)
+                .map(|listed| listed.name().clone())
+                .collect(),
             base: meta.base(),
         };
         *cached = Some((Instant::now(), view.clone()));
         Ok(view)
+    }
+
+    fn land(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
+        let store = self.store()?;
+        let view = self.meta(&store)?;
+        let Some((owner, ..)) = view.listed.iter().find(|(_, _, owns)| *owns) else {
+            return Err(ToolError::Failed("the thread cannot be read".to_owned()));
+        };
+        match &self.lander {
+            Some(lander) if self.me.participant() == owner => {
+                lander.land(&store, arguments, (view.base, &view.collaborators))
+            }
+            Some(_) | None => Ok(landing::owner_only(owner)),
+        }
+    }
+
+    pub(crate) fn with_lander(mut self, lander: Arc<Lander>) -> Self {
+        self.lander = Some(lander);
+        self
     }
 
     fn store(&self) -> Result<Store, ToolError> {
@@ -689,6 +719,37 @@ fn push_note(text: &mut String, file: &Path) {
     }
 }
 
+fn land_tool() -> Tool {
+    Tool {
+        name: "land",
+        description: "Lands the thread: mahi commits the changed files of your \
+                      worktree as the commits you list, each a message and the paths \
+                      it holds, and asks the thread's owner to push them as a pull \
+                      request with the title and description you give. Every changed \
+                      path goes in exactly one commit. Only the owner's agent can \
+                      land. Do not commit or push yourself.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "commits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" },
+                            "paths": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["message", "paths"]
+                    }
+                },
+                "title": { "type": "string" },
+                "description": { "type": "string" }
+            },
+            "required": ["commits", "title", "description"]
+        }),
+    }
+}
+
 fn cleaned(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_TOOL_TEXT));
     push_clean(&mut out, text);
@@ -761,6 +822,7 @@ impl Toolbox for ThreadTools {
                 description: "Lists what the thread's agents claim.",
                 input_schema: json!({ "type": "object", "properties": {} }),
             },
+            land_tool(),
             Tool {
                 name: "read_transcript",
                 description: "Shows what an agent was asked and which tools it used, turn \
@@ -790,6 +852,7 @@ impl Toolbox for ThreadTools {
             "claim" => self.claim(arguments),
             "release" => self.release(arguments),
             "list_claims" => Ok(self.list_claims()),
+            "land" => self.land(arguments),
             _ => Err(ToolError::Unknown),
         }
     }
@@ -1186,6 +1249,34 @@ mod tests {
         assert!(
             huge.text
                 .ends_with("(the rest of this turn is left out for size)\n")
+        );
+    }
+
+    #[test]
+    fn only_the_owners_agent_lands_and_the_others_are_told_who_does() {
+        use crate::workspace_live::tests::setup;
+
+        let setup = setup();
+        let tools = ThreadTools::new(
+            setup.store.common_dir().to_path_buf(),
+            (setup.thread, setup.owner(), None),
+            ("bob.claude".parse().unwrap(), Arc::new(Claims::default())),
+        );
+        assert!(tools.tools().iter().any(|tool| tool.name == "land"));
+        let Value::Object(arguments) = json!({
+            "commits": [{ "message": "m", "paths": ["a"] }],
+            "title": "t",
+            "description": "d"
+        }) else {
+            panic!("the arguments are an object");
+        };
+        assert_eq!(
+            tools.call("land", &arguments).unwrap(),
+            "only alice, the thread's owner, lands this thread; ask them to"
+        );
+        assert_eq!(
+            tools.call("land", &Map::new()).unwrap(),
+            "only alice, the thread's owner, lands this thread; ask them to"
         );
     }
 }

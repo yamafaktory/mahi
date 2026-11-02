@@ -25,6 +25,7 @@ use thiserror::Error;
 
 use crate::{
     hook,
+    mcp::push_clean,
     sync_state,
 };
 
@@ -35,6 +36,7 @@ const CUT: char = '…';
 const MAX_LISTED: usize = 20;
 const LONGEST_PATH: usize = 200;
 const MAX_TEAMMATES: usize = 64;
+const MAX_LANDED_CHARS: usize = 1024;
 const OPENING: &str = "mahi merged your teammates' work into your worktree since your last prompt.";
 const RESOLVE_FIRST: &str = "Resolve these conflicts before anything else.";
 
@@ -44,6 +46,8 @@ const RESOLVE_FIRST: &str = "Resolve these conflicts before anything else.";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Note {
     came: Vec<Came>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    landed: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +117,23 @@ pub(crate) fn take(file: &Path) -> Result<Option<String>, NoteError> {
         loaded => loaded?,
     };
     sync_state::remove(file).map_err(|error| NoteError::Io(file.to_path_buf(), error))?;
-    Ok((!note.came.is_empty()).then(|| note.render()))
+    Ok((!note.is_empty()).then(|| note.render()))
+}
+
+pub(crate) fn record_landing(file: &Path, line: &str) -> Result<(), NoteError> {
+    let _kept = keeping()?;
+    let mut note = match Note::load(file) {
+        Err(NoteError::Malformed(_)) => Note::default(),
+        loaded => loaded?,
+    };
+    let mut cleaned = String::with_capacity(line.len().min(MAX_LANDED_CHARS));
+    let end = line
+        .char_indices()
+        .nth(MAX_LANDED_CHARS)
+        .map_or(line.len(), |(index, _)| index);
+    push_clean(&mut cleaned, line.get(..end).unwrap_or(line));
+    note.landed = Some(cleaned);
+    note.save(file)
 }
 
 /// Returns the note kept in `file` as the text an agent reads, without taking it, or `None`
@@ -121,7 +141,7 @@ pub(crate) fn take(file: &Path) -> Result<Option<String>, NoteError> {
 pub(crate) fn peek(file: &Path) -> Option<String> {
     let _kept = keeping().ok()?;
     let note = Note::load(file).ok()?;
-    (!note.came.is_empty()).then(|| note.render())
+    (!note.is_empty()).then(|| note.render())
 }
 
 /// Takes the note kept in `file` when it still reads `shown`, as an agent's hook read it; a
@@ -130,7 +150,7 @@ pub(crate) fn take_shown(file: &Path, shown: &str) {
     let Ok(_kept) = keeping() else {
         return;
     };
-    let still = Note::load(file).is_ok_and(|note| !note.came.is_empty() && note.render() == shown);
+    let still = Note::load(file).is_ok_and(|note| !note.is_empty() && note.render() == shown);
     if still {
         let _ = sync_state::remove(file);
     }
@@ -238,6 +258,10 @@ impl Note {
         };
         let note: Self = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
         let holds = note.came.len() <= MAX_TEAMMATES
+            && note
+                .landed
+                .as_ref()
+                .is_none_or(|landed| landed.len() <= MAX_TEXT_BYTES)
             && note.came.iter().all(|came| {
                 came.from.parse::<AgentSlot>().is_ok()
                     && [&came.markers, &came.kept, &came.brought]
@@ -245,6 +269,10 @@ impl Note {
                         .all(|listed| listed.holds())
             });
         holds.then_some(note).ok_or_else(malformed)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.came.is_empty() && self.landed.is_none()
     }
 
     /// Returns each teammate's agent the note names, with the first files its merges brought.
@@ -295,7 +323,21 @@ impl Note {
     /// resolve them before anything else, then the files each teammate's merges brought, each
     /// path in a code span.
     pub(crate) fn render(&self) -> String {
-        let mut out = String::from(OPENING);
+        let mut out = String::new();
+        if !self.came.is_empty() {
+            self.render_came(&mut out);
+        }
+        if let Some(landed) = &self.landed {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(landed);
+        }
+        out
+    }
+
+    fn render_came(&self, out: &mut String) {
+        out.push_str(OPENING);
         let mut budget = MAX_TEXT_BYTES;
         out.push('\n');
         let conflicts = self
@@ -313,7 +355,7 @@ impl Note {
                     "Resolve the conflict markers in (from {}): ",
                     came.from
                 );
-                came.markers.push(&mut out, (" ", &mut budget));
+                came.markers.push(out, (" ", &mut budget));
             }
             if !came.kept.is_empty() {
                 let _ = write!(
@@ -321,17 +363,16 @@ impl Note {
                     "Your version was kept, but {} changed these too; check them with read_diff: ",
                     came.from
                 );
-                came.kept.push(&mut out, (" ", &mut budget));
+                came.kept.push(out, (" ", &mut budget));
             }
         }
         for came in &self.came {
             if !came.brought.is_empty() {
                 let _ = write!(out, "merged {}: ", came.from);
-                came.brought.push(&mut out, (", ", &mut budget));
+                came.brought.push(out, (", ", &mut budget));
             }
         }
         out.truncate(out.trim_end().len());
-        out
     }
 }
 
@@ -439,6 +480,37 @@ mod tests {
         assert!(text.ends_with("merged bob.claude: ` a.rs `"), "{text}");
         assert!(!text.contains(RESOLVE_FIRST));
         assert_eq!(take(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn a_landings_outcome_reads_alone_or_after_the_merges_and_the_latest_replaces_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sync/alice.claude/note");
+        record_landing(&file, "alice cancelled your landing; nothing was pushed.").unwrap();
+        record_landing(
+            &file,
+            "alice pushed your landing: 2 commits on mahi/x to origin.\u{7}",
+        )
+        .unwrap();
+        assert_eq!(
+            take(&file).unwrap().as_deref(),
+            Some("alice pushed your landing: 2 commits on mahi/x to origin.")
+        );
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let brought = paths(&["a.rs"]);
+        let merged = Merged {
+            markers: &[],
+            kept: &[],
+            brought: &brought,
+        };
+        record(&file, &bob, merged).unwrap();
+        record_landing(&file, "alice cancelled your landing; nothing was pushed.").unwrap();
+        let text = take(&file).unwrap().unwrap();
+        assert!(text.starts_with(OPENING), "{text}");
+        assert!(
+            text.ends_with("` a.rs `\nalice cancelled your landing; nothing was pushed."),
+            "{text}"
+        );
     }
 
     #[test]

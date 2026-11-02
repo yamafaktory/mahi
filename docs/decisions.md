@@ -155,3 +155,101 @@ Chosen by the user (#16), from the agent's proposals:
 Chosen by the user (#16), from the agent's proposal after D017: `tester.sh does not report
 when its turns end, so your work could not be kept in sync with your teammates'; join with
 Claude Code or Codex`.
+
+## D023 · 2026-11-02 · Wording of the landing confirmation
+
+Chosen by the user (#11), from the agent's proposal, for the open question in DESIGN.md:
+
+```
+Land thread 3f2a91c on mahi/3f2a91c
+
+  Retry failed requests in the client
+    src/client.rs
+    src/retry.rs
+  Test the retry
+    tests/retry.rs
+
+Pull request: Retry failed requests
+
+Not merged yet, so not in this landing:
+  bob.claude  turn ended 4m ago
+
+Enter pushes  Esc cancels
+```
+
+## D024 · 2026-11-02 · Wording of the land tool's answers
+
+Chosen by the user (#11), from the agent's proposal:
+
+```
+only alice, the thread's owner, lands this thread; ask them to
+
+not landed: each changed path goes in exactly one commit
+  in no commit: src/a.rs, src/b.rs
+  in more than one commit: src/c.rs
+  did not change: README.md
+
+not landed: resolve the conflict markers first, in src/a.rs
+
+nothing changed since the last landing
+
+mahi shows the landing to alice to push or cancel; your next note says which
+```
+
+## D025 · 2026-11-02 · Wording of the landing's outcome in the agent's note
+
+Chosen by the user (#11), from the agent's proposal:
+
+```
+alice pushed your landing: 2 commits on mahi/3f2a91c to origin.
+
+alice cancelled your landing; nothing was pushed.
+
+your landing was not pushed: origin refused mahi/3f2a91c: <reason>
+```
+
+## D026 · 2026-11-02 · Wording of the confirmation after a push
+
+Chosen by the user (#11), from the agent's proposal:
+
+```
+Pushed 2 commits on mahi/3f2a91c to origin.
+Open the pull request: https://github.com/…/pull/new/mahi/3f2a91c
+Its description is in <state>/PR.md and on your clipboard.
+
+Esc closes
+```
+
+## D027 · 2026-11-02 · The land tool's description
+
+Chosen by the user (#11), from the agent's proposal: `Lands the thread: mahi commits the
+changed files of your worktree as the commits you list, each a message and the paths it holds,
+and asks the thread's owner to push them as a pull request with the title and description you
+give. Every changed path goes in exactly one commit. Only the owner's agent can land. Do not
+commit or push yourself.`
+
+## D028 · 2026-11-02 · The landing commits carry the owner's git identity
+
+Chosen by the user (#11): the land tool's commits carry `user.name` and `user.email` from the
+repository's git config as author and committer, read once when the run starts, and the time
+they are built. mahi refuses to land when either is not set, and says which one is missing.
+
+## D029 · 2026-11-02 · Wording of the land tool's other refusals
+
+Chosen by the user (#11), from the agent's proposal:
+
+```
+not landed: more than 10000 paths changed since the last landing
+
+not landed: git's user.name is not set in this repository; ask alice to set it with git config user.name
+
+not landed: no remote is chosen for this clone; ask alice to choose one with mahi remote <name> --private or --public
+```
+
+The same as the second line for `user.email`.
+
+## D030 · 2026-11-02 · Wording of the confirmation while a push runs and when it fails
+
+Chosen by the user (#11), from the agent's proposal: the hint reads `Pushing to origin…` while
+the push runs, and a failure replaces the confirmation with `Not pushed: origin refused
+mahi/3f2a91c: <reason>`, then `Esc closes`.

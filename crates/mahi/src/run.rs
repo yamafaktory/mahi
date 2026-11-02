@@ -180,6 +180,10 @@ use crate::{
         AgentInput,
         Pace,
     },
+    land_desk::{
+        Desk,
+        Lander,
+    },
     live::{
         self,
         HostError,
@@ -1225,19 +1229,7 @@ impl Prepared {
     ) -> Result<Outcome, RunError> {
         self.announce(&started);
         let session = self.session_source(&started);
-        let restore = session
-            .as_ref()
-            .zip(started.key.as_ref())
-            .map(|(source, key)| Restore {
-                store: &self.store,
-                of: SessionOf {
-                    thread: started.thread,
-                    slot: &started.slot,
-                    key,
-                    own: started.commits.key(),
-                },
-                dir: &source.dir,
-            });
+        let restore = restore_of(&self.store, session.as_ref(), &started);
         let first = self.first_state();
         let reporting = first.map_or(Reporting::Unreported, |_| Reporting::Reported);
         let (thread, slot) = (started.thread, started.slot.clone());
@@ -1282,6 +1274,7 @@ impl Prepared {
             .map(|setup| start_pusher(setup, &self.git_dir, &started));
         let activity = Arc::new(Activity::telling(live.as_ref().map(Link::tap), first));
         let key = started.key.take().map(Arc::new);
+        let globals = self.globals.clone();
         let (recorder, turns) = start_background(
             &mut started,
             &self.git_dir,
@@ -1293,11 +1286,20 @@ impl Prepared {
         );
         let auto_merge = auto_merge(self.profile, self.owner.as_ref(), (&self.git_dir, &started));
         let note_by = self.profile.map_or(NoteBy::ListAgents, Profile::note_by);
+        let landing = landing_desk(
+            (&self.store, environment, &self.git_dir),
+            (self.owner.as_ref(), key.as_deref(), raw.is_some()),
+            (&started, globals),
+        );
         let tools = serve_tools(
             self.mcp,
             (self.owner, key, live.as_ref()),
             &self.git_dir,
-            (&started, note_by),
+            (
+                &started,
+                note_by,
+                landing.as_ref().map(|(_, lander)| Arc::clone(lander)),
+            ),
         );
         let outcome = finish_run(
             child,
@@ -1306,6 +1308,7 @@ impl Prepared {
                 title: format!("{} · thread {}", started.slot, started.thread),
                 palette_key: self.palette_key,
                 activity,
+                desk: landing.map(|(desk, _)| desk),
             },
             termination,
             Background {
@@ -1367,7 +1370,7 @@ fn serve_tools(
         Option<&Link>,
     ),
     git_dir: &Path,
-    (started, note_by): (&Started, NoteBy),
+    (started, note_by, lander): (&Started, NoteBy, Option<Arc<Lander>>),
 ) -> Arc<AtomicBool> {
     let serving = Arc::new(AtomicBool::new(true));
     let claims = live.map_or_else(|| Arc::new(Claims::default()), Link::claims);
@@ -1381,12 +1384,44 @@ fn serve_tools(
         (started.slot.clone(), claims),
     )
     .with_note_by(note_by);
+    let tools = match lander {
+        Some(lander) => tools.with_lander(lander),
+        None => tools,
+    };
     let flag = Arc::clone(&serving);
     thread::spawn(move || {
         let toolbox: Arc<dyn Toolbox> = Arc::new(tools);
         mcp::serve(&listener, &flag, &toolbox);
     });
     serving
+}
+
+fn landing_desk(
+    (store, environment, git_dir): (&Store, &Environment, &Path),
+    (owner, key, raw): (Option<&ParticipantKey>, Option<&ThreadKey>, bool),
+    (started, globals): (&Started, GlobalPatterns),
+) -> Option<(Arc<Desk>, Arc<Lander>)> {
+    if !(raw && terminal::is_interactive()) {
+        return None;
+    }
+    let owner = owner.filter(|owner| *owner == started.commits.key())?;
+    let meta = load_meta(store, started.thread, owner, 0).ok()?;
+    let landing = meta.private(key?).ok()?.landing_branch().to_owned();
+    let remote =
+        SyncSetup::chosen(store, environment, true).map_err(|error| crate::describe(&error));
+    let (thread, slot) = (started.thread, &started.slot);
+    let desk = Arc::new(Desk::new(
+        (git_dir.to_path_buf(), thread),
+        (slot.participant().clone(), note::file(store, thread, slot)),
+        landing,
+    ));
+    let lander = Lander::new(
+        (thread, slot.clone()),
+        (session::worktree_name(thread, slot.agent()), globals),
+        (store.user_identity(), remote, started.commits.clone()),
+        Arc::clone(&desk),
+    );
+    Some((desk, Arc::new(lander)))
 }
 
 /// Starts pushing the refs of `started`'s agent to the remote `setup` names, and returns the
@@ -1549,6 +1584,7 @@ struct UserSide {
     title: String,
     palette_key: PaletteKey,
     activity: Arc<Activity>,
+    desk: Option<Arc<Desk>>,
 }
 
 fn finish_run(
@@ -1688,7 +1724,7 @@ fn supervise(
     let code = relay(
         child,
         &user.title,
-        interactive.then_some(user.palette_key),
+        (interactive.then_some(user.palette_key), user.desk.clone()),
         &user.activity,
         (events, &received),
         tap,
@@ -1864,6 +1900,24 @@ pub(crate) fn until_stopped<T>(
 }
 
 /// Where to restore the agent's recorded session, once its state directory is ready.
+fn restore_of<'a>(
+    store: &'a Store,
+    session: Option<&'a SessionSource>,
+    started: &'a Started,
+) -> Option<Restore<'a>> {
+    let (source, key) = session.zip(started.key.as_ref())?;
+    Some(Restore {
+        store,
+        of: SessionOf {
+            thread: started.thread,
+            slot: &started.slot,
+            key,
+            own: started.commits.key(),
+        },
+        dir: &source.dir,
+    })
+}
+
 struct Restore<'a> {
     store: &'a Store,
     of: SessionOf<'a>,
@@ -2227,7 +2281,7 @@ impl Host {
 fn relay(
     child: PtyChild,
     title: &str,
-    palette: Option<PaletteKey>,
+    (palette, desk): (Option<PaletteKey>, Option<Arc<Desk>>),
     activity: &Arc<Activity>,
     (events, received): (mpsc::Sender<Event>, &Receiver<Event>),
     tap: Option<OutputTap>,
@@ -2256,9 +2310,10 @@ fn relay(
         .as_ref()
         .filter(|_| palette.is_some())
         .map(|(auto_merge, _)| Arc::clone(&auto_merge.waiting));
+    let desk = desk.filter(|_| palette.is_some());
     let screen = user_screen(
         Screen::new(out, repainter.clone(), palette_key),
-        waiting.as_ref(),
+        (waiting.as_ref(), desk.as_ref()),
     );
     let running = Arc::new(AtomicBool::new(palette.is_some()));
     let commands = palette.and_then(|_| crate::commands::take());
@@ -2280,7 +2335,7 @@ fn relay(
     let forwarding = thread::spawn(move || {
         forward_input(&input_writer, input, &input_activity, &input_quitting);
     });
-    spawn_ticker(Arc::clone(&screen), Arc::clone(&running), waiting);
+    spawn_ticker(Arc::clone(&screen), Arc::clone(&running), (waiting, desk));
     if let Some((auto_merge, merger)) = syncing {
         spawn_auto_merge(auto_merge, merger, (activity, &screen, &writer), &running);
     }
@@ -2313,10 +2368,18 @@ fn relay(
     outcome
 }
 
-/// Shares `screen`, listing the teammates' snapshots in `waiting` too when there is one.
-fn user_screen(screen: UserScreen, waiting: Option<&Arc<HeldQueue>>) -> Arc<UserScreen> {
-    Arc::new(match waiting {
+/// Shares `screen`, listing the teammates' snapshots in `waiting` too when there is one, and
+/// the landing that waits on `desk`.
+fn user_screen(
+    screen: UserScreen,
+    (waiting, desk): (Option<&Arc<HeldQueue>>, Option<&Arc<Desk>>),
+) -> Arc<UserScreen> {
+    let screen = match waiting {
         Some(waiting) => screen.with_waiting(Arc::clone(waiting)),
+        None => screen,
+    };
+    Arc::new(match desk {
+        Some(desk) => screen.with_desk(Arc::clone(desk)),
         None => screen,
     })
 }
@@ -2371,7 +2434,7 @@ fn follow_resizes(
 fn spawn_ticker(
     screen: Arc<UserScreen>,
     ticking: Arc<AtomicBool>,
-    waiting: Option<Arc<HeldQueue>>,
+    (waiting, desk): (Option<Arc<HeldQueue>>, Option<Arc<Desk>>),
 ) {
     thread::spawn(move || {
         while ticking.load(Ordering::SeqCst) {
@@ -2379,7 +2442,9 @@ fn spawn_ticker(
             if screen.is_opening() {
                 let _ = screen.open_now();
             }
-            if waiting.as_ref().is_some_and(|waiting| waiting.wants_open()) {
+            if waiting.as_ref().is_some_and(|waiting| waiting.wants_open())
+                || desk.as_ref().is_some_and(|desk| desk.wants_open())
+            {
                 let _ = screen.open_guarded();
             }
             let _ = screen.tick();
@@ -3009,6 +3074,7 @@ impl DraftWriter {
                 title: "writing the pull request draft".to_owned(),
                 palette_key: prepared.palette_key,
                 activity,
+                desk: None,
             },
             termination,
             AgentSide {

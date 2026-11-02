@@ -42,6 +42,10 @@ use crate::{
         Waiting,
     },
     inject::AgentInput,
+    land_desk::{
+        Desk,
+        LandingView,
+    },
 };
 
 const MAX_HELD_BYTES: usize = 1024 * 1024;
@@ -153,6 +157,7 @@ pub(crate) struct Screen<W, T> {
     state: Mutex<State<W>>,
     terminal: T,
     waiting: Option<Arc<HeldQueue>>,
+    desk: Option<Arc<Desk>>,
     hint: String,
 }
 
@@ -174,6 +179,7 @@ struct State<W> {
     read_whole: Option<Entry>,
     keys: PaletteKeys,
     guard: Guard,
+    landing_drawn: Option<u64>,
 }
 
 /// Whether the palette drops the keys typed to it, as it does when it opened on its own: until
@@ -209,9 +215,11 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                 read_whole: None,
                 keys: PaletteKeys::default(),
                 guard: Guard::Off,
+                landing_drawn: None,
             }),
             terminal,
             waiting: None,
+            desk: None,
             hint: format!("Esc closes · {key} twice sends {key} to the agent"),
         }
     }
@@ -221,6 +229,15 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
     pub(crate) fn with_waiting(mut self, waiting: Arc<HeldQueue>) -> Self {
         self.waiting = Some(waiting);
         self
+    }
+
+    pub(crate) fn with_desk(mut self, desk: Arc<Desk>) -> Self {
+        self.desk = Some(desk);
+        self
+    }
+
+    fn landing(&self) -> Option<LandingView> {
+        self.desk.as_ref()?.view()
     }
 
     fn lock(&self) -> io::Result<MutexGuard<'_, State<W>>> {
@@ -347,6 +364,15 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         if guarded {
             return Ok(bytes.len());
         }
+        if let Some(desk) = &self.desk
+            && let Some(generation) = desk.shown()
+        {
+            if state.landing_drawn != Some(generation) {
+                return Ok(bytes.len());
+            }
+            let desk = Arc::clone(desk);
+            return self.typed_on_landing(&mut state, bytes, &desk);
+        }
         let State {
             keys,
             filter,
@@ -415,6 +441,47 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
             self.release(&mut state)?;
         } else if changed && state.mode == Mode::Open {
             self.draw(&mut state)?;
+        }
+        state.out.flush()?;
+        Ok(used)
+    }
+
+    fn typed_on_landing(
+        &self,
+        state: &mut State<W>,
+        bytes: &[u8],
+        desk: &Arc<Desk>,
+    ) -> io::Result<usize> {
+        let (mut escaped, mut confirmed) = (false, false);
+        let State {
+            keys, scroll, page, ..
+        } = state;
+        let used = keys.read(bytes, |input| {
+            match input {
+                PaletteInput::Escape => escaped = true,
+                PaletteInput::Enter => confirmed = true,
+                PaletteInput::PageDown => *scroll = scroll.saturating_add((*page).max(1)),
+                PaletteInput::PageUp => *scroll = scroll.saturating_sub((*page).max(1)),
+                PaletteInput::Text(_)
+                | PaletteInput::Pasted(_)
+                | PaletteInput::Backspace
+                | PaletteInput::Up
+                | PaletteInput::Down
+                | PaletteInput::Reject
+                | PaletteInput::Tab
+                | PaletteInput::Left
+                | PaletteInput::Right => {}
+            }
+            !escaped
+        });
+        if confirmed {
+            desk.confirm();
+        }
+        if escaped {
+            desk.cancel();
+            self.release(state)?;
+        } else if state.mode == Mode::Open {
+            self.draw(state)?;
         }
         state.out.flush()?;
         Ok(used)
@@ -506,6 +573,29 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
             state.guard = Guard::Until(Instant::now() + OPEN_GUARD);
         }
         let size = self.terminal.size();
+        if let Some(landing) = self.landing() {
+            if state.landing_drawn != Some(landing.generation) {
+                state.landing_drawn = Some(landing.generation);
+                state.guard = Guard::Until(Instant::now() + OPEN_GUARD);
+            }
+            let view = PaletteView {
+                title: &landing.title,
+                filter: "",
+                items: &[],
+                selected: 0,
+                empty: "",
+                hint: &landing.hint,
+                preview: Some(Preview {
+                    text: &landing.body,
+                    scroll: state.scroll,
+                }),
+                true_color: crate::ui::true_color(),
+            };
+            let drawn = view.draw(size.rows, size.cols, &mut state.out.palette_out())?;
+            state.page = drawn.page;
+            state.scroll = state.scroll.min(drawn.lines.saturating_sub(drawn.page));
+            return Ok(());
+        }
         let lines = self.waiting_lines(&state.filter);
         if let Some(position) = state
             .selected_id
@@ -1162,5 +1252,79 @@ mod tests {
         screen.typed(b"\r").unwrap();
         assert!(!screen.is_open());
         assert_eq!(waiting.take_choices().len(), 1);
+    }
+
+    #[test]
+    fn a_landing_shows_in_the_palette_and_escape_cancels_it() {
+        let terminal = FakeTerminal::default();
+        let landing = crate::land_desk::tests::waiting_landing();
+        let desk = Arc::clone(&landing.desk);
+        let screen = screen(&terminal).with_desk(Arc::clone(&desk));
+        screen.open().unwrap();
+        let text = shown(&written(&screen));
+        assert!(text.contains("Land thread"), "{text}");
+        assert!(
+            text.contains("Retry failed requests in the client"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Pull request: Retry failed requests"),
+            "{text}"
+        );
+        assert!(text.contains("Enter pushes  Esc cancels"), "{text}");
+        screen.typed(b"\x1b").unwrap();
+        assert!(
+            desk.view().is_some(),
+            "a key in the first 500 ms is dropped"
+        );
+        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"x\x7f").unwrap();
+        assert!(desk.view().is_some());
+        screen.typed(b"\x1b").unwrap();
+        assert!(!screen.is_open());
+        assert!(desk.view().is_none());
+        assert!(crate::note::take(&landing.note).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_landing_that_comes_while_the_palette_is_open_takes_no_key_before_it_shows() {
+        let terminal = FakeTerminal::default();
+        let landing = crate::land_desk::tests::waiting_landing();
+        let desk = Arc::clone(&landing.desk);
+        let screen = screen(&terminal).with_desk(Arc::clone(&desk));
+        screen.open().unwrap();
+        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"\x1b").unwrap();
+        assert!(desk.view().is_none());
+        screen.open().unwrap();
+        assert!(crate::land_desk::tests::offer_again(&landing));
+        screen.typed(b"\r").unwrap();
+        assert_eq!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
+        screen.tick().unwrap();
+        screen.typed(b"\r").unwrap();
+        assert_eq!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
+        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"\r").unwrap();
+        assert_ne!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
+    }
+
+    #[test]
+    fn enter_pushes_the_landing_and_the_palette_then_shows_the_outcome() {
+        let terminal = FakeTerminal::default();
+        let landing = crate::land_desk::tests::waiting_landing();
+        let desk = Arc::clone(&landing.desk);
+        let screen = screen(&terminal).with_desk(Arc::clone(&desk));
+        screen.open().unwrap();
+        written(&screen);
+        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"\r").unwrap();
+        crate::land_desk::tests::until_done(&desk);
+        screen.tick().unwrap();
+        let text = shown(&written(&screen));
+        assert!(text.contains("Not pushed:"), "{text}");
+        assert!(text.contains("Esc closes"), "{text}");
+        screen.typed(b"\x1b").unwrap();
+        assert!(!screen.is_open());
+        assert!(desk.view().is_none());
     }
 }

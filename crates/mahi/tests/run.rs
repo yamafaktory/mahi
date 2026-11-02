@@ -5826,6 +5826,70 @@ exit 3
             assert!(fixture.mahi(&["end", &thread]).status.success());
         }
 
+        const LANDER: &str = r#"#!/bin/sh
+echo feature > feature.txt
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"land","arguments":{"commits":[{"message":"Add the feature","paths":["feature.txt"]}],"title":"Add the feature","description":"Why."}}}' \
+  | "$MAHI_BIN" mcp
+start=$(date +%s)
+until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
+"#;
+
+        #[test]
+        fn the_owners_agent_lands_the_thread_once_the_owner_presses_enter() {
+            let fixture = fixture();
+            save_identity(&fixture);
+            let (_server, remote) = serve_remote(&fixture);
+            git(&fixture.repo, &["config", "user.name", "Alice Example"]);
+            git(
+                &fixture.repo,
+                &["config", "user.email", "alice@example.com"],
+            );
+            let lander = script(&fixture, "landing", "claude", LANDER);
+            let owner_config = fixture.home.join(".config");
+            let env = owner_env(&fixture, &owner_config);
+            let mut running = Driven::start(mahi_in_terminal(
+                &fixture.repo,
+                &["run", lander.to_str().unwrap()],
+                &env,
+            ));
+            running.wait_for("Enter pushes  Esc cancels");
+            running.wait_for("Pull request: Add the feature");
+            thread::sleep(Duration::from_millis(700));
+            running.terminal.write_all(b"\r").unwrap();
+            running.wait_for("Pushed 1 commit on mahi/");
+            let branches = git(
+                &remote,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "refs/heads/mahi/",
+                ],
+            );
+            let thread = branches
+                .trim()
+                .strip_prefix("mahi/")
+                .unwrap_or_else(|| panic!("{branches:?}"))
+                .to_owned();
+            let branch = format!("mahi/{thread}");
+            let log = git(&remote, &["log", "-1", "--format=%an <%ae>%n%B", &branch]);
+            assert!(
+                log.starts_with("Alice Example <alice@example.com>\nAdd the feature\n"),
+                "{log}"
+            );
+            assert!(
+                log.contains(&format!("Thread: {thread}\nAgent: tester.claude")),
+                "{log:?} {thread:?}"
+            );
+            let files = git(&remote, &["show", "--name-only", "--format=", &branch]);
+            assert_eq!(files.trim(), "feature.txt");
+            running.terminal.write_all(b"\x1b").unwrap();
+            let worktree = worktree_named(&fixture, &format!("{thread}.claude"));
+            fs::write(worktree.join("done"), "").unwrap();
+            assert_eq!(running.exit_code(), 0, "{}", running.text());
+        }
+
         fn bob_works_in_the_thread(fixture: &Fixture) -> Pairing {
             let codex = script(
                 fixture,
