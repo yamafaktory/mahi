@@ -84,6 +84,30 @@ pub(crate) enum UnmergedError {
 }
 
 impl AutoMerge {
+    pub(crate) fn behind(
+        &self,
+        store: &Store,
+    ) -> Result<Vec<(AgentSlot, ObjectId)>, UnmergedError> {
+        let meta = load_meta(store, self.thread, &self.owner, 0)?;
+        let collaborates = |slot: &AgentSlot| {
+            meta.participants().any(|listed| {
+                listed.name() == slot.participant() && listed.role() == Role::Collaborator
+            })
+        };
+        let mut behind: Vec<(AgentSlot, ObjectId)> = self
+            .unmerged(store, &HashSet::new())?
+            .into_iter()
+            .map(|request| (request.from, request.commit))
+            .collect();
+        let held = held::list(store, self.thread, &self.own)
+            .into_iter()
+            .filter(|(slot, _)| collaborates(slot))
+            .map(|(slot, record)| (slot, record.commit));
+        behind.extend(held);
+        behind.sort();
+        Ok(behind)
+    }
+
     /// Returns the merges the user's agent is behind on, none while `meta` does not list the
     /// user as a collaborator: for each agent of another
     /// collaborator `meta` lists, its latest turn-end snapshot, when it is not in `tried`, is
@@ -490,6 +514,25 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_landing_is_behind_on_a_collaborators_due_and_held_turn_ends_only() {
+        let team = team();
+        let auto = team.auto_merge();
+        assert!(auto.behind(&team.store).unwrap().is_empty());
+        let bobs = team.ended("bob.claude", Some(&team.bob.0));
+        team.ended("carol.claude", Some(&team.carol.0));
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        assert_eq!(auto.behind(&team.store).unwrap(), vec![(bob.clone(), bobs)]);
+
+        let waiting = held::file(&team.store, team.started.thread, (&auto.own, &bob));
+        held::HeldSettings::new(bobs, &["CLAUDE.md".to_owned()])
+            .keep(&waiting)
+            .unwrap();
+        assert_eq!(auto.behind(&team.store).unwrap(), vec![(bob.clone(), bobs)]);
+        team.give_role(&team.bob.1, Role::Watcher);
+        assert!(auto.behind(&team.store).unwrap().is_empty());
     }
 
     #[test]

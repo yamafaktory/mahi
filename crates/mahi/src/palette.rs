@@ -778,7 +778,7 @@ impl<W: ScreenOut, T: AgentTerminal> AgentInput for Screen<W, T> {
     }
 }
 
-fn push_age(out: &mut String, age: Duration) {
+pub(crate) fn push_age(out: &mut String, age: Duration) {
     let seconds = age.as_secs();
     let (count, unit) = match seconds {
         0..60 => (seconds, 's'),

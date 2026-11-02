@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     path::PathBuf,
     sync::{
@@ -12,7 +13,10 @@ use std::{
         },
     },
     thread,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use mahi_core::{
@@ -35,6 +39,7 @@ use serde_json::{
 };
 
 use crate::{
+    auto_merge::AutoMerge,
     conflicts,
     landed_branch::BranchRecord,
     landing::{
@@ -48,6 +53,7 @@ use crate::{
 };
 
 const SNAPSHOT_ATTEMPTS: usize = 3;
+const WATCH_EVERY: Duration = Duration::from_secs(1);
 const PUSH_WAIT: Duration = Duration::from_secs(180);
 const PUSHES: &str = "Enter pushes  Esc cancels";
 const CLOSES: &str = "Esc closes";
@@ -90,6 +96,7 @@ pub(crate) struct Pending {
     title: String,
     description: String,
     remote: SyncSetup,
+    behind: Vec<(AgentSlot, Instant)>,
 }
 
 pub(crate) struct LandingView {
@@ -223,6 +230,14 @@ impl Desk {
         }
         body.push_str("\nPull request: ");
         push_line(&mut body, &pending.title);
+        if !pending.behind.is_empty() {
+            body.push_str("\nNot merged yet, so not in this landing:\n");
+        }
+        for (slot, since) in &pending.behind {
+            let _ = write!(body, "  {slot}  turn ended ");
+            crate::palette::push_age(&mut body, since.elapsed());
+            body.push_str(" ago\n");
+        }
         LandingView {
             title: self.title(),
             body,
@@ -490,6 +505,62 @@ pub(crate) struct Lander {
     remote: ChosenRemote,
     commits: CommitKey,
     desk: Arc<Desk>,
+    query: AutoMerge,
+    first_seen: FirstSeen,
+}
+
+#[derive(Debug, Default)]
+struct FirstSeen(Mutex<HashMap<AgentSlot, (ObjectId, Instant)>>);
+
+impl FirstSeen {
+    fn note(&self, slot: &AgentSlot, commit: ObjectId) -> Instant {
+        let now = Instant::now();
+        let Ok(mut seen) = self.0.lock() else {
+            return now;
+        };
+        match seen.get(slot) {
+            Some(&(noted, since)) if noted == commit => since,
+            Some(_) | None => {
+                seen.insert(slot.clone(), (commit, now));
+                now
+            }
+        }
+    }
+}
+
+pub(crate) fn watch_turn_ends(lander: &Arc<Lander>) {
+    let lander = Arc::downgrade(lander);
+    thread::spawn(move || {
+        let mut seen = (Vec::new(), Vec::new());
+        loop {
+            thread::sleep(WATCH_EVERY);
+            let Some(lander) = lander.upgrade() else {
+                return;
+            };
+            let Ok(store) = Store::open(&lander.query.git_dir) else {
+                continue;
+            };
+            let Ok(heads) = store.thread_refs() else {
+                continue;
+            };
+            let held: Vec<(AgentSlot, ObjectId)> =
+                crate::held::list(&store, lander.thread, &lander.me)
+                    .into_iter()
+                    .map(|(slot, record)| (slot, record.commit))
+                    .collect();
+            let now = (heads, held);
+            if now == seen {
+                continue;
+            }
+            let Ok(behind) = lander.query.behind(&store) else {
+                continue;
+            };
+            for (slot, commit) in &behind {
+                lander.first_seen.note(slot, *commit);
+            }
+            seen = now;
+        }
+    });
 }
 
 impl std::fmt::Debug for Lander {
@@ -507,7 +578,7 @@ impl Lander {
         (thread, me): (ThreadId, AgentSlot),
         (worktree, globals): (String, GlobalPatterns),
         (identity, remote, commits): (GitIdentity, ChosenRemote, CommitKey),
-        desk: Arc<Desk>,
+        (desk, query): (Arc<Desk>, AutoMerge),
     ) -> Self {
         Self {
             thread,
@@ -518,6 +589,8 @@ impl Lander {
             remote,
             commits,
             desk,
+            query,
+            first_seen: FirstSeen::default(),
         }
     }
 
@@ -546,6 +619,16 @@ impl Lander {
             Err(reason) => return Err(ToolError::Failed(reason.clone())),
         };
         let failed = |error: &StoreError| ToolError::Failed(crate::describe(error));
+        let behind = self
+            .query
+            .behind(store)
+            .map_err(|error| ToolError::Failed(crate::describe(&error)))?
+            .into_iter()
+            .map(|(slot, commit)| {
+                let since = self.first_seen.note(&slot, commit);
+                (slot, since)
+            })
+            .collect();
         let worktree = self.snapshot(store).map_err(|error| failed(&error))?;
         if let Some(paths) = self.unresolved(store, worktree) {
             return Ok(landing::conflicts_first(&paths));
@@ -583,7 +666,8 @@ impl Lander {
         let Some(&tip) = built.last() else {
             return Ok(landing::NOTHING_CHANGED.to_owned());
         };
-        let pending = pending((landed, tip), call, remote);
+
+        let pending = pending((landed, tip), call, (remote, behind));
         let _offered = self.desk.offer(pending);
         Ok(landing::waiting(owner))
     }
@@ -624,7 +708,11 @@ impl Lander {
     }
 }
 
-fn pending((landed, tip): (ObjectId, ObjectId), call: Call, remote: SyncSetup) -> Pending {
+fn pending(
+    (landed, tip): (ObjectId, ObjectId),
+    call: Call,
+    (remote, behind): (SyncSetup, Vec<(AgentSlot, Instant)>),
+) -> Pending {
     let commits = call
         .commits
         .into_iter()
@@ -645,6 +733,7 @@ fn pending((landed, tip): (ObjectId, ObjectId), call: Call, remote: SyncSetup) -
         title: call.title,
         description: landing::printable(&call.description),
         remote,
+        behind,
     }
 }
 
@@ -729,6 +818,7 @@ pub(crate) mod tests {
             title: "Retry failed\nrequests".to_owned(),
             description: "Why.".to_owned(),
             remote,
+            behind: vec![("bob.claude".parse().unwrap(), Instant::now())],
         };
         assert!(desk.offer(pending));
         Landing {
@@ -750,6 +840,7 @@ pub(crate) mod tests {
             title: "Again".to_owned(),
             description: String::new(),
             remote: unreachable_remote(&landing.store, landing.repo.path()),
+            behind: Vec::new(),
         })
     }
 
@@ -777,7 +868,8 @@ pub(crate) mod tests {
         assert_eq!(
             view.body,
             "  Retry failed requests in the client\n    src/client.rs\n    src/retry.rs\n  \
-             Test the retry\n    tests/retry.rs\n\nPull request: Retry failed requests\n"
+             Test the retry\n    tests/retry.rs\n\nPull request: Retry failed requests\n\nNot \
+             merged yet, so not in this landing:\n  bob.claude  turn ended 0s ago\n"
         );
         assert_eq!(view.hint, "Enter pushes  Esc cancels");
         assert_eq!(desk.shown(), Some(1));
@@ -875,7 +967,16 @@ pub(crate) mod tests {
                 Ok(Some(unreachable_remote(store, &home))),
                 started.commits.clone(),
             ),
-            Arc::clone(&desk),
+            (
+                Arc::clone(&desk),
+                AutoMerge {
+                    git_dir: store.common_dir().to_path_buf(),
+                    thread: started.thread,
+                    owner: started.commits.key().clone(),
+                    own: started.slot.clone(),
+                    waiting: Arc::default(),
+                },
+            ),
         );
         (lander, desk)
     }
@@ -1038,6 +1139,21 @@ pub(crate) mod tests {
         done_with_clipboard(&landing.desk, "Why.");
         assert_eq!(landing.desk.take_clipboard().as_deref(), Some("Why."));
         assert_eq!(landing.desk.take_clipboard(), None);
+    }
+
+    #[test]
+    fn a_turn_end_is_dated_from_when_its_commit_was_first_seen() {
+        let seen = FirstSeen::default();
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let (first, later) = (
+            ObjectId::from_bytes_or_panic(&[1; 20]),
+            ObjectId::from_bytes_or_panic(&[2; 20]),
+        );
+        let noted = seen.note(&bob, first);
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(seen.note(&bob, first), noted);
+        assert!(seen.note(&bob, later) > noted);
+        assert_eq!(seen.0.lock().unwrap().len(), 1);
     }
 
     #[test]

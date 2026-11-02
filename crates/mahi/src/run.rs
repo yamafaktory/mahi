@@ -181,6 +181,7 @@ use crate::{
         Pace,
     },
     land_desk::{
+        self,
         Desk,
         Lander,
     },
@@ -1415,13 +1416,21 @@ fn landing_desk(
         (slot.participant().clone(), note::file(store, thread, slot)),
         landing,
     ));
-    let lander = Lander::new(
+    let query = AutoMerge {
+        git_dir: git_dir.to_path_buf(),
+        thread,
+        owner: owner.clone(),
+        own: slot.clone(),
+        waiting: Arc::default(),
+    };
+    let lander = Arc::new(Lander::new(
         (thread, slot.clone()),
         (session::worktree_name(thread, slot.agent()), globals),
         (store.user_identity(), remote, started.commits.clone()),
-        Arc::clone(&desk),
-    );
-    Some((desk, Arc::new(lander)))
+        (Arc::clone(&desk), query),
+    ));
+    land_desk::watch_turn_ends(&lander);
+    Some((desk, lander))
 }
 
 /// Starts pushing the refs of `started`'s agent to the remote `setup` names, and returns the
