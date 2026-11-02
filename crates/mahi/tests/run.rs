@@ -5859,6 +5859,9 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             thread::sleep(Duration::from_millis(700));
             running.terminal.write_all(b"\r").unwrap();
             running.wait_for("Pushed 1 commit on mahi/");
+            running.wait_for("Its description is in");
+            running.wait_for("\x1b]52;c;");
+            assert!(running.text().contains("\x1b]52;c;V2h5Lg==\x07"));
             let branches = git(
                 &remote,
                 &[
@@ -5885,6 +5888,8 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             let files = git(&remote, &["show", "--name-only", "--format=", &branch]);
             assert_eq!(files.trim(), "feature.txt");
             running.terminal.write_all(b"\x1b").unwrap();
+            let kept = fixture.repo.join(format!(".git/mahi/state/{thread}/PR.md"));
+            assert_eq!(fs::read_to_string(kept).unwrap(), "Why.");
             let worktree = worktree_named(&fixture, &format!("{thread}.claude"));
             fs::write(worktree.join("done"), "").unwrap();
             assert_eq!(running.exit_code(), 0, "{}", running.text());

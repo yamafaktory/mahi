@@ -697,7 +697,7 @@ fn only_line(text: &str) -> Option<&str> {
     }
 }
 
-fn clipboard_sequence(text: &str) -> Vec<u8> {
+pub(crate) fn clipboard_sequence(text: &str) -> Vec<u8> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let mut sequence = Vec::with_capacity(encoded.len() + 8);
     sequence.extend_from_slice(b"\x1b]52;c;");

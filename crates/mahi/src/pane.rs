@@ -107,6 +107,16 @@ impl ScreenOut for Out {
             pane.overlay = None;
         }
     }
+
+    fn pass_through(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Direct(out) => out.write_all(bytes),
+            Self::Pane(pane) => {
+                pane.passed.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// What mahi draws over the agent's screen in the pane, such as its palette, as a screen of
@@ -135,6 +145,7 @@ pub(crate) struct Pane {
     hint: Option<String>,
     replies: mpsc::SyncSender<Vec<u8>>,
     scratch: Vec<u8>,
+    passed: Vec<u8>,
     finished: bool,
 }
 
@@ -157,6 +168,7 @@ impl Pane {
             hint: palette_key.map(str::to_owned),
             replies,
             scratch: Vec::new(),
+            passed: Vec::new(),
             finished: false,
         };
         pane.draw()?;
@@ -215,6 +227,7 @@ impl Pane {
         self.scratch.clear();
         if drawn.is_ok() {
             self.screen.take_passed(&mut self.scratch);
+            self.scratch.append(&mut self.passed);
         }
         self.scratch.extend_from_slice(END_SYNC);
         let mut out = io::stdout().lock();

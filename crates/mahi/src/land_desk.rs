@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     path::PathBuf,
     sync::{
         Arc,
@@ -50,6 +51,8 @@ const SNAPSHOT_ATTEMPTS: usize = 3;
 const PUSH_WAIT: Duration = Duration::from_secs(180);
 const PUSHES: &str = "Enter pushes  Esc cancels";
 const CLOSES: &str = "Esc closes";
+const DESCRIPTION_FILE: &str = "PR.md";
+const MOST_COPIED: usize = 64 * 1024;
 
 pub(crate) struct Desk {
     git_dir: PathBuf,
@@ -76,6 +79,7 @@ enum Stage {
         text: String,
         shown: bool,
         generation: u64,
+        clipboard: Option<String>,
     },
 }
 
@@ -84,6 +88,7 @@ pub(crate) struct Pending {
     tip: ObjectId,
     commits: Vec<(String, Vec<String>)>,
     title: String,
+    description: String,
     remote: SyncSetup,
 }
 
@@ -231,7 +236,7 @@ impl Desk {
             return;
         };
         let Stage::Waiting {
-            pending,
+            mut pending,
             generation,
             ..
         } = std::mem::replace(&mut *stage, Stage::Idle)
@@ -240,6 +245,7 @@ impl Desk {
         };
         let (landed, tip, count) = (pending.landed, pending.tip, pending.commits.len());
         let remote = pending.remote.clone();
+        let description = std::mem::take(&mut pending.description);
         *stage = Stage::Pushing {
             pending,
             generation,
@@ -253,8 +259,8 @@ impl Desk {
                 thread::sleep(PUSH_WAIT);
                 stopping.store(true, Ordering::SeqCst);
             });
-            let pushed = desk.push(&remote, (landed, tip), &interrupt);
-            desk.finish(&remote, count, pushed, generation);
+            let pushed = desk.push(&remote, (landed, tip), &description, &interrupt);
+            desk.finish((&remote, count, &description), &pushed, generation);
         });
     }
 
@@ -274,12 +280,28 @@ impl Desk {
         }
     }
 
+    pub(crate) fn take_clipboard(&self) -> Option<String> {
+        let mut stage = self.stage()?;
+        match &mut *stage {
+            Stage::Done { clipboard, .. } => clipboard.take(),
+            Stage::Idle | Stage::Waiting { .. } | Stage::Pushing { .. } => None,
+        }
+    }
+
+    fn keep_description(&self, store: &Store, description: &str) -> Kept {
+        let file = crate::session::state_root(store, self.thread).join(DESCRIPTION_FILE);
+        crate::sync_state::write(&file, description.as_bytes())
+            .map(|()| file.clone())
+            .map_err(|error| (file, error.to_string()))
+    }
+
     fn push(
         &self,
         remote: &SyncSetup,
         (landed, tip): (ObjectId, ObjectId),
+        description: &str,
         interrupt: &Arc<AtomicBool>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<(Option<String>, Kept), String> {
         let branch = branch_of(self.thread);
         let described = |error: &dyn std::error::Error| crate::describe(error);
         let store = Store::open(&self.git_dir).map_err(|error| described(&error))?;
@@ -322,35 +344,42 @@ impl Desk {
             landing: self.landing.clone(),
             gone: false,
         };
-        Ok(record
+        let unremembered = record
             .write(&store, self.thread)
             .err()
-            .map(|error| format!("cannot remember the pushed branch: {error}")))
+            .map(|error| format!("cannot remember the pushed branch: {error}"));
+        Ok((unremembered, self.keep_description(&store, description)))
     }
 
     fn finish(
         &self,
-        remote: &SyncSetup,
-        count: usize,
-        pushed: Result<Option<String>, String>,
+        (remote, count, description): (&SyncSetup, usize, &str),
+        pushed: &Result<(Option<String>, Kept), String>,
         generation: u64,
     ) {
         let branch = branch_of(self.thread);
-        let remote = &remote.name;
+        let remote = remote.name.to_string();
+        let clipboard = match pushed {
+            Ok((_, Ok(_))) => copied(description),
+            Ok((_, Err(_))) | Err(_) => None,
+        };
         let (line, text) = match pushed {
-            Ok(unremembered) => {
-                let commits = commits(count);
+            Ok((unremembered, kept)) => {
                 let mut line = format!(
-                    "{} pushed your landing: {commits} on {branch} to {remote}.",
-                    self.owner
+                    "{} pushed your landing: {} on {branch} to {remote}.",
+                    self.owner,
+                    commits(count)
                 );
-                let mut text = format!("Pushed {commits} on {branch} to {remote}.");
-                if let Some(unremembered) = &unremembered {
-                    for told in [&mut line, &mut text] {
-                        told.push('\n');
-                        told.push_str(unremembered);
-                    }
+                if let Some(unremembered) = unremembered {
+                    line.push('\n');
+                    line.push_str(unremembered);
                 }
+                let text = pushed_text(
+                    (count, &branch, &remote),
+                    unremembered.as_deref(),
+                    kept,
+                    clipboard.is_some(),
+                );
                 (line, text)
             }
             Err(reason) => (
@@ -364,9 +393,49 @@ impl Desk {
                 text,
                 shown: false,
                 generation,
+                clipboard,
             };
         }
     }
+}
+
+type Kept = Result<PathBuf, (PathBuf, String)>;
+
+fn copied(description: &str) -> Option<String> {
+    (description.len() <= MOST_COPIED).then(|| description.to_owned())
+}
+
+fn pushed_text(
+    (count, branch, remote): (usize, &str, &str),
+    unremembered: Option<&str>,
+    kept: &Kept,
+    copied: bool,
+) -> String {
+    let mut text = format!("Pushed {} on {branch} to {remote}.", commits(count));
+    if let Some(unremembered) = unremembered {
+        text.push('\n');
+        text.push_str(unremembered);
+    }
+    match (kept, copied) {
+        (Ok(file), true) => {
+            let _ = write!(
+                text,
+                "\nIts description is in {} and on your clipboard.",
+                file.display()
+            );
+        }
+        (Ok(file), false) => {
+            let _ = write!(text, "\nIts description is in {}.", file.display());
+        }
+        (Err((file, error)), _) => {
+            let _ = write!(
+                text,
+                "\ncannot keep the pull request draft in {}: {error}",
+                file.display()
+            );
+        }
+    }
+    text
 }
 
 fn push_line(body: &mut String, text: &str) {
@@ -574,6 +643,7 @@ fn pending((landed, tip): (ObjectId, ObjectId), call: Call, remote: SyncSetup) -
         tip,
         commits,
         title: call.title,
+        description: landing::printable(&call.description),
         remote,
     }
 }
@@ -657,6 +727,7 @@ pub(crate) mod tests {
                 ),
             ],
             title: "Retry failed\nrequests".to_owned(),
+            description: "Why.".to_owned(),
             remote,
         };
         assert!(desk.offer(pending));
@@ -677,6 +748,7 @@ pub(crate) mod tests {
             tip: landing.tip,
             commits: vec![("Again".to_owned(), Vec::new())],
             title: "Again".to_owned(),
+            description: String::new(),
             remote: unreachable_remote(&landing.store, landing.repo.path()),
         })
     }
@@ -755,6 +827,7 @@ pub(crate) mod tests {
         let moved = landing.desk.push(
             &unreachable_remote(&landing.store, landing.repo.path()),
             (landing.landed, landing.tip),
+            "",
             &Arc::new(AtomicBool::new(false)),
         );
         assert!(moved.is_err());
@@ -905,6 +978,66 @@ pub(crate) mod tests {
             land(&["a.txt"]),
             landing::waiting(started.slot.participant())
         );
+    }
+
+    pub(crate) fn done_with_clipboard(desk: &Desk, copied: &str) {
+        *desk.stage().unwrap() = Stage::Done {
+            text: "Pushed 1 commit on mahi/x to up.".to_owned(),
+            shown: false,
+            generation: 9,
+            clipboard: Some(copied.to_owned()),
+        };
+    }
+
+    #[test]
+    fn the_outcome_says_where_the_description_is_and_whether_it_was_copied() {
+        let file = PathBuf::from("/state/PR.md");
+        let shown = |kept: &Kept, copied| pushed_text((2, "mahi/x", "up"), None, kept, copied);
+        assert_eq!(
+            shown(&Ok(file.clone()), true),
+            "Pushed 2 commits on mahi/x to up.\nIts description is in /state/PR.md and on your clipboard."
+        );
+        assert_eq!(
+            shown(&Ok(file.clone()), false),
+            "Pushed 2 commits on mahi/x to up.\nIts description is in /state/PR.md."
+        );
+        assert_eq!(
+            pushed_text(
+                (1, "mahi/x", "up"),
+                Some("cannot remember the pushed branch: disk full"),
+                &Err((file, "denied".to_owned())),
+                true
+            ),
+            "Pushed 1 commit on mahi/x to up.\ncannot remember the pushed branch: disk full\ncannot keep the pull request draft in /state/PR.md: denied"
+        );
+    }
+
+    #[test]
+    fn a_description_is_copied_only_up_to_64_kib() {
+        let most = "a".repeat(MOST_COPIED);
+        assert_eq!(copied(&most).as_deref(), Some(most.as_str()));
+        assert_eq!(copied(&format!("{most}a")), None);
+        assert_eq!(copied("").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_description_is_kept_in_the_threads_state_without_control_characters() {
+        let landing = waiting_landing();
+        let file = landing
+            .desk
+            .keep_description(
+                &landing.store,
+                &landing::printable("Why\u{1b}[31m.\n\tAnd\u{200b} how."),
+            )
+            .unwrap();
+        assert_eq!(
+            file,
+            crate::session::state_root(&landing.store, landing.thread).join("PR.md")
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "Why[31m.\n\tAnd how.");
+        done_with_clipboard(&landing.desk, "Why.");
+        assert_eq!(landing.desk.take_clipboard().as_deref(), Some("Why."));
+        assert_eq!(landing.desk.take_clipboard(), None);
     }
 
     #[test]

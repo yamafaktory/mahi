@@ -88,6 +88,16 @@ pub(crate) trait ScreenOut: Write {
 
     /// Takes the palette away from the screen, where it is a layer of its own.
     fn close_palette(&mut self) {}
+
+    /// Sends mahi's own `bytes` to the user's terminal, past the agent's screen, such as a copy
+    /// to the clipboard.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error writing to the terminal gives.
+    fn pass_through(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all(bytes)
+    }
 }
 
 impl ScreenOut for io::Stdout {}
@@ -574,6 +584,11 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         }
         let size = self.terminal.size();
         if let Some(landing) = self.landing() {
+            if let Some(copied) = self.desk.as_ref().and_then(|desk| desk.take_clipboard()) {
+                state
+                    .out
+                    .pass_through(&crate::ui::clipboard_sequence(&copied))?;
+            }
             if state.landing_drawn != Some(landing.generation) {
                 state.landing_drawn = Some(landing.generation);
                 state.guard = Guard::Until(Instant::now() + OPEN_GUARD);
@@ -1306,6 +1321,24 @@ mod tests {
         std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
         screen.typed(b"\r").unwrap();
         assert_ne!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
+    }
+
+    #[test]
+    fn the_outcome_copies_the_description_to_the_clipboard_once() {
+        let terminal = FakeTerminal::default();
+        let landing = crate::land_desk::tests::waiting_landing();
+        crate::land_desk::tests::done_with_clipboard(&landing.desk, "Why.");
+        let screen = screen(&terminal).with_desk(Arc::clone(&landing.desk));
+        screen.open().unwrap();
+        let first = written(&screen);
+        assert!(
+            first
+                .windows(b"\x1b]52;c;V2h5Lg==\x07".len())
+                .any(|window| window == b"\x1b]52;c;V2h5Lg==\x07")
+        );
+        screen.tick().unwrap();
+        let again = written(&screen);
+        assert!(!again.windows(5).any(|window| window == b"\x1b]52;"));
     }
 
     #[test]

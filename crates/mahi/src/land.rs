@@ -19,7 +19,6 @@ use mahi_core::{
     RefKind,
     ThreadId,
     ThreadRef,
-    is_invisible,
 };
 use mahi_crypto::ThreadKey;
 use mahi_identity::{
@@ -391,7 +390,7 @@ fn rewrite_draft(
         }
         RunOutcome::Exited(_) => {}
     }
-    match rewritten.map(|rewritten| printable(&rewritten)) {
+    match rewritten.map(|rewritten| crate::landing::printable(&rewritten)) {
         Some(rewritten) if rewritten != text => keep_draft(&path, &rewritten, &mut report),
         Some(_) => {
             let _ = writeln!(report, "the agent left the pull request draft as it was");
@@ -442,15 +441,6 @@ fn keep_draft(path: &Path, text: &str, report: &mut String) {
         }
     }
     let _ = write!(report, "\n{text}");
-}
-
-fn printable(text: &str) -> String {
-    text.chars()
-        .filter(|character| {
-            (!character.is_control() || matches!(character, '\n' | '\t'))
-                && !is_invisible(*character)
-        })
-        .collect()
 }
 
 /// Writes what the agent rewriting the draft at `draft` is told: its task, then the record of

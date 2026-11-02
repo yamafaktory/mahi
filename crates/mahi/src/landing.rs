@@ -208,6 +208,15 @@ fn push_paths(text: &mut String, paths: &[String]) {
     }
 }
 
+pub(crate) fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|character| {
+            (!character.is_control() || matches!(character, '\n' | '\t'))
+                && !mahi_core::is_invisible(*character)
+        })
+        .collect()
+}
+
 pub(crate) fn trailers(thread: ThreadId, agents: &[AgentSlot]) -> String {
     let mut trailers = format!("Thread: {thread}\n");
     for slot in agents {
