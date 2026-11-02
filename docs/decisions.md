@@ -138,3 +138,20 @@ change_cipher_spec, as RFC 8446 section 5 requires. The `tls-open` target assert
 sealed record opens. It now asserts that such a record fails with
 `IllegalMiddleboxChangeCipherSpec`, and every other type keeps the round trip. mahi's minimum
 rustls becomes 0.23.46.
+||||||| parent of 0719547 (Refuse in mahi join an agent without turn ends and the other role's way in)
+
+## D021 · 2026-11-02 · Wording of the join refusals for the other role
+
+Chosen by the user (#16), from the agent's proposals:
+
+- `mahi join <ticket> -- <agent>` for a watcher: `alice added you to thread 3f2a91c as a
+  watcher, so you cannot run an agent in it; watch it with mahi join <ticket>, or ask alice to
+  invite you as a --collaborator`.
+- `mahi join <ticket>` for a collaborator: `alice added you to thread 3f2a91c as a
+  collaborator, so you join it with your agent: mahi join <ticket> -- claude, or -- codex`.
+
+## D022 · 2026-11-02 · Wording of the join refusal for an agent without turn ends
+
+Chosen by the user (#16), from the agent's proposal after D017: `tester.sh does not report
+when its turns end, so your work could not be kept in sync with your teammates'; join with
+Claude Code or Codex`.

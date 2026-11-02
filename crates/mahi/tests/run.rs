@@ -4686,7 +4686,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         let bob = teammate(&fixture, "bob");
         let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
         let join = |socket: &Path| {
-            let output = teammate_join(&bob, &[&ticket, "--", "true"])
+            let output = teammate_join(&bob, &[&ticket, "--", "claude"])
                 .env("SSH_AUTH_SOCK", socket)
                 .stdin(Stdio::null())
                 .output()
@@ -4744,7 +4744,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         let first = invite_teammate(&fixture, (thread, "--watcher"), &bob);
         let stderr = join(&first);
         assert!(
-            stderr.contains("cannot ask for your passphrase"),
+            stderr.contains("as a watcher, so you cannot run an agent in it"),
             "{stderr}"
         );
 
@@ -4757,6 +4757,63 @@ echo stray > "$CODEX_HOME/history.jsonl"
         );
     }
 
+    #[test]
+    fn mahi_join_refuses_an_agent_without_turn_ends_and_the_other_roles_way_in() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let _host = spawn_local_host(&fixture);
+        let (thread, _key) = running_thread(&fixture);
+        let bob = teammate(&fixture, "bob");
+        let claude = script(
+            &fixture,
+            "bob-tools",
+            "claude",
+            "#!/bin/sh\necho bob-agent-ran\n",
+        );
+        let tester = script(
+            &fixture,
+            "bob-tools",
+            "tester.sh",
+            "#!/bin/sh\necho bob-agent-ran\n",
+        );
+        let join = |arguments: &[&str]| {
+            let output = teammate_join(&bob, arguments)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!text.contains("Passphrase"), "{text}");
+            assert!(!text.contains("bob-agent-ran"), "{text}");
+            (output.status.code(), text)
+        };
+
+        let ticket = invite_teammate(&fixture, (thread, "--watcher"), &bob);
+        let (code, text) = join(&[&ticket, "--", tester.to_str().unwrap()]);
+        assert_eq!(code, Some(1), "{text}");
+        assert!(
+            text.contains("tester.sh does not report when its turns end, so your work could not be kept in sync with your teammates'; join with Claude Code or Codex"),
+            "{text}"
+        );
+        let (code, text) = join(&[&ticket, "--", claude.to_str().unwrap()]);
+        assert_eq!(code, Some(1), "{text}");
+        assert!(
+            text.contains(&format!("tester added you to thread {thread} as a watcher, so you cannot run an agent in it; watch it with mahi join <ticket>, or ask tester to invite you as a --collaborator")),
+            "{text}"
+        );
+
+        let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
+        let (code, text) = join(&[&ticket]);
+        assert_eq!(code, Some(1), "{text}");
+        assert!(
+            text.contains(&format!("tester added you to thread {thread} as a collaborator, so you join it with your agent: mahi join <ticket> -- claude, or -- codex")),
+            "{text}"
+        );
+    }
+
     const CLAIM_WATCHER: &str = r#"#!/bin/sh
 start=$(date +%s)
 while [ $(($(date +%s) - start)) -lt 60 ]; do
@@ -4764,7 +4821,7 @@ while [ $(($(date +%s) - start)) -lt 60 ]; do
     '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
     '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_claims"}}' \
     | "$MAHI_BIN" mcp)
-  case "$out" in *"by bob.sh"*) echo "saw bob's claim"; exit 0;; esac
+  case "$out" in *"by bob.claude"*) echo "saw bob's claim"; exit 0;; esac
   sleep 0.25
 done
 echo "never saw it"
@@ -4793,6 +4850,12 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
         let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
+        let claimer = script(
+            &fixture,
+            "bob-tools",
+            "claude",
+            &format!("#!/bin/sh\n{CLAIMER}\n"),
+        );
         let bob_thread = {
             let bob = Teammate {
                 home: bob.home.clone(),
@@ -4801,7 +4864,11 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
                 key: bob.key.clone(),
             };
             thread::spawn(move || {
-                teammate_in_terminal(&bob, "bob", &["join", &ticket, "--", "sh", "-c", CLAIMER])
+                teammate_in_terminal(
+                    &bob,
+                    "bob",
+                    &["join", &ticket, "--", claimer.to_str().unwrap()],
+                )
             })
         };
         let output = owner.wait_with_output().unwrap();
@@ -4810,7 +4877,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             .unwrap()
             .flat_map(|repository| fs::read_dir(repository.unwrap().path()).unwrap())
             .map(|entry| entry.unwrap().path())
-            .find(|path| path.ends_with(format!("{thread}.sh")))
+            .find(|path| path.ends_with(format!("{thread}.claude")))
             .unwrap();
         fs::write(bob_worktree.join("done"), "").unwrap();
         let (code, text) = bob_thread.join().unwrap();
@@ -4825,6 +4892,18 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         let _host = spawn_local_host(&fixture);
         let (thread, _key) = running_thread(&fixture);
         let bob = teammate(&fixture, "bob");
+        let claude = script(
+            &fixture,
+            "bob-tools",
+            "claude",
+            "#!/bin/sh\nprintf 'bob agent in %s' \"$(basename \"$PWD\")\"; echo change > bob.txt\n",
+        );
+        let resumed = script(
+            &fixture,
+            "bob-resume",
+            "claude",
+            "#!/bin/sh\nprintf 'bob resumed'; echo more > more.txt\n",
+        );
         let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
         assert_eq!(
             Store::open(&bob.repo).unwrap().head_commit().unwrap(),
@@ -4835,14 +4914,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         let (code, text) = teammate_in_terminal(
             &bob,
             "bob",
-            &[
-                "join",
-                &ticket,
-                "--",
-                "sh",
-                "-c",
-                "printf 'bob agent in %s' \"$(basename \"$PWD\")\"; echo change > bob.txt",
-            ],
+            &["join", &ticket, "--", claude.to_str().unwrap()],
         );
         assert_eq!(code, 0, "{text}");
         assert!(text.contains(&format!("bob agent in {thread}")), "{text}");
@@ -4855,7 +4927,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         load_meta(&store, thread, &owner, 1).unwrap();
         let bob_git = gix::open(&bob.repo).unwrap();
         let snapshots = bob_git
-            .find_reference(format!("refs/threads/{thread}/agents/bob.sh/snapshots").as_str())
+            .find_reference(format!("refs/threads/{thread}/agents/bob.claude/snapshots").as_str())
             .unwrap()
             .peel_to_commit()
             .unwrap()
@@ -4867,19 +4939,12 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         let (code, text) = teammate_in_terminal(
             &bob,
             "bob",
-            &[
-                "resume",
-                &thread_text,
-                "--",
-                "sh",
-                "-c",
-                "printf 'bob resumed'; echo more > more.txt",
-            ],
+            &["resume", &thread_text, "--", resumed.to_str().unwrap()],
         );
         assert_eq!(code, 0, "{text}");
         assert!(text.contains("bob resumed"), "{text}");
         let resumed_tree = bob_git
-            .find_reference(format!("refs/threads/{thread}/agents/bob.sh/snapshots").as_str())
+            .find_reference(format!("refs/threads/{thread}/agents/bob.claude/snapshots").as_str())
             .unwrap()
             .peel_to_commit()
             .unwrap()
@@ -4891,7 +4956,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             thread,
             RefKind::Snapshots(AgentSlot::new(
                 ParticipantName::new("bob").unwrap(),
-                AgentName::new("sh").unwrap(),
+                AgentName::new("claude").unwrap(),
             )),
         );
         all_signed_by(&store, &snapshots, &bob.key);
@@ -5440,7 +5505,7 @@ exit 3
             pair_as(
                 fixture,
                 &JoinFrom::Command(&["join"]),
-                ("--collaborator", "/usr/bin:/bin:/usr"),
+                ("--watcher", "/usr/bin:/bin:/usr"),
             )
         }
 

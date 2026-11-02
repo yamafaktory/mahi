@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     env,
+    ffi::OsStr,
     fs,
     io::{
         self,
@@ -104,6 +105,7 @@ use crate::{
         self,
         PairingError,
     },
+    profile::Profile,
     prompt::{
         Prompt,
         TerminalPrompt,
@@ -217,6 +219,18 @@ pub(crate) enum JoinError {
     KeyChanged,
     #[error("your signing key cannot sign commits")]
     SigningKey(#[source] KeyError),
+    #[error(
+        "{0} does not report when its turns end, so your work could not be kept in sync with your teammates'; join with Claude Code or Codex"
+    )]
+    NoTurnEnds(String),
+    #[error(
+        "{0} added you to thread {1} as a watcher, so you cannot run an agent in it; watch it with mahi join <ticket>, or ask {0} to invite you as a --collaborator"
+    )]
+    WatcherWithAgent(ParticipantName, ThreadId),
+    #[error(
+        "{0} added you to thread {1} as a collaborator, so you join it with your agent: mahi join <ticket> -- claude, or -- codex"
+    )]
+    CollaboratorWithoutAgent(ParticipantName, ThreadId),
 }
 
 /// What a viewer shows: the screen of one agent of the participant it follows, rebuilt in its
@@ -482,8 +496,12 @@ fn relays_for(live: LiveMode) -> Result<Relays, JoinError> {
 /// leaves with `q` or Ctrl-C, or mahi is stopped.
 pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<Outcome, JoinError> {
     let relays = relays_for(environment.live)?;
-    if command.agent().is_none() && command.options != LaunchOptions::default() {
-        return Err(JoinError::OptionsNeedAgent);
+    match command.agent() {
+        Some((program, _)) => check_turn_ends(&command.options, program)?,
+        None if command.options != LaunchOptions::default() => {
+            return Err(JoinError::OptionsNeedAgent);
+        }
+        None => {}
     }
     let ticket = &command
         .ticket
@@ -505,6 +523,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     let signer = match signer {
         Some(signer) if crate::report::connected() => {
             let meta = recorded_meta(ticket, &store, own)?;
+            check_role(command, &meta, own)?;
             return join_with_agent(
                 command,
                 environment,
@@ -521,7 +540,8 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
         relays,
         Arc::clone(&peers) as Arc<dyn Peers>,
     )?;
-    let joined = joined_meta(&node, ticket, &store, own);
+    let joined = joined_meta(&node, ticket, &store, own)
+        .and_then(|meta| check_role(command, &meta, own).map(|()| meta));
     let meta = match joined {
         Ok(meta) => meta,
         Err(error) => {
@@ -642,6 +662,29 @@ pub(crate) fn record(
 /// Returns the participant whose node is `own` in `meta`, when it lists them.
 fn own_entry(meta: &VerifiedMeta, own: NodeId) -> Option<&Participant> {
     meta.participants().find(|listed| listed.node() == &own)
+}
+
+fn check_turn_ends(options: &LaunchOptions, program: &OsStr) -> Result<(), JoinError> {
+    if options
+        .profile_for(program)
+        .is_some_and(Profile::reports_turn_ends)
+    {
+        return Ok(());
+    }
+    let name = Path::new(program).file_name().unwrap_or(program);
+    Err(JoinError::NoTurnEnds(name.to_string_lossy().into_owned()))
+}
+
+fn check_role(command: &JoinCommand, meta: &VerifiedMeta, own: NodeId) -> Result<(), JoinError> {
+    if command.ticket.is_none() {
+        return Ok(());
+    }
+    let refusal = match (role_of(meta, own), command.agent()) {
+        (Role::Watcher, Some(_)) => JoinError::WatcherWithAgent,
+        (Role::Collaborator, None) => JoinError::CollaboratorWithoutAgent,
+        (Role::Watcher, None) | (Role::Collaborator, Some(_)) => return Ok(()),
+    };
+    Err(refusal(meta.owner().clone(), meta.thread()))
 }
 
 /// Returns the role `meta` gives the participant whose node is `own`.
@@ -1365,5 +1408,99 @@ mod tests {
             served(Ok(forged), &ticket(current)),
             Err(JoinError::Meta(_))
         ));
+    }
+
+    fn join_command(arguments: &[&str]) -> JoinCommand {
+        use clap::Parser as _;
+
+        use crate::cli::{
+            Cli,
+            Command,
+        };
+
+        let words = ["mahi", "join"]
+            .into_iter()
+            .chain(arguments.iter().copied());
+        let Some(Command::Join(join)) = Cli::try_parse_from(words).unwrap().command else {
+            panic!("mahi join parses as a join");
+        };
+        *join
+    }
+
+    fn turn_ends_checked(arguments: &[&str]) -> Result<(), JoinError> {
+        let command = join_command(arguments);
+        let (program, _) = command.agent().unwrap();
+        check_turn_ends(&command.options, program)
+    }
+
+    #[test]
+    fn a_joining_agent_must_report_its_turn_ends() {
+        assert!(turn_ends_checked(&["--", "claude"]).is_ok());
+        assert!(turn_ends_checked(&["--", "/usr/local/bin/codex", "--full-auto"]).is_ok());
+        for arguments in [
+            ["--", "/opt/tools/tester.sh"].as_slice(),
+            &["--no-profile", "--", "tester.sh"],
+        ] {
+            let refusal = turn_ends_checked(arguments).unwrap_err();
+            assert_eq!(
+                refusal.to_string(),
+                "tester.sh does not report when its turns end, so your work could not be kept in sync with your teammates'; join with Claude Code or Codex"
+            );
+        }
+        assert!(matches!(
+            turn_ends_checked(&["--no-profile", "--", "claude"]),
+            Err(JoinError::NoTurnEnds(name)) if name == "claude"
+        ));
+    }
+
+    #[test]
+    fn a_watcher_joins_only_to_watch_and_a_collaborator_only_with_an_agent() {
+        use mahi_thread::Role;
+
+        use crate::workspace_live::tests::{
+            add_bob,
+            setup,
+        };
+
+        let setup = setup();
+        let watcher = add_bob(&setup, Role::Watcher);
+        let meta = load_meta(&setup.store, setup.thread, &setup.owner(), 0).unwrap();
+        let thread = setup.thread;
+        let owner = meta.owner().clone();
+        let alice = *meta.participants().next().unwrap().node();
+        let ticket = Ticket::new(
+            thread,
+            mahi_live::HostAddress::new(alice, None, Vec::new()).unwrap(),
+            setup.owner(),
+            meta.generation(),
+            *watcher.node(),
+        )
+        .to_string();
+        let watching = join_command(&[&ticket]);
+        let with_agent = join_command(&[&ticket, "--", "claude"]);
+
+        assert!(check_role(&watching, &meta, *watcher.node()).is_ok());
+        assert_eq!(
+            check_role(&with_agent, &meta, *watcher.node())
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "{owner} added you to thread {thread} as a watcher, so you cannot run an agent in it; watch it with mahi join <ticket>, or ask {owner} to invite you as a --collaborator"
+            )
+        );
+
+        assert!(check_role(&with_agent, &meta, alice).is_ok());
+        assert_eq!(
+            check_role(&watching, &meta, alice).unwrap_err().to_string(),
+            format!(
+                "{owner} added you to thread {thread} as a collaborator, so you join it with your agent: mahi join <ticket> -- claude, or -- codex"
+            )
+        );
+
+        let by_code = [join_command(&[]), join_command(&["--", "claude"])];
+        for command in &by_code {
+            assert!(check_role(command, &meta, alice).is_ok());
+            assert!(check_role(command, &meta, *watcher.node()).is_ok());
+        }
     }
 }
