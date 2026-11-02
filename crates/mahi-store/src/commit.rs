@@ -33,6 +33,20 @@ pub struct Identity {
     pub offset: i32,
 }
 
+impl Identity {
+    /// Returns `name` and `email` at the current time, in the local time zone when it is known.
+    #[must_use]
+    pub fn now(name: String, email: String) -> Self {
+        let now = Time::now_local_or_utc();
+        Self {
+            name,
+            email,
+            seconds: now.seconds,
+            offset: now.offset,
+        }
+    }
+}
+
 impl Store {
     /// Returns a tree holding `base`'s entries, with each of the file paths `paths` as `source`
     /// holds it: a file there is taken, and a file of `base` is removed where `source` holds

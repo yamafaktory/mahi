@@ -17,16 +17,6 @@ use gix::{
         ByteSlice,
     },
     object::Kind,
-    refs::{
-        Target,
-        transaction::{
-            Change,
-            LogChange,
-            PreviousValue,
-            RefEdit,
-            RefLog,
-        },
-    },
 };
 
 use crate::{
@@ -35,7 +25,6 @@ use crate::{
         SIGNATURE_HEADER,
         Store,
         StoreError,
-        branch_ref,
     },
 };
 
@@ -137,7 +126,7 @@ impl Store {
             .collect();
         let new_tip = plan.rewritten.get(&tip).copied().unwrap_or(tip);
         if new_tip != tip {
-            self.move_branch(branch, tip, new_tip)?;
+            self.move_branch(branch, Some(tip), new_tip, "mahi land: add trailers")?;
         }
         Ok(Trailed {
             rewritten,
@@ -235,40 +224,6 @@ impl Store {
             owned.message = message;
         }
         Ok(self.repo.write_object(&owned)?.detach())
-    }
-
-    fn move_branch(&self, branch: &str, from: ObjectId, to: ObjectId) -> Result<(), StoreError> {
-        let name = branch_ref(branch)?;
-        let edited = self.repo.edit_references_as(
-            Some(RefEdit::new(
-                name.clone(),
-                Change::Update {
-                    log: LogChange {
-                        mode: RefLog::AndReference,
-                        force_create_reflog: false,
-                        message: "mahi land: add trailers".into(),
-                    },
-                    expected: PreviousValue::MustExistAndMatch(Target::Object(from)),
-                    new: Target::Object(to),
-                },
-            )),
-            None,
-        );
-        match edited {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                let found = self.branch_tip(branch)?;
-                if found == Some(from) {
-                    Err(gix::Error::from_error(error).into())
-                } else {
-                    Err(StoreError::Conflict {
-                        name: name.as_bstr().to_string(),
-                        expected: Some(from),
-                        found,
-                    })
-                }
-            }
-        }
     }
 }
 
@@ -557,7 +512,7 @@ mod tests {
         let two = commit(&store, &[one], "two\n", false);
         set_ref(&store, "refs/heads/land", two);
         assert!(matches!(
-            store.move_branch("land", one, base),
+            store.move_branch("land", Some(one), base, "test"),
             Err(StoreError::Conflict { found: Some(found), .. }) if found == two
         ));
         assert!(matches!(

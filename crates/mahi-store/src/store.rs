@@ -326,6 +326,94 @@ impl Store {
         }
     }
 
+    /// Moves the local branch `branch` to `to`, only from `from`, or makes it at `to` when
+    /// `from` is `None`, with `message` in its reflog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Conflict`] if the branch is not at `from`, or does not stay
+    /// missing, [`StoreError::InvalidBranchName`] if `branch` cannot name a branch, or
+    /// [`StoreError::Git`] if the ref cannot be written.
+    pub fn move_branch(
+        &self,
+        branch: &str,
+        from: Option<ObjectId>,
+        to: ObjectId,
+        message: &str,
+    ) -> Result<(), StoreError> {
+        let name = branch_ref(branch)?;
+        let expected = match from {
+            Some(from) => PreviousValue::MustExistAndMatch(Target::Object(from)),
+            None => PreviousValue::MustNotExist,
+        };
+        let edited = self.repo.edit_references_as(
+            Some(RefEdit::new(
+                name.clone(),
+                Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: message.into(),
+                    },
+                    expected,
+                    new: Target::Object(to),
+                },
+            )),
+            None,
+        );
+        match edited {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let found = self.branch_tip(branch)?;
+                if found == from {
+                    Err(gix::Error::from_error(error).into())
+                } else {
+                    Err(StoreError::Conflict {
+                        name: name.as_bstr().to_string(),
+                        expected: from,
+                        found,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Removes the local branch `branch`, only while it is at `at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Conflict`] if the branch is not at `at`,
+    /// [`StoreError::InvalidBranchName`] if `branch` cannot name a branch, or
+    /// [`StoreError::Git`] if the ref cannot be removed.
+    pub fn delete_branch(&self, branch: &str, at: ObjectId) -> Result<(), StoreError> {
+        let name = branch_ref(branch)?;
+        let edited = self.repo.edit_references_as(
+            Some(RefEdit::new(
+                name.clone(),
+                Change::Delete {
+                    expected: PreviousValue::MustExistAndMatch(Target::Object(at)),
+                    log: RefLog::AndReference,
+                },
+            )),
+            None,
+        );
+        match edited {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let found = self.branch_tip(branch)?;
+                if found == Some(at) {
+                    Err(gix::Error::from_error(error).into())
+                } else {
+                    Err(StoreError::Conflict {
+                        name: name.as_bstr().to_string(),
+                        expected: Some(at),
+                        found,
+                    })
+                }
+            }
+        }
+    }
+
     /// Creates the local branch `name` at `commit` unless it exists, and returns where it
     /// points.
     ///
@@ -414,6 +502,20 @@ impl Store {
             .filter_map(|name| std::str::from_utf8(name.as_ref()).ok().map(str::to_owned))
             .filter(|name| is_plain_remote_name(name))
             .collect()
+    }
+
+    /// Returns the `user.name` and the `user.email` git's configuration gives this
+    /// repository, each when it is set and in UTF-8.
+    #[must_use]
+    pub fn user_identity(&self) -> (Option<String>, Option<String>) {
+        let config = self.repo.config_snapshot();
+        let read = |key| {
+            config
+                .string(key)
+                .and_then(|value| String::from_utf8(value.into()).ok())
+                .filter(|value| !value.trim().is_empty())
+        };
+        (read("user.name"), read("user.email"))
     }
 
     /// Returns the URL the git remote called `name` pushes to when `push` is set, or else
@@ -1442,6 +1544,54 @@ pub(crate) mod tests {
         assert!(matches!(
             store.read_entry(commit, "meta", 100),
             Err(StoreError::TooLarge { id, .. }) if id == commit
+        ));
+    }
+
+    #[test]
+    fn the_user_identity_is_read_from_the_repositorys_git_config() {
+        let (dir, store) = store();
+        let config = dir.path().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[user]\n\tname = Alice Example\n\temail = \n");
+        std::fs::write(&config, text).unwrap();
+        let store = Store::open(store.common_dir()).unwrap();
+        assert_eq!(
+            store.user_identity(),
+            (Some("Alice Example".to_owned()), None)
+        );
+    }
+
+    #[test]
+    fn a_branch_is_made_or_moved_only_from_where_the_caller_saw_it() {
+        let (_dir, store) = store();
+        let r = transcript_ref();
+        let first = store.append(&r, None, empty_tree(&store), "1").unwrap();
+        let second = store
+            .append(&r, Some(first), empty_tree(&store), "2")
+            .unwrap();
+        store.move_branch("mahi/x", None, first, "test").unwrap();
+        assert_eq!(store.branch_tip("mahi/x").unwrap(), Some(first));
+        assert!(matches!(
+            store.move_branch("mahi/x", None, second, "test"),
+            Err(StoreError::Conflict { found: Some(found), .. }) if found == first
+        ));
+        assert!(matches!(
+            store.move_branch("mahi/x", Some(second), second, "test"),
+            Err(StoreError::Conflict { .. })
+        ));
+        store
+            .move_branch("mahi/x", Some(first), second, "test")
+            .unwrap();
+        assert_eq!(store.branch_tip("mahi/x").unwrap(), Some(second));
+        assert!(matches!(
+            store.delete_branch("mahi/x", first),
+            Err(StoreError::Conflict { .. })
+        ));
+        store.delete_branch("mahi/x", second).unwrap();
+        assert_eq!(store.branch_tip("mahi/x").unwrap(), None);
+        assert!(matches!(
+            store.move_branch("-x", None, first, "test"),
+            Err(StoreError::InvalidBranchName(_))
         ));
     }
 
