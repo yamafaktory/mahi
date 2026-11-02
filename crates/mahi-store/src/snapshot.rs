@@ -1167,19 +1167,7 @@ mod tests {
     }
 
     fn base(store: &Store, entries: &[(&str, EntryKind, &[u8])]) -> ObjectId {
-        let mut editor = store
-            .repo
-            .edit_tree(ObjectId::empty_tree(store.repo.object_hash()))
-            .unwrap();
-        for (path, kind, content) in entries {
-            let id = if *kind == EntryKind::Commit {
-                ObjectId::from_hex(content).unwrap()
-            } else {
-                store.write_blob(content).unwrap()
-            };
-            editor.upsert(*path, *kind, id).unwrap();
-        }
-        let tree = editor.write().unwrap().detach();
+        let tree = crate::store::tests::tree_of(store, entries);
         let r = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
         store.append(&r, None, tree, "base").unwrap()
     }

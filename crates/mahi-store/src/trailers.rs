@@ -32,6 +32,7 @@ use gix::{
 use crate::{
     history::NewCommits,
     store::{
+        SIGNATURE_HEADER,
         Store,
         StoreError,
         branch_ref,
@@ -41,7 +42,6 @@ use crate::{
 const MAX_TRAILED_COMMITS: usize = 10_000;
 const MAX_TRAILED_COMMIT_BYTES: u64 = 1 << 20;
 const MAX_HIDDEN_REFS: usize = 65_536;
-const SIGNATURE_HEADER: &[u8] = b"gpgsig";
 const CHERRY_PICKED: &[u8] = b"(cherry picked from commit ";
 const SIGNED_OFF_BY: &[u8] = b"Signed-off-by";
 
@@ -190,7 +190,7 @@ impl Store {
             if commit
                 .extra_headers
                 .iter()
-                .any(|(name, _)| name.starts_with(SIGNATURE_HEADER))
+                .any(|(name, _)| name.starts_with(SIGNATURE_HEADER.as_bytes()))
             {
                 pending.push(*id);
             }
@@ -272,14 +272,12 @@ impl Store {
     }
 }
 
-fn with_trailers(message: &BStr, (key, value): (&str, &str), trailers: &str) -> Option<BString> {
-    let body = message.trim_end();
-    let eol: &[u8] = if body.find(b"\r\n").is_some() {
-        b"\r\n"
-    } else {
-        b"\n"
-    };
-    let block = last_paragraph(body).filter(|block| is_trailer_block(block));
+pub(crate) fn with_trailers(
+    message: &BStr,
+    (key, value): (&str, &str),
+    trailers: &str,
+) -> Option<BString> {
+    let block = last_paragraph(message.trim_end()).filter(|block| is_trailer_block(block));
     if block.is_some_and(|block| {
         block
             .lines()
@@ -290,6 +288,17 @@ fn with_trailers(message: &BStr, (key, value): (&str, &str), trailers: &str) -> 
     }) {
         return None;
     }
+    Some(appended_trailers(message, trailers))
+}
+
+pub(crate) fn appended_trailers(message: &BStr, trailers: &str) -> BString {
+    let body = message.trim_end();
+    let eol: &[u8] = if body.find(b"\r\n").is_some() {
+        b"\r\n"
+    } else {
+        b"\n"
+    };
+    let block = last_paragraph(body).filter(|block| is_trailer_block(block));
     let mut out = BString::from(Vec::with_capacity(
         body.len() + trailers.len() * 2 + 2 * eol.len(),
     ));
@@ -302,7 +311,7 @@ fn with_trailers(message: &BStr, (key, value): (&str, &str), trailers: &str) -> 
         out.extend_from_slice(line);
         out.extend_from_slice(eol);
     }
-    Some(out)
+    out
 }
 
 fn last_paragraph(body: &[u8]) -> Option<&[u8]> {

@@ -71,8 +71,8 @@ pub const COMMITTER_NAME: &str = "mahi";
 pub const COMMITTER_EMAIL: &str = "mahi@mahi.invalid";
 
 const MAX_ENTRY_NAME_BYTES: usize = 255;
-const MAX_COMMIT_BYTES: u64 = 64 * 1024;
-const SIGNATURE_HEADER: &str = "gpgsig";
+pub(crate) const MAX_COMMIT_BYTES: u64 = 64 * 1024;
+pub(crate) const SIGNATURE_HEADER: &str = "gpgsig";
 pub(crate) const MAX_TREE_BYTES: u64 = 1024 * 1024;
 const DISABLE_REFLOG: &str = "core.logAllRefUpdates=false";
 const REF_LOCK_TIMEOUT: &str = "core.filesRefLockTimeout=5000";
@@ -112,6 +112,13 @@ pub enum StoreError {
     /// A thread ref is symbolic, which mahi never writes.
     #[error("{0} is a symbolic ref")]
     Symbolic(String),
+    /// A name or an email for a commit holds `<`, `>` or a line break, which a commit cannot
+    /// carry.
+    #[error("{0:?} cannot be a commit's name or email: it holds <, > or a line break")]
+    InvalidIdentity(String),
+    /// A commit mahi would write is larger than mahi reads a commit.
+    #[error("a commit would be larger than {0} bytes")]
+    CommitTooLarge(u64),
     /// An object is larger than the caller's limit.
     #[error("object {id} is larger than {limit} bytes")]
     TooLarge {
@@ -811,7 +818,7 @@ impl Store {
         self.require_kind(tree, Kind::Tree)?;
         self.require_head(thread_ref, expected)?;
 
-        let mut commit = Commit {
+        let commit = Commit {
             tree,
             parents: expected.into_iter().collect(),
             author: generic_signature(),
@@ -820,15 +827,7 @@ impl Store {
             message: message.into(),
             extra_headers: Vec::new(),
         };
-        if let Some(signer) = signer {
-            let mut payload = Vec::new();
-            commit.write_to(&mut payload)?;
-            let signature = signer.sign_commit(&payload).map_err(StoreError::Sign)?;
-            commit
-                .extra_headers
-                .push((SIGNATURE_HEADER.into(), signature.into()));
-        }
-        let id = self.repo.write_object(&commit)?.detach();
+        let id = self.write_signed(commit, signer, u64::MAX)?;
 
         let previous = match expected {
             Some(parent) => PreviousValue::MustExistAndMatch(Target::Object(parent)),
@@ -928,6 +927,26 @@ impl Store {
         Ok(header.size())
     }
 
+    pub(crate) fn write_signed(
+        &self,
+        mut commit: Commit,
+        signer: Option<&dyn CommitSigner>,
+        most: u64,
+    ) -> Result<ObjectId, StoreError> {
+        let mut payload = Vec::new();
+        commit.write_to(&mut payload)?;
+        if payload.len() as u64 > most {
+            return Err(StoreError::CommitTooLarge(most));
+        }
+        if let Some(signer) = signer {
+            let signature = signer.sign_commit(&payload).map_err(StoreError::Sign)?;
+            commit
+                .extra_headers
+                .push((SIGNATURE_HEADER.into(), signature.into()));
+        }
+        Ok(self.repo.write_object(&commit)?.detach())
+    }
+
     pub(crate) fn require_kind(&self, id: ObjectId, expected: Kind) -> Result<(), StoreError> {
         let header = self.repo.try_find_header(id)?;
         if header.is_some_and(|header| header.kind() == expected) {
@@ -1004,7 +1023,7 @@ pub(crate) fn branch_ref(name: &str) -> Result<FullName, StoreError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use mahi_core::{
         AgentName,
         AgentSlot,
@@ -1018,7 +1037,23 @@ mod tests {
 
     const LIMIT: usize = 1 << 20;
 
-    fn store() -> (TempDir, Store) {
+    pub(crate) fn tree_of(store: &Store, entries: &[(&str, EntryKind, &[u8])]) -> ObjectId {
+        let mut editor = store
+            .repo
+            .edit_tree(ObjectId::empty_tree(store.repo.object_hash()))
+            .unwrap();
+        for (path, kind, content) in entries {
+            let id = if *kind == EntryKind::Commit {
+                ObjectId::from_hex(content).unwrap()
+            } else {
+                store.write_blob(content).unwrap()
+            };
+            editor.upsert(*path, *kind, id).unwrap();
+        }
+        editor.write().unwrap().detach()
+    }
+
+    pub(crate) fn store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
         gix::init(dir.path()).unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -1641,7 +1676,7 @@ mod tests {
         }
     }
 
-    struct Recording(std::sync::Mutex<Vec<Vec<u8>>>);
+    pub(crate) struct Recording(pub(crate) std::sync::Mutex<Vec<Vec<u8>>>);
 
     impl CommitSigner for Recording {
         fn sign_commit(&self, payload: &[u8]) -> Result<String, Box<dyn Error + Send + Sync>> {

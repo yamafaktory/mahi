@@ -5,6 +5,7 @@ compile_error!("mahi supports Linux and macOS only");
 
 mod agent_config;
 mod changes;
+mod commit;
 mod diff;
 mod fetch;
 #[cfg(any(fuzzing, feature = "fuzzing"))]
@@ -24,6 +25,7 @@ pub use changes::{
     Changes,
     PathEntry,
 };
+pub use commit::Identity;
 pub use diff::{
     FileDiff,
     MAX_DIFFED_BYTES,
