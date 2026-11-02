@@ -3,12 +3,12 @@
 use mahi_term::{
     Notice,
     OutputTracker,
-    TerminalHints,
     PaletteInput,
     PaletteItem,
     PaletteKeys,
     PaletteView,
     Preview,
+    TerminalHints,
 };
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
@@ -80,7 +80,10 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let mut drawn = OutputTracker::default();
     drawn.feed(&out);
     assert!(drawn.can_draw());
-    assert!(!out.windows(2).any(|pair| pair == b"\x1b]" || pair == b"\x1bP"));
+    assert!(
+        !out.windows(2)
+            .any(|pair| pair == b"\x1b]" || pair == b"\x1bP")
+    );
     for (term, tmux) in [
         ("xterm", false),
         ("foot", true),

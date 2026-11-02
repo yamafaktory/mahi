@@ -29,9 +29,9 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         assert!(pair != b"\x1bP" && pair != b"\x1b_", "{passed:?}");
     }
     assert!(
-        replies
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'\x1b' | b'[' | b';' | b'R' | b'n')),
+        replies.iter().all(
+            |byte| byte.is_ascii_digit() || matches!(byte, b'\x1b' | b'[' | b';' | b'R' | b'n')
+        ),
         "{replies:?}"
     );
 });

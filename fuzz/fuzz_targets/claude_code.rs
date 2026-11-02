@@ -12,7 +12,10 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
         if let Some(dir) = claude_code::session_dir(std::path::Path::new(path)) {
             let name = dir.strip_prefix("projects/").unwrap();
             assert!(name.len() <= 200);
-            assert!(name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            );
         }
     }
 });

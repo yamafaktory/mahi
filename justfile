@@ -5,9 +5,11 @@ default:
 
 fmt:
     cargo +nightly fmt --all
+    cargo +nightly fmt --manifest-path fuzz/Cargo.toml
 
 fmt-check:
     cargo +nightly fmt --all --check
+    cargo +nightly fmt --check --manifest-path fuzz/Cargo.toml
 
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings

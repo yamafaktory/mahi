@@ -17,5 +17,8 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     assert_eq!(written, written.to_ascii_lowercase());
     assert_eq!(*code.password(), written);
     assert_eq!(written.parse::<PairingCode>().unwrap().to_string(), written);
-    assert_eq!(format!("{code:?}"), format!("PairingCode({}-..)", code.slot()));
+    assert_eq!(
+        format!("{code:?}"),
+        format!("PairingCode({}-..)", code.slot())
+    );
 });
