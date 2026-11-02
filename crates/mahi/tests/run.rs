@@ -4421,7 +4421,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
             ("MAHI_LIVE", OsStr::new("local")),
         ];
         let mut join = mahi_in_terminal(&bob.repo, &["join", &ticket], &bob_env);
-        let (watched, _) = collect(&join);
+        let (watched, watched_end) = collect(&join);
         let mut keys = join.writer().unwrap();
         wait_until("bob's passphrase question", || {
             String::from_utf8_lossy(&watched.lock().unwrap()).contains("Passphrase")
@@ -4451,6 +4451,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         assert!(String::from_utf8_lossy(&watched.lock().unwrap()).contains("first screen"));
         keys.write_all(b"q").unwrap();
         assert_eq!(exit_of(&mut join), 0);
+        let _ = watched_end.recv_timeout(Duration::from_secs(10));
         assert!(String::from_utf8_lossy(&watched.lock().unwrap()).contains("left thread"));
         assert!(!String::from_utf8_lossy(&watched.lock().unwrap()).contains("added you to thread"));
     }
@@ -5447,27 +5448,18 @@ exit 3
             child: PtyChild,
             terminal: fs::File,
             output: Arc<Mutex<Vec<u8>>>,
+            output_end: mpsc::Receiver<()>,
         }
 
         impl Driven {
             fn start(child: PtyChild) -> Self {
                 let terminal = child.writer().unwrap();
-                let mut reader = child.reader().unwrap();
-                let output = Arc::new(Mutex::new(Vec::new()));
-                let collected = Arc::clone(&output);
-                thread::spawn(move || {
-                    let mut buffer = [0_u8; 4096];
-                    while let Ok(read) = reader.read(&mut buffer) {
-                        if read == 0 {
-                            break;
-                        }
-                        collected.lock().unwrap().extend_from_slice(&buffer[..read]);
-                    }
-                });
+                let (output, output_end) = collect(&child);
                 Self {
                     child,
                     terminal,
                     output,
+                    output_end,
                 }
             }
 
@@ -5499,6 +5491,7 @@ exit 3
                 let deadline = Instant::now() + Duration::from_secs(60);
                 loop {
                     if let Some(status) = self.child.try_wait().unwrap() {
+                        let _ = self.output_end.recv_timeout(Duration::from_secs(10));
                         return exit_code(status);
                     }
                     assert!(
