@@ -595,8 +595,7 @@ fn join_with_agent(
             if let Some(signal) = stopped {
                 return Ok(Outcome::Stopped(signal));
             }
-            load_meta(store, ticket.thread(), ticket.owner(), meta.generation())
-                .map_err(JoinError::Pin)?
+            current_meta(command, (store, ticket), &meta, own)?
         }
         None => meta,
     };
@@ -662,6 +661,18 @@ pub(crate) fn record(
 /// Returns the participant whose node is `own` in `meta`, when it lists them.
 fn own_entry(meta: &VerifiedMeta, own: NodeId) -> Option<&Participant> {
     meta.participants().find(|listed| listed.node() == &own)
+}
+
+fn current_meta(
+    command: &JoinCommand,
+    (store, ticket): (&Store, &Ticket),
+    joined: &VerifiedMeta,
+    own: NodeId,
+) -> Result<VerifiedMeta, JoinError> {
+    let meta = load_meta(store, ticket.thread(), ticket.owner(), joined.generation())
+        .map_err(JoinError::Pin)?;
+    check_role(command, &meta, own)?;
+    Ok(meta)
 }
 
 fn check_turn_ends(options: &LaunchOptions, program: &OsStr) -> Result<(), JoinError> {
@@ -1502,5 +1513,40 @@ mod tests {
             assert!(check_role(command, &meta, alice).is_ok());
             assert!(check_role(command, &meta, *watcher.node()).is_ok());
         }
+    }
+
+    #[test]
+    fn a_role_changed_while_the_join_fetched_is_checked_again() {
+        use mahi_live::HostAddress;
+        use mahi_thread::Role;
+
+        use crate::workspace_live::tests::{
+            add_bob,
+            setup,
+            sign_participant,
+        };
+
+        let setup = setup();
+        let bob = add_bob(&setup, Role::Collaborator);
+        let owner = setup.owner();
+        let joined = load_meta(&setup.store, setup.thread, &owner, 0).unwrap();
+        let alice = *joined.participants().next().unwrap().node();
+        let ticket = Ticket::new(
+            setup.thread,
+            HostAddress::new(alice, None, Vec::new()).unwrap(),
+            owner.clone(),
+            joined.generation(),
+            *bob.node(),
+        );
+        let command = join_command(&[&ticket.to_string(), "--", "claude"]);
+        let current = |joined: &VerifiedMeta| {
+            current_meta(&command, (&setup.store, &ticket), joined, *bob.node())
+        };
+        assert!(current(&joined).is_ok());
+        sign_participant(&setup, bob.clone().with_role(Role::Watcher));
+        assert!(matches!(
+            current(&joined),
+            Err(JoinError::WatcherWithAgent(..))
+        ));
     }
 }
