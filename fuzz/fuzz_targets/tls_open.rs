@@ -2,6 +2,8 @@
 
 use rustls::{
     ContentType,
+    Error,
+    PeerMisbehaved,
     ProtocolVersion,
     Side,
     SupportedCipherSuite,
@@ -57,9 +59,18 @@ fn records(suite: &'static Tls13CipherSuite, secret: &[u8], seq: u64, body: &[u8
         ProtocolVersion::TLSv1_2,
         &mut sealed_body,
     );
-    let opened = decrypter
-        .decrypt(opaque, seq)
-        .expect("a sealed record opens");
+    let opened = decrypter.decrypt(opaque, seq);
+    if typ == ContentType::ChangeCipherSpec {
+        assert_eq!(
+            opened.err(),
+            Some(Error::PeerMisbehaved(
+                PeerMisbehaved::IllegalMiddleboxChangeCipherSpec
+            )),
+            "a sealed change_cipher_spec record is refused"
+        );
+        return;
+    }
+    let opened = opened.expect("a sealed record opens");
     assert_eq!(opened.typ, typ);
     assert_eq!(opened.payload, plain);
 }

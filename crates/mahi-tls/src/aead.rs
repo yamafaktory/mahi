@@ -201,6 +201,7 @@ mod tests {
         Aes256Gcm,
     };
     use chacha20poly1305::ChaCha20Poly1305;
+    use rustls::PeerMisbehaved;
 
     use super::*;
     use crate::testing::hex;
@@ -262,23 +263,56 @@ mod tests {
             ),
         ];
         for (seq, (typ, payload, expected)) in (0_u64..).zip(cases) {
-            let message = OutboundPlainMessage {
-                typ,
-                version: ProtocolVersion::TLSv1_2,
-                payload: payload.into(),
-            };
-            let sealed = records.encrypt(message, seq).unwrap().encode();
+            let sealed = seal_record(&mut records, typ, payload, seq);
             assert_eq!(sealed, expected);
-
-            let mut body = sealed[5..].to_vec();
-            let opaque = InboundOpaqueMessage::new(
-                ContentType::ApplicationData,
-                ProtocolVersion::TLSv1_2,
-                &mut body,
+            assert_eq!(
+                open_record(&mut records, &sealed, seq).unwrap(),
+                (typ, payload.to_vec())
             );
-            let plain = records.decrypt(opaque, seq).unwrap();
-            assert_eq!((plain.typ, plain.payload), (typ, payload));
         }
+    }
+
+    #[test]
+    fn a_sealed_change_cipher_spec_record_is_refused() {
+        let mut records = Records {
+            cipher: Aes128Gcm::new_from_slice(&[3; 16]).unwrap(),
+            iv: Iv::from([5; 12]),
+        };
+        let sealed = seal_record(&mut records, ContentType::ChangeCipherSpec, &[1], 0);
+        assert_eq!(
+            open_record(&mut records, &sealed, 0).unwrap_err(),
+            Error::PeerMisbehaved(PeerMisbehaved::IllegalMiddleboxChangeCipherSpec)
+        );
+    }
+
+    fn seal_record<C: Cipher>(
+        records: &mut Records<C>,
+        typ: ContentType,
+        payload: &[u8],
+        seq: u64,
+    ) -> Vec<u8> {
+        let message = OutboundPlainMessage {
+            typ,
+            version: ProtocolVersion::TLSv1_2,
+            payload: payload.into(),
+        };
+        records.encrypt(message, seq).unwrap().encode()
+    }
+
+    fn open_record<C: Cipher>(
+        records: &mut Records<C>,
+        sealed: &[u8],
+        seq: u64,
+    ) -> Result<(ContentType, Vec<u8>), Error> {
+        let mut body = sealed[5..].to_vec();
+        let opaque = InboundOpaqueMessage::new(
+            ContentType::ApplicationData,
+            ProtocolVersion::TLSv1_2,
+            &mut body,
+        );
+        records
+            .decrypt(opaque, seq)
+            .map(|plain| (plain.typ, plain.payload.to_vec()))
     }
 
     #[test]

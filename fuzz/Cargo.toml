@@ -23,7 +23,7 @@ mahi-store = { path = "../crates/mahi-store" }
 mahi-term = { path = "../crates/mahi-term" }
 mahi-thread = { path = "../crates/mahi-thread" }
 mahi-tls = { path = "../crates/mahi-tls" }
-rustls = { version = "0.23.45", default-features = false, features = ["std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 webpki-roots = "1.0.9"
 
 [workspace]

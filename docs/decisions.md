@@ -130,3 +130,11 @@ without asking the user, on issues and pull requests whose author is the user's 
 the user already allowed for pull requests. A comment on one that another person opened, or
 outside this repository, needs the user's approval for each comment. This file stays in the
 repository, because the user's choices belong with the design.
+
+## D020 · 2026-11-02 · The tls-open fuzz target expects a sealed change_cipher_spec record to be refused
+
+Chosen by the user (#27). rustls 0.23.46 refuses a TLS 1.3 record whose inner type is
+change_cipher_spec, as RFC 8446 section 5 requires. The `tls-open` target asserted that every
+sealed record opens. It now asserts that such a record fails with
+`IllegalMiddleboxChangeCipherSpec`, and every other type keeps the round trip. mahi's minimum
+rustls becomes 0.23.46.
