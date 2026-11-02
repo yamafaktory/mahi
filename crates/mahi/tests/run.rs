@@ -3973,7 +3973,8 @@ echo stray > "$CODEX_HOME/history.jsonl"
             "run",
             "sh",
             "-c",
-            "printf 'first screen'; sleep 12; printf ' then live output'; sleep 10",
+            "printf 'first screen'; until [ -e go ]; do sleep 0.1; done; \
+             printf ' then live output'; until [ -e done ]; do sleep 0.1; done",
         ]);
         let mahi = KillOnDrop(
             command
@@ -4000,16 +4001,8 @@ echo stray > "$CODEX_HOME/history.jsonl"
             Arc::new(AdmitsHost(*address.node())),
         )
         .unwrap();
-        let mut document = None;
-        wait_until("the host to serve meta to bob", || {
-            document = viewer.fetch_meta(&address, thread).ok();
-            if document.is_none() {
-                thread::sleep(Duration::from_millis(500));
-            }
-            document.is_some()
-        });
-        let meta =
-            mahi_thread::VerifiedMeta::decode(&document.unwrap(), thread, &fixture.owner).unwrap();
+        let document = served_meta(&viewer, &address, thread);
+        let meta = mahi_thread::VerifiedMeta::decode(&document, thread, &fixture.owner).unwrap();
         let keys = || LiveKeys::derive(&key, thread).unwrap();
         let topic = viewer
             .join(
@@ -4026,6 +4019,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         let mut sender = FrameSender::new(keys(), bob.secret()).unwrap();
         let (mut screen, mut output) = (Vec::new(), Vec::new());
         let mut asked_at: Option<Instant> = None;
+        let worktree = fixture.thread_worktrees().pop().unwrap();
         wait_until("the screen and the live output", || {
             if screen.is_empty() && asked_at.is_none_or(|at| at.elapsed() > Duration::from_secs(1))
             {
@@ -4040,11 +4034,15 @@ echo stray > "$CODEX_HOME/history.jsonl"
                     _ => {}
                 }
             }
+            if String::from_utf8_lossy(&screen).contains("first screen") {
+                fs::write(worktree.join("go"), "").unwrap();
+            }
             String::from_utf8_lossy(&output).contains("then live output")
         });
         assert!(String::from_utf8_lossy(&screen).contains("first screen"));
         wait_for_heartbeat(&topic, &mut receiver);
         viewer.close().unwrap();
+        fs::write(worktree.join("done"), "").unwrap();
         let mut mahi = mahi;
         let mut status = None;
         wait_until("mahi to exit after its agent", || {
@@ -4053,6 +4051,26 @@ echo stray > "$CODEX_HOME/history.jsonl"
         });
         assert!(status.unwrap().success());
         assert!(!published.exists());
+    }
+
+    fn served_meta(
+        viewer: &mahi_live::LiveNode,
+        host: &mahi_live::HostAddress,
+        thread: ThreadId,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match viewer.fetch_meta(host, thread) {
+                Ok(document) => return document,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the host did not serve meta: {error:?}"
+                    );
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
     }
 
     fn watch_screens(
