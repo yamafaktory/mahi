@@ -258,6 +258,10 @@ use crate::{
         LockError,
         ThreadLock,
     },
+    turn_end::{
+        self,
+        Reporting,
+    },
     turns::{
         self,
         Summary,
@@ -1235,6 +1239,8 @@ impl Prepared {
                 dir: &source.dir,
             });
         let first = self.first_state();
+        let reporting = first.map_or(Reporting::Unreported, |_| Reporting::Reported);
+        let (thread, slot) = (started.thread, started.slot.clone());
         let state = self.state_dir(&started);
         let launch = Launch {
             restore,
@@ -1257,7 +1263,11 @@ impl Prepared {
         };
         let (sandbox, network) = (self.sandbox, self.network);
         let live = start_live(self.live.take(), &self.git_dir, &started);
-        let launched = started.launch(&self.store, || launch.spawn(sandbox, network));
+        let store = &self.store;
+        let launched = started.launch(store, || {
+            turn_end::record_reporting(store, thread, &slot, reporting).map_err(RunError::State)?;
+            launch.spawn(sandbox, network)
+        });
         let (child, raw, proxy) = match launched {
             Ok(launched) => launched,
             Err(error) => {

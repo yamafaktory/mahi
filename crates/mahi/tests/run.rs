@@ -4565,6 +4565,32 @@ echo stray > "$CODEX_HOME/history.jsonl"
     }
 
     #[test]
+    fn an_owners_claude_run_without_its_profile_keeps_a_collaborator_out() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let claude = script(&fixture, "bare", "claude", "#!/bin/sh\n");
+        let ran = fixture
+            .command(&["run", "--no-profile", claude.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&ran.stderr);
+        assert!(ran.status.success(), "{stderr}");
+        let thread = thread_of(&worktree_of(&stderr));
+        let invited = fixture
+            .command(&["invite", "--collaborator", &thread])
+            .env("MAHI_LIVE", "local")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&invited.stderr);
+        assert_eq!(invited.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("tester.claude does not report when its turns end"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Pairing code"), "{stderr}");
+    }
+
+    #[test]
     fn a_users_own_claude_profile_reports_no_turn_ends_so_it_keeps_a_collaborator_out() {
         let fixture = fixture();
         write_profile(
@@ -5846,16 +5872,15 @@ exit 3
         /// Resumes `thread` with an agent that waits, so its host serves the thread, and waits
         /// until the host published where it is reached.
         fn run_thread(fixture: &Fixture, thread: &str, env: &[(&str, &OsStr)]) -> Driven {
+            let claude = script(
+                fixture,
+                "resuming",
+                "claude",
+                "#!/bin/sh\necho agent-ready; sleep 120\n",
+            );
             let mut running = Driven::start(mahi_in_terminal(
                 &fixture.repo,
-                &[
-                    "resume",
-                    thread,
-                    "--",
-                    "/bin/sh",
-                    "-c",
-                    "echo agent-ready; sleep 120",
-                ],
+                &["resume", thread, "--", claude.to_str().unwrap()],
                 env,
             ));
             running.wait_for("Passphrase");

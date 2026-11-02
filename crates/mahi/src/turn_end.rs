@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    io,
+    path::PathBuf,
+};
 
 use mahi_core::{
     AgentSlot,
@@ -16,10 +20,41 @@ use mahi_store::{
     StoreError,
 };
 
-use crate::session::SNAPSHOT_MESSAGE;
+use crate::{
+    session::SNAPSHOT_MESSAGE,
+    sync_state,
+};
 
 const TRAILER: &str = "Mahi-Turn-End: ";
 const MAX_WALK: usize = 4096;
+const UNREPORTED_FILE: &str = "turn-ends-unreported";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reporting {
+    Reported,
+    Unreported,
+}
+
+pub(crate) fn record_reporting(
+    store: &Store,
+    thread: ThreadId,
+    slot: &AgentSlot,
+    reporting: Reporting,
+) -> io::Result<()> {
+    let file = unreported_file(store, thread, slot);
+    match reporting {
+        Reporting::Reported => sync_state::remove(&file),
+        Reporting::Unreported => sync_state::write(&file, b""),
+    }
+}
+
+pub(crate) fn last_run_reported(store: &Store, thread: ThreadId, slot: &AgentSlot) -> bool {
+    !sync_state::may_exist(&unreported_file(store, thread, slot))
+}
+
+fn unreported_file(store: &Store, thread: ThreadId, slot: &AgentSlot) -> PathBuf {
+    sync_state::dir(store, thread, slot).join(UNREPORTED_FILE)
+}
 
 /// Returns the message of the snapshot that ends a turn of `slot`.
 pub(crate) fn message(slot: &AgentSlot) -> String {
@@ -175,6 +210,21 @@ mod tests {
 
     fn bytes(commit: ObjectId) -> [u8; COMMIT_BYTES] {
         commit.as_bytes().try_into().unwrap()
+    }
+
+    #[test]
+    fn a_slot_counts_as_reporting_its_turn_ends_until_a_run_without_them_is_recorded() {
+        let (_dir, store) = repository_on_main();
+        let thread = ThreadId::random().unwrap();
+        let (alice, bob) = (slot("alice.claude"), slot("bob.claude"));
+        assert!(last_run_reported(&store, thread, &alice));
+        record_reporting(&store, thread, &alice, Reporting::Unreported).unwrap();
+        assert!(!last_run_reported(&store, thread, &alice));
+        assert!(last_run_reported(&store, thread, &bob));
+        record_reporting(&store, thread, &alice, Reporting::Reported).unwrap();
+        assert!(last_run_reported(&store, thread, &alice));
+        record_reporting(&store, thread, &alice, Reporting::Reported).unwrap();
+        assert!(last_run_reported(&store, thread, &alice));
     }
 
     #[test]

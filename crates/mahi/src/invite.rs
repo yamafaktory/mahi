@@ -66,6 +66,7 @@ use crate::{
         LockError,
         ThreadLock,
     },
+    turn_end,
 };
 
 const RELAY_WAIT: Duration = Duration::from_secs(5);
@@ -282,7 +283,9 @@ fn check_turn_ends(
     }
     let agents = crate::threads::thread_agents(store, thread)?;
     let unsynced = agents.into_iter().find(|slot| {
-        slot.participant() == owner && !Profile::reports_turn_ends_of(slot.agent().as_str())
+        slot.participant() == owner
+            && !(Profile::reports_turn_ends_of(slot.agent().as_str())
+                && turn_end::last_run_reported(store, thread, slot))
     });
     unsynced.map_or(Ok(()), |slot| Err(InviteError::NoTurnEnds(slot)))
 }
@@ -366,6 +369,7 @@ mod tests {
             agent_from,
             tests::repository_on_main,
         },
+        turn_end::Reporting,
     };
 
     const PASSPHRASE: &str = "correct horse";
@@ -462,6 +466,14 @@ mod tests {
                 .unwrap();
         };
         let check = |role| check_turn_ends(&store, owner.thread, (&alice, role));
+        assert!(check(Role::Collaborator).is_ok());
+        let claude = "alice.claude".parse().unwrap();
+        turn_end::record_reporting(&store, owner.thread, &claude, Reporting::Unreported).unwrap();
+        assert!(matches!(
+            check(Role::Collaborator),
+            Err(InviteError::NoTurnEnds(refused)) if refused == claude
+        ));
+        turn_end::record_reporting(&store, owner.thread, &claude, Reporting::Reported).unwrap();
         assert!(check(Role::Collaborator).is_ok());
         add_agent("bob.sh");
         assert!(check(Role::Collaborator).is_ok());
