@@ -253,3 +253,126 @@ The same as the second line for `user.email`.
 Chosen by the user (#11), from the agent's proposal: the hint reads `Pushing to origin…` while
 the push runs, and a failure replaces the confirmation with `Not pushed: origin refused
 mahi/3f2a91c: <reason>`, then `Esc closes`.
+
+## D031 · 2026-11-02 · The owner's run that cannot land
+
+Chosen by the user (#41). When the owner's own run cannot land, because it has no palette on a
+terminal, no thread key, or `meta` cannot be read, its agent is told `not landed: this run of
+alice's agent cannot show the landing to push or cancel; resume the thread in a terminal with
+mahi resume <thread>`.
+
+## D032 · 2026-11-02 · The land tool reads the chosen remote at each call
+
+Chosen by the user (#41). `mahi remote` takes effect on the next `land` call, without a
+restart. The git identity stays read once (D028).
+
+## D033 · 2026-11-02 · Control characters in a landing's commit message
+
+Chosen by the user (#41). A call whose commit message holds control characters other than a
+newline and a tab is refused: `not landed: the message of commit 2 holds control characters;
+write it without them`.
+
+## D034 · 2026-11-02 · The landing shows the branch in full
+
+Chosen by the user (#41). The confirmation, the outcome and the note show `mahi/<thread-id>`
+in full, the branch's real name; the title shows the thread short.
+
+## D035 · 2026-11-02 · A branch the forge deleted refuses the landing for now
+
+Chosen by the user (#41). Until the three-way landing on the forge's branch is built, the
+tool refuses while the branch record says gone: `not landed: the forge deleted
+mahi/<thread-id>, and mahi cannot yet land on top of what it merged`. The fix is built next.
+
+## D036 · 2026-11-02 · PR.md lives in its own folder
+
+Chosen by the user (#41). The description goes to `mahi/state/<thread>/landing/PR.md`, whose
+folder name cannot be an agent slot.
+
+## D037 · 2026-11-02 · Two outcome lines after a push
+
+Chosen by the user (#41): `Its description is in <path>.` when the description is over 64 KiB
+and not copied, and `cannot keep the pull request draft in <path>: <error>` when PR.md cannot
+be written.
+
+## D038 · 2026-11-02 · Where the unremembered branch line goes
+
+Chosen by the user (#41). `cannot remember the pushed branch: <error>` comes last in the
+outcome, after D026's lines.
+
+## D039 · 2026-11-02 · mahi end keeps the turn-end record
+
+Chosen by the user (#36). `mahi end` keeps the record of whether the last run reported its
+turn ends, so an ended thread still refuses a collaborator after a run without them.
+
+## D040 · 2026-11-02 · The invite refusal for a run without its profile
+
+Chosen by the user (#36). When the owner's agent has a built-in profile that reports turn ends
+but its last run went without it: `tester.claude last ran without its profile, so it did not
+report when its turns end; resume the thread without --no-profile, or invite a --watcher`.
+
+## D041 · 2026-11-02 · A run without turn ends is refused once there is another collaborator
+
+Chosen by the user (#36, #34). While `meta` lists another collaborator, `mahi run` and `mahi
+resume`, by the owner or a collaborator, refuse an agent that would not report its turn ends,
+before anything starts: `tester.sh does not report when its turns end, so your teammates' work
+could not be kept in sync with it; run Claude Code or Codex, with its profile`.
+
+## D042 · 2026-11-02 · A join by pairing code joins as the role allows
+
+Chosen by the user (#32). A collaborator who joined by code without an agent watches. A
+watcher who joined by code with an agent is told `alice added you to thread <id> as a watcher,
+so your agent does not run; you watch alice's agents`, and watches.
+
+## D043 · 2026-11-02 · The resume refusal for a watcher
+
+Chosen by the user (#34): `alice made you a watcher in thread <id>, so you cannot run an agent
+in it; watch it with mahi join <ticket>, or ask alice to invite you as a --collaborator`.
+
+## D044 · 2026-11-02 · Turn-end frames are ordered per run
+
+Chosen by the user (#19). Turn-end frames are ordered within each run, as claims frames are, so
+learning a teammate's turn ends needs no anchoring.
+
+## D045 · 2026-11-02 · A failed take says why
+
+Chosen by the user (#19). When taking a held turn fails, the palette shows `Not taken:
+<reason>` under it.
+
+## D046 · 2026-11-02 · The held turns palette in a run without sync
+
+Chosen by the user (#19). A run without sync shows `This run takes in no teammates' work`.
+
+## D047 · 2026-11-02 · A settings path that would not change holds no turn
+
+Chosen by the user (#19). A teammate's turn waits for the keypress only for a settings path
+the merge would change.
+
+## D048 · 2026-11-02 · The pager flake gets an issue
+
+Chosen by the user (#19). The one failure of
+`git_works_for_the_agent_without_showing_the_repositorys_secrets` is tracked in an issue.
+
+## D049 · 2026-11-02 · The join dialog's message when no agent fits
+
+Chosen by the user (#19), replacing D018's text: `no agent on PATH reports when its turns end; a
+collaborator needs Claude Code or Codex with its built-in profile`.
+
+## D050 · 2026-11-02 · No docs on new private items
+
+Chosen by the user (#19). New private and `pub(crate)` items get no `///` docs; only what
+`missing_docs` requires is documented. Existing private docs stay unless a change touches them.
+
+## D051 · 2026-11-02 · Snapshots carry a signed thread trailer
+
+Chosen by the user (DESIGN.md open question). Each snapshot names its thread in a signed
+trailer, and a fetched snapshot without the right one is refused.
+
+## D052 · 2026-11-02 · One sync state per teammate
+
+Chosen by the user (DESIGN.md open question, D005). What sync holds for a teammate becomes one
+enum per teammate, kept in one record.
+
+## D053 · 2026-11-02 · Codex's hooks may carry the note
+
+Chosen by the user (DESIGN.md open question). Find out whether Codex's hooks can add the merge
+note as context, and use them when they can.
