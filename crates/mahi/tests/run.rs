@@ -5834,6 +5834,13 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             let fixture = fixture();
             save_identity(&fixture);
             let (_server, remote) = serve_remote(&fixture);
+            let hook = remote.join("hooks/post-receive");
+            fs::write(
+                &hook,
+                "#!/bin/sh\nwhile read old new ref; do\n  echo 'Create a pull request for it by visiting:'\n  echo \"  https://forge.example/o/r/pull/new/${ref#refs/heads/}\"\ndone\n",
+            )
+            .unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
             git(&fixture.repo, &["config", "user.name", "Alice Example"]);
             git(
                 &fixture.repo,
@@ -5852,6 +5859,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             thread::sleep(Duration::from_millis(700));
             running.terminal.write_all(b"\r").unwrap();
             running.wait_for("Pushed 1 commit on mahi/");
+            running.wait_for("Open the pull request: https://forge.example/o/r/pull/new/");
             running.wait_for("Its description is in");
             running.wait_for("\x1b]52;c;");
             assert!(running.text().contains("\x1b]52;c;V2h5Lg==\x07"));

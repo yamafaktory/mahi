@@ -316,7 +316,7 @@ impl Desk {
         (landed, tip): (ObjectId, ObjectId),
         description: &str,
         interrupt: &Arc<AtomicBool>,
-    ) -> Result<(Option<String>, Kept), String> {
+    ) -> Result<Landed, String> {
         let branch = branch_of(self.thread);
         let described = |error: &dyn std::error::Error| crate::describe(error);
         let store = Store::open(&self.git_dir).map_err(|error| described(&error))?;
@@ -339,19 +339,22 @@ impl Desk {
             .map_err(|error| described(&error))
             .and_then(|transport| {
                 store
-                    .push_branch_within(transport, &branch, remote.push_limit, interrupt)
+                    .push_branch_telling(transport, &branch, remote.push_limit, interrupt)
                     .map_err(|error| described(&error))
             })
-            .and_then(|pushed| {
-                refusal(&remote.name.to_string(), &branch, pushed).map_or(Ok(()), Err)
+            .and_then(|(pushed, link)| {
+                refusal(&remote.name.to_string(), &branch, pushed).map_or(Ok(link), Err)
             });
-        if let Err(reason) = pushed {
-            let _ = match current {
-                Some(current) => store.move_branch(&branch, Some(tip), current, "mahi land"),
-                None => store.delete_branch(&branch, tip),
-            };
-            return Err(reason);
-        }
+        let link = match pushed {
+            Ok(link) => link,
+            Err(reason) => {
+                let _ = match current {
+                    Some(current) => store.move_branch(&branch, Some(tip), current, "mahi land"),
+                    None => store.delete_branch(&branch, tip),
+                };
+                return Err(reason);
+            }
+        };
         let record = BranchRecord {
             remote: remote.name.to_string(),
             branch,
@@ -363,23 +366,28 @@ impl Desk {
             .write(&store, self.thread)
             .err()
             .map(|error| format!("cannot remember the pushed branch: {error}"));
-        Ok((unremembered, self.keep_description(&store, description)))
+        Ok(Landed {
+            unremembered,
+            kept: self.keep_description(&store, description),
+            link,
+        })
     }
 
     fn finish(
         &self,
         (remote, count, description): (&SyncSetup, usize, &str),
-        pushed: &Result<(Option<String>, Kept), String>,
+        pushed: &Result<Landed, String>,
         generation: u64,
     ) {
         let branch = branch_of(self.thread);
         let remote = remote.name.to_string();
         let clipboard = match pushed {
-            Ok((_, Ok(_))) => copied(description),
-            Ok((_, Err(_))) | Err(_) => None,
+            Ok(Landed { kept: Ok(_), .. }) => copied(description),
+            Ok(Landed { kept: Err(_), .. }) | Err(_) => None,
         };
         let (line, text) = match pushed {
-            Ok((unremembered, kept)) => {
+            Ok(landed) => {
+                let unremembered = &landed.unremembered;
                 let mut line = format!(
                     "{} pushed your landing: {} on {branch} to {remote}.",
                     self.owner,
@@ -389,12 +397,7 @@ impl Desk {
                     line.push('\n');
                     line.push_str(unremembered);
                 }
-                let text = pushed_text(
-                    (count, &branch, &remote),
-                    unremembered.as_deref(),
-                    kept,
-                    clipboard.is_some(),
-                );
+                let text = pushed_text((count, &branch, &remote), landed, clipboard.is_some());
                 (line, text)
             }
             Err(reason) => (
@@ -416,22 +419,26 @@ impl Desk {
 
 type Kept = Result<PathBuf, (PathBuf, String)>;
 
+struct Landed {
+    unremembered: Option<String>,
+    kept: Kept,
+    link: Option<String>,
+}
+
 fn copied(description: &str) -> Option<String> {
     (description.len() <= MOST_COPIED).then(|| description.to_owned())
 }
 
 fn pushed_text(
     (count, branch, remote): (usize, &str, &str),
-    unremembered: Option<&str>,
-    kept: &Kept,
+    landed: &Landed,
     copied: bool,
 ) -> String {
     let mut text = format!("Pushed {} on {branch} to {remote}.", commits(count));
-    if let Some(unremembered) = unremembered {
-        text.push('\n');
-        text.push_str(unremembered);
+    if let Some(link) = &landed.link {
+        let _ = write!(text, "\nOpen the pull request: {link}");
     }
-    match (kept, copied) {
+    match (&landed.kept, copied) {
         (Ok(file), true) => {
             let _ = write!(
                 text,
@@ -449,6 +456,10 @@ fn pushed_text(
                 file.display()
             );
         }
+    }
+    if let Some(unremembered) = &landed.unremembered {
+        text.push('\n');
+        text.push_str(unremembered);
     }
     text
 }
@@ -1093,23 +1104,38 @@ pub(crate) mod tests {
     #[test]
     fn the_outcome_says_where_the_description_is_and_whether_it_was_copied() {
         let file = PathBuf::from("/state/PR.md");
-        let shown = |kept: &Kept, copied| pushed_text((2, "mahi/x", "up"), None, kept, copied);
+        let landed = |kept: Kept, link: Option<&str>, unremembered: Option<&str>| Landed {
+            unremembered: unremembered.map(str::to_owned),
+            kept,
+            link: link.map(str::to_owned),
+        };
+        let shown = |landed: &Landed, copied| pushed_text((2, "mahi/x", "up"), landed, copied);
         assert_eq!(
-            shown(&Ok(file.clone()), true),
-            "Pushed 2 commits on mahi/x to up.\nIts description is in /state/PR.md and on your clipboard."
+            shown(
+                &landed(
+                    Ok(file.clone()),
+                    Some("https://forge.example/pull/new/mahi/x"),
+                    None
+                ),
+                true
+            ),
+            "Pushed 2 commits on mahi/x to up.\nOpen the pull request: https://forge.example/pull/new/mahi/x\nIts description is in /state/PR.md and on your clipboard."
         );
         assert_eq!(
-            shown(&Ok(file.clone()), false),
+            shown(&landed(Ok(file.clone()), None, None), false),
             "Pushed 2 commits on mahi/x to up.\nIts description is in /state/PR.md."
         );
         assert_eq!(
             pushed_text(
                 (1, "mahi/x", "up"),
-                Some("cannot remember the pushed branch: disk full"),
-                &Err((file, "denied".to_owned())),
+                &landed(
+                    Err((file, "denied".to_owned())),
+                    None,
+                    Some("cannot remember the pushed branch: disk full")
+                ),
                 true
             ),
-            "Pushed 1 commit on mahi/x to up.\ncannot remember the pushed branch: disk full\ncannot keep the pull request draft in /state/PR.md: denied"
+            "Pushed 1 commit on mahi/x to up.\ncannot keep the pull request draft in /state/PR.md: denied\ncannot remember the pushed branch: disk full"
         );
     }
 

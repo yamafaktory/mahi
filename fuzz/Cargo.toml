@@ -166,6 +166,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "push-sideband"
+path = "fuzz_targets/push_sideband.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "send-pack"
 path = "fuzz_targets/send_pack.rs"
 test = false

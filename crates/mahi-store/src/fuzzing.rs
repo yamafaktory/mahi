@@ -73,6 +73,28 @@ pub fn send_pack(data: &[u8]) {
     }
 }
 
+/// Reads `data` as a remote's side-band answer to a push: packets, each a length byte then
+/// its bytes, with the report nested in the data band and the messages that may hold a pull
+/// request link.
+pub fn push_sideband(data: &[u8]) {
+    let sent: HashSet<String> = HashSet::from(["refs/heads/mahi/x".to_owned()]);
+    let mut rest = data;
+    let answered = push::read_sideband_answer(
+        &mut || {
+            let Some((&length, after)) = rest.split_first() else {
+                return Ok(None);
+            };
+            let (packet, after) = after.split_at(usize::from(length).min(after.len()));
+            rest = after;
+            Ok(Some(packet.to_vec()))
+        },
+        &sent,
+    );
+    if let Ok((_, messages)) = answered {
+        let _ = push::pull_request_link(&messages);
+    }
+}
+
 const HFS_IGNORED: [char; 16] = [
     '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
     '\u{202e}', '\u{206a}', '\u{206b}', '\u{206c}', '\u{206d}', '\u{206e}', '\u{206f}', '\u{feff}',

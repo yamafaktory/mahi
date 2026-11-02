@@ -36,6 +36,7 @@ use gix::{
             WriteMode,
             blocking_io::Transport,
         },
+        packetline::PacketLineRef,
     },
 };
 use mahi_core::{
@@ -88,6 +89,14 @@ pub(crate) struct Advertisement {
     pub(crate) tips: HashSet<ObjectId>,
     pub(crate) atomic: bool,
     pub(crate) delete_refs: bool,
+    pub(crate) sideband: Sideband,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sideband {
+    Off,
+    Messages,
+    QuietMessages,
 }
 
 pub(crate) type Command = (String, Option<ObjectId>, ObjectId);
@@ -208,11 +217,50 @@ impl Store {
     /// Returns the errors of [`Store::push_branch`].
     pub fn push_branch_within<T: Transport>(
         &self,
-        mut transport: T,
+        transport: T,
         branch: &str,
         max_bytes: u64,
         interrupt: &AtomicBool,
     ) -> Result<Pushed, StoreError> {
+        self.push_branch_with(transport, branch, max_bytes, Sideband::Off, interrupt)
+            .map(|(pushed, _)| pushed)
+    }
+
+    /// Pushes `branch` as [`Store::push_branch_within`] does, and returns with the outcome the
+    /// link the remote sent for a new pull request of it, when it sent one: the first link of
+    /// its messages shaped as one (`/pull/new/`, `/merge_requests/new` or
+    /// `/pull-requests/new`), within 200 bytes and without whitespace, control or invisible
+    /// characters. The messages are asked for when the remote offers `side-band-64k`, quietly
+    /// when it also offers `quiet`; once the report is read, what follows can only lose them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Store::push_branch`], and [`StoreError::PushFailed`] when the
+    /// remote reports an error before its report, or sends more than mahi reads.
+    pub fn push_branch_telling<T: Transport>(
+        &self,
+        transport: T,
+        branch: &str,
+        max_bytes: u64,
+        interrupt: &AtomicBool,
+    ) -> Result<(Pushed, Option<String>), StoreError> {
+        self.push_branch_with(
+            transport,
+            branch,
+            max_bytes,
+            Sideband::QuietMessages,
+            interrupt,
+        )
+    }
+
+    fn push_branch_with<T: Transport>(
+        &self,
+        mut transport: T,
+        branch: &str,
+        max_bytes: u64,
+        wanted: Sideband,
+        interrupt: &AtomicBool,
+    ) -> Result<(Pushed, Option<String>), StoreError> {
         let name = branch_ref(branch)?.as_bstr().to_string();
         let local = self
             .branch_tip(branch)?
@@ -226,7 +274,7 @@ impl Store {
         })?;
         let Some(command) = command else {
             finish_without_commands(&mut transport)?;
-            return Ok(outcome);
+            return Ok((outcome, None));
         };
         let objects = self.branch_objects(local, &advertised.tips, interrupt)?;
         if self
@@ -235,16 +283,20 @@ impl Store {
             > max_bytes
         {
             finish_without_commands(&mut transport)?;
-            return Ok(Pushed::TooLarge(max_bytes));
+            return Ok((Pushed::TooLarge(max_bytes), None));
         }
-        let report = self.send(
+        let sideband = match wanted {
+            Sideband::Off => Sideband::Off,
+            Sideband::Messages | Sideband::QuietMessages => advertised.sideband,
+        };
+        let (report, messages) = self.send_with(
             &mut transport,
             std::slice::from_ref(&command),
-            (advertised.atomic, &objects),
+            (advertised.atomic, &objects, sideband),
             interrupt,
         )?;
         settle(&mut outcome, &report, &name);
-        Ok(outcome)
+        Ok((outcome, pull_request_link(&messages)))
     }
 
     pub(crate) fn send<T: Transport>(
@@ -254,6 +306,22 @@ impl Store {
         (atomic, objects): (bool, &[ObjectId]),
         interrupt: &AtomicBool,
     ) -> Result<Report, StoreError> {
+        self.send_with(
+            transport,
+            commands,
+            (atomic, objects, Sideband::Off),
+            interrupt,
+        )
+        .map(|(report, _)| report)
+    }
+
+    pub(crate) fn send_with<T: Transport>(
+        &self,
+        transport: &mut T,
+        commands: &[Command],
+        (atomic, objects, sideband): (bool, &[ObjectId], Sideband),
+        interrupt: &AtomicBool,
+    ) -> Result<(Report, Vec<u8>), StoreError> {
         let mut writer = transport
             .request(
                 WriteMode::OneLfTerminatedLinePerWriteCall,
@@ -270,6 +338,11 @@ impl Store {
                 if atomic {
                     line.push_str("atomic ");
                 }
+                match sideband {
+                    Sideband::Off => {}
+                    Sideband::Messages => line.push_str("side-band-64k "),
+                    Sideband::QuietMessages => line.push_str("side-band-64k quiet "),
+                }
                 line.push_str(AGENT);
             }
             writer.write_all(line.as_bytes())?;
@@ -285,7 +358,22 @@ impl Store {
             raw.flush()?;
         }
         let sent: HashSet<String> = commands.iter().map(|(name, _, _)| name.clone()).collect();
-        read_report(&mut |line| reader.readline_str(line), &sent)
+        if sideband == Sideband::Off {
+            return read_report(&mut |line| reader.readline_str(line), &sent)
+                .map(|report| (report, Vec::new()));
+        }
+        read_sideband_answer(
+            &mut || match reader.readline() {
+                None
+                | Some(Ok(Ok(
+                    PacketLineRef::Flush | PacketLineRef::Delimiter | PacketLineRef::ResponseEnd,
+                ))) => Ok(None),
+                Some(Ok(Ok(PacketLineRef::Data(bytes)))) => Ok(Some(bytes.to_vec())),
+                Some(Ok(Err(error))) => Err(io::Error::other(error.to_string())),
+                Some(Err(error)) => Err(error),
+            },
+            &sent,
+        )
     }
 
     /// Deletes on the remote `transport` reaches each ref under `thread`'s prefix that
@@ -670,12 +758,21 @@ pub(crate) fn advertisement<T: Transport>(
     }
     let atomic = response.capabilities.contains("atomic");
     let delete_refs = response.capabilities.contains("delete-refs");
+    let sideband = match (
+        response.capabilities.contains("side-band-64k"),
+        response.capabilities.contains("quiet"),
+    ) {
+        (false, _) => Sideband::Off,
+        (true, false) => Sideband::Messages,
+        (true, true) => Sideband::QuietMessages,
+    };
     let Some(mut lines) = response.refs else {
         return Ok(Advertisement {
             wanted: HashMap::new(),
             tips: HashSet::new(),
             atomic,
             delete_refs,
+            sideband,
         });
     };
     let (wanted, tips) = parse_advertisement(&mut |line| lines.readline_str(line), wanted, is_tip)?;
@@ -684,6 +781,7 @@ pub(crate) fn advertisement<T: Transport>(
         tips,
         atomic,
         delete_refs,
+        sideband,
     })
 }
 
@@ -767,6 +865,119 @@ pub(crate) fn read_report(
         }
     }
     Err(StoreError::PushFailed("the report is too long".to_owned()))
+}
+
+const MAX_MESSAGE_BYTES: usize = 64 << 10;
+const MAX_LINK_BYTES: usize = 200;
+const MAX_REPORT_BYTES: usize = 1 << 20;
+const PULL_REQUEST_PATHS: [&str; 3] = ["/pull/new/", "/merge_requests/new", "/pull-requests/new"];
+
+pub(crate) fn read_sideband_answer(
+    next: &mut dyn FnMut() -> io::Result<Option<Vec<u8>>>,
+    sent: &HashSet<String>,
+) -> Result<(Report, Vec<u8>), StoreError> {
+    let mut data = Vec::new();
+    let mut messages = Vec::new();
+    let mut report = None;
+    for _ in 0..MAX_REPORT_LINES {
+        let packet = match next() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => break,
+            Err(_) if report.is_some() => break,
+            Err(error) => return Err(error.into()),
+        };
+        let Some((&band, payload)) = packet.split_first() else {
+            continue;
+        };
+        match band {
+            1 if report.is_none() => {
+                if data.len() + payload.len() > MAX_REPORT_BYTES {
+                    return Err(StoreError::PushFailed("the report is too long".to_owned()));
+                }
+                data.extend_from_slice(payload);
+                if let Some(lines) = nested_report(&data)? {
+                    report = Some(report_of(&lines, sent)?);
+                }
+            }
+            1 => {}
+            2 => {
+                let room = MAX_MESSAGE_BYTES.saturating_sub(messages.len());
+                messages
+                    .extend_from_slice(payload.get(..room.min(payload.len())).unwrap_or_default());
+            }
+            3 if report.is_some() => break,
+            3 => {
+                return Err(StoreError::PushFailed(format!(
+                    "the remote reported an error: {}",
+                    escaped(&String::from_utf8_lossy(payload))
+                )));
+            }
+            _ if report.is_some() => break,
+            _ => {
+                return Err(StoreError::PushFailed(
+                    "unexpected side-band data".to_owned(),
+                ));
+            }
+        }
+    }
+    match report {
+        Some(report) => Ok((report, messages)),
+        None => Err(StoreError::PushFailed(
+            "the remote sent no report".to_owned(),
+        )),
+    }
+}
+
+fn report_of(lines: &[String], sent: &HashSet<String>) -> Result<Report, StoreError> {
+    let mut lines = lines.iter();
+    read_report(
+        &mut |line| {
+            Ok(lines.next().map_or(0, |next| {
+                line.push_str(next);
+                next.len()
+            }))
+        },
+        sent,
+    )
+}
+
+fn nested_report(data: &[u8]) -> Result<Option<Vec<String>>, StoreError> {
+    let unexpected = || StoreError::PushFailed("unexpected report data".to_owned());
+    let mut lines = Vec::new();
+    let mut rest = data;
+    while let Some((length, after)) = rest.split_first_chunk::<4>() {
+        let length = std::str::from_utf8(length)
+            .ok()
+            .and_then(|length| usize::from_str_radix(length, 16).ok())
+            .ok_or_else(unexpected)?;
+        if length == 0 {
+            return Ok(Some(lines));
+        }
+        let size = length.checked_sub(4).ok_or_else(unexpected)?;
+        let Some(payload) = after.get(..size) else {
+            return Ok(None);
+        };
+        let text = std::str::from_utf8(payload).map_err(|_| unexpected())?;
+        lines.push(text.trim_end_matches('\n').to_owned());
+        rest = after.get(size..).unwrap_or_default();
+    }
+    Ok(None)
+}
+
+pub(crate) fn pull_request_link(messages: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(messages);
+    let ends_link = |character: char| {
+        character.is_whitespace() || character.is_control() || mahi_core::is_invisible(character)
+    };
+    text.match_indices("https://").find_map(|(start, _)| {
+        let rest = text.get(start..)?;
+        let window = rest.get(..rest.floor_char_boundary(MAX_LINK_BYTES))?;
+        let link = window.split(ends_link).next()?;
+        PULL_REQUEST_PATHS
+            .iter()
+            .any(|path| link.contains(path))
+            .then(|| link.to_owned())
+    })
 }
 
 fn escaped(text: &str) -> String {
@@ -877,5 +1088,113 @@ mod tests {
                 "{failed:?}"
             );
         }
+    }
+
+    fn packet(payload: &[u8]) -> Vec<u8> {
+        let mut line = format!("{:04x}", payload.len() + 4).into_bytes();
+        line.extend_from_slice(payload);
+        line
+    }
+
+    fn answered(packets: &[Vec<u8>]) -> Result<(Report, Vec<u8>), StoreError> {
+        let sent = HashSet::from(["refs/heads/mahi/x".to_owned()]);
+        let mut packets = packets.iter().cloned();
+        read_sideband_answer(&mut || Ok(packets.next()), &sent)
+    }
+
+    fn band(band: u8, payload: &[u8]) -> Vec<u8> {
+        let mut with_band = vec![band];
+        with_band.extend_from_slice(payload);
+        with_band
+    }
+
+    #[test]
+    fn a_side_band_answer_gives_the_report_and_the_messages_joined_as_sent() {
+        let report = [
+            packet(b"unpack ok\n"),
+            packet(b"ok refs/heads/mahi/x\n"),
+            b"0000".to_vec(),
+        ]
+        .concat();
+        let (first, second) = report.split_at(7);
+        let link = format!(
+            "  https://forge.example/group/project/-/merge_requests/new?merge_request%5Bsource_branch%5D=mahi/{}\n",
+            "0123456789abcdef".repeat(2)
+        );
+        let (start, end) = link.as_bytes().split_at(100);
+        let (read, messages) = answered(&[
+            band(
+                2,
+                b"remote: GitHub found 1 vulnerability: https://forge.example/o/r/security\n",
+            ),
+            band(1, first),
+            band(1, second),
+            band(2, start),
+            band(2, end),
+        ])
+        .unwrap();
+        assert_eq!(read.get("refs/heads/mahi/x"), Some(&None));
+        assert_eq!(pull_request_link(&messages).as_deref(), Some(link.trim()));
+    }
+
+    #[test]
+    fn once_the_report_is_read_what_follows_cannot_fail_the_push() {
+        let report = [
+            packet(b"unpack ok\n"),
+            packet(b"ok refs/heads/mahi/x\n"),
+            b"0000".to_vec(),
+        ]
+        .concat();
+        let after_error = answered(&[band(1, &report), band(3, b"hook crashed")]).unwrap();
+        assert_eq!(after_error.0.get("refs/heads/mahi/x"), Some(&None));
+        let sent = HashSet::from(["refs/heads/mahi/x".to_owned()]);
+        let mut packets = vec![band(1, &report)].into_iter();
+        let dropped = read_sideband_answer(
+            &mut || match packets.next() {
+                Some(packet) => Ok(Some(packet)),
+                None => Err(io::Error::other("connection reset")),
+            },
+            &sent,
+        );
+        assert!(dropped.is_ok());
+    }
+
+    #[test]
+    fn an_error_before_the_report_or_too_many_packets_fail_the_push() {
+        assert!(matches!(
+            answered(&[band(3, b"hook declined")]),
+            Err(StoreError::PushFailed(reason)) if reason.contains("hook declined")
+        ));
+        assert!(answered(&[band(7, b"?")]).is_err());
+        assert!(answered(&[band(2, b"no report")]).is_err());
+        let keepalives = vec![band(1, b""); MAX_REPORT_LINES + 1];
+        assert!(answered(&keepalives).is_err());
+        assert!(answered(&[band(1, b"zzzz")]).is_err());
+        let flood = vec![band(2, &[b'a'; 4096]); 40];
+        let report = [packet(b"unpack ok\n"), b"0000".to_vec()].concat();
+        let mut packets = flood;
+        packets.push(band(1, &report));
+        let (_, messages) = answered(&packets).unwrap();
+        assert_eq!(messages.len(), MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn a_pull_request_link_is_cleaned_and_cut_to_200_bytes() {
+        assert_eq!(pull_request_link(b"remote: nothing to see"), None);
+        assert_eq!(
+            pull_request_link(b"https://forge.example/o/r/pull/new/x\x1b[31m\n").as_deref(),
+            Some("https://forge.example/o/r/pull/new/x")
+        );
+        assert_eq!(
+            pull_request_link(b"see https:// or https://forge.example/o/r/security").as_deref(),
+            None
+        );
+        assert_eq!(
+            pull_request_link(b"https://gitlab.example/g/p/-/merge_requests/new?b=x").as_deref(),
+            Some("https://gitlab.example/g/p/-/merge_requests/new?b=x")
+        );
+        let long = format!("https://forge.example/pull/new/{}", "é".repeat(200));
+        let cut = pull_request_link(long.as_bytes()).unwrap();
+        assert!(cut.len() <= 200 && long.starts_with(&cut));
     }
 }
