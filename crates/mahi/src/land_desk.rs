@@ -49,7 +49,10 @@ use crate::{
     mcp::ToolError,
     note,
     session::CommitKey,
-    sync::SyncSetup,
+    sync::{
+        Reach,
+        SyncSetup,
+    },
 };
 
 const SNAPSHOT_ATTEMPTS: usize = 3;
@@ -58,6 +61,7 @@ const PUSH_WAIT: Duration = Duration::from_secs(180);
 const PUSHES: &str = "Enter pushes  Esc cancels";
 const CLOSES: &str = "Esc closes";
 const DESCRIPTION_FILE: &str = "PR.md";
+const LANDING_DIR: &str = "landing";
 const MOST_COPIED: usize = 64 * 1024;
 
 pub(crate) struct Desk {
@@ -304,7 +308,9 @@ impl Desk {
     }
 
     fn keep_description(&self, store: &Store, description: &str) -> Kept {
-        let file = crate::session::state_root(store, self.thread).join(DESCRIPTION_FILE);
+        let file = crate::session::state_root(store, self.thread)
+            .join(LANDING_DIR)
+            .join(DESCRIPTION_FILE);
         crate::sync_state::write(&file, description.as_bytes())
             .map(|()| file.clone())
             .map_err(|error| (file, error.to_string()))
@@ -505,7 +511,6 @@ fn branch_of(thread: ThreadId) -> String {
 }
 
 pub(crate) type GitIdentity = (Option<String>, Option<String>);
-pub(crate) type ChosenRemote = Result<Option<SyncSetup>, String>;
 
 pub(crate) struct Lander {
     thread: ThreadId,
@@ -513,7 +518,8 @@ pub(crate) struct Lander {
     worktree: String,
     globals: GlobalPatterns,
     identity: GitIdentity,
-    remote: ChosenRemote,
+    reach: Reach,
+    push_limit: u64,
     commits: CommitKey,
     desk: Arc<Desk>,
     query: AutoMerge,
@@ -588,7 +594,7 @@ impl Lander {
     pub(crate) fn new(
         (thread, me): (ThreadId, AgentSlot),
         (worktree, globals): (String, GlobalPatterns),
-        (identity, remote, commits): (GitIdentity, ChosenRemote, CommitKey),
+        (identity, (reach, push_limit), commits): (GitIdentity, (Reach, u64), CommitKey),
         (desk, query): (Arc<Desk>, AutoMerge),
     ) -> Self {
         Self {
@@ -597,7 +603,8 @@ impl Lander {
             worktree,
             globals,
             identity,
-            remote,
+            reach,
+            push_limit,
             commits,
             desk,
             query,
@@ -613,6 +620,9 @@ impl Lander {
     ) -> Result<String, ToolError> {
         let call = landing::parse(arguments)?;
         let owner = self.me.participant();
+        if let Some(commit) = landing::controlled_commit(&call) {
+            return Ok(landing::control_characters(commit));
+        }
         if self.desk.is_busy() {
             return Ok(landing::waiting(owner));
         }
@@ -624,11 +634,17 @@ impl Lander {
             };
             return Ok(landing::identity_unset(key, owner));
         };
-        let remote = match &self.remote {
-            Ok(Some(remote)) => remote.clone(),
+        let remote = match SyncSetup::chosen_by(store, (&self.reach, || self.push_limit), true) {
+            Ok(Some(remote)) => remote,
             Ok(None) => return Ok(landing::no_remote(owner)),
-            Err(reason) => return Err(ToolError::Failed(reason.clone())),
+            Err(error) => return Err(ToolError::Failed(crate::describe(&error))),
         };
+        let branch = branch_of(self.thread);
+        let record = BranchRecord::read(store, self.thread)
+            .filter(|record| record.branch == branch && record.remote == remote.name.as_str());
+        if record.as_ref().is_some_and(|record| record.gone) {
+            return Ok(landing::branch_gone(&branch));
+        }
         let failed = |error: &StoreError| ToolError::Failed(crate::describe(error));
         let behind = self
             .query
@@ -644,10 +660,7 @@ impl Lander {
         if let Some(paths) = self.unresolved(store, worktree) {
             return Ok(landing::conflicts_first(&paths));
         }
-        let branch = branch_of(self.thread);
-        let landed = BranchRecord::read(store, self.thread)
-            .filter(|record| !record.gone && record.branch == branch)
-            .map_or(base, |record| record.tip);
+        let landed = record.map_or(base, |record| record.tip);
         let landed_tree = store.commit_tree(landed).map_err(|error| failed(&error))?;
         let Some(changed) =
             landing::changed(store, (landed_tree, worktree)).map_err(|error| failed(&error))?
@@ -788,15 +801,18 @@ pub(crate) mod tests {
         fs::write(&config, text).unwrap();
         let store = Store::open(store.common_dir()).unwrap();
         remote::choose(&store, &"up".parse().unwrap(), Visibility::Private).unwrap();
-        let environment = Environment {
+        SyncSetup::chosen(&store, &environment(home), true)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn environment(home: &std::path::Path) -> Environment {
+        Environment {
             ssh_auth_sock: Some(home.join("agent.sock")),
             user: Some("tester".to_owned()),
             home: Some(home.to_path_buf()),
             ..Environment::default()
-        };
-        SyncSetup::chosen(&store, &environment, true)
-            .unwrap()
-            .unwrap()
+        }
     }
 
     pub(crate) fn waiting_landing() -> Landing {
@@ -975,7 +991,7 @@ pub(crate) mod tests {
                     Some("Alice".to_owned()),
                     Some("alice@example.com".to_owned()),
                 ),
-                Ok(Some(unreachable_remote(store, &home))),
+                (Reach::gather(&environment(&home)), u64::MAX),
                 started.commits.clone(),
             ),
             (
@@ -1013,10 +1029,23 @@ pub(crate) mod tests {
         .unwrap();
         let started = crate::session::tests::start_with(&store, &key).unwrap();
         let store = Store::open(store.common_dir()).unwrap();
+        unreachable_remote(&store, store.common_dir());
         let (lander, desk) = lander_for(&started, &store);
+        let store = Store::open(store.common_dir()).unwrap();
         let base = store.head_commit().unwrap();
         let land = |paths: &[&str]| lander.land(&store, &call(paths), (base, &[])).unwrap();
         assert_eq!(land(&["a.txt"]), landing::NOTHING_CHANGED);
+        let Value::Object(escaped) = serde_json::json!({
+            "commits": [{ "message": "Add", "paths": [] }, { "message": "Fix\u{1b}[2J", "paths": [] }],
+            "title": "t",
+            "description": "d"
+        }) else {
+            panic!("the arguments are an object");
+        };
+        assert_eq!(
+            lander.land(&store, &escaped, (base, &[])).unwrap(),
+            landing::control_characters(2)
+        );
 
         fs::write(
             started.worktree.join("a.txt"),
@@ -1053,7 +1082,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_landing_starts_from_the_branch_last_pushed_unless_the_forge_deleted_it() {
+    fn a_landing_starts_from_the_branch_last_pushed_and_is_refused_once_the_forge_deleted_it_there()
+    {
         let (_dir, store) = repository_on_main();
         let key = ssh_key::PrivateKey::random(
             &mut ssh_key::rand_core::OsRng,
@@ -1062,7 +1092,9 @@ pub(crate) mod tests {
         .unwrap();
         let started = crate::session::tests::start_with(&store, &key).unwrap();
         let store = Store::open(store.common_dir()).unwrap();
+        unreachable_remote(&store, store.common_dir());
         let (lander, _desk) = lander_for(&started, &store);
+        let store = Store::open(store.common_dir()).unwrap();
         let base = store.head_commit().unwrap();
         fs::write(started.worktree.join("a.txt"), "a\n").unwrap();
         let worktree = lander.snapshot(&store).unwrap();
@@ -1085,6 +1117,12 @@ pub(crate) mod tests {
         let land = |paths: &[&str]| lander.land(&store, &call(paths), (base, &[])).unwrap();
         assert_eq!(land(&["a.txt"]), landing::NOTHING_CHANGED);
         record.gone = true;
+        record.write(&store, started.thread).unwrap();
+        assert_eq!(
+            land(&["a.txt"]),
+            landing::branch_gone(&branch_of(started.thread))
+        );
+        record.remote = "other".to_owned();
         record.write(&store, started.thread).unwrap();
         assert_eq!(
             land(&["a.txt"]),
@@ -1159,7 +1197,9 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             file,
-            crate::session::state_root(&landing.store, landing.thread).join("PR.md")
+            crate::session::state_root(&landing.store, landing.thread)
+                .join("landing")
+                .join("PR.md")
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), "Why[31m.\n\tAnd how.");
         done_with_clipboard(&landing.desk, "Why.");
@@ -1180,6 +1220,25 @@ pub(crate) mod tests {
         assert_eq!(seen.note(&bob, first), noted);
         assert!(seen.note(&bob, later) > noted);
         assert_eq!(seen.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_remote_chosen_after_the_run_started_is_used_at_the_next_call() {
+        let (_dir, store) = repository_on_main();
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let started = crate::session::tests::start_with(&store, &key).unwrap();
+        let (lander, _desk) = lander_for(&started, &store);
+        let base = store.head_commit().unwrap();
+        let land = |store: &Store| lander.land(store, &call(&["a.txt"]), (base, &[])).unwrap();
+        let owner = started.slot.participant();
+        assert_eq!(land(&store), landing::no_remote(owner));
+        unreachable_remote(&store, store.common_dir());
+        let store = Store::open(store.common_dir()).unwrap();
+        assert_eq!(land(&store), landing::NOTHING_CHANGED);
     }
 
     #[test]

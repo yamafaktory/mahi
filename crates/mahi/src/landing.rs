@@ -184,6 +184,24 @@ pub(crate) fn identity_unset(key: &str, owner: &ParticipantName) -> String {
     )
 }
 
+pub(crate) fn control_characters(commit: usize) -> String {
+    format!(
+        "not landed: the message of commit {commit} holds control characters; write it without them"
+    )
+}
+
+pub(crate) fn branch_gone(branch: &str) -> String {
+    format!(
+        "not landed: the forge deleted {branch}, and mahi cannot yet land on top of what it merged"
+    )
+}
+
+pub(crate) fn cannot_confirm(owner: &ParticipantName, thread: ThreadId) -> String {
+    format!(
+        "not landed: this run of {owner}'s agent cannot show the landing to push or cancel; resume the thread in a terminal with mahi resume {thread}"
+    )
+}
+
 pub(crate) fn no_remote(owner: &ParticipantName) -> String {
     format!(
         "not landed: no remote is chosen for this clone; ask {owner} to choose one with mahi remote <name> --private or --public"
@@ -210,11 +228,19 @@ fn push_paths(text: &mut String, paths: &[String]) {
 
 pub(crate) fn printable(text: &str) -> String {
     text.chars()
-        .filter(|character| {
-            (!character.is_control() || matches!(character, '\n' | '\t'))
-                && !mahi_core::is_invisible(*character)
-        })
+        .filter(|character| !is_control(*character) && !mahi_core::is_invisible(*character))
         .collect()
+}
+
+pub(crate) fn controlled_commit(call: &Call) -> Option<usize> {
+    call.commits
+        .iter()
+        .position(|commit| commit.message.chars().any(is_control))
+        .map(|index| index + 1)
+}
+
+fn is_control(character: char) -> bool {
+    character.is_control() && !matches!(character, '\n' | '\t')
 }
 
 pub(crate) fn trailers(thread: ThreadId, agents: &[AgentSlot]) -> String {
@@ -292,6 +318,24 @@ mod tests {
 
     fn owned(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|path| (*path).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_first_commit_whose_message_holds_a_control_character_is_named() {
+        assert_eq!(
+            controlled_commit(&call(&[("Add\n\n\tWhy.", &[]), ("Fix", &[])])),
+            None
+        );
+        assert_eq!(
+            controlled_commit(&call(&[
+                ("Add", &[]),
+                ("Fix\u{1b}[2J", &[]),
+                ("Bell\u{7}", &[])
+            ])),
+            Some(2)
+        );
+        assert_eq!(controlled_commit(&call(&[("C1\u{9b}", &[])])), Some(1));
+        assert_eq!(controlled_commit(&call(&[("Line\r", &[])])), Some(1));
     }
 
     #[test]

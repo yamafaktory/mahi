@@ -188,14 +188,26 @@ impl SyncSetup {
         environment: &Environment,
         owns_meta: bool,
     ) -> Result<Option<Self>, SetupError> {
+        let reach = Reach::gather(environment);
+        let push_limit = || transfer_limits(environment).push_limit;
+        Self::chosen_by(store, (&reach, push_limit), owns_meta)
+    }
+
+    /// Returns how the clone around `store` pushes through `reach`, as [`Self::chosen`] does,
+    /// reading the push limit only once a remote is chosen.
+    pub(crate) fn chosen_by(
+        store: &Store,
+        (reach, push_limit): (&Reach, impl FnOnce() -> u64),
+        owns_meta: bool,
+    ) -> Result<Option<Self>, SetupError> {
         let Some(chosen) = remote::sync_remote(store)? else {
             return Ok(None);
         };
         let remote = remote::push_url(store, &chosen.name)?;
-        let access = Access::gather(environment, &remote).map_err(SetupError::Access)?;
+        let access = reach.access(&remote).map_err(SetupError::Access)?;
         Ok(Some(Self {
             name: chosen.name,
-            push_limit: transfer_limits(environment).push_limit,
+            push_limit: push_limit(),
             remote,
             visibility: chosen.visibility,
             owns_meta,
@@ -951,6 +963,18 @@ mod tests {
             ParticipantName::new("alice").unwrap(),
             AgentName::new("claude").unwrap(),
         )
+    }
+
+    #[test]
+    fn no_chosen_remote_reads_no_push_limit() {
+        let (_dir, store) = crate::session::tests::repository_on_main();
+        let reach = Reach::gather(&Environment::default());
+        let chosen = SyncSetup::chosen_by(
+            &store,
+            (&reach, || panic!("the push limit is read without a remote")),
+            true,
+        );
+        assert!(matches!(chosen, Ok(None)));
     }
 
     #[test]

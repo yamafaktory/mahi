@@ -5907,7 +5907,9 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             let files = git(&remote, &["show", "--name-only", "--format=", &branch]);
             assert_eq!(files.trim(), "feature.txt");
             running.terminal.write_all(b"\x1b").unwrap();
-            let kept = fixture.repo.join(format!(".git/mahi/state/{thread}/PR.md"));
+            let kept = fixture
+                .repo
+                .join(format!(".git/mahi/state/{thread}/landing/PR.md"));
             assert_eq!(fs::read_to_string(kept).unwrap(), "Why.");
             let worktree = worktree_named(&fixture, &format!("{thread}.claude"));
             fs::write(worktree.join("done"), "").unwrap();

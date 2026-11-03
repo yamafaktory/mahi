@@ -417,11 +417,12 @@ impl ThreadTools {
         let Some((owner, ..)) = view.listed.iter().find(|(_, _, owns)| *owns) else {
             return Err(ToolError::Failed("the thread cannot be read".to_owned()));
         };
+        if self.me.participant() != owner {
+            return Ok(landing::owner_only(owner));
+        }
         match &self.lander {
-            Some(lander) if self.me.participant() == owner => {
-                lander.land(&store, arguments, (view.base, &view.collaborators))
-            }
-            Some(_) | None => Ok(landing::owner_only(owner)),
+            Some(lander) => lander.land(&store, arguments, (view.base, &view.collaborators)),
+            None => Ok(landing::cannot_confirm(owner, self.thread)),
         }
     }
 
@@ -1277,6 +1278,18 @@ mod tests {
         assert_eq!(
             tools.call("land", &Map::new()).unwrap(),
             "only alice, the thread's owner, lands this thread; ask them to"
+        );
+        let owners = ThreadTools::new(
+            setup.store.common_dir().to_path_buf(),
+            (setup.thread, setup.owner(), None),
+            ("alice.claude".parse().unwrap(), Arc::new(Claims::default())),
+        );
+        assert_eq!(
+            owners.call("land", &arguments).unwrap(),
+            format!(
+                "not landed: this run of alice's agent cannot show the landing to push or cancel; resume the thread in a terminal with mahi resume {}",
+                setup.thread
+            )
         );
     }
 }

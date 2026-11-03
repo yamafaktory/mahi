@@ -1056,13 +1056,16 @@ struct Prepared {
     sync: Option<SyncSetup>,
     palette_key: PaletteKey,
     approvals: AgentApprovals,
+    push_limit: u64,
 }
 
 impl Prepared {
-    /// Takes from `settings` the palette's key and whether the agent asks for permissions.
+    /// Takes from `settings` the palette's key, whether the agent asks for permissions and the
+    /// push limit a landing uses.
     fn apply(&mut self, settings: &Settings) {
         self.palette_key = settings.palette_key;
         self.approvals = settings.agent_approvals;
+        self.push_limit = settings.push_limit;
     }
 
     /// Sets the thread's live layer, if any, and the owner of its `meta`, which the agent's
@@ -1160,6 +1163,7 @@ impl Prepared {
             sync: None,
             palette_key: PaletteKey::default(),
             approvals: AgentApprovals::default(),
+            push_limit: Settings::default().push_limit,
         })
     }
 
@@ -1288,7 +1292,7 @@ impl Prepared {
         let auto_merge = auto_merge(self.profile, self.owner.as_ref(), (&self.git_dir, &started));
         let note_by = self.profile.map_or(NoteBy::ListAgents, Profile::note_by);
         let landing = landing_desk(
-            (&self.store, environment, &self.git_dir),
+            (&self.store, environment, &self.git_dir, self.push_limit),
             (self.owner.as_ref(), key.as_deref(), raw.is_some()),
             (&started, globals),
         );
@@ -1398,7 +1402,7 @@ fn serve_tools(
 }
 
 fn landing_desk(
-    (store, environment, git_dir): (&Store, &Environment, &Path),
+    (store, environment, git_dir, push_limit): (&Store, &Environment, &Path, u64),
     (owner, key, raw): (Option<&ParticipantKey>, Option<&ThreadKey>, bool),
     (started, globals): (&Started, GlobalPatterns),
 ) -> Option<(Arc<Desk>, Arc<Lander>)> {
@@ -1408,8 +1412,7 @@ fn landing_desk(
     let owner = owner.filter(|owner| *owner == started.commits.key())?;
     let meta = load_meta(store, started.thread, owner, 0).ok()?;
     let landing = meta.private(key?).ok()?.landing_branch().to_owned();
-    let remote =
-        SyncSetup::chosen(store, environment, true).map_err(|error| crate::describe(&error));
+    let reach = (crate::sync::Reach::gather(environment), push_limit);
     let (thread, slot) = (started.thread, &started.slot);
     let desk = Arc::new(Desk::new(
         (git_dir.to_path_buf(), thread),
@@ -1426,7 +1429,7 @@ fn landing_desk(
     let lander = Arc::new(Lander::new(
         (thread, slot.clone()),
         (session::worktree_name(thread, slot.agent()), globals),
-        (store.user_identity(), remote, started.commits.clone()),
+        (store.user_identity(), reach, started.commits.clone()),
         (Arc::clone(&desk), query),
     ));
     land_desk::watch_turn_ends(&lander);
