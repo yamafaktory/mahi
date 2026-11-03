@@ -56,7 +56,7 @@ impl SyncView {
                     .map(|path| String::from_utf8_lossy(path).into_owned())
                     .collect();
                 Kept {
-                    from: kept.from().to_string(),
+                    from: kept.from().named(),
                     more: kept.paths().count() - paths.len(),
                     paths,
                 }
@@ -64,7 +64,7 @@ impl SyncView {
         let brought = Note::load(&note::file(store, thread, own))
             .map(|note| {
                 note.brought()
-                    .map(|(from, paths)| (from.to_owned(), paths.to_vec()))
+                    .map(|(from, paths)| (from.to_string(), paths.to_vec()))
                     .collect()
             })
             .unwrap_or_default();
@@ -122,6 +122,7 @@ mod tests {
         held::HeldSettings,
         note::Merged,
         palette::HELD_DETAIL,
+        source::Source,
         teammates::Teammates,
     };
 
@@ -150,14 +151,14 @@ mod tests {
             .keep(&held::file(&store, thread, (&own, &dan)))
             .unwrap();
         let marked = paths(&["src/a.rs", "src/b.rs"]);
-        KeptConflicts::of_merge((&carol, commit), marked.iter())
+        KeptConflicts::of_merge((&Source::Agent(carol.clone()), commit), marked.iter())
             .unwrap()
             .save(&conflicts::file(&store, thread, &own))
             .unwrap();
         let brought = paths(&["src/client.rs"]);
         note::record(
             &note::file(&store, thread, &own),
-            &carol,
+            &Source::Agent(carol.clone()),
             Merged {
                 markers: &[],
                 kept: &[],
@@ -221,7 +222,7 @@ mod tests {
         let bob: AgentSlot = "bob.claude".parse().unwrap();
         let marked: Vec<String> = (0..25).map(|index| format!("src/{index}.rs")).collect();
         KeptConflicts::of_merge(
-            (&bob, ObjectId::from_bytes_or_panic(&[1; 20])),
+            (&Source::Agent(bob), ObjectId::from_bytes_or_panic(&[1; 20])),
             marked.iter(),
         )
         .unwrap()

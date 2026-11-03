@@ -277,9 +277,12 @@ pub(crate) fn onto(
     let paths: Vec<&str> = changed.iter().map(String::as_str).collect();
     let ours = store.tree_with_paths(measured, parent, &paths)?;
     let merged = store.merge_trees(measured, ours, worktree, ("landing", "worktree"))?;
-    let swapped = store.kind_clashes(measured, merged.tree, &paths)?;
-    let mut clashes = store.kind_clashes(parent, merged.tree, &paths)?;
-    clashes.retain(|path| !swapped.contains(path));
+    let mut clashes = Vec::new();
+    for (path, at) in store.kind_clashes(parent, merged.tree, &paths)? {
+        if store.object_at(parent, at)? != store.object_at(measured, at)? {
+            clashes.push(path);
+        }
+    }
     if merged.conflicts.is_empty() && clashes.is_empty() {
         return Ok(Onto::Merged(merged.tree));
     }
@@ -646,6 +649,22 @@ mod tests {
         assert_eq!(
             store.changed_paths(worktree, landing, 10).unwrap().paths,
             [("u.txt".to_owned(), mahi_store::Change::Added)]
+        );
+        let grown = store
+            .write_tree(&[
+                ("guide.md", EntryKind::Blob, blob(b"guide\n")),
+                ("new.md", EntryKind::Blob, blob(b"new\n")),
+            ])
+            .unwrap();
+        let added_under = store
+            .write_tree(&[
+                ("d", EntryKind::Blob, blob(b"file\n")),
+                ("docs", EntryKind::Tree, grown),
+            ])
+            .unwrap();
+        assert_eq!(
+            onto(&store, (landed, added_under, worktree), &paths).unwrap(),
+            Onto::Conflicts(owned(&["docs"]))
         );
     }
 }

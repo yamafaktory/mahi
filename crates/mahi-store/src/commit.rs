@@ -92,8 +92,8 @@ impl Store {
     }
 
     /// Returns the paths of `paths` where `source` holds a file and [`Store::tree_with_paths`]
-    /// would put it over something of `base`'s of the other kind: a directory at the path, or
-    /// a file at one of its parent directories.
+    /// would put it over something of `base`'s of the other kind, each with where that is: a
+    /// directory at the path itself, or a file at one of its parent directories.
     ///
     /// # Errors
     ///
@@ -104,7 +104,7 @@ impl Store {
         base: ObjectId,
         source: ObjectId,
         paths: &[&'path str],
-    ) -> Result<Vec<&'path str>, StoreError> {
+    ) -> Result<Vec<(&'path str, &'path str)>, StoreError> {
         self.require_kind(base, Kind::Tree)?;
         self.require_kind(source, Kind::Tree)?;
         let (source, base) = (self.repo.find_tree(source)?, self.repo.find_tree(base)?);
@@ -119,13 +119,14 @@ impl Store {
             }
             let mut clash = base
                 .lookup_entry(path.split('/'))?
-                .is_some_and(|entry| entry.mode().is_tree());
+                .is_some_and(|entry| entry.mode().is_tree())
+                .then_some(path);
             let parents = path.match_indices('/').map(|(end, _)| &path[..end]);
             for parent in parents {
-                if clash {
+                if clash.is_some() {
                     break;
                 }
-                clash = if let Some(&known) = file_at.get(parent) {
+                let is_file = if let Some(&known) = file_at.get(parent) {
                     known
                 } else {
                     let known = base
@@ -134,12 +135,29 @@ impl Store {
                     file_at.insert(parent, known);
                     known
                 };
+                clash = is_file.then_some(parent);
             }
-            if clash {
-                clashes.push(path);
+            if let Some(at) = clash {
+                clashes.push((path, at));
             }
         }
         Ok(clashes)
+    }
+
+    /// Returns the object `tree` holds at `path`, a file's or a directory's, or `None` when it
+    /// holds nothing there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `tree` is not a tree, or [`StoreError::Git`] if a
+    /// tree cannot be read.
+    pub fn object_at(&self, tree: ObjectId, path: &str) -> Result<Option<ObjectId>, StoreError> {
+        self.require_kind(tree, Kind::Tree)?;
+        Ok(self
+            .repo
+            .find_tree(tree)?
+            .lookup_entry(path.split('/'))?
+            .map(|entry| entry.object_id()))
     }
 
     /// Writes a commit of `tree` on `parent` by `identity`, its message `message` with
@@ -379,8 +397,15 @@ mod tests {
         let paths = ["docs", "d/f", "src/a.rs", "src/b/c.rs", "gone.txt"];
         assert_eq!(
             store.kind_clashes(base, source, &paths).unwrap(),
-            ["docs", "d/f"]
+            [("docs", "docs"), ("d/f", "d")]
         );
+        assert_eq!(
+            store.object_at(base, "src/a.rs").unwrap(),
+            Some(store.write_blob(b"a").unwrap())
+        );
+        assert!(store.object_at(base, "docs").unwrap().is_some());
+        assert_eq!(store.object_at(base, "gone.txt").unwrap(), None);
+
         assert!(store.kind_clashes(base, base, &paths).unwrap().is_empty());
     }
 

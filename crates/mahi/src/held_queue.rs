@@ -7,10 +7,12 @@ use std::{
     time::Instant,
 };
 
-use mahi_core::AgentSlot;
 use mahi_store::ObjectId;
 
-use crate::held::HeldSettings;
+use crate::{
+    held::HeldSettings,
+    source::Source,
+};
 
 /// The teammates' snapshots that wait for the user because they change agent settings, as the
 /// run's palette shows them, and what the user chose for each.
@@ -22,8 +24,8 @@ pub(crate) struct HeldQueue {
 #[derive(Debug, Default)]
 struct State {
     waiting: Vec<Waiting>,
-    choices: VecDeque<(AgentSlot, HeldSettings, Choice)>,
-    seen: HashMap<(AgentSlot, ObjectId), Instant>,
+    choices: VecDeque<(Source, HeldSettings, Choice)>,
+    seen: HashMap<(Source, ObjectId), Instant>,
     open: bool,
 }
 
@@ -31,7 +33,7 @@ struct State {
 /// first saw it.
 #[derive(Debug, Clone)]
 pub(crate) struct Waiting {
-    pub(crate) from: AgentSlot,
+    pub(crate) from: Source,
     pub(crate) held: HeldSettings,
     pub(crate) since: Instant,
 }
@@ -52,7 +54,7 @@ impl HeldQueue {
 
     /// Shows the snapshots in `held` as the ones that wait, but those the user already chose
     /// for, and asks for the palette to open when one comes that this run had not shown.
-    pub(crate) fn show(&self, held: Vec<(AgentSlot, HeldSettings)>) {
+    pub(crate) fn show(&self, held: Vec<(Source, HeldSettings)>) {
         let Some(mut state) = self.lock() else {
             return;
         };
@@ -94,7 +96,7 @@ impl HeldQueue {
     }
 
     /// Returns the snapshot of `from` that waits, if one does.
-    pub(crate) fn waiting(&self, from: &AgentSlot) -> Option<Waiting> {
+    pub(crate) fn waiting(&self, from: &Source) -> Option<Waiting> {
         let state = self.lock()?;
         state
             .waiting
@@ -105,7 +107,7 @@ impl HeldQueue {
 
     /// Records the user's `choice` for the snapshot `commit` of `from`, and says whether it
     /// still waited.
-    pub(crate) fn choose(&self, (from, commit): (&AgentSlot, ObjectId), choice: Choice) -> bool {
+    pub(crate) fn choose(&self, (from, commit): (&Source, ObjectId), choice: Choice) -> bool {
         let Some(mut state) = self.lock() else {
             return false;
         };
@@ -122,7 +124,7 @@ impl HeldQueue {
     }
 
     /// Takes the choices the user made, oldest first.
-    pub(crate) fn take_choices(&self) -> Vec<(AgentSlot, HeldSettings, Choice)> {
+    pub(crate) fn take_choices(&self) -> Vec<(Source, HeldSettings, Choice)> {
         self.lock()
             .map(|mut state| state.choices.drain(..).collect())
             .unwrap_or_default()
@@ -157,7 +159,7 @@ mod tests {
     #[test]
     fn a_new_held_snapshot_asks_once_for_the_palette_and_a_choice_takes_it_off() {
         let queue = HeldQueue::default();
-        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let bob: Source = "bob.claude".parse().unwrap();
         assert!(!queue.wants_open());
         queue.show(vec![(bob.clone(), record(1))]);
         assert!(queue.wants_open());

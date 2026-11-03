@@ -37,6 +37,10 @@ use crate::{
     note,
     session::CommitKey,
     settings_links,
+    source::{
+        LandingBranch,
+        Source,
+    },
 };
 
 const SNAPSHOT_ATTEMPTS: usize = 3;
@@ -58,8 +62,8 @@ pub(crate) enum MergeError {
     Store(#[from] StoreError),
     #[error("{0} merged from more agents than mahi records")]
     TooManySources(AgentSlot),
-    #[error("the merge from {0} changes agent settings, which wait for the user")]
-    HoldsAgentSettings(AgentSlot),
+    #[error("the merge from {} changes agent settings, which wait for the user", .0.named())]
+    HoldsAgentSettings(Source),
     #[error(transparent)]
     Held(#[from] HeldError),
     #[error(
@@ -74,7 +78,7 @@ pub(crate) enum MergeError {
 
 /// What a merge brings into an agent's worktree: the latest snapshot of the agent `from`,
 /// already checked to be signed by the key the thread lists for it, and the thread's base.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MergeRequest {
     pub(crate) from: AgentSlot,
     pub(crate) commit: ObjectId,
@@ -97,8 +101,13 @@ pub(crate) struct Recording<'a> {
 pub(crate) enum MergeDone {
     /// The agent already has the requested snapshot; nothing changed.
     Already,
-    /// The merge was written and recorded in the snapshot `commit` of the tree `tree`.
-    Merged { commit: ObjectId, tree: ObjectId },
+    /// The merge was written and recorded in the snapshot `commit` of the tree `tree`, leaving
+    /// some paths of the worktree as they were or none.
+    Merged {
+        commit: ObjectId,
+        tree: ObjectId,
+        left: PathsLeft,
+    },
 }
 
 /// Whether a merge may write the paths an agent reads as its settings or instructions.
@@ -150,20 +159,87 @@ pub(crate) fn merge_now(
     }
     merged_from.absorb(store, (&theirs, into.snapshots.thread()), Some(into.slot));
     let (base, theirs) = (store.commit_tree(base)?, store.commit_tree(request.commit)?);
+    let source = Source::Agent(request.from.clone());
+    let done = merge_into(
+        store,
+        into,
+        ((&source, request.commit), (base, theirs), settings),
+        (&previous, &merged_from),
+        (cache, head),
+        interrupt,
+    )?;
+    if let MergeDone::Merged {
+        left: PathsLeft::None,
+        ..
+    } = done
+    {
+        held::release_merged(store, into.snapshots.thread(), into.slot, &merged_from);
+    }
+    Ok(done)
+}
+
+/// Merges into `into`'s worktree what the landing on `landing`'s tip `tip` brought, from the
+/// tree `measured` of the worktree that landing measured, as [`merge_now`] merges a teammate's
+/// snapshot: refused while the worktree holds the markers of a merge before, or, unless
+/// `settings` takes them, when it changes agent settings; its markers labelled with the
+/// landing branch, and its snapshot keeping the trailers the agent's snapshots had.
+pub(crate) fn merge_landing_now(
+    store: &Store,
+    into: Recording<'_>,
+    ((landing, measured, tip), settings): ((&LandingBranch, ObjectId, ObjectId), AgentSettings),
+    (cache, head): (&mut SnapshotCache, Option<ObjectId>),
+    interrupt: &AtomicBool,
+) -> Result<MergeDone, MergeError> {
+    let previous = MergedFrom::read(store, into.snapshots)?;
+    let source = Source::Landing(landing.clone());
+    let theirs = store.commit_tree(tip)?;
+    merge_into(
+        store,
+        into,
+        ((&source, tip), (measured, theirs), settings),
+        (&previous, &previous),
+        (cache, head),
+        interrupt,
+    )
+}
+
+/// Whether a merge left some paths of the worktree as they were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathsLeft {
+    None,
+    Some,
+}
+
+/// Merges the tree `theirs` from `from`, whose commit is `commit`, into `into`'s worktree from
+/// the tree `base`, keeps the conflicts, writes the worktree, records it in a snapshot with the
+/// trailers of `merged_from`, or of `previous` when a path was left as it was, and adds the
+/// merge to the agent's note.
+fn merge_into(
+    store: &Store,
+    into: Recording<'_>,
+    ((from, commit), (base, theirs), settings): (
+        (&Source, ObjectId),
+        (ObjectId, ObjectId),
+        AgentSettings,
+    ),
+    (previous, merged_from): (&MergedFrom, &MergedFrom),
+    (cache, head): (&mut SnapshotCache, Option<ObjectId>),
+    interrupt: &AtomicBool,
+) -> Result<MergeDone, MergeError> {
     let ours = snapshot(store, into.worktree, (into.globals, cache), interrupt)?;
     let kept = conflicts::file(store, into.snapshots.thread(), into.slot);
     if !conflicts::resolved(store, into.slot, &kept, ours)? {
         return Err(MergeError::MarkersUnresolved(into.slot.clone()));
     }
-    let labels = (conflicts::label(into.slot), conflicts::label(&request.from));
+    let labels = (conflicts::label(into.slot), from.label());
     let merged = store.merge_trees(base, ours, theirs, (&labels.0, &labels.1))?;
-    let waiting = held::file(store, into.snapshots.thread(), (into.slot, &request.from));
+    let waiting = held::file_for(store, into.snapshots.thread(), (into.slot, from));
     let compared = [(ours, merged.tree), (base, theirs)];
     if settings == AgentSettings::Hold
         && let Some(paths) = agent_settings_changed(store, ours, compared)
     {
-        HeldSettings::new(request.commit, &paths).keep(&waiting)?;
-        return Err(MergeError::HoldsAgentSettings(request.from.clone()));
+        HeldSettings::new(commit, &paths).keep(&waiting)?;
+        return Err(MergeError::HoldsAgentSettings(from.clone()));
     }
     let markers = merged
         .conflicts
@@ -174,22 +250,28 @@ pub(crate) fn merge_now(
         Some(head) => store.commit_tree(head)?,
         None => store.write_tree(&[])?,
     };
-    if let Some(conflicts) = KeptConflicts::of_merge((&request.from, before), markers) {
+    if let Some(conflicts) = KeptConflicts::of_merge((from, before), markers) {
         conflicts.save(&kept)?;
     }
-    let (applied, tree, commit) = write_merge(
+    let (applied, tree, written) = write_merge(
         store,
         into,
         (ours, merged.tree),
-        (&previous, &merged_from),
+        (previous, merged_from),
         (cache, head),
         interrupt,
     )?;
-    if applied.left.is_empty() {
-        held::release_merged(store, into.snapshots.thread(), into.slot, &merged_from);
-    }
-    note_merge(store, into, (&request.from, &merged), (ours, tree));
-    Ok(MergeDone::Merged { commit, tree })
+    let left = if applied.left.is_empty() {
+        PathsLeft::None
+    } else {
+        PathsLeft::Some
+    };
+    note_merge(store, into, (from, &merged), (ours, tree));
+    Ok(MergeDone::Merged {
+        commit: written,
+        tree,
+        left,
+    })
 }
 
 /// Writes the tree `merged` into `into`'s worktree over `ours`, then records the worktree in a
@@ -231,7 +313,7 @@ fn write_merge(
 fn note_merge(
     store: &Store,
     into: Recording<'_>,
-    (from, merged): (&AgentSlot, &Merged),
+    (from, merged): (&Source, &Merged),
     (ours, tree): (ObjectId, ObjectId),
 ) {
     let of_kind = |kind: Conflict| -> Vec<String> {

@@ -38,6 +38,7 @@ use thiserror::Error;
 use crate::{
     held::{
         self,
+        HeldError,
         HeldSettings,
     },
     held_queue::{
@@ -51,13 +52,24 @@ use crate::{
         Pace,
         Readiness,
     },
+    landed_branch::BranchRecord,
     merge::{
         AgentSettings,
+        MergeDone,
         MergeError,
         MergeRequest,
+        PathsLeft,
     },
     merged::MergedFrom,
-    recorder::Merger,
+    recorder::{
+        Merger,
+        Wanted,
+    },
+    source::{
+        LandingBranch,
+        Source,
+    },
+    sync_state,
     turn_end,
 };
 
@@ -180,10 +192,22 @@ impl AutoMerge {
     fn choose(
         &self,
         store: &Store,
-        (merger, from, record, choice): (&Merger, &AgentSlot, &HeldSettings, Choice),
+        (merger, from, record, choice): (&Merger, &Source, &HeldSettings, Choice),
         (activity, agent, writer): (&Activity, &impl AgentInput, &Mutex<impl Write>),
         (running, pace): (&AtomicBool, Pace),
     ) -> bool {
+        let from = match from {
+            Source::Agent(slot) => slot,
+            Source::Landing(_) => {
+                return choice != Choice::Take
+                    || self.take_landing(
+                        store,
+                        (merger, from, record),
+                        (activity, agent, writer),
+                        (running, pace),
+                    );
+            }
+        };
         let waiting = held::file(store, self.thread, (&self.own, from));
         match choice {
             Choice::Skip => {
@@ -214,6 +238,74 @@ impl AutoMerge {
         }
     }
 
+    /// Takes the landing branch's merge that waited for the user, agent settings and all, once
+    /// the agent is idle with its turn closed, when the last landing still brings it. Returns
+    /// `false` when the run ended meanwhile.
+    fn take_landing(
+        &self,
+        store: &Store,
+        (merger, from, record): (&Merger, &Source, &HeldSettings),
+        (activity, agent, writer): (&Activity, &impl AgentInput, &Mutex<impl Write>),
+        (running, pace): (&AtomicBool, Pace),
+    ) -> bool {
+        let waiting = held::file_for(store, self.thread, (&self.own, from));
+        let Some(wanted) = self.pending_landing(store).filter(
+            |wanted| matches!(wanted, Wanted::Landing { tip, .. } if *tip == record.commit),
+        ) else {
+            let _ = sync_state::remove(&waiting);
+            return true;
+        };
+        let done = inject::when_ready(
+            activity,
+            agent,
+            writer,
+            (running, pace, Readiness::TurnClosed),
+            || {
+                let still = Store::open(&self.git_dir)
+                    .ok()
+                    .and_then(|store| self.pending_landing(&store))
+                    .as_ref()
+                    == Some(&wanted);
+                still.then(|| merger.merge_wanted(wanted.clone(), AgentSettings::Take))
+            },
+        );
+        let Some(outcome) = done else {
+            return false;
+        };
+        match outcome {
+            Some(Ok(done)) => {
+                let _ = sync_state::remove(&waiting);
+                self.landing_taken(store, &wanted, &done);
+            }
+            Some(Err(_)) => self.waiting.failed(),
+            None => {
+                let _ = sync_state::remove(&waiting);
+            }
+        }
+        true
+    }
+
+    /// Returns the merges that wait for the user: each teammate's snapshot that changes agent
+    /// settings, and the landing branch's merge that does, while the last landing still brings
+    /// it.
+    fn held_now(&self, store: &Store) -> Vec<(Source, HeldSettings)> {
+        let mut held: Vec<(Source, HeldSettings)> = held::list(store, self.thread, &self.own)
+            .into_iter()
+            .map(|(slot, record)| (Source::Agent(slot), record))
+            .collect();
+        let landing = self.pending_landing(store).and_then(|wanted| {
+            let Wanted::Landing { landing, tip, .. } = wanted else {
+                return None;
+            };
+            let from = Source::Landing(landing);
+            let file = held::file_for(store, self.thread, (&self.own, &from));
+            let record = HeldSettings::load(&file).ok()??;
+            (record.commit == tip).then_some((from, record))
+        });
+        held.extend(landing);
+        held
+    }
+
     /// Returns the merge of `from`'s snapshot `commit`, when `meta` lists both the user and
     /// `from`'s participant as collaborators and that participant signed it.
     fn signed_by_collaborator(
@@ -236,6 +328,67 @@ impl AutoMerge {
                 commit,
                 thread_base: meta.base(),
             })
+    }
+
+    /// Returns what the last landing brought from the landing branch and the agent's worktree
+    /// has not taken yet: the record of a landing whose pushed tip's tree differs from the
+    /// worktree tree it measured, while no merge of it waits for the user; a held merge of an
+    /// earlier landing's tip is dropped, since this one brings what it did.
+    fn landing_due(&self, store: &Store) -> Option<Wanted> {
+        let wanted = self.pending_landing(store)?;
+        let Wanted::Landing { landing, tip, .. } = &wanted else {
+            return None;
+        };
+        let from = Source::Landing(landing.clone());
+        let waiting = held::file_for(store, self.thread, (&self.own, &from));
+        if held::waits(&waiting) {
+            match HeldSettings::load(&waiting) {
+                Ok(None) => {}
+                Ok(Some(held)) if held.commit != *tip => sync_state::remove(&waiting).ok()?,
+                Err(HeldError::Malformed(_)) => sync_state::remove(&waiting).ok()?,
+                Ok(Some(_)) | Err(HeldError::Io(..)) => return None,
+            }
+        }
+        Some(wanted)
+    }
+
+    /// Returns what the last landing brought from the landing branch, while the record says
+    /// the agent's worktree has not taken it.
+    fn pending_landing(&self, store: &Store) -> Option<Wanted> {
+        let record = BranchRecord::read(store, self.thread)?;
+        let measured = record.worktree?;
+        let landing = LandingBranch::new(&record.remote, &record.landing)?;
+        Some(Wanted::Landing {
+            landing,
+            measured,
+            tip: record.tip,
+        })
+    }
+
+    /// Forgets the worktree tree the last landing measured once the agent's worktree took all
+    /// that `wanted` brought, as `done` says, so the next landing measures from the pushed
+    /// tip's tree; a merge that left a path as it was keeps it, to be merged again.
+    fn landing_taken(&self, store: &Store, wanted: &Wanted, done: &MergeDone) {
+        let (
+            Wanted::Landing { measured, tip, .. },
+            MergeDone::Merged {
+                left: PathsLeft::None,
+                ..
+            },
+        ) = (wanted, done)
+        else {
+            return;
+        };
+        let forgotten = BranchRecord::update(store, self.thread, |record| {
+            let still = record.tip == *tip && record.worktree == Some(*measured);
+            if still {
+                record.worktree = None;
+            }
+            still
+        });
+        if forgotten.unwrap_or(false) {
+            let _ = store.release_landed_tree(self.thread, *measured);
+        }
     }
 
     /// Says whether `request` is still one of the merges the agent is behind on.
@@ -261,14 +414,14 @@ impl AutoMerge {
         (running, pace): (&AtomicBool, Pace),
     ) {
         let mut tried = HashSet::new();
+        let mut tried_landing = None;
         let mut seen = Vec::new();
         while running.load(Ordering::SeqCst) {
             thread::sleep(LOOK_EVERY);
             let Ok(store) = Store::open(&self.git_dir) else {
                 continue;
             };
-            self.waiting
-                .show(held::list(&store, self.thread, &self.own));
+            self.waiting.show(self.held_now(&store));
             for (from, record, choice) in self.waiting.take_choices() {
                 seen.clear();
                 if !self.choose(
@@ -279,6 +432,18 @@ impl AutoMerge {
                 ) {
                     return;
                 }
+            }
+            if let Some(wanted) = self.landing_due(&store)
+                && tried_landing.as_ref() != Some(&wanted)
+                && !self.merge_landing(
+                    merger,
+                    &wanted,
+                    &mut tried_landing,
+                    (activity, agent, writer),
+                    (running, pace),
+                )
+            {
+                return;
             }
             let Ok(heads) = store.thread_refs() else {
                 continue;
@@ -311,6 +476,45 @@ impl AutoMerge {
                 }
             }
         }
+    }
+
+    /// Merges what the last landing brought from the landing branch, `wanted`, once the agent
+    /// is idle after a turn its hook reported, and only while it is still due then; tried once
+    /// in this run, but for a merge refused while the agent's conflicts are unresolved.
+    /// Returns `false` when the run ended meanwhile.
+    fn merge_landing(
+        &self,
+        merger: &Merger,
+        wanted: &Wanted,
+        tried: &mut Option<Wanted>,
+        (activity, agent, writer): (&Activity, &impl AgentInput, &Mutex<impl Write>),
+        (running, pace): (&AtomicBool, Pace),
+    ) -> bool {
+        *tried = Some(wanted.clone());
+        let done = inject::when_ready(
+            activity,
+            agent,
+            writer,
+            (running, pace, Readiness::AfterTurnEnd),
+            || {
+                let store = Store::open(&self.git_dir).ok()?;
+                (self.landing_due(&store).as_ref() == Some(wanted)).then(|| {
+                    (
+                        merger.merge_wanted(wanted.clone(), AgentSettings::Hold),
+                        store,
+                    )
+                })
+            },
+        );
+        let Some(outcome) = done else {
+            return false;
+        };
+        match outcome {
+            Some((Ok(done), store)) => self.landing_taken(&store, wanted, &done),
+            Some((Err(MergeError::MarkersUnresolved(_)), _)) => *tried = None,
+            Some((Err(_), _)) | None => {}
+        }
+        true
     }
 }
 
@@ -608,10 +812,13 @@ mod tests {
             });
             merging.activity.saw(HookKind::TurnEnd, b"");
             wait_for("bob's snapshot was never held", &merging.running, || {
-                auto.waiting.waiting(&bob).is_some()
+                auto.waiting.waiting(&Source::Agent(bob.clone())).is_some()
             });
             assert!(auto.waiting.wants_open());
-            assert!(auto.waiting.choose((&bob, first), Choice::Skip));
+            assert!(
+                auto.waiting
+                    .choose((&Source::Agent(bob.clone()), first), Choice::Skip)
+            );
             let next = tree_of(
                 &team,
                 &[
@@ -658,9 +865,12 @@ mod tests {
             });
             merging.activity.saw(HookKind::TurnEnd, b"");
             wait_for("bob's snapshot was never held", &merging.running, || {
-                auto.waiting.waiting(&bob).is_some()
+                auto.waiting.waiting(&Source::Agent(bob.clone())).is_some()
             });
-            assert!(auto.waiting.choose((&bob, first), Choice::Take));
+            assert!(
+                auto.waiting
+                    .choose((&Source::Agent(bob.clone()), first), Choice::Take)
+            );
             wait_for("bob's settings were never taken", &merging.running, || {
                 worktree.join("CLAUDE.md").exists()
             });
@@ -735,6 +945,107 @@ mod tests {
         activity: Activity,
         writer: Mutex<Vec<u8>>,
         running: AtomicBool,
+    }
+
+    #[test]
+    fn a_held_landing_merge_of_an_older_tip_is_dropped_so_the_newer_one_comes_due() {
+        let team = team();
+        let auto = team.auto_merge();
+        let store = &team.store;
+        let thread = team.started.thread;
+        assert_eq!(auto.landing_due(store), None);
+        let head = store.head(&team.started.snapshots).unwrap().unwrap();
+        let measured = store.commit_tree(head).unwrap();
+        let mut record = BranchRecord {
+            remote: "up".to_owned(),
+            branch: format!("mahi/{thread}"),
+            tip: head,
+            landing: "main".to_owned(),
+            worktree: Some(measured),
+            gone: false,
+        };
+        record.write(store, thread).unwrap();
+        let landing = LandingBranch::new("up", "main").unwrap();
+        let wanted = |tip| Wanted::Landing {
+            landing: landing.clone(),
+            measured,
+            tip,
+        };
+        assert_eq!(auto.landing_due(store), Some(wanted(head)));
+        let waiting = held::file_for(
+            store,
+            thread,
+            (&auto.own, &Source::Landing(landing.clone())),
+        );
+        HeldSettings::new(head, &["CLAUDE.md".to_owned()])
+            .keep(&waiting)
+            .unwrap();
+        assert_eq!(auto.landing_due(store), None);
+        assert_eq!(auto.held_now(store).len(), 1);
+        let later = store
+            .append(&team.started.snapshots, Some(head), measured, "later")
+            .unwrap();
+        record.tip = later;
+        record.write(store, thread).unwrap();
+        assert!(auto.held_now(store).is_empty());
+        assert_eq!(auto.landing_due(store), Some(wanted(later)));
+        assert!(!waiting.exists());
+        fs::write(&waiting, "not a held record").unwrap();
+        assert_eq!(auto.landing_due(store), Some(wanted(later)));
+        assert!(!waiting.exists());
+    }
+
+    #[test]
+    fn an_idle_agent_takes_the_landing_branchs_changes_though_no_thread_ref_moves() {
+        let mut team = team();
+        let worktree = team.started.worktree.clone();
+        let merging = team.merging();
+        let auto = team.auto_merge();
+        let store = Store::open(team.store.common_dir()).unwrap();
+        let thread = team.started.thread;
+        let head = store.head(&team.started.snapshots).unwrap().unwrap();
+        let measured = store.commit_tree(head).unwrap();
+        let blob = store.write_blob(b"upstream\n").unwrap();
+        let file = store
+            .write_tree(&[("upstream.txt", EntryKind::Blob, blob)])
+            .unwrap();
+        let upstream = store
+            .tree_with_paths(measured, file, &["upstream.txt"])
+            .unwrap();
+        let parked = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
+        let tip = store.append(&parked, None, upstream, "tip").unwrap();
+        thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                auto.run(
+                    &merging.merger,
+                    (&merging.activity, &Closed, &merging.writer),
+                    (&merging.running, pace()),
+                );
+            });
+            merging.activity.saw(HookKind::TurnEnd, b"");
+            thread::sleep(Duration::from_millis(1500));
+            store.keep_landed_tree(thread, Some(measured)).unwrap();
+            BranchRecord {
+                remote: "up".to_owned(),
+                branch: format!("mahi/{thread}"),
+                tip,
+                landing: "main".to_owned(),
+                worktree: Some(measured),
+                gone: false,
+            }
+            .write(&store, thread)
+            .unwrap();
+            wait_for("main's changes never came in", &merging.running, || {
+                BranchRecord::read(&store, thread).is_some_and(|record| record.worktree.is_none())
+            });
+            merging.running.store(false, Ordering::SeqCst);
+            running.join().unwrap();
+        });
+        merging.recorder.finish().unwrap();
+        assert_eq!(
+            fs::read_to_string(worktree.join("upstream.txt")).unwrap(),
+            "upstream\n"
+        );
     }
 
     fn pace() -> Pace {

@@ -19,10 +19,12 @@ use thiserror::Error;
 
 use crate::{
     merged::MergedFrom,
+    source::Source,
     sync_state,
 };
 
 const HELD_DIR: &str = "held";
+const LANDING_HELD: &str = "landing";
 const SKIPPED_DIR: &str = "skipped";
 const MAX_SKIPPED_BYTES: u64 = 128;
 const MAX_HELD_BYTES: u64 = 64 * 1024;
@@ -57,6 +59,21 @@ pub(crate) fn file(
     sync_state::dir(store, thread, into)
         .join(HELD_DIR)
         .join(from.to_string())
+}
+
+/// Returns where the merge from `from` that waits for the user is kept, for `into`'s worktree
+/// in `thread`: [`file`] for a teammate's agent, and `held/landing` for the landing branch.
+pub(crate) fn file_for(
+    store: &Store,
+    thread: ThreadId,
+    (into, from): (&AgentSlot, &Source),
+) -> PathBuf {
+    match from {
+        Source::Agent(from) => file(store, thread, (into, from)),
+        Source::Landing(_) => sync_state::dir(store, thread, into)
+            .join(HELD_DIR)
+            .join(LANDING_HELD),
+    }
 }
 
 /// Returns where the snapshot of `from` the user skipped is kept, for `into`'s worktree in

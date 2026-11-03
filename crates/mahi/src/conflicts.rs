@@ -18,19 +18,22 @@ use mahi_store::{
 };
 use thiserror::Error;
 
-use crate::sync_state;
+use crate::{
+    source::Source,
+    sync_state,
+};
 
 const CONFLICTS_FILE: &str = "conflicts";
 const MAX_KEPT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_KEPT_PATHS: usize = 2 * MAX_MERGED_PATHS;
 const SHORTEST_MARKER: usize = 7;
 
-/// The paths a merge left with conflict markers in an agent's worktree, the agent they came
+/// The paths a merge left with conflict markers in an agent's worktree, where the merge came
 /// from, and the tree the worktree had before the merge, kept in the agent's state until the
 /// markers are resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeptConflicts {
-    from: AgentSlot,
+    from: Source,
     before: ObjectId,
     paths: Vec<Vec<u8>>,
 }
@@ -63,7 +66,7 @@ impl KeptConflicts {
     /// Returns the conflicts of a merge from `from` into a worktree whose tree was `before`,
     /// which left markers in `paths`, or `None` when it left none.
     pub(crate) fn of_merge<'path, P: AsRef<[u8]> + 'path>(
-        (from, before): (&AgentSlot, ObjectId),
+        (from, before): (&Source, ObjectId),
         paths: impl Iterator<Item = &'path P>,
     ) -> Option<Self> {
         let paths: Vec<Vec<u8>> = paths.map(|path| path.as_ref().to_vec()).collect();
@@ -74,8 +77,8 @@ impl KeptConflicts {
         })
     }
 
-    /// Returns the teammate's agent whose merge left the markers.
-    pub(crate) fn from(&self) -> &AgentSlot {
+    /// Returns where the merge that left the markers came from.
+    pub(crate) fn from(&self) -> &Source {
         &self.from
     }
 
@@ -172,7 +175,7 @@ pub(crate) fn resolved(
     let Some(kept) = KeptConflicts::load(file)? else {
         return Ok(true);
     };
-    let slots = [into, &kept.from].map(|slot| format!(" {}", label(slot)).into_bytes());
+    let slots = [label(into), kept.from.label()].map(|label| format!(" {label}").into_bytes());
     if store.changed_files_hold(kept.before, tree, &|line| is_marker(line, &slots))? {
         return Ok(false);
     }
@@ -220,7 +223,7 @@ mod tests {
         "<<<<<<< mahi alice.claude\nours\n=======\ntheirs\n>>>>>>> mahi bob.codex\n";
 
     fn kept_from(file: &Path, before: ObjectId, paths: &[&str]) {
-        KeptConflicts::of_merge((&slots().1, before), paths.iter())
+        KeptConflicts::of_merge((&Source::Agent(slots().1), before), paths.iter())
             .unwrap()
             .save(file)
             .unwrap();
@@ -231,7 +234,7 @@ mod tests {
         let (dir, store) = store();
         let file = dir.path().join("state/sync/alice.claude/conflicts");
         assert_eq!(KeptConflicts::load(&file).unwrap(), None);
-        let (_, bob) = slots();
+        let bob = Source::Agent(slots().1);
         let before = tree(&store, &[("a.txt", "a\n")]);
         let paths = ["a.txt", "dir/b \n\u{e9}.txt"];
         let kept = KeptConflicts::of_merge((&bob, before), paths.iter()).unwrap();
@@ -289,6 +292,30 @@ mod tests {
         assert!(resolved(&store, &alice, &file, done).unwrap());
         assert!(!file.exists());
         assert!(resolved(&store, &alice, &file, marked).unwrap());
+    }
+
+    #[test]
+    fn the_landing_branchs_markers_hold_a_conflict_until_they_are_resolved() {
+        let (dir, store) = store();
+        let file = dir.path().join("sync/alice.claude/conflicts");
+        let (alice, _) = slots();
+        let main: Source = "landing:up:main".parse().unwrap();
+        let before = tree(&store, &[("a.txt", "ours\n")]);
+        KeptConflicts::of_merge((&main, before), ["a.txt"].iter())
+            .unwrap()
+            .save(&file)
+            .unwrap();
+        assert_eq!(KeptConflicts::load(&file).unwrap().unwrap().from(), &main);
+        let marked = tree(
+            &store,
+            &[(
+                "a.txt",
+                "<<<<<<< mahi alice.claude\nours\n=======\ntheirs\n>>>>>>> mahi main\n",
+            )],
+        );
+        assert!(!resolved(&store, &alice, &file, marked).unwrap());
+        let done = tree(&store, &[("a.txt", "ours and theirs\n")]);
+        assert!(resolved(&store, &alice, &file, done).unwrap());
     }
 
     #[test]

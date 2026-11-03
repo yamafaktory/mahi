@@ -421,6 +421,28 @@ impl Store {
         Ok(())
     }
 
+    /// Removes the ref [`Store::keep_landed_tree`] keeps for `thread`, only while it keeps
+    /// `tree`, so a tree a later landing keeps there stays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Git`] if the ref keeps another tree or cannot be removed.
+    pub fn release_landed_tree(&self, thread: ThreadId, tree: ObjectId) -> Result<(), StoreError> {
+        let name = FullName::try_from(format!("{LANDED_PREFIX}{thread}"))
+            .map_err(gix::Error::from_error)?;
+        self.repo.edit_references_as(
+            Some(RefEdit::new(
+                name,
+                Change::Delete {
+                    expected: PreviousValue::MustExistAndMatch(Target::Object(tree)),
+                    log: RefLog::AndReference,
+                },
+            )),
+            None,
+        )?;
+        Ok(())
+    }
+
     /// Removes the local branch `branch`, only while it is at `at`.
     ///
     /// # Errors
@@ -1622,6 +1644,14 @@ pub(crate) mod tests {
         assert_eq!(kept(), Some(tree));
         store.keep_landed_tree(thread, Some(tree)).unwrap();
         store.keep_landed_tree(thread, None).unwrap();
+        assert_eq!(kept(), None);
+        let other = store
+            .write_tree(&[("a", EntryKind::Blob, store.write_blob(b"a").unwrap())])
+            .unwrap();
+        store.keep_landed_tree(thread, Some(other)).unwrap();
+        assert!(store.release_landed_tree(thread, tree).is_err());
+        assert_eq!(kept(), Some(other));
+        store.release_landed_tree(thread, other).unwrap();
         assert_eq!(kept(), None);
         let blob = store.write_blob(b"x").unwrap();
         assert!(matches!(

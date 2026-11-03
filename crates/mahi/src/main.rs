@@ -46,6 +46,7 @@ mod session;
 mod session_sync;
 mod settings;
 mod settings_links;
+mod source;
 mod sync;
 mod sync_state;
 mod sync_view;

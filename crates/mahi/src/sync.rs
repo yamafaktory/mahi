@@ -236,16 +236,7 @@ impl SyncSetup {
         interrupt: &Arc<AtomicBool>,
         fetch: impl FnOnce(AnyTransport) -> Result<R, FetchError>,
     ) -> Result<R, FetchError> {
-        let budget = ReadBudget::new(fetch_limit);
-        let fetched = self
-            .access
-            .connect(&self.remote, interrupt, budget.clone())
-            .map_err(FetchError::from)
-            .and_then(fetch);
-        if budget.exceeded() {
-            return Err(FetchError::OverLimit(fetch_limit));
-        }
-        fetched
+        fetch_bounded((&self.access, &self.remote), fetch_limit, interrupt, fetch)
     }
 }
 
@@ -461,24 +452,41 @@ pub(crate) fn fetch_thread(
         }
     };
     eprintln!("mahi: fetching the thread from {name}");
-    let budget = ReadBudget::new(transfer_limits(environment).fetch_limit);
-    let outcome = access
-        .connect(&url, interrupt, budget.clone())
-        .map_err(FetchError::from)
-        .and_then(|transport| fetch_and_accept(store, transport, thread, owner, local, interrupt));
-    if budget.exceeded() {
+    let limit = transfer_limits(environment).fetch_limit;
+    let outcome = fetch_bounded((&access, &url), limit, interrupt, |transport| {
+        fetch_and_accept(store, transport, thread, owner, local, interrupt)
+    });
+    if let Err(FetchError::OverLimit(limit)) = &outcome {
         eprintln!(
-            "mahi: the thread is not fetched from {name}: it sent more than {} bytes; raise \
-             fetch-limit in config.toml to fetch it",
-            budget.limit()
+            "mahi: the thread is not fetched from {name}: it sent more than {limit} bytes; raise \
+             fetch-limit in config.toml to fetch it"
         );
     } else if let Some(told) = fetch_report(&outcome, &name) {
         eprint!("{told}");
     }
-    let answered = matches!(outcome, Ok(_) | Err(FetchError::Accept(_))) && !budget.exceeded();
+    let answered = matches!(outcome, Ok(_) | Err(FetchError::Accept(_)));
     if chosen && answered && !interrupt.load(Ordering::SeqCst) {
         check_branch(store, thread, (&access, &url, &name), interrupt);
     }
+}
+
+/// Connects to `remote` through `access` with its reads bounded by `limit` bytes and runs
+/// `fetch` on the connection, saying so when the remote sent more than that.
+fn fetch_bounded<R>(
+    (access, remote): (&Access, &RemoteUrl),
+    limit: u64,
+    interrupt: &Arc<AtomicBool>,
+    fetch: impl FnOnce(AnyTransport) -> Result<R, FetchError>,
+) -> Result<R, FetchError> {
+    let budget = ReadBudget::new(limit);
+    let fetched = access
+        .connect(remote, interrupt, budget.clone())
+        .map_err(FetchError::from)
+        .and_then(fetch);
+    if budget.exceeded() {
+        return Err(FetchError::OverLimit(limit));
+    }
+    fetched
 }
 
 /// Notes, and says, when the thread branch `mahi land --push` pushed is gone from the remote.
@@ -488,7 +496,7 @@ fn check_branch(
     (access, url, name): (&Access, &RemoteUrl, &RemoteName),
     interrupt: &Arc<AtomicBool>,
 ) {
-    let Some(mut record) = BranchRecord::read(store, thread)
+    let Some(record) = BranchRecord::read(store, thread)
         .filter(|record| !record.gone && record.remote == name.as_str())
     else {
         return;
@@ -502,8 +510,14 @@ fn check_branch(
                 .map_err(|_| ())
         });
     if let Ok(None) = found {
-        record.gone = true;
-        let _ = record.write(store, thread);
+        let marked = BranchRecord::update(store, thread, |now| {
+            let same = now.tip == record.tip && now.branch == record.branch && !now.gone;
+            now.gone |= same;
+            same
+        });
+        if let Ok(false) = marked {
+            return;
+        }
         eprintln!(
             "mahi: the branch {} is gone from {name}, merged or closed; mahi purge {thread} \
              removes the thread",

@@ -6,6 +6,10 @@ use std::{
         Read,
     },
     path::PathBuf,
+    sync::{
+        Mutex,
+        MutexGuard,
+    },
 };
 
 use mahi_core::{
@@ -68,6 +72,29 @@ impl BranchRecord {
 
     /// Writes this record for `thread`, replacing any earlier one whole.
     pub(crate) fn write(&self, store: &Store, thread: ThreadId) -> io::Result<()> {
+        let _held = locked()?;
+        self.write_unlocked(store, thread)
+    }
+
+    /// Reads `thread`'s record, lets `change` change it, and writes it back when `change` says
+    /// so, with no other write of a record in between; says whether it wrote.
+    pub(crate) fn update(
+        store: &Store,
+        thread: ThreadId,
+        change: impl FnOnce(&mut Self) -> bool,
+    ) -> io::Result<bool> {
+        let _held = locked()?;
+        let Some(mut record) = Self::read(store, thread) else {
+            return Ok(false);
+        };
+        if !change(&mut record) {
+            return Ok(false);
+        }
+        record.write_unlocked(store, thread)?;
+        Ok(true)
+    }
+
+    fn write_unlocked(&self, store: &Store, thread: ThreadId) -> io::Result<()> {
         let target = path(store, thread);
         let directory = target
             .parent()
@@ -103,6 +130,14 @@ impl BranchRecord {
             _ => Ok(()),
         }
     }
+}
+
+static WRITING: Mutex<()> = Mutex::new(());
+
+fn locked() -> io::Result<MutexGuard<'static, ()>> {
+    WRITING
+        .lock()
+        .map_err(|_| io::Error::other("the lock on branch records is poisoned"))
 }
 
 fn path(store: &Store, thread: ThreadId) -> PathBuf {

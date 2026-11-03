@@ -26,6 +26,7 @@ use thiserror::Error;
 use crate::{
     hook,
     mcp::push_clean,
+    source::Source,
     sync_state,
 };
 
@@ -52,7 +53,7 @@ pub(crate) struct Note {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Came {
-    from: String,
+    from: Source,
     markers: Listed,
     kept: Listed,
     brought: Listed,
@@ -98,7 +99,7 @@ fn keeping() -> Result<MutexGuard<'static, ()>, NoteError> {
 
 /// Adds what a merge from `from` left to the note kept in `file`, which a note that cannot
 /// be read no longer holds back; past 1 MiB the note keeps what it held.
-pub(crate) fn record(file: &Path, from: &AgentSlot, merged: Merged<'_>) -> Result<(), NoteError> {
+pub(crate) fn record(file: &Path, from: &Source, merged: Merged<'_>) -> Result<(), NoteError> {
     let _kept = keeping()?;
     let mut note = match Note::load(file) {
         Err(NoteError::Malformed(_)) => Note::default(),
@@ -263,10 +264,9 @@ impl Note {
                 .as_ref()
                 .is_none_or(|landed| landed.len() <= MAX_TEXT_BYTES)
             && note.came.iter().all(|came| {
-                came.from.parse::<AgentSlot>().is_ok()
-                    && [&came.markers, &came.kept, &came.brought]
-                        .iter()
-                        .all(|listed| listed.holds())
+                [&came.markers, &came.kept, &came.brought]
+                    .iter()
+                    .all(|listed| listed.holds())
             });
         holds.then_some(note).ok_or_else(malformed)
     }
@@ -276,10 +276,12 @@ impl Note {
     }
 
     /// Returns each teammate's agent the note names, with the first files its merges brought.
-    pub(crate) fn brought(&self) -> impl Iterator<Item = (&str, &[String])> {
-        self.came
-            .iter()
-            .map(|came| (came.from.as_str(), came.brought.paths.as_slice()))
+    pub(crate) fn brought(&self) -> impl Iterator<Item = (&AgentSlot, &[String])> {
+        self.came.iter().filter_map(|came| {
+            came.from
+                .agent()
+                .map(|slot| (slot, came.brought.paths.as_slice()))
+        })
     }
 
     fn save(&self, file: &Path) -> Result<(), NoteError> {
@@ -293,16 +295,15 @@ impl Note {
 
     /// Adds what a merge from `from` left, to what that teammate's earlier merges left; a
     /// teammate past the 64th is left out.
-    pub(crate) fn add(&mut self, from: &AgentSlot, merged: Merged<'_>) {
+    pub(crate) fn add(&mut self, from: &Source, merged: Merged<'_>) {
         if merged.markers.is_empty() && merged.kept.is_empty() && merged.brought.is_empty() {
             return;
         }
-        let from = from.to_string();
-        let index = match self.came.iter().position(|came| came.from == from) {
+        let index = match self.came.iter().position(|came| came.from == *from) {
             Some(index) => index,
             None if self.came.len() < MAX_TEAMMATES => {
                 self.came.push(Came {
-                    from,
+                    from: from.clone(),
                     markers: Listed::default(),
                     kept: Listed::default(),
                     brought: Listed::default(),
@@ -349,26 +350,30 @@ impl Note {
             out.push('\n');
         }
         for came in &self.came {
+            let from = came.from.named();
             if !came.markers.is_empty() {
-                let _ = write!(
-                    out,
-                    "Resolve the conflict markers in (from {}): ",
-                    came.from
-                );
+                let _ = write!(out, "Resolve the conflict markers in (from {from}): ");
                 came.markers.push(out, (" ", &mut budget));
             }
             if !came.kept.is_empty() {
-                let _ = write!(
-                    out,
-                    "Your version was kept, but {} changed these too; check them with read_diff: ",
-                    came.from
-                );
+                match came.from {
+                    Source::Landing(_) => {
+                        let _ =
+                            write!(out, "Your version was kept, but {from} changed these too: ");
+                    }
+                    Source::Agent(_) => {
+                        let _ = write!(
+                            out,
+                            "Your version was kept, but {from} changed these too; check them with read_diff: "
+                        );
+                    }
+                }
                 came.kept.push(out, (" ", &mut budget));
             }
         }
         for came in &self.came {
             if !came.brought.is_empty() {
-                let _ = write!(out, "merged {}: ", came.from);
+                let _ = write!(out, "merged {}: ", came.from.named());
                 came.brought.push(out, (", ", &mut budget));
             }
         }
@@ -389,8 +394,8 @@ mod tests {
     #[test]
     fn the_note_lists_conflicts_first_then_what_each_teammate_brought() {
         let mut note = Note::default();
-        let bob: AgentSlot = "bob.claude".parse().unwrap();
-        let carol: AgentSlot = "carol.codex".parse().unwrap();
+        let bob: Source = "bob.claude".parse().unwrap();
+        let carol: Source = "carol.codex".parse().unwrap();
         let brought: Vec<String> = (0..23).map(|index| format!("src/{index}.rs")).collect();
         note.add(
             &bob,
@@ -436,9 +441,33 @@ mod tests {
     }
 
     #[test]
+    fn the_landing_branchs_merge_is_named_with_its_remote_and_points_to_no_tool() {
+        let mut note = Note::default();
+        let main: Source = "landing:up:main".parse().unwrap();
+        note.add(
+            &main,
+            Merged {
+                markers: &paths(&["m.txt"]),
+                kept: &paths(&["logo.png"]),
+                brought: &paths(&["upstream.txt", "m.txt"]),
+            },
+        );
+        assert_eq!(
+            note.render(),
+            format!(
+                "{OPENING}\n{RESOLVE_FIRST}\n\
+                 Resolve the conflict markers in (from main on up): ` m.txt `\n\
+                 Your version was kept, but main on up changed these too: ` logo.png `\n\
+                 merged main on up: ` upstream.txt `, ` m.txt `"
+            )
+        );
+        assert_eq!(note.brought().count(), 0);
+    }
+
+    #[test]
     fn a_teammates_path_is_quoted_as_data_and_cut_short() {
         let mut note = Note::default();
-        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let bob: Source = "bob.claude".parse().unwrap();
         let long = format!("{}.rs", "\u{e9}".repeat(300));
         note.add(
             &bob,
@@ -468,7 +497,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("sync/alice.claude/note");
         assert_eq!(take(&file).unwrap(), None);
-        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let bob: Source = "bob.claude".parse().unwrap();
         let merged = Merged {
             markers: &[],
             kept: &[],
@@ -496,7 +525,7 @@ mod tests {
             take(&file).unwrap().as_deref(),
             Some("alice pushed your landing: 2 commits on mahi/x to origin.")
         );
-        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let bob: Source = "bob.claude".parse().unwrap();
         let brought = paths(&["a.rs"]);
         let merged = Merged {
             markers: &[],
@@ -527,7 +556,10 @@ mod tests {
                 kept: &crafted,
                 brought: &crafted,
             };
-            assert!(record(&file, &from, merged).is_ok() || Note::load(&file).is_ok());
+            assert!(
+                record(&file, &Source::Agent(from.clone()), merged).is_ok()
+                    || Note::load(&file).is_ok()
+            );
         }
         let text = take(&file).unwrap().unwrap();
         assert!(text.len() <= MAX_TEXT_BYTES + 1024, "{}", text.len());
@@ -537,7 +569,7 @@ mod tests {
     #[test]
     fn a_cut_path_says_so_and_a_merge_that_left_nothing_adds_nothing() {
         let mut note = Note::default();
-        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let bob: Source = "bob.claude".parse().unwrap();
         let long = |end: &str| format!("{}{end}", "d/".repeat(150));
         note.add(
             &bob,
@@ -569,7 +601,7 @@ mod tests {
         fs::write(&file, "not json").unwrap();
         assert_eq!(take(&file).unwrap(), None);
         fs::write(&file, "not json").unwrap();
-        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let bob: Source = "bob.claude".parse().unwrap();
         record(
             &file,
             &bob,
@@ -587,7 +619,7 @@ mod tests {
     fn a_note_the_hook_read_is_taken_but_one_that_grew_since_stays() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("note");
-        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let bob: Source = "bob.claude".parse().unwrap();
         let brought = |name: &str| vec![name.to_owned()];
         let merged = |paths: &[String]| {
             record(

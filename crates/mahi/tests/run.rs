@@ -5928,11 +5928,20 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
 "#;
 
         fn land_with_enter(running: &mut Driven, fixture: &Fixture, thread: Option<&str>) {
+            push_with_enter(running);
+            end_lander(running, fixture, thread);
+        }
+
+        fn push_with_enter(running: &mut Driven) {
             running.wait_for("Enter pushes  Esc cancels");
             thread::sleep(Duration::from_millis(700));
             running.terminal.write_all(b"\r").unwrap();
             running.wait_for("Pushed 1 commit on mahi/");
+            thread::sleep(Duration::from_millis(700));
             running.terminal.write_all(b"\x1b").unwrap();
+        }
+
+        fn end_lander(running: &mut Driven, fixture: &Fixture, thread: Option<&str>) {
             let thread = thread.map_or_else(
                 || {
                     let workspaces = fs::read_dir(fixture.repo.join(".git/mahi/state")).unwrap();
@@ -5949,6 +5958,31 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             let worktree = worktree_named(fixture, &format!("{thread}.claude"));
             fs::write(worktree.join("done"), "").unwrap();
             assert_eq!(running.exit_code(), 0, "{}", running.text());
+        }
+
+        /// Merges `branch` into `main` on `remote` as a forge does, adds a commit of its own to
+        /// `main` and deletes `branch`, then returns `main`'s tip.
+        fn forge_merges_and_deletes(fixture: &Fixture, remote: &Path, branch: &str) -> String {
+            let forge = fixture.root.join("forge");
+            git(
+                &fixture.root,
+                &[
+                    "clone",
+                    "-q",
+                    remote.to_str().unwrap(),
+                    forge.to_str().unwrap(),
+                ],
+            );
+            git(
+                &forge,
+                &["checkout", "-q", "-b", "main", &format!("origin/{branch}")],
+            );
+            fs::write(forge.join("upstream.txt"), "upstream\n").unwrap();
+            git(&forge, &["add", "upstream.txt"]);
+            git(&forge, &["commit", "-q", "-m", "Upstream"]);
+            git(&forge, &["push", "-q", "origin", "main"]);
+            git(&forge, &["push", "-q", "origin", "--delete", branch]);
+            git(remote, &["rev-parse", "main"])
         }
 
         #[test]
@@ -5982,26 +6016,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             let branch = branches.trim().to_owned();
             let thread = branch.strip_prefix("mahi/").unwrap().to_owned();
 
-            let forge = fixture.root.join("forge");
-            git(
-                &fixture.root,
-                &[
-                    "clone",
-                    "-q",
-                    remote.to_str().unwrap(),
-                    forge.to_str().unwrap(),
-                ],
-            );
-            git(
-                &forge,
-                &["checkout", "-q", "-b", "main", &format!("origin/{branch}")],
-            );
-            fs::write(forge.join("upstream.txt"), "upstream\n").unwrap();
-            git(&forge, &["add", "upstream.txt"]);
-            git(&forge, &["commit", "-q", "-m", "Upstream"]);
-            git(&forge, &["push", "-q", "origin", "main"]);
-            git(&forge, &["push", "-q", "origin", "--delete", &branch]);
-            let main = git(&remote, &["rev-parse", "main"]).trim().to_owned();
+            let main = forge_merges_and_deletes(&fixture, &remote, &branch);
 
             let again = script(&fixture, "landing-again", "claude", LANDER_AGAIN);
             let mut second = Driven::start(mahi_in_terminal(
@@ -6012,7 +6027,28 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             second.wait_for("Passphrase");
             second.type_line(PASSPHRASE);
             second.wait_for(&format!("the branch {branch} is gone from up"));
-            land_with_enter(&mut second, &fixture, Some(&thread));
+            push_with_enter(&mut second);
+            let landed_tree = format!("refs/mahi/landed/{thread}");
+            assert!(!git(&fixture.repo, &["for-each-ref", &landed_tree]).is_empty());
+            let note = fixture
+                .repo
+                .join(format!(".git/mahi/state/{thread}/sync/tester.claude/note"));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !fs::read_to_string(&note).is_ok_and(|note| note.contains("landing:up:main")) {
+                assert!(Instant::now() < deadline, "{}", second.text());
+                thread::sleep(Duration::from_millis(50));
+            }
+            let worktree = worktree_named(&fixture, &format!("{thread}.claude"));
+            assert_eq!(
+                fs::read_to_string(worktree.join("upstream.txt")).unwrap(),
+                "upstream\n"
+            );
+            assert_eq!(
+                fs::read_to_string(worktree.join("feature.txt")).unwrap(),
+                "feature\nmore\n"
+            );
+            end_lander(&mut second, &fixture, Some(&thread));
+            assert!(git(&fixture.repo, &["for-each-ref", &landed_tree]).is_empty());
             let parent = git(&remote, &["rev-parse", &format!("{branch}^")]);
             assert_eq!(parent.trim(), main);
             let files = git(&remote, &["ls-tree", "--name-only", &branch]);

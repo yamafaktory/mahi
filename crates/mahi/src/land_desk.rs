@@ -728,7 +728,10 @@ impl Lander {
                 .landing_tip(store, &remote)
                 .map_err(|error| ToolError::Failed(crate::describe(&error)))?
                 .ok_or_else(|| {
-                    ToolError::Failed(landing::no_landing_branch(&self.desk.landing, &remote.name))
+                    ToolError::Failed(landing::no_landing_branch(
+                        &BranchRecord::shown(&self.desk.landing),
+                        &remote.name,
+                    ))
                 })?,
             OnRemote::Kept => landed,
         };
@@ -739,7 +742,7 @@ impl Lander {
             Onto::Merged(merged) => merged,
             Onto::Conflicts(paths) => {
                 return Ok(landing::changed_upstream(
-                    &self.desk.landing,
+                    &BranchRecord::shown(&self.desk.landing),
                     &remote.name,
                     &paths,
                 ));

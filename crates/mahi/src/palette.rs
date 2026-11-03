@@ -16,10 +16,7 @@ use std::{
     },
 };
 
-use mahi_core::{
-    AgentSlot,
-    is_invisible,
-};
+use mahi_core::is_invisible;
 use mahi_sandbox::{
     PtyResizer,
     WindowSize,
@@ -46,6 +43,7 @@ use crate::{
         Desk,
         LandingView,
     },
+    source::Source,
 };
 
 const MAX_HELD_BYTES: usize = 1024 * 1024;
@@ -56,6 +54,8 @@ const NO_MATCH: &str = "No held turn matches the filter";
 pub(crate) const HELD_DETAIL: &str = "changes agent settings";
 const HELD_READ: &str = "PgDn reads on · Ctrl-X skips · Esc closes";
 const HELD_DECIDE: &str = "Enter takes · Ctrl-X skips · Esc closes";
+const LANDING_HELD_READ: &str = "PgDn reads on · Esc closes";
+const LANDING_HELD_DECIDE: &str = "Enter takes · Esc closes";
 const HELD_INTRO: &str = "Its turn changes what agents read as their settings or instructions:";
 const HELD_UNTOLD: &str = "(mahi could not tell which paths)";
 const HELD_BEHIND: &str = "Its later turns wait behind it.";
@@ -173,7 +173,7 @@ pub(crate) struct Screen<W, T> {
 
 /// What a line of the palette stands for: a teammate's snapshot that waits because it changes
 /// agent settings, by its teammate and its commit.
-type Entry = (AgentSlot, ObjectId);
+type Entry = (Source, ObjectId);
 
 #[derive(Debug)]
 struct State<W> {
@@ -627,10 +627,13 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         state.selected_id.clone_from(&selected_id);
         let text = selected_id.as_ref().and_then(|id| self.text_of(id));
         let read_whole = selected_id.is_some() && state.read_whole == selected_id;
-        let hint = match (&text, read_whole) {
-            (None, _) => self.hint.as_str(),
-            (Some(_), false) => HELD_READ,
-            (Some(_), true) => HELD_DECIDE,
+        let landing = matches!(&selected_id, Some((Source::Landing(_), _)));
+        let hint = match (&text, read_whole, landing) {
+            (None, ..) => self.hint.as_str(),
+            (Some(_), false, false) => HELD_READ,
+            (Some(_), true, false) => HELD_DECIDE,
+            (Some(_), false, true) => LANDING_HELD_READ,
+            (Some(_), true, true) => LANDING_HELD_DECIDE,
         };
         let items: Vec<PaletteItem<'_>> = lines
             .iter()
@@ -674,7 +677,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         let now = Instant::now();
         if let Some(waiting) = &self.waiting {
             waiting.each(|held| {
-                let from = held.from.to_string();
+                let from = held.from.shown();
                 if contains_ignoring_case(&from, filter)
                     || contains_ignoring_case(HELD_DETAIL, filter)
                 {
@@ -709,9 +712,12 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
     }
 
     fn choose(&self, (from, commit): &Entry, choice: Choice) -> bool {
-        self.waiting
-            .as_ref()
-            .is_some_and(|waiting| waiting.choose((from, *commit), choice))
+        let skippable = from.agent().is_some() || choice == Choice::Take;
+        skippable
+            && self
+                .waiting
+                .as_ref()
+                .is_some_and(|waiting| waiting.choose((from, *commit), choice))
     }
 
     /// Redraws the open palette, so the held turns that came and their ages show.
@@ -760,7 +766,12 @@ fn held_text(waiting: &Waiting) -> String {
     } else if more > 0 {
         let _ = writeln!(text, "  and {more} more");
     }
-    text.push_str(HELD_BEHIND);
+    match waiting.from {
+        Source::Agent(_) => text.push_str(HELD_BEHIND),
+        Source::Landing(_) => {
+            text.pop();
+        }
+    }
     text
 }
 
@@ -1055,7 +1066,7 @@ mod tests {
         assert!(!reopened.contains("fi"));
     }
 
-    fn held(teammate: &str, commit: u8, paths: &[&str]) -> (AgentSlot, crate::held::HeldSettings) {
+    fn held(teammate: &str, commit: u8, paths: &[&str]) -> (Source, crate::held::HeldSettings) {
         let paths: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
         (
             teammate.parse().unwrap(),
@@ -1185,6 +1196,37 @@ mod tests {
         assert!(drawn.contains("Its later turns wait behind it."), "{drawn}");
         assert!(drawn.contains(" takes"), "{drawn}");
         assert!(drawn.contains(" skips"), "{drawn}");
+        screen.typed(b"\r").unwrap();
+        assert!(!screen.is_open());
+        let choices = waiting.take_choices();
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].2, Choice::Take);
+    }
+
+    #[test]
+    fn the_landing_branchs_held_merge_is_named_by_its_branch_and_only_enter_takes_it() {
+        let terminal = FakeTerminal::default();
+        let waiting = Arc::new(HeldQueue::default());
+        let screen = screen(&terminal).with_waiting(Arc::clone(&waiting));
+        let record = crate::held::HeldSettings::new(
+            mahi_store::ObjectId::from_bytes_or_panic(&[2; 20]),
+            &["CLAUDE.md".to_owned()],
+        );
+        waiting.show(vec![("landing:up:main".parse().unwrap(), record)]);
+        screen.open().unwrap();
+        let drawn = String::from_utf8_lossy(&written(&screen)).into_owned();
+        assert!(drawn.contains("main"), "{drawn}");
+        assert!(!drawn.contains("landing:up"), "{drawn}");
+        assert!(drawn.contains("CLAUDE.md"), "{drawn}");
+        assert!(
+            !drawn.contains("Its later turns wait behind it."),
+            "{drawn}"
+        );
+        assert!(drawn.contains(" takes"), "{drawn}");
+        assert!(!drawn.contains(" skips"), "{drawn}");
+        screen.typed(b"\x18").unwrap();
+        assert!(screen.is_open());
+        assert!(waiting.take_choices().is_empty());
         screen.typed(b"\r").unwrap();
         assert!(!screen.is_open());
         let choices = waiting.take_choices();

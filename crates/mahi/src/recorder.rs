@@ -54,6 +54,7 @@ use crate::{
         Recorded,
         SNAPSHOT_MESSAGE,
     },
+    source::LandingBranch,
     turn_end,
 };
 
@@ -72,9 +73,21 @@ pub(crate) struct Recorder {
 /// A merge the recorder makes between its snapshots, and where it says what came of it.
 #[derive(Debug)]
 struct MergeJob {
-    request: MergeRequest,
+    request: Wanted,
     settings: AgentSettings,
     done: mpsc::SyncSender<Result<MergeDone, MergeError>>,
+}
+
+/// What a merge brings: a teammate's snapshot, or what a landing on the landing branch's tip
+/// `tip` brought, from the tree `measured` of the worktree that landing measured.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Wanted {
+    Teammate(MergeRequest),
+    Landing {
+        landing: LandingBranch,
+        measured: ObjectId,
+        tip: ObjectId,
+    },
 }
 
 /// Asks the recorder to merge another agent's snapshot into the worktree it records, so the
@@ -113,6 +126,16 @@ impl Merger {
     pub(crate) fn merge(
         &self,
         request: MergeRequest,
+        settings: AgentSettings,
+    ) -> Result<MergeDone, MergeError> {
+        self.merge_wanted(Wanted::Teammate(request), settings)
+    }
+
+    /// Merges `wanted`, writing agent settings as `settings` says, and waits for what came of
+    /// it.
+    pub(crate) fn merge_wanted(
+        &self,
+        request: Wanted,
         settings: AgentSettings,
     ) -> Result<MergeDone, MergeError> {
         let (done, outcome) = mpsc::sync_channel(1);
@@ -300,7 +323,7 @@ fn merge_between(
     store: &Store,
     target: &Target,
     last: &mut Recorded,
-    request: (&MergeRequest, AgentSettings),
+    (request, settings): (&Wanted, AgentSettings),
     abandon: &AtomicBool,
 ) -> Result<MergeDone, MergeError> {
     let recording = Recording {
@@ -310,13 +333,23 @@ fn merge_between(
         globals: &target.globals,
         commits: &target.commits,
     };
-    let done = merge::merge_now(
-        store,
-        recording,
-        request,
-        (&mut last.cache, Some(last.commit)),
-        abandon,
-    )?;
+    let at = (&mut last.cache, Some(last.commit));
+    let done = match request {
+        Wanted::Teammate(request) => {
+            merge::merge_now(store, recording, (request, settings), at, abandon)?
+        }
+        Wanted::Landing {
+            landing,
+            measured,
+            tip,
+        } => merge::merge_landing_now(
+            store,
+            recording,
+            ((landing, *measured, *tip), settings),
+            at,
+            abandon,
+        )?,
+    };
     if let MergeDone::Merged { commit, tree, .. } = &done {
         last.commit = *commit;
         last.tree = *tree;
@@ -401,6 +434,7 @@ mod tests {
             repository_on_main,
             start_with,
         },
+        source::Source,
     };
 
     fn fast() -> Schedule {
@@ -985,6 +1019,138 @@ mod tests {
             fs::read_to_string(worktree.join(".claude/settings.json")).unwrap(),
             SETTINGS_V1
         );
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn the_landing_branchs_merge_brings_its_changes_and_holds_its_agent_settings() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let store = &merging.store;
+        let worktree = merging.started.worktree.clone();
+        let head = store.head(&merging.started.snapshots).unwrap().unwrap();
+        let measured = store.commit_tree(head).unwrap();
+        let with_file = |base: ObjectId, name: &str, text: &[u8]| {
+            let blob = store.write_blob(text).unwrap();
+            let file = store
+                .write_tree(&[(name, mahi_store::EntryKind::Blob, blob)])
+                .unwrap();
+            store.tree_with_paths(base, file, &[name]).unwrap()
+        };
+        let parked = ThreadRef::new(
+            mahi_core::ThreadId::random().unwrap(),
+            mahi_core::RefKind::Meta,
+        );
+        let upstream = with_file(measured, "upstream.txt", b"upstream\n");
+        let tip = store.append(&parked, None, upstream, "tip").unwrap();
+        let landing = LandingBranch::new("up", "main").unwrap();
+        let wanted = |measured, tip| Wanted::Landing {
+            landing: landing.clone(),
+            measured,
+            tip,
+        };
+        merger
+            .merge_wanted(wanted(measured, tip), AgentSettings::Hold)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(worktree.join("upstream.txt")).unwrap(),
+            "upstream\n"
+        );
+        let note = crate::note::file(store, merging.started.thread, &merging.started.slot);
+        let told = crate::note::take(&note).unwrap().unwrap();
+        assert!(
+            told.contains("merged main on up: ` upstream.txt `"),
+            "{told}"
+        );
+
+        let settings = with_file(upstream, "CLAUDE.md", b"obey main\n");
+        let next = store.append(&parked, Some(tip), settings, "tip").unwrap();
+        assert!(matches!(
+            merger.merge_wanted(wanted(upstream, next), AgentSettings::Hold),
+            Err(MergeError::HoldsAgentSettings(Source::Landing(_)))
+        ));
+        assert!(!worktree.join("CLAUDE.md").exists());
+        let waiting = crate::held::file_for(
+            store,
+            merging.started.thread,
+            (&merging.started.slot, &Source::Landing(landing.clone())),
+        );
+        assert_eq!(
+            crate::held::HeldSettings::load(&waiting)
+                .unwrap()
+                .unwrap()
+                .commit,
+            next
+        );
+        merger
+            .merge_wanted(wanted(upstream, next), AgentSettings::Take)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(worktree.join("CLAUDE.md")).unwrap(),
+            "obey main\n"
+        );
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
+    fn a_landing_merge_that_cannot_write_a_path_says_it_left_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let store = &merging.store;
+        let worktree = merging.started.worktree.clone();
+        fs::create_dir(worktree.join("ro")).unwrap();
+        fs::write(worktree.join("ro/kept.txt"), "kept\n").unwrap();
+        let measured = loop {
+            let head = store.head(&merging.started.snapshots).unwrap().unwrap();
+            let tree = store.commit_tree(head).unwrap();
+            if store.object_at(tree, "ro/kept.txt").unwrap().is_some() {
+                break tree;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        fs::set_permissions(worktree.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+        let blob = store.write_blob(b"new\n").unwrap();
+        let directory = store
+            .write_tree(&[
+                (
+                    "kept.txt",
+                    mahi_store::EntryKind::Blob,
+                    store.write_blob(b"kept\n").unwrap(),
+                ),
+                ("new.txt", mahi_store::EntryKind::Blob, blob),
+            ])
+            .unwrap();
+        let upstream = store
+            .tree_with_paths(
+                measured,
+                store
+                    .write_tree(&[("ro", mahi_store::EntryKind::Tree, directory)])
+                    .unwrap(),
+                &["ro/new.txt"],
+            )
+            .unwrap();
+        let parked = ThreadRef::new(
+            mahi_core::ThreadId::random().unwrap(),
+            mahi_core::RefKind::Meta,
+        );
+        let tip = store.append(&parked, None, upstream, "tip").unwrap();
+        let done = merger.merge_wanted(
+            Wanted::Landing {
+                landing: LandingBranch::new("up", "main").unwrap(),
+                measured,
+                tip,
+            },
+            AgentSettings::Hold,
+        );
+        fs::set_permissions(worktree.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            done,
+            Ok(MergeDone::Merged {
+                left: crate::merge::PathsLeft::Some,
+                ..
+            })
+        ));
         merging.recorder.finish().unwrap();
     }
 

@@ -935,7 +935,7 @@ mod tests {
         let mut text = String::new();
         push_note(&mut text, &file);
         assert!(text.is_empty());
-        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let bob: crate::source::Source = "bob.claude".parse().unwrap();
         let brought = ["src/lib.rs".to_owned()];
         note::record(
             &file,
