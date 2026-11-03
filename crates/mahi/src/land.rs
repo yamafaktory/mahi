@@ -420,6 +420,7 @@ fn remember_branch(
         branch: branch.to_owned(),
         tip,
         landing: landing.to_owned(),
+        worktree: None,
         gone: false,
     };
     if let Err(error) = record.write(store, thread) {

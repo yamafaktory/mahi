@@ -3,7 +3,10 @@ use std::{
         BTreeMap,
         BTreeSet,
     },
-    fmt::Write as _,
+    fmt::{
+        Display,
+        Write as _,
+    },
 };
 
 use mahi_agent::mcp;
@@ -190,10 +193,16 @@ pub(crate) fn control_characters(commit: usize) -> String {
     )
 }
 
-pub(crate) fn branch_gone(branch: &str) -> String {
-    format!(
-        "not landed: the forge deleted {branch}, and mahi cannot yet land on top of what it merged"
-    )
+pub(crate) fn no_landing_branch(landing: &str, remote: &impl Display) -> String {
+    format!("the landing branch {landing} does not exist on {remote}")
+}
+
+pub(crate) fn changed_upstream(landing: &str, remote: &impl Display, paths: &[String]) -> String {
+    let mut text = format!(
+        "not landed: {landing} on {remote} changed these paths since the last landing too: "
+    );
+    push_paths(&mut text, paths);
+    text
 }
 
 pub(crate) fn cannot_confirm(owner: &ParticipantName, thread: ThreadId) -> String {
@@ -251,10 +260,42 @@ pub(crate) fn trailers(thread: ThreadId, agents: &[AgentSlot]) -> String {
     trailers
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Onto {
+    Merged(ObjectId),
+    Conflicts(Vec<String>),
+}
+
+pub(crate) fn onto(
+    store: &Store,
+    (measured, parent, worktree): (ObjectId, ObjectId, ObjectId),
+    changed: &[String],
+) -> Result<Onto, StoreError> {
+    if parent == measured {
+        return Ok(Onto::Merged(worktree));
+    }
+    let paths: Vec<&str> = changed.iter().map(String::as_str).collect();
+    let ours = store.tree_with_paths(measured, parent, &paths)?;
+    let merged = store.merge_trees(measured, ours, worktree, ("landing", "worktree"))?;
+    let swapped = store.kind_clashes(measured, merged.tree, &paths)?;
+    let mut clashes = store.kind_clashes(parent, merged.tree, &paths)?;
+    clashes.retain(|path| !swapped.contains(path));
+    if merged.conflicts.is_empty() && clashes.is_empty() {
+        return Ok(Onto::Merged(merged.tree));
+    }
+    let conflicting: BTreeSet<String> = merged
+        .conflicts
+        .iter()
+        .map(|(path, _)| path.to_string())
+        .chain(clashes.iter().map(|path| (*path).to_owned()))
+        .collect();
+    Ok(Onto::Conflicts(conflicting.into_iter().collect()))
+}
+
 pub(crate) fn build(
     store: &Store,
     (landed, worktree): (ObjectId, ObjectId),
-    call: &Call,
+    call: &mut Call,
     (thread, agents): (ThreadId, &[AgentSlot]),
     (identity, signer): (&Identity, &dyn CommitSigner),
 ) -> Result<Vec<ObjectId>, StoreError> {
@@ -262,9 +303,14 @@ pub(crate) fn build(
     let mut tree = store.commit_tree(landed)?;
     let mut parent = landed;
     let mut built = Vec::with_capacity(call.commits.len());
-    for planned in &call.commits {
+    let mut kept = Vec::with_capacity(call.commits.len());
+    for planned in call.commits.drain(..) {
         let paths: Vec<&str> = planned.paths.iter().map(String::as_str).collect();
-        tree = store.tree_with_paths(tree, worktree, &paths)?;
+        let next = store.tree_with_paths(tree, worktree, &paths)?;
+        if next == tree {
+            continue;
+        }
+        tree = next;
         parent = store.write_commit(
             (tree, parent),
             (&planned.message, &trailers),
@@ -272,7 +318,9 @@ pub(crate) fn build(
             signer,
         )?;
         built.push(parent);
+        kept.push(planned);
     }
+    call.commits = kept;
     Ok(built)
 }
 
@@ -440,10 +488,11 @@ mod tests {
             seconds: 1_793_000_000,
             offset: 0,
         };
+        let mut planned = planned;
         let built = build(
             &store,
             (landed, worktree),
-            &planned,
+            &mut planned,
             (thread, &agents),
             (&identity, &Signing),
         )
@@ -459,9 +508,144 @@ mod tests {
             format!("Add a\n\nThread: {thread}\nAgent: alice.claude\nAgent: bob.codex\n")
         );
         assert!(store.commit_signature(built[1]).unwrap().is_some());
+        let mut again = call(&[("Add a again", &["a.txt"]), ("Add b", &["b.txt"])]);
+        let on_a = build(
+            &store,
+            (built[0], worktree),
+            &mut again,
+            (thread, &agents),
+            (&identity, &Signing),
+        )
+        .unwrap();
+        assert_eq!(on_a.len(), 1);
+        assert_eq!(store.parent(on_a[0]).unwrap(), Some(built[0]));
+        assert_eq!(store.commit_tree(on_a[0]).unwrap(), worktree);
+        assert_eq!(again, call(&[("Add b", &["b.txt"])]));
         assert_eq!(
             changed(&store, (worktree, worktree)).unwrap(),
             Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_landing_onto_its_parent_keeps_both_sides_changes_and_lists_the_paths_that_conflict() {
+        let (_dir, store) = repository_on_main();
+        let tree = |files: &[(&str, &str)]| {
+            let entries: Vec<_> = files
+                .iter()
+                .map(|(name, content)| {
+                    (
+                        *name,
+                        EntryKind::Blob,
+                        store.write_blob(content.as_bytes()).unwrap(),
+                    )
+                })
+                .collect();
+            store.write_tree(&entries).unwrap()
+        };
+        let landed = tree(&[("m.txt", "1\n2\n3\n4\n5\n")]);
+        let upstream = tree(&[("m.txt", "one\n2\n3\n4\n5\n"), ("u.txt", "u\n")]);
+        let worktree = tree(&[("m.txt", "1\n2\n3\n4\nfive\n"), ("w.txt", "w\n")]);
+        let paths = changed(&store, (landed, worktree)).unwrap().unwrap();
+        assert_eq!(paths, owned(&["m.txt", "w.txt"]));
+        let Onto::Merged(merged) = onto(&store, (landed, upstream, worktree), &paths).unwrap()
+        else {
+            panic!("the changes do not overlap");
+        };
+        let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let landing = store.tree_with_paths(upstream, merged, &path_refs).unwrap();
+        assert_eq!(
+            landing,
+            tree(&[
+                ("m.txt", "one\n2\n3\n4\nfive\n"),
+                ("u.txt", "u\n"),
+                ("w.txt", "w\n")
+            ])
+        );
+        let clashing = tree(&[("m.txt", "1\n2\n3\n4\nFIVE\n"), ("w.txt", "other\n")]);
+        assert_eq!(
+            onto(&store, (landed, clashing, worktree), &paths).unwrap(),
+            Onto::Conflicts(owned(&["m.txt", "w.txt"]))
+        );
+        let next = tree(&[("m.txt", "1\n2\nthree\n4\nfive\n"), ("w.txt", "w\n")]);
+        let paths = changed(&store, (worktree, next)).unwrap().unwrap();
+        assert_eq!(paths, owned(&["m.txt"]));
+        let Onto::Merged(merged) = onto(&store, (worktree, landing, next), &paths).unwrap() else {
+            panic!("the landing branch's lines stay apart from the new change");
+        };
+        assert_eq!(
+            store.tree_with_paths(landing, merged, &["m.txt"]).unwrap(),
+            tree(&[
+                ("m.txt", "one\n2\nthree\n4\nfive\n"),
+                ("u.txt", "u\n"),
+                ("w.txt", "w\n")
+            ])
+        );
+        let inner = tree(&[("inner", "x\n")]);
+        let directory = store
+            .write_tree(&[
+                (
+                    "m.txt",
+                    EntryKind::Blob,
+                    store.write_blob(b"1\n2\n3\n4\n5\n").unwrap(),
+                ),
+                ("w.txt", EntryKind::Tree, inner),
+            ])
+            .unwrap();
+        assert_eq!(
+            onto(&store, (landed, directory, worktree), &owned(&["w.txt"])).unwrap(),
+            Onto::Conflicts(owned(&["w.txt"]))
+        );
+        assert_eq!(
+            changed_upstream("main", &"up", &owned(&["src/a.rs", "src/b.rs"])),
+            "not landed: main on up changed these paths since the last landing too: src/a.rs, src/b.rs"
+        );
+    }
+
+    #[test]
+    fn a_worktree_that_swaps_a_directory_for_a_file_lands_where_the_parent_did_not_change_it() {
+        let (_dir, store) = repository_on_main();
+        let blob = |content: &[u8]| store.write_blob(content).unwrap();
+        let guide = store
+            .write_tree(&[("guide.md", EntryKind::Blob, blob(b"guide\n"))])
+            .unwrap();
+        let landed = store
+            .write_tree(&[
+                ("d", EntryKind::Blob, blob(b"file\n")),
+                ("docs", EntryKind::Tree, guide),
+            ])
+            .unwrap();
+        let inner = store
+            .write_tree(&[("f", EntryKind::Blob, blob(b"under\n"))])
+            .unwrap();
+        let worktree = store
+            .write_tree(&[
+                ("d", EntryKind::Tree, inner),
+                ("docs", EntryKind::Blob, blob(b"now a file\n")),
+            ])
+            .unwrap();
+        let paths = changed(&store, (landed, worktree)).unwrap().unwrap();
+        assert_eq!(paths, owned(&["d/f", "d", "docs/guide.md", "docs"]));
+        assert_eq!(
+            onto(&store, (landed, landed, worktree), &paths).unwrap(),
+            Onto::Merged(worktree)
+        );
+        let upstream = store
+            .write_tree(&[
+                ("d", EntryKind::Blob, blob(b"file\n")),
+                ("docs", EntryKind::Tree, guide),
+                ("u.txt", EntryKind::Blob, blob(b"u\n")),
+            ])
+            .unwrap();
+        let Onto::Merged(merged) = onto(&store, (landed, upstream, worktree), &paths).unwrap()
+        else {
+            panic!("the landing branch kept d and docs as they were");
+        };
+        let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let landing = store.tree_with_paths(upstream, merged, &path_refs).unwrap();
+        assert_eq!(
+            store.changed_paths(worktree, landing, 10).unwrap().paths,
+            [("u.txt".to_owned(), mahi_store::Change::Added)]
         );
     }
 }

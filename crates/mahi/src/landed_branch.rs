@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs,
     io::{
         self,
@@ -19,15 +20,17 @@ use mahi_store::{
 const DIRECTORY: [&str; 2] = ["mahi", "branches"];
 const MAX_RECORD_BYTES: u64 = 4096;
 
-/// What `mahi land --push` left on the remote for a thread: the thread branch, the commit it
-/// pushed there and the landing branch it is meant for; and whether a later fetch found the
-/// thread branch gone from the remote.
+/// What a landing left on the remote for a thread: the thread branch, the commit it pushed
+/// there, the landing branch it is meant for and, when the `land` tool pushed it, the tree of
+/// the owner's worktree it landed; and whether a later fetch found the thread branch gone from
+/// the remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchRecord {
     pub(crate) remote: String,
     pub(crate) branch: String,
     pub(crate) tip: ObjectId,
     pub(crate) landing: String,
+    pub(crate) worktree: Option<ObjectId>,
     pub(crate) gone: bool,
 }
 
@@ -42,7 +45,15 @@ impl BranchRecord {
         let branch = lines.next()?.strip_prefix("branch ")?.to_owned();
         let tip = ObjectId::from_hex(lines.next()?.strip_prefix("tip ")?.as_bytes()).ok()?;
         let landing = lines.next()?.strip_prefix("landing ")?.to_owned();
-        let gone = lines.next() == Some("gone");
+        let mut next = lines.next();
+        let worktree = match next.and_then(|line| line.strip_prefix("worktree ")) {
+            Some(hex) => {
+                next = lines.next();
+                Some(ObjectId::from_hex(hex.as_bytes()).ok()?)
+            }
+            None => None,
+        };
+        let gone = next == Some("gone");
         let valid =
             |name: &str| !name.is_empty() && name.chars().all(|character| !character.is_control());
         (valid(&remote) && valid(&branch) && valid(&landing)).then_some(Self {
@@ -50,6 +61,7 @@ impl BranchRecord {
             branch,
             tip,
             landing,
+            worktree,
             gone,
         })
     }
@@ -66,6 +78,9 @@ impl BranchRecord {
             "remote {}\nbranch {}\ntip {}\nlanding {}\n",
             self.remote, self.branch, self.tip, self.landing
         );
+        if let Some(worktree) = self.worktree {
+            let _ = writeln!(text, "worktree {worktree}");
+        }
         if self.gone {
             text.push_str("gone\n");
         }
@@ -112,11 +127,19 @@ mod tests {
             branch: format!("mahi/{thread}"),
             tip: ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
             landing: "main".to_owned(),
+            worktree: None,
             gone: false,
         };
         record.write(&store, thread).unwrap();
         assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
         record.gone = true;
+        record.write(&store, thread).unwrap();
+        assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
+        record.worktree =
+            Some(ObjectId::from_hex(b"89abcdef0123456789abcdef0123456789abcdef").unwrap());
+        record.write(&store, thread).unwrap();
+        assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
+        record.gone = false;
         record.write(&store, thread).unwrap();
         assert_eq!(BranchRecord::read(&store, thread), Some(record));
         BranchRecord::remove(&store, thread).unwrap();

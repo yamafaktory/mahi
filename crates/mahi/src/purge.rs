@@ -203,7 +203,14 @@ pub(crate) fn purge(
     if let Err(error) = forget_here(&store, (thread, &participant), keep_meta, &mut report) {
         return Ok(Purged::Failed(report, error));
     }
-    if let Err(error) = BranchRecord::remove(&store, thread) {
+    let forgotten = BranchRecord::remove(&store, thread)
+        .map_err(|error| error.to_string())
+        .and_then(|()| {
+            store
+                .keep_landed_tree(thread, None)
+                .map_err(|error| crate::describe(&error))
+        });
+    if let Err(error) = forgotten {
         let _ = writeln!(report, "cannot forget the pushed branch's record: {error}");
     }
     lock.remove().map_err(PurgeError::Remove)?;
@@ -495,6 +502,7 @@ mod tests {
             branch: format!("mahi/{thread}"),
             tip: landed,
             landing: "main".to_owned(),
+            worktree: None,
             gone: true,
         };
         record.write(&store, thread).unwrap();

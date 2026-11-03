@@ -227,6 +227,26 @@ impl SyncSetup {
             .access
             .connect(&self.remote, interrupt, ReadBudget::unlimited())?)
     }
+
+    /// Connects to the remote with its reads bounded by `fetch_limit` bytes and runs `fetch`
+    /// on the connection, saying so when the remote sent more than that.
+    pub(crate) fn fetch_within<R>(
+        &self,
+        fetch_limit: u64,
+        interrupt: &Arc<AtomicBool>,
+        fetch: impl FnOnce(AnyTransport) -> Result<R, FetchError>,
+    ) -> Result<R, FetchError> {
+        let budget = ReadBudget::new(fetch_limit);
+        let fetched = self
+            .access
+            .connect(&self.remote, interrupt, budget.clone())
+            .map_err(FetchError::from)
+            .and_then(fetch);
+        if budget.exceeded() {
+            return Err(FetchError::OverLimit(fetch_limit));
+        }
+        fetched
+    }
 }
 
 /// What reaching a remote needs from the environment, gathered once, so a check that runs
@@ -608,16 +628,9 @@ pub(crate) fn fetch_from(
     fetch_limit: u64,
     interrupt: &Arc<AtomicBool>,
 ) -> Result<Option<Accepted>, FetchError> {
-    let budget = ReadBudget::new(fetch_limit);
-    let fetched = setup
-        .access
-        .connect(&setup.remote, interrupt, budget.clone())
-        .map_err(FetchError::from)
-        .and_then(|transport| fetch_and_accept(store, transport, thread, owner, local, interrupt));
-    if budget.exceeded() {
-        return Err(FetchError::OverLimit(fetch_limit));
-    }
-    fetched
+    setup.fetch_within(fetch_limit, interrupt, |transport| {
+        fetch_and_accept(store, transport, thread, owner, local, interrupt)
+    })
 }
 
 /// Fetches only `thread`'s `meta` from where this clone fetches threads, reached through

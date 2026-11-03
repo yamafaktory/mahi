@@ -376,3 +376,65 @@ enum per teammate, kept in one record.
 
 Chosen by the user (DESIGN.md open question). Find out whether Codex's hooks can add the merge
 note as context, and use them when they can.
+
+## D054 · 2026-11-03 · Wording of the refusal when the landing branch changed a path too
+
+Chosen by the user (#11). When the forge deleted `mahi/<thread-id>`, the next landing starts
+from the landing branch's tip on the remote. A path that the landing branch changed since the
+last landing, and that conflicts with the worktree, refuses the landing: `not landed: main on
+up changed these paths since the last landing too: src/a.rs, src/b.rs`. The refusal gives no
+advice.
+
+## D055 · 2026-11-03 · Wording when the remote has no landing branch
+
+Chosen by the user (#11). When the forge deleted `mahi/<thread-id>` and the chosen remote has
+no landing branch to build on, the land tool fails with `the landing branch main does not
+exist on up`, in the shape of `mahi land`'s `the landing branch main does not exist here`.
+
+## D056 · 2026-11-03 · A closed pull request counts as merged for now
+
+Chosen by the user (#11). mahi cannot tell a pull request closed without a merge from a squash
+merge without the forge's API. The landing after a deleted branch builds on the landing branch
+as DESIGN.md says, so the work of a landing whose pull request was closed is not landed again.
+The case is an open question (#62).
+
+## D057 · 2026-11-03 · The worktree takes the tip a landing on the landing branch pushed
+
+Chosen by the user (#11). After a landing that builds on the landing branch's tip, because the
+forge deleted `mahi/<thread-id>`, mahi merges the pushed tip into the owner's worktree once the
+agent is idle, as it merges a teammate's turn, and the agent's note says so. The worktree then
+holds what the landing branch brought, and the next landing finds its changed paths from the
+last landed commit's tree, as before.
+
+## D058 · 2026-11-03 · The landing branch's agent settings wait for the user
+
+Chosen by the user (#64). When the merge of a pushed tip into the owner's worktree (D057)
+brings a change from the landing branch to an agent settings path, it waits for the user's
+keypress, as a teammate's turn does. The palette lists it as a held teammate turn, for example
+`main  3m · changes agent settings`. Enter takes it and Ctrl-X skips it.
+
+## D059 · 2026-11-03 · The landing branch's conflict markers
+
+Chosen by the user (#64). The conflict markers of that merge carry the label `mahi main`: the
+landing branch's name after `mahi`, as a teammate's carry `mahi bob.claude`.
+
+## D060 · 2026-11-03 · The note after the landing branch's merge
+
+Chosen by the user (#64). The note keeps a teammate merge's header and lines, with `main on
+up` as the source. The line for a path where the agent's version was kept points to no tool,
+since read_diff cannot show the landing branch's side:
+
+```
+mahi merged your teammates' work into your worktree since your last prompt.
+Resolve these conflicts before anything else.
+Resolve the conflict markers in (from main on up): `m.txt`
+Your version was kept, but main on up changed these too: `logo.png`
+merged main on up: `upstream.txt`, `m.txt`
+```
+
+## D061 · 2026-11-03 · The landing branch's held merge has no skip
+
+Chosen by the user (#64). The merge of the landing branch's changes that waits for the user
+(D058) has no Ctrl-X: the palette shows only `Enter takes`, and the merge waits until the user
+takes it. Landings meanwhile measure from the tree the last landing recorded, so nothing of the
+landing branch's is reverted.

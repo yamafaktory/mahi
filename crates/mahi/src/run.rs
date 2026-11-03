@@ -1054,18 +1054,14 @@ struct Prepared {
     credentials: Vec<Handed>,
     live: Option<LiveSetup>,
     sync: Option<SyncSetup>,
-    palette_key: PaletteKey,
-    approvals: AgentApprovals,
-    push_limit: u64,
+    settings: Settings,
 }
 
 impl Prepared {
-    /// Takes from `settings` the palette's key, whether the agent asks for permissions and the
-    /// push limit a landing uses.
+    /// Takes `settings`: the palette's key, whether the agent asks for permissions and the
+    /// transfer limits a landing uses.
     fn apply(&mut self, settings: &Settings) {
-        self.palette_key = settings.palette_key;
-        self.approvals = settings.agent_approvals;
-        self.push_limit = settings.push_limit;
+        self.settings = settings.clone();
     }
 
     /// Sets the thread's live layer, if any, and the owner of its `meta`, which the agent's
@@ -1161,9 +1157,7 @@ impl Prepared {
             credentials,
             live: None,
             sync: None,
-            palette_key: PaletteKey::default(),
-            approvals: AgentApprovals::default(),
-            push_limit: Settings::default().push_limit,
+            settings: Settings::default(),
         })
     }
 
@@ -1213,7 +1207,7 @@ impl Prepared {
         if terminal::is_interactive() {
             eprintln!(
                 "mahi: {} opens mahi's palette (palette-key in config.toml changes it)",
-                self.palette_key
+                self.settings.palette_key
             );
         }
     }
@@ -1256,7 +1250,7 @@ impl Prepared {
             profile: self.profile,
             state: state.clone(),
             credentials: &self.credentials,
-            approvals: self.approvals,
+            approvals: self.settings.agent_approvals,
         };
         let (sandbox, network) = (self.sandbox, self.network);
         let live = start_live(self.live.take(), &self.git_dir, &started);
@@ -1292,7 +1286,7 @@ impl Prepared {
         let auto_merge = auto_merge(self.profile, self.owner.as_ref(), (&self.git_dir, &started));
         let note_by = self.profile.map_or(NoteBy::ListAgents, Profile::note_by);
         let landing = landing_desk(
-            (&self.store, environment, &self.git_dir, self.push_limit),
+            (&self.store, environment, &self.git_dir, &self.settings),
             (self.owner.as_ref(), key.as_deref(), raw.is_some()),
             (&started, globals),
         );
@@ -1311,7 +1305,7 @@ impl Prepared {
             raw,
             &UserSide {
                 title: format!("{} · thread {}", started.slot, started.thread),
-                palette_key: self.palette_key,
+                palette_key: self.settings.palette_key,
                 activity,
                 desk: landing.map(|(desk, _)| desk),
             },
@@ -1402,7 +1396,7 @@ fn serve_tools(
 }
 
 fn landing_desk(
-    (store, environment, git_dir, push_limit): (&Store, &Environment, &Path, u64),
+    (store, environment, git_dir, limits): (&Store, &Environment, &Path, &Settings),
     (owner, key, raw): (Option<&ParticipantKey>, Option<&ThreadKey>, bool),
     (started, globals): (&Started, GlobalPatterns),
 ) -> Option<(Arc<Desk>, Arc<Lander>)> {
@@ -1412,7 +1406,7 @@ fn landing_desk(
     let owner = owner.filter(|owner| *owner == started.commits.key())?;
     let meta = load_meta(store, started.thread, owner, 0).ok()?;
     let landing = meta.private(key?).ok()?.landing_branch().to_owned();
-    let reach = (crate::sync::Reach::gather(environment), push_limit);
+    let reach = (crate::sync::Reach::gather(environment), limits.clone());
     let (thread, slot) = (started.thread, &started.slot);
     let desk = Arc::new(Desk::new(
         (git_dir.to_path_buf(), thread),
@@ -3068,7 +3062,7 @@ impl DraftWriter {
             profile: prepared.profile,
             state: prepared.profile.map(|_| state),
             credentials: &prepared.credentials,
-            approvals: prepared.approvals,
+            approvals: prepared.settings.agent_approvals,
         };
         let sandbox = mem::take(&mut prepared.sandbox);
         let (child, raw, proxy) = launch.spawn(sandbox, prepared.network.take())?;
@@ -3084,7 +3078,7 @@ impl DraftWriter {
             raw,
             &UserSide {
                 title: "writing the pull request draft".to_owned(),
-                palette_key: prepared.palette_key,
+                palette_key: prepared.settings.palette_key,
                 activity,
                 desk: None,
             },

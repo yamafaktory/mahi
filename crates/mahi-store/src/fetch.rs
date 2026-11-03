@@ -32,6 +32,7 @@ use mahi_core::{
 use crate::store::{
     Store,
     StoreError,
+    branch_ref,
 };
 
 /// The prefix under which fetched thread refs wait until they are checked, as
@@ -85,7 +86,35 @@ impl Store {
         interrupt: &AtomicBool,
     ) -> Result<Option<ObjectId>, StoreError> {
         let meta = ThreadRef::new(thread, RefKind::Meta).to_string();
-        let prepared = self.prepare_fetch(transport, &meta)?;
+        self.fetch_one(transport, &meta, interrupt)
+    }
+
+    /// Fetches only the branch `branch` from the remote `transport` reaches, and returns the
+    /// commit it points to there, or `None` when the remote does not have it. No ref is
+    /// written: the commit stays unreferenced until a ref takes it, or until git's garbage
+    /// collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBranchName`] if `branch` is not a valid branch name, or
+    /// [`StoreError::Git`] if the fetch fails or is interrupted.
+    pub fn fetch_branch<T: Transport>(
+        &self,
+        transport: T,
+        branch: &str,
+        interrupt: &AtomicBool,
+    ) -> Result<Option<ObjectId>, StoreError> {
+        let name = branch_ref(branch)?.as_bstr().to_string();
+        self.fetch_one(transport, &name, interrupt)
+    }
+
+    fn fetch_one<T: Transport>(
+        &self,
+        transport: T,
+        name: &str,
+        interrupt: &AtomicBool,
+    ) -> Result<Option<ObjectId>, StoreError> {
+        let prepared = self.prepare_fetch(transport, name)?;
         let Some(commit) = prepared
             .ref_map()
             .mappings

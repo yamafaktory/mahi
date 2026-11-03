@@ -37,6 +37,7 @@ use gix_validate::path::component::{
 };
 use mahi_core::{
     THREADS_PREFIX,
+    ThreadId,
     ThreadRef,
 };
 use mahi_crypto::{
@@ -69,6 +70,9 @@ pub struct CommitSignature {
 pub const COMMITTER_NAME: &str = "mahi";
 /// The committer and author email on every thread commit.
 pub const COMMITTER_EMAIL: &str = "mahi@mahi.invalid";
+/// The prefix of the refs that keep the tree each thread's last landing measured, as
+/// `refs/mahi/landed/<thread-id>`.
+pub(crate) const LANDED_PREFIX: &str = "refs/mahi/landed/";
 
 const MAX_ENTRY_NAME_BYTES: usize = 255;
 pub(crate) const MAX_COMMIT_BYTES: u64 = 64 * 1024;
@@ -376,6 +380,45 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Keeps `tree`, the tree of a thread's worktree that its last landing measured, reachable
+    /// for git's garbage collection under `refs/mahi/landed/<thread-id>`, or removes that ref
+    /// when `tree` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `tree` is not a tree, or [`StoreError::Git`] if
+    /// the ref cannot be written.
+    pub fn keep_landed_tree(
+        &self,
+        thread: ThreadId,
+        tree: Option<ObjectId>,
+    ) -> Result<(), StoreError> {
+        let name = FullName::try_from(format!("{LANDED_PREFIX}{thread}"))
+            .map_err(gix::Error::from_error)?;
+        let change = match tree {
+            Some(tree) => {
+                self.require_kind(tree, Kind::Tree)?;
+                Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: "mahi land".into(),
+                    },
+                    expected: PreviousValue::Any,
+                    new: Target::Object(tree),
+                }
+            }
+            None if self.repo.try_find_reference(&name)?.is_none() => return Ok(()),
+            None => Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+            },
+        };
+        self.repo
+            .edit_references_as(Some(RefEdit::new(name, change)), None)?;
+        Ok(())
     }
 
     /// Removes the local branch `branch`, only while it is at `at`.
@@ -1559,6 +1602,32 @@ pub(crate) mod tests {
             store.user_identity(),
             (Some("Alice Example".to_owned()), None)
         );
+    }
+
+    #[test]
+    fn a_landed_tree_is_kept_under_its_ref_until_it_is_let_go() {
+        let (_dir, store) = store();
+        let thread = ThreadId::random().unwrap();
+        let tree = empty_tree(&store);
+        let kept = || {
+            store
+                .repo
+                .try_find_reference(format!("{LANDED_PREFIX}{thread}").as_str())
+                .unwrap()
+                .map(|mut found| found.peel_to_id().unwrap().detach())
+        };
+        store.keep_landed_tree(thread, None).unwrap();
+        assert_eq!(kept(), None);
+        store.keep_landed_tree(thread, Some(tree)).unwrap();
+        assert_eq!(kept(), Some(tree));
+        store.keep_landed_tree(thread, Some(tree)).unwrap();
+        store.keep_landed_tree(thread, None).unwrap();
+        assert_eq!(kept(), None);
+        let blob = store.write_blob(b"x").unwrap();
+        assert!(matches!(
+            store.keep_landed_tree(thread, Some(blob)),
+            Err(StoreError::WrongObject { .. })
+        ));
     }
 
     #[test]

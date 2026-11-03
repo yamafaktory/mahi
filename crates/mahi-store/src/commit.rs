@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use gix::{
     ObjectId,
     actor::Signature,
@@ -66,25 +68,78 @@ impl Store {
         self.require_kind(source, Kind::Tree)?;
         let (source, old) = (self.repo.find_tree(source)?, self.repo.find_tree(base)?);
         let mut editor = self.repo.edit_tree(base)?;
+        let file = |tree: &gix::Tree<'_>, path: &str| {
+            tree.lookup_entry(path.split('/')).map(|entry| {
+                entry
+                    .filter(|entry| !entry.mode().is_tree())
+                    .map(|entry| (EntryKind::from(entry.mode()), entry.object_id()))
+            })
+        };
+        let mut taken = Vec::with_capacity(paths.len());
         for &path in paths {
-            let file = |tree: &gix::Tree<'_>| {
-                tree.lookup_entry(path.split('/')).map(|entry| {
-                    entry
-                        .filter(|entry| !entry.mode().is_tree())
-                        .map(|entry| (EntryKind::from(entry.mode()), entry.object_id()))
-                })
-            };
-            match file(&source)? {
-                Some((kind, id)) => {
-                    editor.upsert(path, kind, id)?;
-                }
-                None if file(&old)?.is_some() => {
+            match file(&source, path)? {
+                Some(entry) => taken.push((path, entry)),
+                None if file(&old, path)?.is_some() => {
                     editor.remove(path)?;
                 }
                 None => {}
             }
         }
+        for (path, (kind, id)) in taken {
+            editor.upsert(path, kind, id)?;
+        }
         Ok(editor.write()?.detach())
+    }
+
+    /// Returns the paths of `paths` where `source` holds a file and [`Store::tree_with_paths`]
+    /// would put it over something of `base`'s of the other kind: a directory at the path, or
+    /// a file at one of its parent directories.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::WrongObject`] if `base` or `source` is not a tree, or
+    /// [`StoreError::Git`] if a tree cannot be read.
+    pub fn kind_clashes<'path>(
+        &self,
+        base: ObjectId,
+        source: ObjectId,
+        paths: &[&'path str],
+    ) -> Result<Vec<&'path str>, StoreError> {
+        self.require_kind(base, Kind::Tree)?;
+        self.require_kind(source, Kind::Tree)?;
+        let (source, base) = (self.repo.find_tree(source)?, self.repo.find_tree(base)?);
+        let mut file_at: HashMap<&str, bool> = HashMap::new();
+        let mut clashes = Vec::new();
+        for &path in paths {
+            let is_file = source
+                .lookup_entry(path.split('/'))?
+                .is_some_and(|entry| !entry.mode().is_tree());
+            if !is_file {
+                continue;
+            }
+            let mut clash = base
+                .lookup_entry(path.split('/'))?
+                .is_some_and(|entry| entry.mode().is_tree());
+            let parents = path.match_indices('/').map(|(end, _)| &path[..end]);
+            for parent in parents {
+                if clash {
+                    break;
+                }
+                clash = if let Some(&known) = file_at.get(parent) {
+                    known
+                } else {
+                    let known = base
+                        .lookup_entry(parent.split('/'))?
+                        .is_some_and(|entry| !entry.mode().is_tree());
+                    file_at.insert(parent, known);
+                    known
+                };
+            }
+            if clash {
+                clashes.push(path);
+            }
+        }
+        Ok(clashes)
     }
 
     /// Writes a commit of `tree` on `parent` by `identity`, its message `message` with
@@ -298,6 +353,45 @@ mod tests {
                 store.write_commit((second, parent), ("m", trailers), &odd, &signer),
                 Err(StoreError::InvalidIdentity(_))
             ));
+        }
+    }
+
+    #[test]
+    fn a_file_over_a_directory_or_under_a_file_clashes() {
+        let (_dir, store) = store();
+        let base = tree(
+            &store,
+            &[
+                ("docs/guide.md", EntryKind::Blob, b"guide"),
+                ("d", EntryKind::Blob, b"file"),
+                ("src/a.rs", EntryKind::Blob, b"a"),
+            ],
+        );
+        let source = tree(
+            &store,
+            &[
+                ("docs", EntryKind::Blob, b"now a file"),
+                ("d/f", EntryKind::Blob, b"under a file"),
+                ("src/a.rs", EntryKind::Blob, b"new a"),
+                ("src/b/c.rs", EntryKind::Blob, b"new c"),
+            ],
+        );
+        let paths = ["docs", "d/f", "src/a.rs", "src/b/c.rs", "gone.txt"];
+        assert_eq!(
+            store.kind_clashes(base, source, &paths).unwrap(),
+            ["docs", "d/f"]
+        );
+        assert!(store.kind_clashes(base, base, &paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_that_becomes_a_directory_keeps_the_files_under_it_whatever_the_order() {
+        let (_dir, store) = store();
+        let base = tree(&store, &[("d", EntryKind::Blob, b"file")]);
+        let source = tree(&store, &[("d/f", EntryKind::Blob, b"under")]);
+        for paths in [["d/f", "d"], ["d", "d/f"]] {
+            assert_eq!(store.tree_with_paths(base, source, &paths).unwrap(), source);
+            assert_eq!(store.tree_with_paths(source, base, &paths).unwrap(), base);
         }
     }
 }

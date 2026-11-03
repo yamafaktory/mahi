@@ -5916,6 +5916,131 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             assert_eq!(running.exit_code(), 0, "{}", running.text());
         }
 
+        const LANDER_AGAIN: &str = r#"#!/bin/sh
+rm -f done
+echo more >> feature.txt
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"land","arguments":{"commits":[{"message":"Extend the feature","paths":["feature.txt"]}],"title":"Extend the feature","description":"Why."}}}' \
+  | "$MAHI_BIN" mcp
+start=$(date +%s)
+until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
+"#;
+
+        fn land_with_enter(running: &mut Driven, fixture: &Fixture, thread: Option<&str>) {
+            running.wait_for("Enter pushes  Esc cancels");
+            thread::sleep(Duration::from_millis(700));
+            running.terminal.write_all(b"\r").unwrap();
+            running.wait_for("Pushed 1 commit on mahi/");
+            running.terminal.write_all(b"\x1b").unwrap();
+            let thread = thread.map_or_else(
+                || {
+                    let workspaces = fs::read_dir(fixture.repo.join(".git/mahi/state")).unwrap();
+                    let names: Vec<_> = workspaces
+                        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                        .collect();
+                    let [only] = names.as_slice() else {
+                        panic!("{names:?}");
+                    };
+                    only.clone()
+                },
+                str::to_owned,
+            );
+            let worktree = worktree_named(fixture, &format!("{thread}.claude"));
+            fs::write(worktree.join("done"), "").unwrap();
+            assert_eq!(running.exit_code(), 0, "{}", running.text());
+        }
+
+        #[test]
+        fn a_landing_after_the_forge_merged_and_deleted_the_branch_starts_from_the_landing_branch()
+        {
+            let fixture = fixture();
+            save_identity(&fixture);
+            let (_server, remote) = serve_remote(&fixture);
+            git(&fixture.repo, &["config", "user.name", "Alice Example"]);
+            git(
+                &fixture.repo,
+                &["config", "user.email", "alice@example.com"],
+            );
+            let lander = script(&fixture, "landing", "claude", LANDER);
+            let owner_config = fixture.home.join(".config");
+            let env = owner_env(&fixture, &owner_config);
+            let mut first = Driven::start(mahi_in_terminal(
+                &fixture.repo,
+                &["run", lander.to_str().unwrap()],
+                &env,
+            ));
+            land_with_enter(&mut first, &fixture, None);
+            let branches = git(
+                &remote,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "refs/heads/mahi/",
+                ],
+            );
+            let branch = branches.trim().to_owned();
+            let thread = branch.strip_prefix("mahi/").unwrap().to_owned();
+
+            let forge = fixture.root.join("forge");
+            git(
+                &fixture.root,
+                &[
+                    "clone",
+                    "-q",
+                    remote.to_str().unwrap(),
+                    forge.to_str().unwrap(),
+                ],
+            );
+            git(
+                &forge,
+                &["checkout", "-q", "-b", "main", &format!("origin/{branch}")],
+            );
+            fs::write(forge.join("upstream.txt"), "upstream\n").unwrap();
+            git(&forge, &["add", "upstream.txt"]);
+            git(&forge, &["commit", "-q", "-m", "Upstream"]);
+            git(&forge, &["push", "-q", "origin", "main"]);
+            git(&forge, &["push", "-q", "origin", "--delete", &branch]);
+            let main = git(&remote, &["rev-parse", "main"]).trim().to_owned();
+
+            let again = script(&fixture, "landing-again", "claude", LANDER_AGAIN);
+            let mut second = Driven::start(mahi_in_terminal(
+                &fixture.repo,
+                &["resume", &thread, "--", again.to_str().unwrap()],
+                &env,
+            ));
+            second.wait_for("Passphrase");
+            second.type_line(PASSPHRASE);
+            second.wait_for(&format!("the branch {branch} is gone from up"));
+            land_with_enter(&mut second, &fixture, Some(&thread));
+            let parent = git(&remote, &["rev-parse", &format!("{branch}^")]);
+            assert_eq!(parent.trim(), main);
+            let files = git(&remote, &["ls-tree", "--name-only", &branch]);
+            assert!(files.lines().any(|file| file == "upstream.txt"), "{files}");
+            let feature = git(&remote, &["show", &format!("{branch}:feature.txt")]);
+            assert_eq!(feature, "feature\nmore");
+            let changed = git(&remote, &["show", "--name-only", "--format=", &branch]);
+            assert_eq!(changed.trim(), "feature.txt");
+
+            let second_tip = git(&remote, &["rev-parse", &branch]);
+            let mut third = Driven::start(mahi_in_terminal(
+                &fixture.repo,
+                &["resume", &thread, "--", again.to_str().unwrap()],
+                &env,
+            ));
+            third.wait_for("Passphrase");
+            third.type_line(PASSPHRASE);
+            land_with_enter(&mut third, &fixture, Some(&thread));
+            let parent = git(&remote, &["rev-parse", &format!("{branch}^")]);
+            assert_eq!(parent, second_tip);
+            let files = git(&remote, &["ls-tree", "--name-only", &branch]);
+            assert!(files.lines().any(|file| file == "upstream.txt"), "{files}");
+            let feature = git(&remote, &["show", &format!("{branch}:feature.txt")]);
+            assert_eq!(feature, "feature\nmore\nmore");
+            let changed = git(&remote, &["show", "--name-only", "--format=", &branch]);
+            assert_eq!(changed.trim(), "feature.txt");
+        }
+
         fn bob_works_in_the_thread(fixture: &Fixture) -> Pairing {
             let codex = script(
                 fixture,

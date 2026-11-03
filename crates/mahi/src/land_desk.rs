@@ -11,6 +11,10 @@ use std::{
             AtomicU64,
             Ordering,
         },
+        mpsc::{
+            self,
+            RecvTimeoutError,
+        },
     },
     thread,
     time::{
@@ -45,11 +49,14 @@ use crate::{
     landing::{
         self,
         Call,
+        Onto,
     },
     mcp::ToolError,
     note,
     session::CommitKey,
+    settings::Settings,
     sync::{
+        FetchError,
         Reach,
         SyncSetup,
     },
@@ -58,6 +65,7 @@ use crate::{
 const SNAPSHOT_ATTEMPTS: usize = 3;
 const WATCH_EVERY: Duration = Duration::from_secs(1);
 const PUSH_WAIT: Duration = Duration::from_secs(180);
+const FETCH_WAIT: Duration = Duration::from_secs(60);
 const PUSHES: &str = "Enter pushes  Esc cancels";
 const CLOSES: &str = "Esc closes";
 const DESCRIPTION_FILE: &str = "PR.md";
@@ -96,6 +104,7 @@ enum Stage {
 pub(crate) struct Pending {
     landed: ObjectId,
     tip: ObjectId,
+    worktree: ObjectId,
     commits: Vec<(String, Vec<String>)>,
     title: String,
     description: String,
@@ -262,7 +271,8 @@ impl Desk {
         else {
             return;
         };
-        let (landed, tip, count) = (pending.landed, pending.tip, pending.commits.len());
+        let built = (pending.landed, pending.tip, pending.worktree);
+        let count = pending.commits.len();
         let remote = pending.remote.clone();
         let description = std::mem::take(&mut pending.description);
         *stage = Stage::Pushing {
@@ -272,13 +282,8 @@ impl Desk {
         drop(stage);
         let desk = Arc::clone(self);
         thread::spawn(move || {
-            let interrupt = Arc::new(AtomicBool::new(false));
-            let stopping = Arc::clone(&interrupt);
-            thread::spawn(move || {
-                thread::sleep(PUSH_WAIT);
-                stopping.store(true, Ordering::SeqCst);
-            });
-            let pushed = desk.push(&remote, (landed, tip), &description, &interrupt);
+            let deadline = Deadline::after(PUSH_WAIT);
+            let pushed = desk.push(&remote, built, &description, &deadline.interrupt);
             desk.finish((&remote, count, &description), &pushed, generation);
         });
     }
@@ -319,7 +324,7 @@ impl Desk {
     fn push(
         &self,
         remote: &SyncSetup,
-        (landed, tip): (ObjectId, ObjectId),
+        (landed, tip, worktree): (ObjectId, ObjectId, ObjectId),
         description: &str,
         interrupt: &Arc<AtomicBool>,
     ) -> Result<Landed, String> {
@@ -361,15 +366,26 @@ impl Desk {
                 return Err(reason);
             }
         };
+        let apart = store
+            .commit_tree(tip)
+            .map_or(true, |landed| landed != worktree)
+            .then_some(worktree);
         let record = BranchRecord {
             remote: remote.name.to_string(),
             branch,
             tip,
             landing: self.landing.clone(),
+            worktree: apart,
             gone: false,
         };
-        let unremembered = record
-            .write(&store, self.thread)
+        let unremembered = store
+            .keep_landed_tree(self.thread, apart)
+            .map_err(|error| described(&error))
+            .and_then(|()| {
+                record
+                    .write(&store, self.thread)
+                    .map_err(|error| error.to_string())
+            })
             .err()
             .map(|error| format!("cannot remember the pushed branch: {error}"));
         Ok(Landed {
@@ -506,6 +522,40 @@ fn refusal(remote: &str, branch: &str, pushed: Pushed) -> Option<String> {
     })
 }
 
+struct Deadline {
+    interrupt: Arc<AtomicBool>,
+    _cancel: mpsc::Sender<()>,
+}
+
+impl Deadline {
+    fn after(wait: Duration) -> Self {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&interrupt);
+        let (cancel, cancelled) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            if cancelled.recv_timeout(wait) == Err(RecvTimeoutError::Timeout) {
+                stopping.store(true, Ordering::SeqCst);
+            }
+        });
+        Self {
+            interrupt,
+            _cancel: cancel,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnRemote {
+    Kept,
+    Gone,
+}
+
+struct LastLanding {
+    tip: ObjectId,
+    measured: ObjectId,
+    on_remote: OnRemote,
+}
+
 fn branch_of(thread: ThreadId) -> String {
     format!("mahi/{thread}")
 }
@@ -519,7 +569,7 @@ pub(crate) struct Lander {
     globals: GlobalPatterns,
     identity: GitIdentity,
     reach: Reach,
-    push_limit: u64,
+    limits: Settings,
     commits: CommitKey,
     desk: Arc<Desk>,
     query: AutoMerge,
@@ -594,7 +644,7 @@ impl Lander {
     pub(crate) fn new(
         (thread, me): (ThreadId, AgentSlot),
         (worktree, globals): (String, GlobalPatterns),
-        (identity, (reach, push_limit), commits): (GitIdentity, (Reach, u64), CommitKey),
+        (identity, (reach, limits), commits): (GitIdentity, (Reach, Settings), CommitKey),
         (desk, query): (Arc<Desk>, AutoMerge),
     ) -> Self {
         Self {
@@ -604,7 +654,7 @@ impl Lander {
             globals,
             identity,
             reach,
-            push_limit,
+            limits,
             commits,
             desk,
             query,
@@ -618,7 +668,7 @@ impl Lander {
         arguments: &Map<String, Value>,
         (base, collaborators): (ObjectId, &[ParticipantName]),
     ) -> Result<String, ToolError> {
-        let call = landing::parse(arguments)?;
+        let mut call = landing::parse(arguments)?;
         let owner = self.me.participant();
         if let Some(commit) = landing::controlled_commit(&call) {
             return Ok(landing::control_characters(commit));
@@ -634,17 +684,12 @@ impl Lander {
             };
             return Ok(landing::identity_unset(key, owner));
         };
-        let remote = match SyncSetup::chosen_by(store, (&self.reach, || self.push_limit), true) {
-            Ok(Some(remote)) => remote,
-            Ok(None) => return Ok(landing::no_remote(owner)),
-            Err(error) => return Err(ToolError::Failed(crate::describe(&error))),
-        };
-        let branch = branch_of(self.thread);
-        let record = BranchRecord::read(store, self.thread)
-            .filter(|record| record.branch == branch && record.remote == remote.name.as_str());
-        if record.as_ref().is_some_and(|record| record.gone) {
-            return Ok(landing::branch_gone(&branch));
-        }
+        let remote =
+            match SyncSetup::chosen_by(store, (&self.reach, || self.limits.push_limit), true) {
+                Ok(Some(remote)) => remote,
+                Ok(None) => return Ok(landing::no_remote(owner)),
+                Err(error) => return Err(ToolError::Failed(crate::describe(&error))),
+            };
         let failed = |error: &StoreError| ToolError::Failed(crate::describe(error));
         let behind = self
             .query
@@ -660,10 +705,15 @@ impl Lander {
         if let Some(paths) = self.unresolved(store, worktree) {
             return Ok(landing::conflicts_first(&paths));
         }
-        let landed = record.map_or(base, |record| record.tip);
-        let landed_tree = store.commit_tree(landed).map_err(|error| failed(&error))?;
+        let LastLanding {
+            tip: landed,
+            measured,
+            on_remote,
+        } = self
+            .last_landing(store, &remote, base)
+            .map_err(|error| failed(&error))?;
         let Some(changed) =
-            landing::changed(store, (landed_tree, worktree)).map_err(|error| failed(&error))?
+            landing::changed(store, (measured, worktree)).map_err(|error| failed(&error))?
         else {
             return Ok(landing::TOO_MANY.to_owned());
         };
@@ -673,6 +723,28 @@ impl Lander {
         if let Err(misplaced) = landing::check(&call, &changed) {
             return Ok(misplaced.text());
         }
+        let parent = match on_remote {
+            OnRemote::Gone => self
+                .landing_tip(store, &remote)
+                .map_err(|error| ToolError::Failed(crate::describe(&error)))?
+                .ok_or_else(|| {
+                    ToolError::Failed(landing::no_landing_branch(&self.desk.landing, &remote.name))
+                })?,
+            OnRemote::Kept => landed,
+        };
+        let parent_tree = store.commit_tree(parent).map_err(|error| failed(&error))?;
+        let merged = match landing::onto(store, (measured, parent_tree, worktree), &changed)
+            .map_err(|error| failed(&error))?
+        {
+            Onto::Merged(merged) => merged,
+            Onto::Conflicts(paths) => {
+                return Ok(landing::changed_upstream(
+                    &self.desk.landing,
+                    &remote.name,
+                    &paths,
+                ));
+            }
+        };
         let agents = crate::threads::thread_agents(store, self.thread)
             .map_err(|error| failed(&error))?
             .into_iter()
@@ -681,8 +753,8 @@ impl Lander {
         let identity = Identity::now(name.clone(), email.clone());
         let built = landing::build(
             store,
-            (landed, worktree),
-            &call,
+            (parent, merged),
+            &mut call,
             (self.thread, &agents),
             (&identity, self.commits.signer()),
         )
@@ -691,9 +763,52 @@ impl Lander {
             return Ok(landing::NOTHING_CHANGED.to_owned());
         };
 
-        let pending = pending((landed, tip), call, (remote, behind));
+        let pending = pending((landed, tip, worktree), call, (remote, behind));
         let _offered = self.desk.offer(pending);
         Ok(landing::waiting(owner))
+    }
+
+    fn last_landing(
+        &self,
+        store: &Store,
+        remote: &SyncSetup,
+        base: ObjectId,
+    ) -> Result<LastLanding, StoreError> {
+        let branch = branch_of(self.thread);
+        let record = BranchRecord::read(store, self.thread)
+            .filter(|record| record.branch == branch && record.remote == remote.name.as_str());
+        let Some(record) = record else {
+            return Ok(LastLanding {
+                tip: base,
+                measured: store.commit_tree(base)?,
+                on_remote: OnRemote::Kept,
+            });
+        };
+        let measured = match record.worktree {
+            Some(tree) => tree,
+            None => store.commit_tree(record.tip)?,
+        };
+        let on_remote = if record.gone {
+            OnRemote::Gone
+        } else {
+            OnRemote::Kept
+        };
+        Ok(LastLanding {
+            tip: record.tip,
+            measured,
+            on_remote,
+        })
+    }
+
+    fn landing_tip(
+        &self,
+        store: &Store,
+        remote: &SyncSetup,
+    ) -> Result<Option<ObjectId>, FetchError> {
+        let deadline = Deadline::after(FETCH_WAIT);
+        remote.fetch_within(self.limits.fetch_limit, &deadline.interrupt, |transport| {
+            Ok(store.fetch_branch(transport, &self.desk.landing, &deadline.interrupt)?)
+        })
     }
 
     fn snapshot(&self, store: &Store) -> Result<ObjectId, StoreError> {
@@ -733,7 +848,7 @@ impl Lander {
 }
 
 fn pending(
-    (landed, tip): (ObjectId, ObjectId),
+    (landed, tip, worktree): (ObjectId, ObjectId, ObjectId),
     call: Call,
     (remote, behind): (SyncSetup, Vec<(AgentSlot, Instant)>),
 ) -> Pending {
@@ -753,6 +868,7 @@ fn pending(
     Pending {
         landed,
         tip,
+        worktree,
         commits,
         title: call.title,
         description: landing::printable(&call.description),
@@ -832,6 +948,7 @@ pub(crate) mod tests {
         let pending = Pending {
             landed,
             tip,
+            worktree: tree,
             commits: vec![
                 (
                     "Retry failed requests in the client".to_owned(),
@@ -863,6 +980,7 @@ pub(crate) mod tests {
         landing.desk.offer(Pending {
             landed: landing.landed,
             tip: landing.tip,
+            worktree: landing.store.commit_tree(landing.tip).unwrap(),
             commits: vec![("Again".to_owned(), Vec::new())],
             title: "Again".to_owned(),
             description: String::new(),
@@ -945,7 +1063,11 @@ pub(crate) mod tests {
             .unwrap();
         let moved = landing.desk.push(
             &unreachable_remote(&landing.store, landing.repo.path()),
-            (landing.landed, landing.tip),
+            (
+                landing.landed,
+                landing.tip,
+                landing.store.commit_tree(landing.tip).unwrap(),
+            ),
             "",
             &Arc::new(AtomicBool::new(false)),
         );
@@ -991,7 +1113,7 @@ pub(crate) mod tests {
                     Some("Alice".to_owned()),
                     Some("alice@example.com".to_owned()),
                 ),
-                (Reach::gather(&environment(&home)), u64::MAX),
+                (Reach::gather(&environment(&home)), Settings::default()),
                 started.commits.clone(),
             ),
             (
@@ -1082,8 +1204,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_landing_starts_from_the_branch_last_pushed_and_is_refused_once_the_forge_deleted_it_there()
-    {
+    fn a_landing_starts_from_the_branch_last_pushed_or_from_the_remote_once_the_forge_deleted_it_there()
+     {
         let (_dir, store) = repository_on_main();
         let key = ssh_key::PrivateKey::random(
             &mut ssh_key::rand_core::OsRng,
@@ -1111,6 +1233,7 @@ pub(crate) mod tests {
             branch: branch_of(started.thread),
             tip: pushed_tip,
             landing: "main".to_owned(),
+            worktree: None,
             gone: false,
         };
         record.write(&store, started.thread).unwrap();
@@ -1118,14 +1241,20 @@ pub(crate) mod tests {
         assert_eq!(land(&["a.txt"]), landing::NOTHING_CHANGED);
         record.gone = true;
         record.write(&store, started.thread).unwrap();
-        assert_eq!(
-            land(&["a.txt"]),
-            landing::branch_gone(&branch_of(started.thread))
+        assert_eq!(land(&["a.txt"]), landing::NOTHING_CHANGED);
+        fs::write(started.worktree.join("b.txt"), "b\n").unwrap();
+        let Err(ToolError::Failed(unreached)) = lander.land(&store, &call(&["b.txt"]), (base, &[]))
+        else {
+            panic!("the landing reaches the remote for its landing branch");
+        };
+        assert!(
+            unreached.starts_with("cannot reach the remote: "),
+            "{unreached}"
         );
         record.remote = "other".to_owned();
         record.write(&store, started.thread).unwrap();
         assert_eq!(
-            land(&["a.txt"]),
+            land(&["a.txt", "b.txt"]),
             landing::waiting(started.slot.participant())
         );
     }

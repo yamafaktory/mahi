@@ -1,4 +1,5 @@
-//! Fetches thread refs with `Store::fetch_thread` and `Store::fetch_meta` through gix's local transport, which runs the
+//! Fetches thread refs with `Store::fetch_thread` and `Store::fetch_meta`, and a branch with
+//! `Store::fetch_branch`, through gix's local transport, which runs the
 //! real `git upload-pack`, so it needs `git` and runs with `just test-git`.
 
 #[cfg(test)]
@@ -151,6 +152,46 @@ mod tests {
         assert_eq!(
             target.fetched_refs(thread).unwrap(),
             [(meta.clone(), waiting)]
+        );
+    }
+
+    #[test]
+    fn a_branch_is_fetched_with_its_history_and_no_ref_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source_dir, target_dir) = (dir.path().join("source"), dir.path().join("target"));
+        gix::init(&source_dir).unwrap();
+        gix::init(&target_dir).unwrap();
+        let source = Store::open(&source_dir).unwrap();
+        let target = Store::open(&target_dir).unwrap();
+        let connect = || {
+            file::connect(
+                source_dir.as_os_str().as_encoded_bytes(),
+                Protocol::V2,
+                false,
+            )
+            .unwrap()
+        };
+        let fetch = || {
+            target
+                .fetch_branch(connect(), "main", &AtomicBool::new(false))
+                .unwrap()
+        };
+        assert_eq!(fetch(), None);
+        let parked = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
+        let first = commit(&source, &parked, None, "first");
+        let tip = commit(&source, &parked, Some(first), "second");
+        source.move_branch("main", None, tip, "test").unwrap();
+        assert_eq!(fetch(), Some(tip));
+        assert_eq!(target.parent(tip).unwrap(), Some(first));
+        assert_eq!(
+            target.commit_tree(first).unwrap(),
+            source.commit_tree(first).unwrap()
+        );
+        assert_eq!(target.branch_tip("main").unwrap(), None);
+        assert!(
+            target
+                .fetch_branch(connect(), "refs/heads/main", &AtomicBool::new(false))
+                .is_err()
         );
     }
 }

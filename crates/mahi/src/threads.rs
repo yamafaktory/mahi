@@ -400,6 +400,7 @@ mod tests {
             branch: "mahi/\"x\"\u{200b}".to_owned(),
             tip: ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
             landing: "main".to_owned(),
+            worktree: None,
             gone: true,
         }
         .write(&store, thread)
