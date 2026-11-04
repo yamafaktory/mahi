@@ -40,7 +40,6 @@ use thiserror::Error;
 
 use crate::{
     environment::Environment,
-    handoff,
     prompt::{
         Prompt as _,
         TerminalPrompt,
@@ -51,6 +50,7 @@ use crate::{
         AsText,
         Format,
     },
+    turns::split_event,
     unlocked,
 };
 
@@ -307,7 +307,7 @@ fn found_text(matches: &[Match<'_>]) -> String {
 /// A prompt is searched whole. A tool call is searched in its tool's name and in every text
 /// of its input, and shown as its tool's name and the excerpt of the text that holds it.
 fn matched(payload: &[u8], needle: &[char], cleaned: &mut String) -> Option<(Kind, String)> {
-    let (name, details) = handoff::split_event(payload)?;
+    let (name, details) = split_event(payload)?;
     let kind = match HookKind::parse(name)? {
         HookKind::Prompt => Kind::Asked,
         HookKind::Tool => Kind::Used,

@@ -27,10 +27,7 @@ use std::{
 };
 
 use mahi_agent::{
-    claude_code::{
-        self,
-        LogLine,
-    },
+    claude_code,
     codex::{
         self,
         HookTrust,
@@ -84,9 +81,6 @@ const CODEX_LOG_DEPTH: usize = 3;
 const MOST_SESSION_ENTRIES: usize = 10_000;
 const CLAUDE_CODE_SESSIONS: &str = "sessions";
 
-/// Reads one line of an agent's own session log.
-pub(crate) type ReadLogLine = fn(&[u8]) -> Option<LogLine>;
-
 /// Finds where an agent keeps its sessions for a worktree.
 pub(crate) type SessionDir = fn(&Path) -> Option<String>;
 
@@ -128,7 +122,6 @@ pub(crate) struct Profile {
     pub(crate) args: Vec<String>,
     pub(crate) credential: Option<ProfileCredential>,
     reader: Option<Reader>,
-    pub(crate) takes_prompt: bool,
     pub(crate) tools: Tools,
     install: Install,
     approvals: Option<Approvals>,
@@ -218,7 +211,6 @@ fn claude_code_profile() -> Profile {
             ),
         }),
         reader: Some(Reader::ClaudeCode),
-        takes_prompt: true,
         tools: Tools::McpFlag("--mcp-config"),
         install: Install::ClaudeCode,
         approvals: Some(Approvals {
@@ -269,7 +261,6 @@ fn codex_profile() -> Profile {
         args: CODEX_ARGS.iter().map(|arg| (*arg).to_owned()).collect(),
         credential: None,
         reader: Some(Reader::Codex),
-        takes_prompt: true,
         tools: Tools::Args(
             CODEX_TOOL_ARGS
                 .iter()
@@ -420,7 +411,6 @@ fn read_profile(path: &Path) -> Result<Profile, LoadError> {
         args: user.args,
         credential: user.credential,
         reader: user.reader,
-        takes_prompt: user.first_prompt_arg,
         tools: if user.tool_args.is_empty() {
             Tools::None
         } else {
@@ -531,14 +521,6 @@ impl Profile {
                 .filter(|skip| !(skip.chosen)(arguments))
                 .map_or(&[], |skip| skip.args),
         }
-    }
-
-    /// Returns how one line of the agent's session log reads, when mahi has a reader for it.
-    pub(crate) fn log_line(&self) -> Option<ReadLogLine> {
-        self.reader.map(|reader| match reader {
-            Reader::ClaudeCode => claude_code::log_line as ReadLogLine,
-            Reader::Codex => codex::log_line,
-        })
     }
 
     /// Writes the profile's files into the agent's state directory, open as `state` and found
@@ -1246,7 +1228,6 @@ pass-env = ["OPENAI_API_KEY"]
 env = { CODEX_QUIET = "1" }
 state-env = "CODEX_HOME"
 resume-args = ["resume", "--last"]
-first-prompt-arg = true
 credential = { name = "openai", variable = "OPENAI_TOKEN", hint = "make one at platform.openai.com" }
 
 [tools]
@@ -1283,7 +1264,7 @@ content = "first\n"
         );
         assert_eq!(codex.state_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(codex.set_names(), ["CODEX_QUIET", "CODEX_HOME"]);
-        assert!(codex.takes_prompt && codex.session_dir().is_none());
+        assert!(codex.session_dir().is_none());
         assert_eq!(
             codex
                 .credential
@@ -1351,15 +1332,6 @@ content = "first\n"
         assert!(matches!(
             read_profiles(&linked.path().join("profiles")),
             Err(LoadError::Read(..))
-        ));
-
-        let handoff = profiles_dir(&[(
-            "h.toml",
-            "name = \"h\"\nprogram = \"h\"\nenv = { MAHI_HANDOFF = \"/x\" }\n",
-        )]);
-        assert!(matches!(
-            read_profiles(handoff.path()),
-            Err(LoadError::Variable(..))
         ));
 
         let builtin_name =
@@ -1774,7 +1746,7 @@ content = "first\n"
         let codex = codex_profile();
         assert_eq!(codex.state_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(codex.resume_args, ["resume", "--last", "--all"]);
-        assert!(codex.takes_prompt && codex.credential.is_none() && codex.optional_env.is_empty());
+        assert!(codex.credential.is_none() && codex.optional_env.is_empty());
         let hosts: Vec<String> = codex.hosts.iter().map(ToString::to_string).collect();
         assert_eq!(hosts, ["api.openai.com", "chatgpt.com", "auth.openai.com"]);
         assert_eq!(codex.args, CODEX_ARGS);

@@ -13,7 +13,6 @@ use clap::{
 use mahi_agent::hook::HookKind;
 use mahi_core::{
     AgentName,
-    AgentSlot,
     NameError,
     ThreadId,
 };
@@ -57,9 +56,6 @@ pub(crate) enum Command {
     Run(RunCommand),
     /// Resumes a thread you started, in its worktree, with the same agent.
     Resume(ResumeCommand),
-    /// Merges a thread's agents' work into its landing worktree, on a branch from the
-    /// thread's landing branch, for you to curate into commits there with git.
-    Land(LandCommand),
     /// Ends a thread you started that is not running: records its worktree in a last
     /// snapshot, then removes the worktree and the agent's state. Its history stays.
     End(EndCommand),
@@ -311,31 +307,6 @@ pub(crate) struct ResumeCommand {
     /// after `--`.
     #[arg(last = true, value_name = "COMMAND")]
     pub(crate) command: Vec<OsString>,
-}
-
-#[derive(Debug, Args, PartialEq, Eq)]
-pub(crate) struct LandCommand {
-    /// The thread, as `mahi threads` lists it.
-    pub(crate) thread: ThreadId,
-    /// An agent whose work to land, as `<participant>.<agent>`; every agent when left out.
-    #[arg(long, value_name = "PARTICIPANT.AGENT")]
-    pub(crate) from: Vec<AgentSlot>,
-    /// The branch to land on, `mahi/<thread>` when left out.
-    #[arg(long, value_name = "BRANCH")]
-    pub(crate) branch: Option<String>,
-    /// Add the thread's trailers to the branch's unpushed commits and push it to the chosen
-    /// remote, fast-forward only, instead of merging.
-    #[arg(long, conflicts_with = "from")]
-    pub(crate) push: bool,
-    /// After the push, starts this agent, sandboxed, with the landing worktree read-only and
-    /// the pull request draft to rewrite.
-    #[arg(long = "with", value_name = "AGENT", requires = "push")]
-    pub(crate) with: Option<OsString>,
-    #[command(flatten)]
-    pub(crate) options: LaunchOptions,
-    /// Arguments passed to the `--with` agent unchanged, after `--`.
-    #[arg(last = true, value_name = "ARGUMENT", requires = "with")]
-    pub(crate) arguments: Vec<OsString>,
 }
 
 #[derive(Debug, Args, PartialEq, Eq)]

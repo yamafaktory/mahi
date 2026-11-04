@@ -650,9 +650,7 @@ enum Entry {
     Quit,
 }
 
-const THREAD_ACTIONS: [(ThreadChoice, &str); 4] = [
-    (ThreadChoice::Land, "Land this thread"),
-    (ThreadChoice::Push, "Push the landed commits"),
+const THREAD_ACTIONS: [(ThreadChoice, &str); 2] = [
     (ThreadChoice::End, "End this thread"),
     (ThreadChoice::Invite, "Invite a teammate"),
 ];
@@ -2556,18 +2554,16 @@ mod tests {
                 .find(|row| row.contains(item))
                 .unwrap_or_else(|| panic!("{item} missing: {rows:#?}"))
         };
-        for item in [
-            "Land this thread",
-            "Push the landed commits",
-            "End this thread",
-            "Invite a teammate",
-        ] {
+        for item in ["End this thread", "Invite a teammate"] {
             row_of(item);
         }
         assert!(
-            !rows
-                .iter()
-                .any(|row| row.contains("Add an agent") || row.contains("Hand off")),
+            !rows.iter().any(|row| {
+                row.contains("Add an agent")
+                    || row.contains("Hand off")
+                    || row.contains("Land this thread")
+                    || row.contains("Push the landed commits")
+            }),
             "{rows:#?}"
         );
         let sent = row_of("Pass Ctrl-Space through to the agent");

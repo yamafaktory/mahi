@@ -79,11 +79,10 @@ sandbox cannot start Windows programs. CI runs mahi's tests inside WSL 2.
 
 ```sh
 cd my-project                 # any git repository
-mahi                          # the home screen: your threads, and keys to start, resume, land, end or purge them; agents run in tabs
+mahi                          # the home screen: your threads, and keys to start, resume, end or purge them; agents run in tabs
 mahi run claude               # run an agent in a sandbox, in a new thread
 mahi threads                  # list this repository's threads
 mahi resume <thread>          # pick a thread up again, with the same agent
-mahi land <thread>            # bring the thread's work back as a branch to curate into commits
 ```
 
 The first `mahi run` sets mahi up: it creates your mahi key, asking for its passphrase, and
@@ -91,6 +90,8 @@ picks the SSH key in ssh-agent that signs your threads (asking which when there 
 `mahi init` does the same ahead of time. The first `mahi run` also asks, once per agent, for a credential the
 agent signs in with that mahi does not have yet (Claude Code's token), and, once per clone,
 whether to push threads to `origin` and whether `origin` is private or public.
+
+The owner lands the thread by asking their own agent, which calls mahi's `land` tool.
 
 To work with a teammate, the thread's owner runs `mahi invite --collaborator <thread>`, or
 presses `i` on the home screen; `--watcher` invites a teammate who only watches. mahi shows a
@@ -207,7 +208,6 @@ Some things stay out of them:
 | `mahi resume <thread>` | Runs the thread's agent again, continuing its latest session |
 | `mahi threads [--json]` | Lists the repository's threads and their agents, as JSON with `--json` |
 | `mahi threads search <text> [--json]` | Finds the turns whose prompts or tool calls hold the text, in every thread |
-| `mahi land <thread>` | Brings the thread's work back as a branch to curate into commits |
 | `mahi end <thread>` | Ends a thread: records a last snapshot and removes its worktree |
 | `mahi purge <thread>` | Deletes a thread here and on its remote |
 | `mahi remote [name]` | Shows or chooses the remote threads are pushed to |

@@ -5,13 +5,11 @@ mod commits;
 mod fetched;
 #[cfg(any(fuzzing, feature = "fuzzing"))]
 pub mod fuzzing;
-mod handoff;
 mod key;
 mod meta;
 mod node;
 mod owners;
 mod pins;
-mod pull_request;
 mod session_files;
 mod signer;
 mod thread;
@@ -34,13 +32,6 @@ pub use fetched::{
     accept_fetched,
     accept_fetched_meta,
     accept_snapshots,
-};
-pub use handoff::{
-    BRIEFED_PROMPTS,
-    BRIEFED_REPLIES,
-    Briefing,
-    MAX_BRIEFING_BYTES,
-    push_code,
 };
 pub use key::{
     KeyError,
@@ -69,11 +60,6 @@ pub use owners::{
     remembered_owner,
 };
 pub use pins::PinError;
-pub use pull_request::{
-    LandedAgent,
-    MAX_DRAFT_BYTES,
-    PullRequestDraft,
-};
 pub use session_files::{
     MAX_SESSION_BYTES,
     MAX_SESSION_CHUNKS,

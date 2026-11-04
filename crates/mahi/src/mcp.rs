@@ -83,13 +83,13 @@ use crate::{
         MAX_NOTE_BYTES,
         MAX_WHAT_BYTES,
     },
-    handoff,
     land_desk::Lander,
     landing,
     note::{
         self,
         NoteBy,
     },
+    turns::split_event,
 };
 
 const RELAY_CHUNK: usize = 8192;
@@ -640,7 +640,7 @@ impl TurnsRead {
             if self.text.len() > TURNS_BUDGET {
                 break;
             }
-            let Some((name, payload)) = handoff::split_event(payload) else {
+            let Some((name, payload)) = split_event(payload) else {
                 continue;
             };
             match HookKind::parse(name) {

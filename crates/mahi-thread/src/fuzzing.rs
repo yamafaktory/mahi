@@ -9,11 +9,7 @@ use std::{
 
 use ed25519_dalek::SigningKey;
 use mahi_core::ThreadId;
-use mahi_store::{
-    Change,
-    Changes,
-    ObjectId,
-};
+use mahi_store::ObjectId;
 use ssh_key::{
     PublicKey,
     public::Ed25519PublicKey,
@@ -21,8 +17,6 @@ use ssh_key::{
 
 pub use self::fetched::fetched;
 use crate::{
-    Briefing,
-    MAX_BRIEFING_BYTES,
     ParticipantCard,
     ParticipantKey,
     VerifiedMeta,
@@ -91,47 +85,6 @@ pub fn session_manifest(data: &[u8]) {
             session_files::decode_manifest(&encoded, null()).expect("an encoded manifest decodes");
         assert!(again == manifest);
     }
-}
-
-/// Renders a briefing from records cut out of `data` at zero bytes, each repeated as many times
-/// as `data`'s first byte says so that records can reach their limits, and checks its size.
-///
-/// # Panics
-///
-/// Panics if the briefing is larger than [`MAX_BRIEFING_BYTES`], which is the bug looked for.
-pub fn briefing(data: &[u8]) {
-    let repeat = usize::from(data.first().copied().unwrap_or_default()) + 1;
-    let mut parts = data
-        .split(|byte| *byte == 0)
-        .map(|part| String::from_utf8_lossy(part).repeat(repeat));
-    let mut next = || parts.next().unwrap_or_default();
-    let title = next();
-    let branch = next();
-    let from = next();
-    let rest: Vec<String> = std::iter::from_fn(|| Some(next()))
-        .take_while(|part| !part.is_empty())
-        .collect();
-    let third = rest.len() / 3;
-    let briefing = Briefing {
-        title,
-        branch,
-        from,
-        prompts: rest.get(..third).unwrap_or_default().to_vec(),
-        omitted_prompts: data.len(),
-        transcript_cut: data.first().is_some_and(|byte| byte % 2 == 1),
-        changes: Changes {
-            paths: rest
-                .iter()
-                .skip(third)
-                .take(third)
-                .map(|path| (path.clone(), Change::Modified))
-                .collect(),
-            truncated: data.len().is_multiple_of(2),
-        },
-        tools: rest.iter().skip(2 * third).cloned().collect(),
-        replies: rest.iter().rev().take(4).cloned().collect(),
-    };
-    assert!(briefing.render().len() <= MAX_BRIEFING_BYTES);
 }
 
 /// Decodes `data` as a session manifest and, when it decodes, checks the files a reader would

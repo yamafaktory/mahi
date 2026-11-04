@@ -2,10 +2,6 @@
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     use mahi_agent::claude_code;
-    if let Some(line) = claude_code::log_line(data) {
-        assert!(line.reply.is_none_or(|reply| reply.chars().count() <= 4000));
-        assert!(line.timestamp.is_none_or(|time| time.chars().count() <= 64));
-    }
     assert!(mahi_agent::payload::prompt_text(data).chars().count() <= 4000);
     assert!(mahi_agent::payload::tool_text(data).chars().count() <= 4000);
     if let Ok(path) = std::str::from_utf8(data) {

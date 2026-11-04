@@ -967,11 +967,9 @@ fn command_words(
             )?,
         ],
         HomeAction::Resume(thread) => vec!["resume".to_owned(), thread],
-        HomeAction::Land(thread) => vec!["land".to_owned(), thread],
         HomeAction::End(thread) => vec!["end".to_owned(), thread],
         HomeAction::Invite(thread) => invite_words(store, thread)?,
         HomeAction::Purge(thread) => vec!["purge".to_owned(), thread],
-        HomeAction::Push(thread) => push_words(store, thread, environment)?,
         HomeAction::Join => vec!["join".to_owned()],
         HomeAction::Remote => return Err(choose_remote(store, None)),
         HomeAction::Card => vec!["id".to_owned()],
@@ -1092,8 +1090,10 @@ fn agent_to_run(
     (title, question): (&str, &str),
     agents: Agents,
 ) -> Result<String, String> {
-    let found: Vec<&str> = programs_on_path(environment)
-        .filter(|program| agents.offers(program))
+    let found: Vec<&str> = Profile::programs()
+        .filter(|program| {
+            agents.offers(program) && run::is_on_path(program, environment.path.as_deref())
+        })
         .collect();
     match found.as_slice() {
         [] => Err(agents.none_found().to_owned()),
@@ -1177,54 +1177,6 @@ impl Agents {
             }
         }
     }
-}
-
-/// Returns the programs mahi has a profile for that are on `PATH`.
-fn programs_on_path(environment: &Environment) -> impl Iterator<Item = &'static str> + '_ {
-    Profile::programs().filter(|program| run::is_on_path(program, environment.path.as_deref()))
-}
-
-/// Asks whether an agent should rewrite the pull request draft after the push, and returns
-/// the command that pushes the thread's landing branch, once the thread has been landed here.
-fn push_words(
-    store: &Store,
-    thread: String,
-    environment: &Environment,
-) -> Result<Vec<String>, String> {
-    if store.worktree_dir(&format!("{thread}@land")).is_err() {
-        return Err(format!(
-            "thread {thread} is not landed here yet: land it first, with Land in its menu"
-        ));
-    }
-    let writers: Vec<&str> = programs_on_path(environment).collect();
-    let mut items = Vec::with_capacity(writers.len() + 1);
-    items.push("Just push".to_owned());
-    items.extend(
-        writers
-            .iter()
-            .map(|program| format!("Push, then let {program} rewrite the pull request draft")),
-    );
-    let dialog = Dialog::choose(
-        "Push",
-        vec![format!(
-            "Push thread {thread}'s landing branch to the chosen remote, fast-forward only, \
-             with the thread's trailers added to the commits that are not pushed yet?"
-        )],
-        items,
-    );
-    let index = match DialogPrompt::default().ask(dialog) {
-        Ok(Answer::Choice(index)) => index,
-        Ok(_) => return Err(String::new()),
-        Err(error) => return Err(format!("cannot ask how to push: {error}")),
-    };
-    let mut words = vec!["land".to_owned(), thread, "--push".to_owned()];
-    if let Some(index) = index.checked_sub(1) {
-        let writer = writers
-            .get(index)
-            .ok_or_else(|| "no agent was chosen".to_owned())?;
-        words.extend(["--with".to_owned(), (*writer).to_owned()]);
-    }
-    Ok(words)
 }
 
 /// What the Remote dialog can do with one of its items.

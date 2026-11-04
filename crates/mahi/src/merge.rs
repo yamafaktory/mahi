@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    fmt::Write as _,
     sync::atomic::AtomicBool,
 };
 
@@ -12,7 +11,6 @@ use mahi_store::{
     Applied,
     Conflict,
     GlobalPatterns,
-    Left,
     MAX_MERGED_PATHS,
     Merged,
     ObjectId,
@@ -44,8 +42,6 @@ use crate::{
 };
 
 const SNAPSHOT_ATTEMPTS: usize = 3;
-const LISTED: usize = 20;
-const LONGEST_LISTED: usize = 200;
 const AGENT_SETTINGS: [&str; 7] = [
     "CLAUDE.md",
     "CLAUDE.local.md",
@@ -474,100 +470,8 @@ fn snapshot(
     }
 }
 
-/// Says what a merge did: the files written and removed, the conflicts and the paths left.
-pub(crate) fn report(
-    from: &AgentSlot,
-    into: &dyn std::fmt::Display,
-    merged: &Merged,
-    applied: &Applied,
-) -> String {
-    let mut report = format!(
-        "merged {from} into {into}: {} written, {} removed\n",
-        applied.written, applied.removed
-    );
-    let markers = merged
-        .conflicts
-        .iter()
-        .filter(|(_, conflict)| *conflict == Conflict::Markers)
-        .map(|(path, _)| path);
-    list(
-        &mut report,
-        (format_args!("conflict markers to resolve in"), LISTED),
-        markers,
-    );
-    let kept = merged
-        .conflicts
-        .iter()
-        .filter(|(_, conflict)| *conflict == Conflict::KeptOurs)
-        .map(|(path, _)| path);
-    list(
-        &mut report,
-        (format_args!("kept {into}'s side of"), LISTED),
-        kept,
-    );
-    for (why, label) in [
-        (Left::UnsafeName, "names git refuses to check out"),
-        (Left::TooDeep, "nested too deep"),
-        (Left::TooLarge, "too large"),
-        (Left::Blocked, "something else is in the way"),
-        (Left::Unwritable, "cannot be written"),
-    ] {
-        let paths = applied
-            .left
-            .iter()
-            .filter(|(_, left)| *left == why)
-            .map(|(path, _)| path);
-        list(
-            &mut report,
-            (format_args!("left as they were ({label})"), LISTED),
-            paths,
-        );
-    }
-    if !applied.left.is_empty() {
-        let _ = writeln!(
-            report,
-            "this merge is not recorded, since paths were left as they were: the next merge of \
-             {from} starts from the same base"
-        );
-    }
-    report
-}
-
-fn list<'a, T: std::fmt::Debug + 'a>(
-    report: &mut String,
-    (heading, most): (std::fmt::Arguments<'_>, usize),
-    paths: impl Iterator<Item = &'a T>,
-) {
-    let mut count = 0;
-    for path in paths {
-        if count == 0 {
-            let _ = write!(report, "{heading}:");
-        }
-        if count < most {
-            let start = report.len();
-            let _ = write!(report, " {path:?}");
-            if report.len() - start > LONGEST_LISTED {
-                let mut end = start + LONGEST_LISTED;
-                while !report.is_char_boundary(end) {
-                    end -= 1;
-                }
-                report.truncate(end);
-                report.push_str("...");
-            }
-        }
-        count += 1;
-    }
-    if count > most {
-        let _ = write!(report, " and {} more", count - most);
-    }
-    if count > 0 {
-        report.push('\n');
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use gix::bstr::BString;
     use mahi_core::{
         RefKind,
         ThreadId,
@@ -687,57 +591,5 @@ mod tests {
         for path in others {
             assert!(!is_agent_settings(path), "{path}");
         }
-    }
-
-    #[test]
-    fn the_report_lists_conflicts_and_left_paths_escaped_and_cut_short() {
-        let from: AgentSlot = "bob.codex".parse().unwrap();
-        let into: AgentSlot = "alice.claude".parse().unwrap();
-        let merged = Merged {
-            tree: ObjectId::empty_tree(gix::hash::Kind::Sha1),
-            conflicts: vec![
-                (BString::from("a.txt"), Conflict::Markers),
-                (BString::from("bad\x1b]0;x\x07"), Conflict::Markers),
-                (BString::from("image.bin"), Conflict::KeptOurs),
-            ],
-        };
-        let applied = Applied {
-            written: 3,
-            removed: 1,
-            left: (0..25)
-                .map(|index| (BString::from(format!("p{index:02}")), Left::Blocked))
-                .collect(),
-        };
-        let report = report(&from, &into, &merged, &applied);
-        assert!(report.starts_with("merged bob.codex into alice.claude: 3 written, 1 removed\n"));
-        assert!(
-            report.contains("conflict markers to resolve in: \"a.txt\" \"bad\\x1b]0;x\\x07\"\n"),
-            "{report}"
-        );
-        assert!(
-            report.contains("kept alice.claude's side of: \"image.bin\"\n"),
-            "{report}"
-        );
-        assert!(
-            report.contains("something else is in the way): \"p00\""),
-            "{report}"
-        );
-        assert!(report.contains("\"p19\" and 5 more\n"), "{report}");
-        assert!(!report.contains('\x1b'));
-    }
-
-    #[test]
-    fn a_long_path_is_cut_short_in_the_report() {
-        let from: AgentSlot = "bob.codex".parse().unwrap();
-        let into: AgentSlot = "alice.claude".parse().unwrap();
-        let long = "\u{e9}".repeat(400);
-        let merged = Merged {
-            tree: ObjectId::empty_tree(gix::hash::Kind::Sha1),
-            conflicts: vec![(BString::from(long.as_str()), Conflict::Markers)],
-        };
-        let report = report(&from, &into, &merged, &Applied::default());
-        let line = report.lines().nth(1).unwrap();
-        assert!(line.ends_with("..."), "{line}");
-        assert!(line.len() < "conflict markers to resolve in:".len() + LONGEST_LISTED + 4);
     }
 }

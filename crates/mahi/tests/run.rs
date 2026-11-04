@@ -1681,7 +1681,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         let claude = script(&fixture, "palette-action", "claude", agent);
         script(&fixture, "palette-action", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_end = [b"\x1b[B".repeat(7), b"\r".to_vec()].concat();
+        let to_end = [b"\x1b[B".repeat(5), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
@@ -1759,7 +1759,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         let claude = script(&fixture, "palette-declined", "claude", agent);
         script(&fixture, "palette-declined", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let to_end = [b"\x1b[B".repeat(7), b"\r".to_vec()].concat();
+        let to_end = [b"\x1b[B".repeat(5), b"\r".to_vec()].concat();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
@@ -2181,7 +2181,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         parser.process(&output.as_bytes()[..asked]);
         let screen = parser.screen().contents();
         assert!(screen.contains("Threads"), "{screen}");
-        assert!(!screen.contains("Land: merge"), "{screen}");
+        assert!(!screen.contains("End: save"), "{screen}");
     }
 
     #[test]
@@ -2233,9 +2233,9 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
             &[
                 (&thread, b"r"),
                 ("Passphrase", passphrase.as_bytes()),
-                (&resumed, b"l"),
-                ("Land thread", b"y"),
-                (&format!("mahi land {thread}: done"), b"q"),
+                (&resumed, b"n"),
+                ("Which agent should start the thread?", b"2"),
+                ("mahi run codex: done", b"q"),
             ],
         );
         assert_eq!(code, 0, "{output}");
@@ -2496,42 +2496,6 @@ printf 'fn parse() { codex }\n' > parser.rs
 ";
 
     #[test]
-    fn the_home_screen_pushes_a_landing_from_the_thread_menu() {
-        let fixture = fixture();
-        let (thread, _claude) = worked_thread(&fixture);
-        let (code, output) = in_terminal_typing(
-            terminal_command(&fixture, &[]),
-            &[
-                (&thread, b"\r"),
-                ("Push: add the thread's trailers", b"3"),
-                (&format!("thread {thread} is not landed here yet"), b"q"),
-            ],
-        );
-        assert_eq!(code, 0, "{output}");
-        let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
-        assert_eq!(code, 0, "{output}");
-        let writer = script(&fixture, "home-push", "claude", "#!/bin/sh\n");
-        let path = format!("{}:/usr/bin:/bin:/usr", writer.parent().unwrap().display());
-        let (code, output) = in_terminal_typing(
-            terminal_command(&fixture, &[]).env("PATH", &path),
-            &[
-                (&thread, b"\r"),
-                ("Push: add the thread's trailers", b"3"),
-                ("Just push", b"1"),
-                ("no remote is chosen", b""),
-                (&format!("mahi land {thread} --push failed"), b"\r"),
-                ("Push: add the thread's trailers", b"3"),
-                ("Push, then let claude rewrite the pull request draft", b"2"),
-                (
-                    &format!("mahi land {thread} --push --with claude failed"),
-                    b"q",
-                ),
-            ],
-        );
-        assert_eq!(code, 0, "{output}");
-    }
-
-    #[test]
     fn mahi_apparmor_prints_a_userns_profile_named_after_its_own_path() {
         let binary = std::fs::canonicalize(mahi_binary()).unwrap();
         let output = Command::new(&binary).arg("apparmor").output().unwrap();
@@ -2667,58 +2631,6 @@ call() {
             text(4)
         );
         assert_eq!(replies[&5]["error"]["code"], -32602);
-    }
-
-    #[test]
-    fn pushing_a_landing_branch_needs_a_chosen_remote_and_a_landing_worktree() {
-        let fixture = fixture();
-        let (thread, _claude) = worked_thread(&fixture);
-        let (code, output) = in_terminal(&fixture, &["land", &thread, "--push"], None);
-        assert_eq!(code, 1, "{output}");
-        assert!(output.contains("no remote is chosen"), "{output}");
-        let config = fixture.repo.join(".git/config");
-        let mut text = fs::read_to_string(&config).unwrap();
-        text.push_str("[remote \"up\"]\n\turl = ssh://git@example.invalid/x.git\n");
-        fs::write(&config, text).unwrap();
-        assert!(
-            fixture
-                .mahi(&["remote", "up", "--private"])
-                .status
-                .success()
-        );
-        let (code, output) = in_terminal(&fixture, &["land", &thread, "--push"], None);
-        assert_eq!(code, 1, "{output}");
-        assert!(
-            output.contains(&format!(
-                "has no landing worktree here; run mahi land {thread} first"
-            )),
-            "{output}"
-        );
-        let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
-        assert_eq!(code, 0, "{output}");
-        let admin = fixture
-            .repo
-            .join(".git/worktrees")
-            .join(format!("{thread}@land"));
-        fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        let (code, output) = in_terminal(&fixture, &["land", &thread, "--push"], Some(PASSPHRASE));
-        assert_eq!(code, 1, "{output}");
-        assert!(
-            output.contains("cannot land on main: it is the thread's landing branch"),
-            "{output}"
-        );
-        let (code, output) = in_terminal(
-            &fixture,
-            &["land", &thread, "--push", "--allow-host", "example.com"],
-            None,
-        );
-        assert_eq!(code, 1, "{output}");
-        assert!(output.contains("agent options need --with"), "{output}");
-        let without_push = fixture.mahi(&["land", &thread, "--with", "claude"]);
-        assert_eq!(without_push.status.code(), Some(2));
-        let refused = fixture.mahi(&["land", &thread, "--push", "--from", "tester.claude"]);
-        assert_eq!(refused.status.code(), Some(2));
-        assert!(fixture.mahi(&["end", &thread]).status.success());
     }
 
     fn terminal_command(fixture: &Fixture, arguments: &[&str]) -> PtyCommand {
@@ -5336,25 +5248,6 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         use super::*;
         use crate::openssh;
 
-        const WRITER: &str = r#"#!/bin/sh
-for last in "$@"; do :; done
-echo "last=$last"
-if touch probe 2>/dev/null; then echo worktree-writable; else echo worktree-read-only; fi
-grep -q 'Rewrite that file' "$MAHI_HANDOFF" && echo notes-read
-echo "secret=$MAHI_TEST_SECRET"
-printf 'Rewritten by the writer\n' > "$TMPDIR/PR.md"
-"#;
-
-        const REDIRECTING: &str = r#"#!/bin/sh
-rm -rf "$TMPDIR"
-ln -s "$ELSEWHERE" "$TMPDIR"
-"#;
-
-        const FAILING: &str = r#"#!/bin/sh
-printf 'half a draft' > "$TMPDIR/PR.md"
-exit 3
-"#;
-
         #[test]
         fn git_works_for_the_agent_without_showing_the_repositorys_secrets() {
             let fixture = fixture();
@@ -5370,40 +5263,6 @@ exit 3
             }
             assert!(!stdout.contains(LEAKED_TOKEN), "{stdout}");
             assert!(!stdout.contains("upstream"), "{stdout}");
-        }
-
-        fn land_with(
-            fixture: &Fixture,
-            thread: &str,
-            writer: &Path,
-            extra: &[(&str, &Path)],
-        ) -> (i32, String) {
-            let mut command = PtyCommand::new(
-                mahi_binary().as_path(),
-                &fixture.repo,
-                WindowSize {
-                    rows: 24,
-                    cols: 200,
-                },
-            )
-            .arg("land")
-            .arg(thread)
-            .arg("--push")
-            .arg("--with")
-            .arg(writer)
-            .arg("--pass-env")
-            .arg("MAHI_TEST_SECRET")
-            .env("PATH", "/usr/bin:/bin:/usr")
-            .env("HOME", &fixture.home)
-            .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
-            .env("SSH_AUTH_SOCK", &fixture.socket)
-            .env("USER", "tester")
-            .env("MAHI_LIVE", "off")
-            .env("MAHI_TEST_SECRET", "secret-value");
-            for (name, value) in extra {
-                command = command.arg("--pass-env").arg(name).env(name, value);
-            }
-            in_terminal_with(command, Some(PASSPHRASE))
         }
 
         fn git(repository: &Path, args: &[&str]) -> String {
@@ -5528,7 +5387,6 @@ exit 3
             thread: String,
             owner: Driven,
             joiner: Driven,
-            bob: Teammate,
             _running: Option<Driven>,
         }
 
@@ -5641,7 +5499,6 @@ exit 3
                 thread,
                 owner,
                 joiner,
-                bob,
                 _running: running,
             }
         }
@@ -5752,89 +5609,6 @@ exit 3
             ));
             let _ = pairing.joiner.child.kill();
             let _ = pairing.joiner.child.wait();
-        }
-
-        #[test]
-        fn landing_merges_every_agents_work_into_a_branch_worktree_once() {
-            let fixture = fixture();
-            let pairing = bob_works_in_the_thread(&fixture);
-            let thread = pairing.thread.clone();
-            let (code, output) = in_terminal(
-                &fixture,
-                &["land", &thread, "--branch", "main"],
-                Some(PASSPHRASE),
-            );
-            assert_eq!(code, 1, "{output}");
-            assert!(
-                output.contains("it is the thread's landing branch"),
-                "{output}"
-            );
-            let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
-            assert_eq!(code, 0, "{output}");
-            assert!(
-                output.contains("merged tester.claude into the landing worktree: 1 written"),
-                "{output}"
-            );
-            assert!(
-                output.contains("merged bob.codex into the landing worktree: 1 written"),
-                "{output}"
-            );
-            let landing = worktree_named(&fixture, &format!("{thread}@land"));
-            assert_eq!(
-                fs::read_to_string(landing.join("parser.rs")).unwrap(),
-                "fn parse() {}\n"
-            );
-            assert_eq!(
-                fs::read_to_string(landing.join("codex.txt")).unwrap(),
-                "from codex\n"
-            );
-            let opened = gix::open(&landing).unwrap();
-            assert_eq!(
-                opened.head_name().unwrap().unwrap().as_bstr(),
-                format!("refs/heads/mahi/{thread}").as_str()
-            );
-            assert_eq!(opened.head_id().unwrap().detach(), fixture.base);
-
-            let (code, output) = in_terminal(&fixture, &["land", &thread], None);
-            assert_eq!(code, 0, "{output}");
-            assert!(
-                output
-                    .contains("the landing worktree already has the latest snapshot of bob.codex"),
-                "{output}"
-            );
-            assert!(
-                output.contains(&format!("on branch mahi/{thread}")),
-                "{output}"
-            );
-            let (code, output) =
-                in_terminal(&fixture, &["land", &thread, "--branch", "elsewhere"], None);
-            assert_eq!(code, 1, "{output}");
-            assert!(
-                output.contains(&format!("is on mahi/{thread}, not on elsewhere")),
-                "{output}"
-            );
-            fs::remove_dir_all(&landing).unwrap();
-            let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
-            assert_eq!(code, 0, "{output}");
-            assert!(
-                output.contains("merged bob.codex into the landing worktree: 1 written"),
-                "{output}"
-            );
-            assert_eq!(
-                fs::read_to_string(landing.join("codex.txt")).unwrap(),
-                "from codex\n"
-            );
-            let (code, output) = in_terminal(
-                &fixture,
-                &["land", &thread, "--from", "mallory.claude"],
-                None,
-            );
-            assert_eq!(code, 1, "{output}");
-            assert!(
-                output.contains("lists no participant called mallory"),
-                "{output}"
-            );
-            assert!(fixture.mahi(&["end", &thread]).status.success());
         }
 
         const LANDER: &str = r#"#!/bin/sh
@@ -6075,49 +5849,6 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             assert_eq!(feature, "feature\nmore\nmore");
             let changed = git(&remote, &["show", "--name-only", "--format=", &branch]);
             assert_eq!(changed.trim(), "feature.txt");
-        }
-
-        fn bob_works_in_the_thread(fixture: &Fixture) -> Pairing {
-            let codex = script(
-                fixture,
-                "bob-tools",
-                "codex",
-                "#!/bin/sh\nprintf 'from codex\\n' > codex.txt\n",
-            );
-            let tools = codex.parent().unwrap().to_str().unwrap().to_owned();
-            let mut pairing = pair_as(
-                fixture,
-                &JoinFrom::Command(&["join", "--", "codex"]),
-                ("--collaborator", &tools),
-            );
-            let thread = pairing.thread.clone();
-            let mut remote = Command::new(mahi_binary());
-            remote
-                .current_dir(&pairing.bob.repo)
-                .args(["remote", "origin", "--private"]);
-            teammate_env(&mut remote, &pairing.bob, "bob");
-            let chosen = remote.output().unwrap();
-            assert!(chosen.status.success(), "{chosen:?}");
-            let owner_config = fixture.home.join(".config");
-            let mut running = run_thread(fixture, &thread, &owner_env(fixture, &owner_config));
-            pairing.owner.type_line("y");
-            pairing.owner.wait_for("Passphrase");
-            pairing.owner.type_line(PASSPHRASE);
-            assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
-            pairing.joiner.wait_for("Passphrase");
-            pairing.joiner.type_line(PASSPHRASE);
-            assert_eq!(pairing.joiner.exit_code(), 0, "{}", pairing.joiner.text());
-            let refs = git(&pairing.remote, &["for-each-ref", "refs/threads/"]);
-            assert!(
-                refs.contains("bob.codex"),
-                "{refs}\n{}",
-                pairing.joiner.text()
-            );
-            let _ = running.child.kill();
-            let _ = running.child.wait();
-            let pushed = script(fixture, "pushing", "claude", "#!/bin/sh\n");
-            push_thread_refs(fixture, &pairing.thread, &pushed, &pairing.remote);
-            pairing
         }
 
         /// Resumes `thread` with an agent that waits, so its host serves the thread, and waits
@@ -6377,25 +6108,17 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
         }
 
-        fn push_thread_refs(fixture: &Fixture, thread: &str, agent: &Path, remote: &Path) {
-            let (code, output) = in_terminal(
+        fn resume_quietly(fixture: &Fixture, thread: &str, agent: &Path) -> (i32, String) {
+            in_terminal(
                 fixture,
                 &["resume", thread, "--", agent.to_str().unwrap()],
                 Some(PASSPHRASE),
-            );
-            assert_eq!(code, 0, "{output}");
-            assert!(
-                git(remote, &["for-each-ref", "refs/threads/"])
-                    .lines()
-                    .count()
-                    > 1,
-                "{output}"
-            );
+            )
         }
 
-        fn notice_gone_branch(fixture: &Fixture, thread: &str, remote: &Path) {
+        fn notice_gone_branch(fixture: &Fixture, thread: &str, agent: &Path, remote: &Path) {
             git(remote, &["branch", "-D", &format!("mahi/{thread}")]);
-            let (code, output) = in_terminal(fixture, &["land", thread], None);
+            let (code, output) = resume_quietly(fixture, thread, agent);
             assert_eq!(code, 0, "{output}");
             assert!(
                 output.contains(&format!("the branch mahi/{thread} is gone from up")),
@@ -6433,103 +6156,47 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
         }
 
         #[test]
-        fn a_landed_branch_is_pushed_with_its_trailers_and_its_draft_rewritten_read_only() {
+        fn a_pushed_landing_whose_branch_is_deleted_is_noticed_and_purged_with_a_warning() {
             let fixture = fixture();
-            let (thread, claude) = worked_thread(&fixture);
-            let (server, remote) = serve_remote(&fixture);
-            push_thread_refs(&fixture, &thread, &claude, &remote);
-            let (code, output) = in_terminal(&fixture, &["land", &thread], Some(PASSPHRASE));
-            assert_eq!(code, 0, "{output}");
-            let landing = worktree_named(&fixture, &format!("{thread}@land"));
-            git(&landing, &["add", "-A"]);
-            git(&landing, &["commit", "-qm", "Add the parser"]);
-            let writer = script(&fixture, "writing", "claude", WRITER);
-            let (code, output) = land_with(&fixture, &thread, &writer, &[]);
-            assert_eq!(code, 0, "{output}\n{}", server.log());
-            let branch = format!("mahi/{thread}");
-            assert!(
-                output.contains("added the thread's trailers to 1 commit"),
-                "{output}"
+            save_identity(&fixture);
+            let (_server, remote) = serve_remote(&fixture);
+            git(&fixture.repo, &["config", "user.name", "Alice Example"]);
+            git(
+                &fixture.repo,
+                &["config", "user.email", "alice@example.com"],
             );
-            assert!(
-                output.contains(&format!("pushed {branch} to up")),
-                "{output}"
+            let lander = script(&fixture, "landing", "claude", LANDER);
+            let owner_config = fixture.home.join(".config");
+            let env = owner_env(&fixture, &owner_config);
+            let mut running = Driven::start(mahi_in_terminal(
+                &fixture.repo,
+                &["run", lander.to_str().unwrap()],
+                &env,
+            ));
+            land_with_enter(&mut running, &fixture, None);
+            let branches = git(
+                &remote,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "refs/heads/mahi/",
+                ],
             );
-            assert!(output.contains("## Thread"), "{output}");
-            assert!(output.contains("worktree-read-only"), "{output}");
-            assert!(output.contains("notes-read"), "{output}");
-            assert!(output.contains("last=Read the notes at "), "{output}");
-            assert!(!output.contains("tell the agent"), "{output}");
-            assert!(output.contains("secret=secret-value"), "{output}");
-            assert!(output.contains("Rewritten by the writer"), "{output}");
-            assert!(!landing.join("probe").exists());
-            let message = git(&remote, &["log", "-1", "--format=%B", &branch]);
-            assert!(
-                message.starts_with(&format!(
-                    "Add the parser\n\nThread: {thread}\nAgent: tester.claude"
-                )),
-                "{message}"
-            );
-            assert_eq!(
-                git(&remote, &["rev-parse", &branch]),
-                git(&landing, &["rev-parse", "HEAD"])
-            );
-            let kept = fs::read_to_string(
-                fixture
-                    .repo
-                    .join(".git/worktrees")
-                    .join(format!("{thread}@land"))
-                    .join("PR.md"),
-            )
-            .unwrap();
-            assert_eq!(kept, "Rewritten by the writer\n");
-            let (code, output) =
-                in_terminal(&fixture, &["land", &thread, "--push"], Some(PASSPHRASE));
-            assert_eq!(code, 0, "{output}");
-            assert!(
-                output.contains(&format!("{branch} on up is up to date")),
-                "{output}"
-            );
-            let draft = fixture
-                .repo
-                .join(".git/worktrees")
-                .join(format!("{thread}@land"))
-                .join("PR.md");
-            let elsewhere = fixture.root.join("elsewhere");
-            fs::create_dir(&elsewhere).unwrap();
-            fs::write(elsewhere.join("PR.md"), "outside the sandbox\n").unwrap();
-            let redirecting = script(&fixture, "redirecting", "writer", REDIRECTING);
-            let (code, output) = land_with(
-                &fixture,
-                &thread,
-                &redirecting,
-                &[("ELSEWHERE", &elsewhere)],
-            );
-            assert_eq!(code, 0, "{output}");
-            assert!(
-                output.contains("left no readable pull request draft"),
-                "{output}"
-            );
-            assert!(!output.contains("outside the sandbox"), "{output}");
-            assert!(fs::read_to_string(&draft).unwrap().contains("## Thread"));
-            let failing = script(&fixture, "failing", "writer", FAILING);
-            let (code, output) = land_with(&fixture, &thread, &failing, &[]);
-            assert_eq!(code, 1, "{output}");
-            assert!(output.contains("the agent exited with 3"), "{output}");
-            assert!(fs::read_to_string(&draft).unwrap().contains("## Thread"));
+            let thread = branches.trim().strip_prefix("mahi/").unwrap().to_owned();
+            let quiet = script(&fixture, "quiet", "claude", "#!/bin/sh\n");
             fs::write(
                 config_dir(&fixture.home).settings_file(),
                 "fetch-limit = \"100 B\"\n",
             )
             .unwrap();
-            let (code, output) = in_terminal(&fixture, &["land", &thread], None);
+            let (code, output) = resume_quietly(&fixture, &thread, &quiet);
             assert_eq!(code, 0, "{output}");
             assert!(
                 output.contains("it sent more than 100 bytes; raise fetch-limit in config.toml"),
                 "{output}"
             );
             fs::remove_file(config_dir(&fixture.home).settings_file()).unwrap();
-            notice_gone_branch(&fixture, &thread, &remote);
+            notice_gone_branch(&fixture, &thread, &quiet, &remote);
             purge_on_remote(&fixture, &thread, &remote);
         }
     }

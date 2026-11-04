@@ -385,26 +385,24 @@ mod tests {
         thread
     }
 
-    fn lands_cleanly(world: &World, thread: &str) {
-        let output = Terminal::start(world.command(&["land", thread])).quit(&[]);
-        assert!(!output.contains("conflict"), "{output}");
-        let landing = world.worktree(thread, "@land");
+    fn its_work_passes_its_tests(world: &World, thread: &str) {
+        let worktree = world.worktree(thread, ".claude");
         let tested = Command::new("python3")
             .arg("test_calc.py")
-            .current_dir(&landing)
+            .current_dir(&worktree)
             .status()
             .unwrap();
-        assert!(tested.success(), "the landed tests pass");
+        assert!(tested.success(), "the agent's tests pass");
         for name in ["add", "subtract"] {
             assert!(
-                contains(&landing.join("calc.py"), &format!("def {name}(")),
+                contains(&worktree.join("calc.py"), &format!("def {name}(")),
                 "{name}"
             );
         }
     }
 
     #[test]
-    fn claude_works_in_a_new_thread_that_lands_cleanly() {
+    fn claude_works_in_a_new_thread_whose_tests_pass() {
         let file = env::var_os("MAHI_DOGFOOD_CLAUDE_TOKEN").map_or_else(
             || PathBuf::from(required_env("HOME")).join(".config/mahi-test-token"),
             PathBuf::from,
@@ -419,6 +417,6 @@ mod tests {
         let world = world();
         init_with_claude_token(&world, &token);
         let thread = claude_works_in_a_new_thread(&world);
-        lands_cleanly(&world, &thread);
+        its_work_passes_its_tests(&world, &thread);
     }
 }

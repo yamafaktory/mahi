@@ -265,6 +265,12 @@ impl Turns {
     }
 }
 
+/// Splits a recorded hook event into its name and its payload.
+pub(crate) fn split_event(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+    let at = payload.iter().position(|byte| *byte == b'\n')?;
+    Some((payload.get(..at)?, payload.get(at + 1..)?))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -309,6 +315,15 @@ mod tests {
             .iter()
             .map(|event| String::from_utf8(event.payload().to_vec()).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn a_transcript_event_splits_into_its_name_and_payload() {
+        assert_eq!(
+            split_event(b"prompt\n{}"),
+            Some((&b"prompt"[..], &b"{}"[..]))
+        );
+        assert_eq!(split_event(b"no newline"), None);
     }
 
     #[test]

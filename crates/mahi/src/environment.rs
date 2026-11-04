@@ -39,12 +39,11 @@ pub(crate) const MAHI_BIN: &str = "MAHI_BIN";
 pub(crate) const PROXY_VARIABLES: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 
 const LONGEST_ENV_NAME: usize = 128;
-const RESERVED: [&str; 17] = [
+const RESERVED: [&str; 16] = [
     "HOME",
     KEY_FD,
     REPORT_FD,
     COMMAND_FD,
-    "MAHI_HANDOFF",
     "TMPDIR",
     HOOK_SOCKET,
     MCP_SOCKET,

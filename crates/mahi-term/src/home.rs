@@ -108,16 +108,12 @@ pub enum HomeAction {
     New,
     /// Resume the thread.
     Resume(String),
-    /// Land the thread, confirmed.
-    Land(String),
     /// End the thread, confirmed.
     End(String),
     /// Invite a teammate to the thread.
     Invite(String),
     /// Purge the thread here and on the remote; the purge asks first.
     Purge(String),
-    /// Push the thread's landed commits, with its trailers.
-    Push(String),
     /// Join a thread with a pairing code.
     Join,
     /// Choose the remote threads are pushed to.
@@ -147,10 +143,6 @@ enum Pending {
 pub enum ThreadChoice {
     /// Start the user's agent again where it stopped.
     Resume,
-    /// Land the thread, confirmed.
-    Land,
-    /// Push the thread's landed commits, with its trailers.
-    Push,
     /// End the thread, confirmed.
     End,
     /// Purge the thread here and on the remote.
@@ -165,8 +157,6 @@ impl ThreadChoice {
     pub fn label(self) -> &'static str {
         match self {
             Self::Resume => "Resume: start your agent again where it stopped",
-            Self::Land => "Land: merge its agents' work onto a branch to commit",
-            Self::Push => "Push: add the thread's trailers to your commits and push the branch",
             Self::End => "End: save its work in a last snapshot and remove its worktrees",
             Self::Purge => "Purge: delete it here and on the remote, for good",
             Self::Invite => {
@@ -180,8 +170,6 @@ impl ThreadChoice {
     pub fn action(self, thread: String) -> HomeAction {
         match self {
             Self::Resume => HomeAction::Resume(thread),
-            Self::Land => HomeAction::Land(thread),
-            Self::Push => HomeAction::Push(thread),
             Self::End => HomeAction::End(thread),
             Self::Purge => HomeAction::Purge(thread),
             Self::Invite => HomeAction::Invite(thread),
@@ -194,11 +182,6 @@ impl HomeAction {
     #[must_use]
     pub fn question(&self) -> Option<String> {
         match self {
-            Self::Land(thread) => Some(format!(
-                "Land thread {thread}? Its agents' work is merged into a landing worktree on a \
-                 branch, where you turn it into commits with git, then push them with Push in \
-                 the thread's menu."
-            )),
             Self::End(thread) => Some(format!(
                 "End thread {thread}? Its worktrees are recorded in a last snapshot, then removed. \
                  Its history stays, and resuming it brings the worktrees back."
@@ -241,9 +224,7 @@ impl Home {
             Some((
                 _,
                 Pending::ThreadMenu(thread, _)
-                | Pending::Confirm(
-                    HomeAction::Land(thread) | HomeAction::End(thread) | HomeAction::Resume(thread),
-                ),
+                | Pending::Confirm(HomeAction::End(thread) | HomeAction::Resume(thread)),
             )) => Some(thread),
             _ => None,
         };
@@ -253,8 +234,7 @@ impl Home {
         }
     }
 
-    /// Reads one key and returns the action it completes, if any. Landing and ending ask
-    /// first; Escape closes a dialog, and quits otherwise. Pasted text is never a key.
+    /// Reads one key and returns the action it completes, if any. Ending asks first; Escape closes a dialog, and quits otherwise. Pasted text is never a key.
     pub fn key(&mut self, input: PaletteInput, rows: &[HomeRow]) -> Option<HomeAction> {
         self.fit(rows);
         self.note = None;
@@ -308,7 +288,6 @@ impl Home {
             PaletteInput::Text('i') => {
                 return selected.map(|row| HomeAction::Invite(row.thread.clone()));
             }
-            PaletteInput::Text('l') => self.ask(selected, HomeAction::Land),
             PaletteInput::Text('e') => self.ask(selected, HomeAction::End),
             PaletteInput::Text('p') => {
                 return selected.map(|row| HomeAction::Purge(row.thread.clone()));
@@ -355,17 +334,11 @@ impl Home {
             self.note = Some(NO_THREADS);
             return;
         };
-        let mut choices = Vec::with_capacity(6);
+        let mut choices = Vec::with_capacity(4);
         if row.owned {
             choices.push(ThreadChoice::Resume);
         }
-        choices.extend([
-            ThreadChoice::Land,
-            ThreadChoice::Push,
-            ThreadChoice::End,
-            ThreadChoice::Invite,
-            ThreadChoice::Purge,
-        ]);
+        choices.extend([ThreadChoice::End, ThreadChoice::Invite, ThreadChoice::Purge]);
         let labels = choices
             .iter()
             .map(|choice| choice.label().to_owned())
@@ -408,11 +381,6 @@ impl Home {
             ["enter", "open", "open the menu of what is selected"],
             ["n", "new", "start a thread with an agent"],
             ["r", "resume", "start your agent again where it stopped"],
-            [
-                "l",
-                "land",
-                "merge its agents' work onto a branch to commit",
-            ],
             ["e", "end", "snapshot its work and remove its worktrees"],
             [
                 "p",
@@ -606,7 +574,6 @@ impl Home {
                 ("↑↓ jk", "move"),
                 ("enter", "actions"),
                 ("r", "resume"),
-                ("l", "land"),
                 ("e", "end"),
                 ("p", "purge"),
                 ("i", "invite"),
@@ -849,13 +816,12 @@ mod tests {
         assert!(help.contains("Help"), "{help}");
         for row in [
             "key     action       what it does",
-            "l       land         merge its agents' work onto a branch to commit",
             "e       end          snapshot its work and remove its worktrees",
             "q esc   quit         leave mahi",
         ] {
             assert!(help.contains(row), "{help}");
         }
-        let narrow = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
+        let narrow = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 23));
         for row in [
             "r       resume       start your agent again where it stopped",
             "i       invite       show a code so a teammate can watch and prompt it",
@@ -866,7 +832,7 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(home.key(PaletteInput::Text('j'), &rows), None);
         }
-        let scrolled = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
+        let scrolled = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 23));
         for row in [
             "s       credentials  keep the tokens agents and remotes sign in with",
             "u       card         show the line a thread's owner invites you with",
@@ -887,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_a_thread_opens_its_actions_and_landing_asks_first() {
+    fn enter_on_a_thread_opens_its_actions_and_ending_asks_first() {
         let rows = rows();
         let mut home = Home::default();
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
@@ -901,26 +867,26 @@ mod tests {
         );
         assert_eq!(
             home.key(PaletteInput::Text('3'), &rows),
-            Some(HomeAction::Push("t1".to_owned()))
+            Some(HomeAction::Invite("t1".to_owned()))
         );
         home.key(PaletteInput::Enter, &rows);
         assert_eq!(home.key(PaletteInput::Text('2'), &rows), None);
-        assert!(screen(&home, &rows, "").contains("Land thread t1?"));
+        assert!(screen(&home, &rows, "").contains("End thread t1?"));
         assert_eq!(
             home.key(PaletteInput::Text('y'), &rows),
-            Some(HomeAction::Land("t1".to_owned()))
+            Some(HomeAction::End("t1".to_owned()))
         );
         home.key(PaletteInput::Down, &rows);
         home.key(PaletteInput::Enter, &rows);
         let teammate = screen(&home, &rows, "");
         assert!(!teammate.contains("Resume:"), "{teammate}");
         assert_eq!(
-            home.key(PaletteInput::Text('4'), &rows),
+            home.key(PaletteInput::Text('2'), &rows),
             Some(HomeAction::Invite("t2".to_owned()))
         );
         home.key(PaletteInput::Enter, &rows);
         assert_eq!(
-            home.key(PaletteInput::Text('5'), &rows),
+            home.key(PaletteInput::Text('3'), &rows),
             Some(HomeAction::Purge("t2".to_owned()))
         );
         assert_eq!(
@@ -932,14 +898,11 @@ mod tests {
     }
 
     #[test]
-    fn landing_and_ending_wait_for_yes_and_anything_else_cancels() {
+    fn ending_waits_for_yes_and_anything_else_cancels() {
         let rows = rows();
         let mut home = Home::default();
-        assert!(keys(&mut home, &rows, "l").is_empty());
-        assert_eq!(
-            keys(&mut home, &rows, "y"),
-            [HomeAction::Land("t1".to_owned())]
-        );
+        assert!(keys(&mut home, &rows, "ly").is_empty());
+        assert!(!home.has_dialog());
         assert!(keys(&mut home, &rows, "en").is_empty());
         assert!(!home.has_dialog());
         home.key(PaletteInput::Down, &rows);
@@ -959,7 +922,8 @@ mod tests {
         let rows = rows();
         let mut home = Home::default();
         home.key(PaletteInput::Down, &rows);
-        assert!(keys(&mut home, &rows, "l").is_empty());
+        assert!(keys(&mut home, &rows, "e").is_empty());
+        assert!(home.has_dialog());
         home.fit(&[rows[0].clone()]);
         assert!(!home.has_dialog());
         assert!(keys(&mut home, &rows, "y").is_empty());
@@ -1097,7 +1061,7 @@ mod tests {
         assert!(!drawn.contains("Selected"), "{drawn}");
         let keys = screen(&home, &rows, "");
         assert!(
-            keys.contains("enter actions  r resume  l land  e end  p purge  i invite  n new"),
+            keys.contains("enter actions  r resume  e end  p purge  i invite  n new"),
             "{keys}"
         );
         let empty = screen(&home, &[], "");

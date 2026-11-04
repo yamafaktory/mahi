@@ -158,7 +158,7 @@ pub(crate) fn purge(
     let is_owner = owner == own && signed_by(&store, thread, &own);
     let lock = match ThreadLock::acquire(&config, thread) {
         Ok(lock) => lock,
-        Err(LockError::Busy(_) | LockError::AgentBusy(..) | LockError::LandBusy(_)) => {
+        Err(LockError::Busy(_) | LockError::AgentBusy(..)) => {
             return Err(PurgeError::Running(thread));
         }
         Err(LockError::Io(error)) => return Err(PurgeError::Lock(error)),
@@ -348,7 +348,7 @@ fn describe(outcome: &Pushed) -> String {
     }
 }
 
-/// Says, when `mahi land --push` pushed the thread branch, whether the work it last pushed is
+/// Says, when a landing pushed the thread branch, whether the work it last pushed is
 /// missing from the landing branch here; a squash merge looks like that too.
 fn unmerged_work(store: &Store, thread: ThreadId) -> Option<String> {
     let record = BranchRecord::read(store, thread)?;

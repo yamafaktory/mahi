@@ -14,9 +14,9 @@ use std::{
 use mahi_core::{
     AgentSlot,
     ThreadId,
+    is_invisible,
 };
 use mahi_store::Store;
-use mahi_thread::push_code;
 use serde::{
     Deserialize,
     Serialize,
@@ -381,11 +381,62 @@ impl Note {
     }
 }
 
+fn shown_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().filter(|character| {
+        (!character.is_control() || matches!(character, '\n' | '\t')) && !is_invisible(*character)
+    })
+}
+
+fn push_code(out: &mut String, text: &str, max_chars: usize) {
+    let mut longest = 0;
+    let mut run = 0;
+    for character in shown_chars(text).take(max_chars) {
+        run = if character == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = |out: &mut String| out.extend(std::iter::repeat_n('`', longest + 1));
+    fence(out);
+    out.push(' ');
+    let mut chars = shown_chars(text);
+    for character in chars.by_ref().take(max_chars) {
+        out.push(if matches!(character, '\n' | '\t') {
+            ' '
+        } else {
+            character
+        });
+    }
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out.push(' ');
+    fence(out);
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn a_code_span_is_fenced_past_its_backquotes_on_one_line_and_cut_short() {
+        let mut out = String::new();
+        push_code(&mut out, "a``b\nc\u{1b}[2J\u{200b}", 20);
+        assert_eq!(out, "``` a``b c[2J ```");
+        out.clear();
+        push_code(&mut out, "abcdef", 3);
+        assert_eq!(out, "` abc… `");
+    }
+
+    #[test]
+    fn a_code_span_drops_what_could_hide_text_or_break_its_line() {
+        let mut out = String::new();
+        push_code(&mut out, "evil\u{202e}txt.exe\u{2028}# x\u{e0041}", 40);
+        for hidden in ['\u{202e}', '\u{2028}', '\u{e0041}'] {
+            assert!(!out.contains(hidden), "{hidden:?}");
+        }
+        assert_eq!(out, "` eviltxt.exe# x `");
+    }
 
     fn paths(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_owned()).collect()

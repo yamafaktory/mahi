@@ -33,13 +33,6 @@ members = ["."]
 debug = 1
 
 [[bin]]
-name = "briefing"
-path = "fuzz_targets/briefing.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "core-names"
 path = "fuzz_targets/core_names.rs"
 test = false

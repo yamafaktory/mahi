@@ -4,7 +4,6 @@ use std::{
         OsStr,
         OsString,
     },
-    fmt,
     fs::{
         self,
         File,
@@ -14,17 +13,13 @@ use std::{
         Read,
         Write,
     },
-    mem,
     os::unix::{
         ffi::OsStrExt,
         fs::{
             OpenOptionsExt,
             PermissionsExt,
         },
-        io::{
-            AsFd,
-            OwnedFd,
-        },
+        io::AsFd,
         net::{
             UnixListener,
             UnixStream,
@@ -125,7 +120,6 @@ use mahi_thread::{
     KeyError,
     OwnerError,
     ParticipantKey,
-    VerifiedMeta,
     load_meta,
 };
 use rustix::{
@@ -289,10 +283,6 @@ const PROGRAM_HEADERS: [&[u8]; 5] = [
 ];
 const HOOK_SOCKET_NAME: &str = "mahi.sock";
 const MCP_SOCKET_NAME: &str = "mcp.sock";
-const HANDOFF_NOTES: &str = "mahi-handoff.md";
-const DRAFT_NAME: &str = "PR.md";
-const MAX_DRAFT_BYTES: u64 = 256 * 1024;
-const HANDOFF_ENV: &str = "MAHI_HANDOFF";
 const HOOK_QUEUE: usize = 16;
 const HOME: &str = "home";
 const GIT_SHARED: [&str; 6] = [
@@ -444,10 +434,6 @@ pub(crate) enum RunError {
         "this clone has a worktree for thread {0}, whose files would hide what is taken from the remote; record and remove it with mahi end, or resume without --take-remote"
     )]
     WorktreeHere(ThreadId),
-    #[error("cannot write the agent's notes")]
-    Notes(#[source] io::Error),
-    #[error("cannot give the agent the pull request draft")]
-    Draft(#[source] io::Error),
 }
 
 #[derive(Debug)]
@@ -664,7 +650,7 @@ pub(crate) fn resume(
 /// fetches the thread as that participant when `fetch` is set, and
 /// returns the key that signs the user's commits: `signer`, or one made from `signing`. The
 /// inner `Err` is the signal that stopped the fetch.
-pub(crate) fn listed_and_fetched(
+fn listed_and_fetched(
     store: &Store,
     environment: &Environment,
     (thread, fetch): (ThreadId, bool),
@@ -700,17 +686,6 @@ fn ask_passphrase() -> Result<SecretString, RunError> {
     TerminalPrompt::open()
         .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
         .map_err(RunError::Terminal)
-}
-
-/// Asks for the passphrase of the user's mahi key and opens `meta`'s thread key with it.
-pub(crate) fn unlock_thread_key(
-    meta: &VerifiedMeta,
-    participant: &ParticipantName,
-    config: &ConfigDir,
-) -> Result<ThreadKey, RunError> {
-    let identity = unlocked::identity(&config.identity_file(), ask_passphrase, RunError::Unlock)?;
-    meta.thread_key(participant, identity.as_age())
-        .map_err(|error| ResumeError::NotParticipant(meta.thread(), Box::new(error)).into())
 }
 
 /// Returns what the live layer needs, unless `MAHI_LIVE` turns it off.
@@ -870,31 +845,14 @@ struct Handed {
     credential: Credential,
 }
 
-/// Loads the credentials the agent gets, asking on the terminal for a missing one.
+/// Loads the credentials the agent gets: those named with `--credential`, which must exist, and
+/// the profile's, when stored, or else asked for on the terminal when the agent would otherwise
+/// get no value for it; a variable may be given only one way.
 fn gather_credentials(
     config: &ConfigDir,
     options: &LaunchOptions,
     profile: Option<&Profile>,
     environment: &Environment,
-) -> Result<Vec<Handed>, RunError> {
-    gather_credentials_with(
-        config,
-        options,
-        profile,
-        environment,
-        TerminalPrompt::open_interactive,
-    )
-}
-
-/// Loads the credentials the agent gets: those named with `--credential`, which must exist, and
-/// the profile's, when stored, or else asked for on the terminal `open` gives when the agent
-/// would otherwise get no value for it; a variable may be given only one way.
-fn gather_credentials_with<P: Prompt>(
-    config: &ConfigDir,
-    options: &LaunchOptions,
-    profile: Option<&Profile>,
-    environment: &Environment,
-    open: impl FnOnce() -> io::Result<P>,
 ) -> Result<Vec<Handed>, RunError> {
     let set_by_profile = profile.map(Profile::set_names).unwrap_or_default();
     let given_otherwise = |variable: &str| {
@@ -935,7 +893,7 @@ fn gather_credentials_with<P: Prompt>(
             None if passed_from_environment(wanted, profile, environment) => None,
             None => {
                 given_otherwise(&wanted.variable)?;
-                ask_for_credential(config, wanted, open)?
+                ask_for_credential(config, wanted, TerminalPrompt::open_interactive)?
             }
         };
         if let Some(credential) = credential {
@@ -947,11 +905,6 @@ fn gather_credentials_with<P: Prompt>(
         }
     }
     Ok(handed)
-}
-
-/// Gives no terminal, so a credential missing while a pull request is drafted is not asked for.
-fn no_terminal() -> io::Result<TerminalPrompt> {
-    Err(io::Error::other("drafting asks nothing"))
 }
 
 /// Returns whether the profile's credential variable reaches the agent from mahi's own
@@ -1083,20 +1036,6 @@ impl Prepared {
         let live = live_setup(environment, config, owner.clone(), bootstrap)?;
         self.set_thread(live, owner);
         Ok(())
-    }
-
-    /// Writes the notes the agent reads first into its private temporary directory, readable
-    /// by the user only, and returns their path.
-    fn write_notes(&self, notes: &str) -> Result<PathBuf, RunError> {
-        let path = self.scratch.join(TMP).join(HANDOFF_NOTES);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(RunError::Notes)?;
-        file.write_all(notes.as_bytes()).map_err(RunError::Notes)?;
-        Ok(path)
     }
 
     fn new(
@@ -1235,9 +1174,6 @@ impl Prepared {
         let state = self.state_dir(&started);
         let launch = Launch {
             restore,
-            notes: None,
-            worktree_access: Access::ReadWrite,
-            tools: true,
             arguments: &self.arguments,
             environment,
             agent: &self.agent,
@@ -1323,12 +1259,6 @@ impl Prepared {
         keep_hook_trust(self.profile, state, config.path());
         outcome
     }
-}
-
-/// Says whether an agent run with `profile` gets, as its first prompt, the request to read
-/// its `notes`: its profile takes one, and the notes' path is text.
-fn gives_first_prompt(profile: Option<&Profile>, notes: &Path) -> bool {
-    profile.is_some_and(|profile| profile.takes_prompt) && notes.to_str().is_some()
 }
 
 /// Keeps in the user's configuration directory, for their later threads, the approvals of
@@ -1932,9 +1862,6 @@ struct Restore<'a> {
 
 struct Launch<'a> {
     restore: Option<Restore<'a>>,
-    notes: Option<&'a Path>,
-    worktree_access: Access,
-    tools: bool,
     credentials: &'a [Handed],
     profile: Option<&'static Profile>,
     approvals: AgentApprovals,
@@ -1971,8 +1898,7 @@ impl Launch<'_> {
     /// that start it asking no permission unless the user chose otherwise, then, when
     /// mahi serves the agent its tools, what its profile adds for them (a flag and the file in
     /// its state directory `state` that tells it where `mahi mcp` is, or the profile's tool
-    /// arguments), then the user's after `--` and the first prompt to read its notes, after
-    /// those so it is not taken as one of their values.
+    /// arguments), then the user's after `--`.
     fn agent_arguments(&self, mut pty: PtyCommand, state: Option<&Path>) -> PtyCommand {
         let arguments = if self.continues_nothing(state) {
             eprintln!(
@@ -2022,31 +1948,14 @@ impl Launch<'_> {
         for argument in after {
             pty = pty.arg(argument);
         }
-        match self.notes {
-            Some(notes) => self.ask_to_read(pty, notes),
-            None => pty,
-        }
+        pty
     }
 
     /// Returns the mahi binary and the socket the agent's tools are served at, as text a
     /// profile's configuration can hold, when both are known and are UTF-8.
     fn tools_config(&self) -> Option<(&str, &str)> {
-        if !self.tools {
-            return None;
-        }
         let mahi = self.environment.mahi_exe.as_deref()?.to_str()?;
         Some((mahi, self.mcp_socket.to_str()?))
-    }
-
-    /// Gives the agent the first prompt asking it to read the `notes`, when its profile takes
-    /// one, or else tells the user to give it.
-    fn ask_to_read(&self, pty: PtyCommand, notes: &Path) -> PtyCommand {
-        let prompt = draft_prompt(&notes.display().to_string());
-        if gives_first_prompt(self.profile, notes) {
-            return pty.arg("--").arg(&prompt);
-        }
-        eprintln!("mahi: tell the agent: {prompt}");
-        pty
     }
 
     fn restore_session(&self, state: &Path) {
@@ -2155,7 +2064,7 @@ impl Launch<'_> {
     ) -> Result<(PtyChild, Option<RawMode>, Option<Running>), RunError> {
         let git_file = self.worktree.join(".git");
         for (path, access) in binds(
-            (self.worktree, self.worktree_access),
+            self.worktree,
             self.git_dir,
             self.agent,
             self.scratch,
@@ -2203,9 +2112,6 @@ impl Launch<'_> {
         }
         if let Some(mahi) = &self.environment.mahi_exe {
             pty = pty.env(MAHI_BIN, mahi);
-        }
-        if let Some(notes) = self.notes {
-            pty = pty.env(HANDOFF_ENV, notes);
         }
         let handed = |name: &str| {
             self.credentials
@@ -2866,7 +2772,7 @@ fn require_program(path: &Path) -> Result<(), RunError> {
 }
 
 fn binds(
-    (cwd, cwd_access): (&Path, Access),
+    cwd: &Path,
     git_dir: &Path,
     agent: &Agent,
     scratch: &Path,
@@ -2880,9 +2786,9 @@ fn binds(
     let covered = |binds: &[(PathBuf, Access)], path: &Path| {
         binds.iter().any(|(bound, _)| path.starts_with(bound))
     };
-    for (path, access) in [(cwd, cwd_access), (scratch, Access::ReadWrite)] {
+    for path in [cwd, scratch] {
         if !covered(&binds, path) {
-            binds.push((path.to_path_buf(), access));
+            binds.push((path.to_path_buf(), Access::ReadWrite));
         }
     }
     binds.extend(git_binds(cwd, git_dir)?);
@@ -2971,145 +2877,6 @@ pub(crate) fn notice(environment: &Environment) -> Notice {
     })
 }
 
-/// An agent set up to rewrite a pull request draft: sandboxed as any other, with a worktree it
-/// can only read, and no snapshots, transcript, tools or teammates.
-pub(crate) struct DraftWriter {
-    prepared: Prepared,
-}
-
-impl fmt::Debug for DraftWriter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DraftWriter").finish_non_exhaustive()
-    }
-}
-
-impl DraftWriter {
-    /// Sets up the agent `program` with `arguments` and what `options` let it reach, for the
-    /// repository around the current directory, checking everything a launch needs before any
-    /// change is made.
-    pub(crate) fn prepare(
-        (program, arguments): (&OsStr, &[OsString]),
-        options: &LaunchOptions,
-        environment: &Environment,
-    ) -> Result<Self, RunError> {
-        let cwd = env::current_dir()
-            .and_then(fs::canonicalize)
-            .map_err(RunError::CurrentDirectory)?;
-        let host = Host::from_environment(environment)?;
-        let config = ConfigDir::resolve(
-            environment.home.as_deref(),
-            environment.xdg_config_home.as_deref(),
-        )?;
-        let profile = options.profile_for(program);
-        let hosts = allowed_hosts(options.allow_hosts(), profile);
-        let settings = Settings::load(&config)?;
-        let credentials =
-            gather_credentials_with(&config, options, profile, environment, no_terminal)?;
-        let store = Store::discover(&cwd)?;
-        let mut prepared = Prepared::new(
-            environment,
-            host,
-            &cwd,
-            store,
-            &AgentRequest {
-                program,
-                arguments,
-                profile,
-                hosts: &hosts,
-            },
-            credentials,
-        )?;
-        prepared.apply(&settings);
-        Ok(Self { prepared })
-    }
-
-    /// Runs the agent in `worktree`, which it can only read, with the draft `draft` in its
-    /// private temporary directory and the notes `notes` writes for that path, keeping its
-    /// profile's state in `state`. Returns how it ended and the draft it left, or `None` if it
-    /// left no readable one.
-    pub(crate) fn rewrite(
-        mut self,
-        environment: &Environment,
-        (worktree, state): (&Path, PathBuf),
-        draft: &str,
-        notes: &dyn Fn(&Path) -> String,
-    ) -> Result<(Outcome, Option<String>), RunError> {
-        let prepared = &mut self.prepared;
-        let draft_path = prepared.scratch.join(TMP).join(DRAFT_NAME);
-        write_private(&draft_path, draft.as_bytes()).map_err(RunError::Draft)?;
-        let tmp = rustix::fs::open(
-            prepared.scratch.join(TMP),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| RunError::Draft(error.into()))?;
-        let notes_path = prepared.write_notes(&notes(&draft_path))?;
-        let termination = TerminationSignals::listen().map_err(RunError::Signals)?;
-        let launch = Launch {
-            restore: None,
-            notes: Some(&notes_path),
-            worktree_access: Access::ReadOnly,
-            tools: false,
-            arguments: &prepared.arguments,
-            environment,
-            agent: &prepared.agent,
-            worktree,
-            git_dir: &prepared.git_dir,
-            scratch: &prepared.scratch,
-            hook_socket: &prepared.hook_socket,
-            mcp_socket: &prepared.mcp_socket,
-            host: &prepared.host,
-            profile: prepared.profile,
-            state: prepared.profile.map(|_| state),
-            credentials: &prepared.credentials,
-            approvals: prepared.settings.agent_approvals,
-        };
-        let sandbox = mem::take(&mut prepared.sandbox);
-        let (child, raw, proxy) = launch.spawn(sandbox, prepared.network.take())?;
-        let activity = Arc::new(Activity::default());
-        let closing = Arc::new(AtomicBool::new(false));
-        let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
-        let hooks = prepared.hooks.try_clone().map_err(RunError::Scratch)?;
-        let (flag, seen) = (Arc::clone(&closing), Arc::clone(&activity));
-        thread::spawn(move || hook::serve(&hooks, &flag, &messages, (&seen, None)));
-        thread::spawn(move || for _ in inputs {});
-        let (code, received, _signals) = supervise(
-            child,
-            raw,
-            &UserSide {
-                title: "writing the pull request draft".to_owned(),
-                palette_key: prepared.settings.palette_key,
-                activity,
-                desk: None,
-            },
-            termination,
-            AgentSide {
-                tap: None,
-                merger: None,
-                auto_merge: None,
-            },
-        );
-        closing.store(true, Ordering::SeqCst);
-        if matches!(code, Ok(Outcome::Stopped(_))) {
-            while received.try_recv().is_ok() {}
-        }
-        let (caught, _) = mpsc::channel();
-        thread::spawn(move || stop_on_signal(&received, &[], &caught));
-        for error in proxy.into_iter().flat_map(Running::stopped) {
-            eprintln!("mahi: the proxy stopped serving the agent: {error}");
-        }
-        let code = code?;
-        let left = matches!(code, Outcome::Exited(0))
-            .then(|| read_draft(&tmp))
-            .flatten();
-        Ok((code, left))
-    }
-}
-
-fn draft_prompt(notes: &str) -> String {
-    format!("Read the notes at {notes} and rewrite the pull request description they point to.")
-}
-
 /// Writes in the fresh `scratch` directory the repository's configuration `config`, cleaned of
 /// what the agent must not read, where the agent's git reads it: a file shown in place of the
 /// repository's own on Linux, and on macOS a git directory of its own with links to the parts
@@ -3141,29 +2908,6 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         .mode(0o600)
         .open(path)?;
     file.write_all(contents)
-}
-
-fn read_draft(directory: &OwnedFd) -> Option<String> {
-    let file = rustix::fs::openat(
-        directory,
-        DRAFT_NAME,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .ok()?;
-    let stat = rustix::fs::fstat(&file).ok()?;
-    if !FileType::from_raw_mode(stat.st_mode).is_file() {
-        return None;
-    }
-    let mut text = Vec::new();
-    File::from(file)
-        .take(MAX_DRAFT_BYTES + 1)
-        .read_to_end(&mut text)
-        .ok()?;
-    if text.len() as u64 > MAX_DRAFT_BYTES {
-        return None;
-    }
-    String::from_utf8(text).ok()
 }
 
 #[cfg(test)]
@@ -3199,16 +2943,6 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
-    }
-
-    #[test]
-    fn the_notes_are_the_first_prompt_only_when_the_profile_takes_one_and_the_path_is_text() {
-        let claude = Profile::for_agent(OsStr::new("claude"));
-        let notes = Path::new("/tmp/notes.md");
-        assert!(gives_first_prompt(claude, notes));
-        assert!(!gives_first_prompt(None, notes));
-        let unreadable = Path::new(OsStr::from_bytes(b"/tmp/\xff.md"));
-        assert!(!gives_first_prompt(claude, unreadable));
     }
 
     #[test]
@@ -3376,7 +3110,7 @@ mod tests {
         for cwd in [&home, &root.join("home"), &root, &home.join(".ssh/keys")] {
             assert!(matches!(
                 binds(
-                    (cwd, Access::ReadWrite),
+                    cwd,
                     Path::new("/repo/.git"),
                     &agent,
                     Path::new("/scratch"),
@@ -3388,7 +3122,7 @@ mod tests {
         }
         assert!(
             binds(
-                (&home.join("project"), Access::ReadWrite),
+                &home.join("project"),
                 Path::new("/repo/.git"),
                 &agent,
                 Path::new("/scratch"),
@@ -3423,7 +3157,7 @@ mod tests {
         .unwrap();
         let agent = agent_at(&tools.join("agent"));
         let binds = binds(
-            (&project, Access::ReadWrite),
+            &project,
             Path::new("/repo/.git"),
             &agent,
             &root.join("scratch"),
@@ -3453,7 +3187,7 @@ mod tests {
             canonical: package.join("cli.js"),
         };
         let binds = binds(
-            (&home.join("project"), Access::ReadWrite),
+            &home.join("project"),
             Path::new("/repo/.git"),
             &agent,
             &root.join("scratch"),
@@ -3471,7 +3205,7 @@ mod tests {
         fs::create_dir_all(home.join("project")).unwrap();
         let agent = agent_at(&home.join("agent.sh"));
         let binds = binds(
-            (&home.join("project"), Access::ReadWrite),
+            &home.join("project"),
             Path::new("/repo/.git"),
             &agent,
             &root.join("scratch"),
@@ -3519,7 +3253,7 @@ mod tests {
         fs::create_dir_all(git.join("hooks")).unwrap();
         let agent = agent_at(Path::new("/usr/bin/true"));
         let binds = binds(
-            (&worktree, Access::ReadWrite),
+            &worktree,
             &git,
             &agent,
             &root.join("scratch"),
@@ -3570,16 +3304,7 @@ mod tests {
         let (git, worktree) = linked_worktree(&root);
         let agent = agent_at(Path::new("/usr/bin/true"));
         let host = host_with_home(&root.join("home"));
-        let attempt = |cwd: &Path| {
-            binds(
-                (cwd, Access::ReadWrite),
-                &git,
-                &agent,
-                Path::new("/scratch"),
-                None,
-                &host,
-            )
-        };
+        let attempt = |cwd: &Path| binds(cwd, &git, &agent, Path::new("/scratch"), None, &host);
         let checkout = root.join("checkout");
         fs::create_dir_all(checkout.join(".git")).unwrap();
         assert!(matches!(

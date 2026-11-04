@@ -489,7 +489,7 @@ fn fetch_bounded<R>(
     fetched
 }
 
-/// Notes, and says, when the thread branch `mahi land --push` pushed is gone from the remote.
+/// Notes, and says, when the thread branch a landing pushed is gone from the remote.
 fn check_branch(
     store: &Store,
     thread: ThreadId,

@@ -438,3 +438,9 @@ Chosen by the user (#64). The merge of the landing branch's changes that waits f
 (D058) has no Ctrl-X: the palette shows only `Enter takes`, and the merge waits until the user
 takes it. Landings meanwhile measure from the tree the last landing recorded, so nothing of the
 landing branch's is reverted.
+
+## D062 · 2026-11-03 · The profile key first-prompt-arg goes with mahi land
+
+Chosen by the user (#12). `first-prompt-arg` only told mahi where the first prompt asking an
+agent to read its notes goes, which only `mahi land --with` gave. It goes from the profile
+format with `mahi land`, so a profile that still sets it is refused as an unknown key is.

@@ -9,7 +9,6 @@ mod conflicts;
 mod credentials;
 mod end;
 mod environment;
-mod handoff;
 mod held;
 mod held_queue;
 mod home;
@@ -20,7 +19,6 @@ mod init;
 mod inject;
 mod invite;
 mod join;
-mod land;
 mod land_desk;
 mod landed_branch;
 mod landing;
@@ -118,7 +116,6 @@ fn main() {
         None | Some(Command::Invite(_)) => Some(Vec::new()),
         Some(Command::Run(command)) => Some(command.options.pass_env().to_vec()),
         Some(Command::Resume(command)) => Some(command.options.pass_env().to_vec()),
-        Some(Command::Land(command)) => Some(command.options.pass_env().to_vec()),
         Some(Command::Join(command)) if command.agent().is_some() => {
             Some(command.options.pass_env().to_vec())
         }
@@ -263,7 +260,6 @@ fn dispatch(command: Command, environment: &Environment) -> i32 {
             0
         }
         Command::Mcp => serve_mcp(environment),
-        Command::Land(command) => landed(&command, environment),
         Command::Resume(command) => outcome_code(run::resume(&command, environment)),
         Command::Run(command) => outcome_code(run::run(&command, environment)),
     }
@@ -416,35 +412,6 @@ pub(crate) fn purge_unless_declined(
             1
         }
     })
-}
-
-/// Runs `mahi land`, prints its report, and returns its exit code.
-fn landed(command: &cli::LandCommand, environment: &Environment) -> i32 {
-    match land::land(command, environment) {
-        Ok(land::Outcome::Done(report)) => {
-            eprint!("{report}");
-            0
-        }
-        Ok(land::Outcome::Incomplete(report)) => {
-            eprint!("{report}");
-            1
-        }
-        Ok(land::Outcome::Failed(told, error)) => {
-            eprint!("{told}");
-            report(&error);
-            1
-        }
-        Ok(land::Outcome::Stopped(signal, report)) => {
-            eprint!("{report}");
-            ui::before_dying();
-            signal.reraise();
-            128 + signal.number()
-        }
-        Err(error) => {
-            report(&error);
-            1
-        }
-    }
 }
 
 /// Relays `mahi mcp` to the mahi that runs the agent, and returns its exit code.

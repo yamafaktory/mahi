@@ -177,9 +177,6 @@ pub struct UserProfile {
     pub args: Vec<String>,
     /// The stored credential the agent gets.
     pub credential: Option<ProfileCredential>,
-    /// Whether the first prompt asking the agent to read its notes is given as its last
-    /// argument, after `--`.
-    pub first_prompt_arg: bool,
     /// The reader mahi has built in for the agent's sessions.
     pub reader: Option<Reader>,
     /// The arguments added before the user's when mahi serves the agent its tools.
@@ -245,8 +242,6 @@ struct RawProfile {
     #[serde(default)]
     args: Vec<String>,
     credential: Option<RawCredential>,
-    #[serde(default)]
-    first_prompt_arg: bool,
     reader: Option<String>,
     tools: Option<RawTools>,
     #[serde(default)]
@@ -598,7 +593,6 @@ impl UserProfile {
             resume_args,
             args,
             credential,
-            first_prompt_arg: raw.first_prompt_arg,
             reader,
             tool_args,
             files,
@@ -620,7 +614,6 @@ state-env = "CODEX_HOME"
 resume-args = ["resume", "--last"]
 args = ["-c", "sandbox_mode=\"danger-full-access\""]
 credential = { name = "openai", variable = "OPENAI_TOKEN", hint = "make one at platform.openai.com" }
-first-prompt-arg = true
 reader = "claude-code"
 
 [tools]
@@ -654,7 +647,6 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
             credential.hint.as_deref(),
             Some("make one at platform.openai.com")
         );
-        assert!(profile.first_prompt_arg);
         assert_eq!(profile.reader, Some(Reader::ClaudeCode));
         let codex = UserProfile::parse(&FULL.replace("\"claude-code\"", "\"codex\"")).unwrap();
         assert_eq!(codex.reader, Some(Reader::Codex));
@@ -681,7 +673,10 @@ content = '{{"command": "{mahi_bin}", "socket": "{mcp_socket}"}}'
     fn a_minimal_profile_names_its_program() {
         let profile = UserProfile::parse("name = \"aider\"\nprogram = \"aider\"\n").unwrap();
         assert!(profile.hosts.is_empty() && profile.files.is_empty());
-        assert!(!profile.first_prompt_arg);
+        assert!(
+            UserProfile::parse("name = \"aider\"\nprogram = \"aider\"\nfirst-prompt-arg = true\n")
+                .is_err()
+        );
     }
 
     #[test]
