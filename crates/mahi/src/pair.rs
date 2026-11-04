@@ -417,7 +417,6 @@ fn owner_pairs(
     Ok(name)
 }
 
-/// What the joiner named when they joined by pairing code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JoinedWith {
     Agent,

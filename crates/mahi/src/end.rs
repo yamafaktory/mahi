@@ -208,8 +208,6 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
     Ok(Ended::Done(report))
 }
 
-/// Removes `directory` and everything under it but the files in `kept` and the directories
-/// that hold them, and says whether `directory` was there.
 fn remove_all_but(directory: &Path, kept: &[PathBuf]) -> io::Result<bool> {
     let entries = match fs::read_dir(directory) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),

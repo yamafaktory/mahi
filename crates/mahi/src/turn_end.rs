@@ -57,8 +57,6 @@ pub(crate) fn last_run_reported(store: &Store, thread: ThreadId, slot: &AgentSlo
     unreported_record(store, thread, slot).is_none()
 }
 
-/// Returns the file that records that `slot`'s last run in `thread` did not report its turn
-/// ends, unless it is surely missing.
 pub(crate) fn unreported_record(
     store: &Store,
     thread: ThreadId,
@@ -72,8 +70,6 @@ fn unreported_file(store: &Store, thread: ThreadId, slot: &AgentSlot) -> PathBuf
     sync_state::dir(store, thread, slot).join(UNREPORTED_FILE)
 }
 
-/// Returns the file name of the agent `program`, to name it in a refusal, when its profile
-/// `profile` does not report its turn ends.
 pub(crate) fn unreported_name(program: &OsStr, profile: Option<&Profile>) -> Option<String> {
     if profile.is_some_and(Profile::reports_turn_ends) {
         return None;

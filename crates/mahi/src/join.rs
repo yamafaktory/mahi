@@ -681,16 +681,12 @@ fn check_turn_ends(options: &LaunchOptions, program: &OsStr) -> Result<(), JoinE
         .map_or(Ok(()), |name| Err(JoinError::NoTurnEnds(name)))
 }
 
-/// What a join does in a thread whose `meta` the user is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Joining {
     Agent,
     Watch,
 }
 
-/// Returns what `command` does with the role `meta` gives the user: a join with a ticket is
-/// refused for the other role, and a join by pairing code, which learns the role only once the
-/// owner added the user, runs the agent only for a collaborator and else watches.
 fn joining(command: &JoinCommand, meta: &VerifiedMeta, own: NodeId) -> Result<Joining, JoinError> {
     let refusal = match (role_of(meta, own), command.agent(), &command.ticket) {
         (Role::Collaborator, Some(_), _) => return Ok(Joining::Agent),

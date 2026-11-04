@@ -711,9 +711,6 @@ fn listed<'meta>(
         .ok_or_else(|| RunError::NotListed(thread, participant.clone()))
 }
 
-/// Checks that `meta` lists the user's key `own` under the name `participant` as a
-/// collaborator, and that the agent `program` reports its turn ends while `meta` lists another
-/// collaborator.
 fn may_run(
     meta: &VerifiedMeta,
     thread: ThreadId,
@@ -736,8 +733,6 @@ fn may_run(
         .map_or(Ok(()), |name| Err(RunError::NoTurnEnds(name)))
 }
 
-/// Returns the refusal for a user without an agent in `thread`: D043's when the `meta` held
-/// makes them a watcher.
 fn no_agent(
     store: &Store,
     thread: ThreadId,
