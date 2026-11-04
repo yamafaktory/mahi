@@ -1176,8 +1176,8 @@ impl Agents {
         match self {
             Self::Any => "no agent mahi has a profile for is on PATH; run mahi run <agent>",
             Self::ReportingTurnEnds => {
-                "neither Claude Code nor Codex, the agents that report when their turns end, is \
-                 on PATH"
+                "no agent on PATH reports when its turns end; a collaborator needs Claude Code or \
+                 Codex with its built-in profile"
             }
         }
     }
@@ -1334,6 +1334,27 @@ fn add_remote(store: &mut Store) -> Result<Added, remote::RemoteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_join_dialog_says_a_collaborator_needs_an_agent_that_reports_its_turn_ends() {
+        let empty = tempfile::tempdir().unwrap();
+        let environment = Environment {
+            path: Some(empty.path().as_os_str().to_owned()),
+            ..Environment::default()
+        };
+        assert_eq!(
+            agent_to_run(
+                &environment,
+                ("Join", "Which agent?"),
+                Agents::ReportingTurnEnds
+            ),
+            Err(
+                "no agent on PATH reports when its turns end; a collaborator needs Claude Code \
+                 or Codex with its built-in profile"
+                    .to_owned()
+            )
+        );
+    }
 
     #[test]
     fn a_joining_collaborator_is_offered_only_agents_that_report_their_turn_ends() {
