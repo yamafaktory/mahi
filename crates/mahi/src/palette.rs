@@ -59,6 +59,7 @@ const LANDING_HELD_DECIDE: &str = "Enter takes · Esc closes";
 const HELD_INTRO: &str = "Its turn changes what agents read as their settings or instructions:";
 const HELD_UNTOLD: &str = "(mahi could not tell which paths)";
 const HELD_BEHIND: &str = "Its later turns wait behind it.";
+const NOT_TAKEN: &str = "Not taken: ";
 const OPEN_GUARD: Duration = Duration::from_millis(500);
 const CLEAR: &[u8] = b"\x1b[2J";
 const REPAINT_PAUSE: Duration = Duration::from_millis(100);
@@ -655,21 +656,12 @@ struct Line {
     detail: String,
 }
 
-/// Returns what the palette shows of a snapshot that waits: the paths it changes that hold
-/// it, each without control or invisible characters, and that the teammate's later turns
-/// wait behind it.
 fn held_text(waiting: &Waiting) -> String {
     let mut text = String::from(HELD_INTRO);
     text.push('\n');
     for path in &waiting.held.paths {
         text.push_str("  ");
-        text.extend(path.chars().map(|c| {
-            if c.is_control() || is_invisible(c) {
-                '?'
-            } else {
-                c
-            }
-        }));
+        push_shown(&mut text, path);
         text.push('\n');
     }
     let more = waiting
@@ -687,7 +679,22 @@ fn held_text(waiting: &Waiting) -> String {
             text.pop();
         }
     }
+    if let Some(reason) = &waiting.failure {
+        text.push('\n');
+        text.push_str(NOT_TAKEN);
+        push_shown(&mut text, reason);
+    }
     text
+}
+
+fn push_shown(text: &mut String, shown: &str) {
+    text.extend(shown.chars().map(|c| {
+        if c.is_control() || is_invisible(c) {
+            '?'
+        } else {
+            c
+        }
+    }));
 }
 
 fn contains_ignoring_case(text: &str, part: &str) -> bool {
@@ -1006,6 +1013,42 @@ mod tests {
         let choices = waiting.take_choices();
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].2, Choice::Take);
+    }
+
+    #[test]
+    fn a_held_snapshot_whose_take_failed_says_why_under_it() {
+        let terminal = FakeTerminal::default();
+        let waiting = Arc::new(HeldQueue::default());
+        let screen = screen(&terminal).with_waiting(Arc::clone(&waiting));
+        let (bob, record) = held("bob.claude", 1, &["CLAUDE.md"]);
+        waiting.show(vec![(bob.clone(), record.clone())]);
+        waiting.failed(
+            (&bob, record.commit),
+            Some("the merge write went over its limit".to_owned()),
+        );
+        waiting.show(vec![(bob, record)]);
+        screen.open().unwrap();
+        let drawn = String::from_utf8_lossy(&written(&screen)).into_owned();
+        assert!(
+            drawn.contains("Not taken: the merge write went over its limit"),
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn a_failed_takes_reason_comes_last_cleaned_and_only_after_a_failure() {
+        let (bob, record) = held("bob.claude", 1, &["CLAUDE.md"]);
+        let mut waiting = Waiting {
+            from: bob,
+            held: record,
+            since: Instant::now(),
+            failure: None,
+        };
+        assert!(!held_text(&waiting).contains(NOT_TAKEN));
+        waiting.failure = Some("bad\u{1b}]0;x\u{202e}".to_owned());
+        let text = held_text(&waiting);
+        assert!(text.ends_with("\nNot taken: bad?]0;x?"), "{text}");
+        assert!(text.contains(HELD_BEHIND), "{text}");
     }
 
     #[test]

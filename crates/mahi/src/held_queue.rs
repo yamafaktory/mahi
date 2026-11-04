@@ -25,7 +25,7 @@ pub(crate) struct HeldQueue {
 struct State {
     waiting: Vec<Waiting>,
     choices: VecDeque<(Source, HeldSettings, Choice)>,
-    seen: HashMap<(Source, ObjectId), Instant>,
+    seen: HashMap<(Source, ObjectId), (Instant, Option<String>)>,
     open: bool,
 }
 
@@ -36,6 +36,7 @@ pub(crate) struct Waiting {
     pub(crate) from: Source,
     pub(crate) held: HeldSettings,
     pub(crate) since: Instant,
+    pub(crate) failure: Option<String>,
 }
 
 /// What the user chose for a snapshot that waits.
@@ -69,17 +70,18 @@ impl HeldQueue {
                 continue;
             }
             let key = (from.clone(), record.commit);
-            let since = if let Some(since) = state.seen.get(&key) {
-                *since
+            let (since, failure) = if let Some((since, failure)) = state.seen.get(&key) {
+                (*since, failure.clone())
             } else {
-                state.seen.insert(key, now);
+                state.seen.insert(key, (now, None));
                 state.open = true;
-                now
+                (now, None)
             };
             waiting.push(Waiting {
                 from,
                 held: record,
                 since,
+                failure,
             });
         }
         state.waiting = waiting;
@@ -119,6 +121,9 @@ impl HeldQueue {
             return false;
         };
         let chosen = state.waiting.remove(index);
+        if let Some((_, failure)) = state.seen.get_mut(&(chosen.from.clone(), commit)) {
+            *failure = None;
+        }
         state.choices.push_back((chosen.from, chosen.held, choice));
         true
     }
@@ -130,11 +135,12 @@ impl HeldQueue {
             .unwrap_or_default()
     }
 
-    /// Asks for the palette to open again, since taking a snapshot failed and it waits once
-    /// more.
-    pub(crate) fn failed(&self) {
+    pub(crate) fn failed(&self, (from, commit): (&Source, ObjectId), reason: Option<String>) {
         if let Some(mut state) = self.lock() {
             state.open = true;
+            if let Some((_, failure)) = state.seen.get_mut(&(from.clone(), commit)) {
+                *failure = reason;
+            }
         }
     }
 
@@ -181,5 +187,35 @@ mod tests {
         assert_eq!(queue.waiting(&bob).unwrap().held.commit, record(2).commit);
         queue.show(Vec::new());
         assert!(queue.waiting(&bob).is_none());
+    }
+
+    #[test]
+    fn a_failed_take_keeps_its_reason_until_the_user_chooses_again() {
+        let queue = HeldQueue::default();
+        let bob: Source = "bob.claude".parse().unwrap();
+        queue.show(vec![(bob.clone(), record(1))]);
+        assert!(queue.waiting(&bob).unwrap().failure.is_none());
+        assert!(queue.choose((&bob, record(1).commit), Choice::Take));
+        queue.take_choices();
+        queue.wants_open();
+        queue.failed(
+            (&bob, record(1).commit),
+            Some("the merge failed".to_owned()),
+        );
+        assert!(queue.wants_open());
+        queue.show(vec![(bob.clone(), record(1))]);
+        assert_eq!(
+            queue.waiting(&bob).unwrap().failure.as_deref(),
+            Some("the merge failed")
+        );
+        queue.show(vec![(bob.clone(), record(2))]);
+        assert!(queue.waiting(&bob).unwrap().failure.is_none());
+        queue.show(vec![(bob.clone(), record(1))]);
+        assert!(queue.choose((&bob, record(1).commit), Choice::Take));
+        queue.show(vec![(bob.clone(), record(1))]);
+        assert!(queue.waiting(&bob).is_none());
+        queue.take_choices();
+        queue.show(vec![(bob.clone(), record(1))]);
+        assert!(queue.waiting(&bob).unwrap().failure.is_none());
     }
 }

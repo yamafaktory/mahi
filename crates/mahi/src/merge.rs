@@ -54,7 +54,7 @@ const AGENT_SETTINGS: [&str; 7] = [
 
 #[derive(Debug, Error)]
 pub(crate) enum MergeError {
-    #[error("cannot open the git repository")]
+    #[error(transparent)]
     Store(#[from] StoreError),
     #[error("{0} merged from more agents than mahi records")]
     TooManySources(AgentSlot),

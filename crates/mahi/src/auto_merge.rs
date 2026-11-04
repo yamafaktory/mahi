@@ -196,7 +196,7 @@ impl AutoMerge {
         (activity, agent, writer): (&Activity, &impl AgentInput, &Mutex<impl Write>),
         (running, pace): (&AtomicBool, Pace),
     ) -> bool {
-        let from = match from {
+        let slot = match from {
             Source::Agent(slot) => slot,
             Source::Landing(_) => {
                 return choice != Choice::Take
@@ -208,16 +208,16 @@ impl AutoMerge {
                     );
             }
         };
-        let waiting = held::file(store, self.thread, (&self.own, from));
+        let waiting = held::file(store, self.thread, (&self.own, slot));
         match choice {
             Choice::Skip => {
-                let skipped = held::skipped_file(store, self.thread, (&self.own, from));
+                let skipped = held::skipped_file(store, self.thread, (&self.own, slot));
                 let _ = record.skip((&waiting, &skipped));
                 true
             }
             Choice::Take => {
-                let Some(request) = self.signed_by_collaborator(store, from, record.commit) else {
-                    self.waiting.failed();
+                let Some(request) = self.signed_by_collaborator(store, slot, record.commit) else {
+                    self.waiting.failed((from, record.commit), None);
                     return true;
                 };
                 let done = inject::when_ready(
@@ -230,8 +230,9 @@ impl AutoMerge {
                 let Some(outcome) = done else {
                     return false;
                 };
-                if outcome.is_err() {
-                    self.waiting.failed();
+                if let Err(error) = outcome {
+                    self.waiting
+                        .failed((from, record.commit), Some(error.to_string()));
                 }
                 true
             }
@@ -277,7 +278,9 @@ impl AutoMerge {
                 let _ = sync_state::remove(&waiting);
                 self.landing_taken(store, &wanted, &done);
             }
-            Some(Err(_)) => self.waiting.failed(),
+            Some(Err(error)) => self
+                .waiting
+                .failed((from, record.commit), Some(error.to_string())),
             None => {
                 let _ = sync_state::remove(&waiting);
             }
