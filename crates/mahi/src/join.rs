@@ -103,6 +103,7 @@ use crate::{
     live,
     pair::{
         self,
+        JoinedWith,
         PairingError,
     },
     prompt::{
@@ -523,7 +524,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     let signer = match signer {
         Some(signer) if crate::report::connected() => {
             let meta = recorded_meta(ticket, &store, own)?;
-            check_role(command, &meta, own)?;
+            joining(command, &meta, own)?;
             return join_with_agent(
                 command,
                 environment,
@@ -541,16 +542,16 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
         Arc::clone(&peers) as Arc<dyn Peers>,
     )?;
     let joined = joined_meta(&node, ticket, &store, own)
-        .and_then(|meta| check_role(command, &meta, own).map(|()| meta));
-    let meta = match joined {
-        Ok(meta) => meta,
+        .and_then(|meta| joining(command, &meta, own).map(|joining| (meta, joining)));
+    let (meta, joining) = match joined {
+        Ok(joined) => joined,
         Err(error) => {
             let _ = node.close();
             return Err(error);
         }
     };
     tell_added(command, &meta, own);
-    if let Some(signer) = signer {
+    if let (Joining::Agent, Some(signer)) = (joining, signer) {
         let _ = node.close();
         return join_with_agent(
             command,
@@ -671,7 +672,7 @@ fn current_meta(
 ) -> Result<VerifiedMeta, JoinError> {
     let meta = load_meta(store, ticket.thread(), ticket.owner(), joined.generation())
         .map_err(JoinError::Pin)?;
-    check_role(command, &meta, own)?;
+    joining(command, &meta, own)?;
     Ok(meta)
 }
 
@@ -680,14 +681,24 @@ fn check_turn_ends(options: &LaunchOptions, program: &OsStr) -> Result<(), JoinE
         .map_or(Ok(()), |name| Err(JoinError::NoTurnEnds(name)))
 }
 
-fn check_role(command: &JoinCommand, meta: &VerifiedMeta, own: NodeId) -> Result<(), JoinError> {
-    if command.ticket.is_none() {
-        return Ok(());
-    }
-    let refusal = match (role_of(meta, own), command.agent()) {
-        (Role::Watcher, Some(_)) => JoinError::WatcherWithAgent,
-        (Role::Collaborator, None) => JoinError::CollaboratorWithoutAgent,
-        (Role::Watcher, None) | (Role::Collaborator, Some(_)) => return Ok(()),
+/// What a join does in a thread whose `meta` the user is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Joining {
+    Agent,
+    Watch,
+}
+
+/// Returns what `command` does with the role `meta` gives the user: a join with a ticket is
+/// refused for the other role, and a join by pairing code, which learns the role only once the
+/// owner added the user, runs the agent only for a collaborator and else watches.
+fn joining(command: &JoinCommand, meta: &VerifiedMeta, own: NodeId) -> Result<Joining, JoinError> {
+    let refusal = match (role_of(meta, own), command.agent(), &command.ticket) {
+        (Role::Collaborator, Some(_), _) => return Ok(Joining::Agent),
+        (Role::Watcher, None, _) | (Role::Collaborator | Role::Watcher, _, None) => {
+            return Ok(Joining::Watch);
+        }
+        (Role::Watcher, Some(_), Some(_)) => JoinError::WatcherWithAgent,
+        (Role::Collaborator, None, Some(_)) => JoinError::CollaboratorWithoutAgent,
     };
     Err(refusal(meta.owner().clone(), meta.thread()))
 }
@@ -698,12 +709,17 @@ fn role_of(meta: &VerifiedMeta, own: NodeId) -> Role {
 }
 
 /// Tells the user who added them to the thread of `meta` and as what, when they joined
-/// through a pairing code rather than a ticket.
+/// through a pairing code rather than a ticket, and that a watcher's agent does not run.
 fn tell_added(command: &JoinCommand, meta: &VerifiedMeta, own: NodeId) {
-    if command.ticket.is_none() {
-        let told = pair::added(meta.owner(), meta.thread(), role_of(meta, own));
-        eprintln!("mahi: {told}");
+    if command.ticket.is_some() {
+        return;
     }
+    let with = match command.agent() {
+        Some(_) => JoinedWith::Agent,
+        None => JoinedWith::Nothing,
+    };
+    let told = pair::added(meta.owner(), meta.thread(), (role_of(meta, own), with));
+    eprintln!("mahi: {told}");
 }
 
 /// Returns the current directory, the configuration, the node key and the node id of the
@@ -1459,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn a_watcher_joins_only_to_watch_and_a_collaborator_only_with_an_agent() {
+    fn a_ticket_join_is_refused_for_the_other_role_and_a_code_join_does_what_the_role_allows() {
         use mahi_thread::Role;
 
         use crate::workspace_live::tests::{
@@ -1484,9 +1500,12 @@ mod tests {
         let watching = join_command(&[&ticket]);
         let with_agent = join_command(&[&ticket, "--", "claude"]);
 
-        assert!(check_role(&watching, &meta, *watcher.node()).is_ok());
         assert_eq!(
-            check_role(&with_agent, &meta, *watcher.node())
+            joining(&watching, &meta, *watcher.node()).unwrap(),
+            Joining::Watch
+        );
+        assert_eq!(
+            joining(&with_agent, &meta, *watcher.node())
                 .unwrap_err()
                 .to_string(),
             format!(
@@ -1494,18 +1513,25 @@ mod tests {
             )
         );
 
-        assert!(check_role(&with_agent, &meta, alice).is_ok());
+        assert_eq!(joining(&with_agent, &meta, alice).unwrap(), Joining::Agent);
         assert_eq!(
-            check_role(&watching, &meta, alice).unwrap_err().to_string(),
+            joining(&watching, &meta, alice).unwrap_err().to_string(),
             format!(
                 "{owner} added you to thread {thread} as a collaborator, so you join it with your agent: mahi join <ticket> -- claude, or -- codex"
             )
         );
 
-        let by_code = [join_command(&[]), join_command(&["--", "claude"])];
-        for command in &by_code {
-            assert!(check_role(command, &meta, alice).is_ok());
-            assert!(check_role(command, &meta, *watcher.node()).is_ok());
+        let (code, code_with_agent) = (join_command(&[]), join_command(&["--", "claude"]));
+        assert_eq!(joining(&code, &meta, alice).unwrap(), Joining::Watch);
+        assert_eq!(
+            joining(&code_with_agent, &meta, alice).unwrap(),
+            Joining::Agent
+        );
+        for command in [&code, &code_with_agent] {
+            assert_eq!(
+                joining(command, &meta, *watcher.node()).unwrap(),
+                Joining::Watch
+            );
         }
     }
 

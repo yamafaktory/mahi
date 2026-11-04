@@ -6007,6 +6007,79 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
         }
 
         #[test]
+        fn a_collaborator_who_joins_with_a_code_without_an_agent_watches() {
+            let fixture = fixture();
+            let mut pairing = pair_as(
+                &fixture,
+                &JoinFrom::Command(&["join"]),
+                ("--collaborator", "/usr/bin:/bin:/usr"),
+            );
+            let owner_config = fixture.home.join(".config");
+            let _running = run_thread(
+                &fixture,
+                &pairing.thread,
+                &owner_env(&fixture, &owner_config),
+            );
+            pairing.owner.type_line("y");
+            pairing.owner.wait_for("Passphrase");
+            pairing.owner.type_line(PASSPHRASE);
+            assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
+
+            pairing.joiner.wait_for(&format!(
+                "mahi: tester added you to thread {} as a collaborator.",
+                pairing.thread
+            ));
+            pairing.joiner.wait_for("Passphrase");
+            pairing.joiner.type_line(PASSPHRASE);
+            pairing.joiner.wait_for("agent-ready");
+            let _ = pairing.joiner.child.kill();
+            let _ = pairing.joiner.child.wait();
+        }
+
+        #[test]
+        fn a_watcher_who_joins_with_a_code_and_an_agent_is_told_so_and_watches() {
+            let fixture = fixture();
+            let codex = script(
+                &fixture,
+                "bob-tools",
+                "codex",
+                "#!/bin/sh\necho bob-runs\nexec /bin/sleep 60\n",
+            );
+            let tools = codex.parent().unwrap().to_str().unwrap().to_owned();
+            let mut pairing = pair_as(
+                &fixture,
+                &JoinFrom::Command(&["join", "--", "codex"]),
+                ("--watcher", &tools),
+            );
+            let owner_config = fixture.home.join(".config");
+            let _running = run_thread(
+                &fixture,
+                &pairing.thread,
+                &owner_env(&fixture, &owner_config),
+            );
+            pairing.owner.type_line("y");
+            pairing.owner.wait_for("Passphrase");
+            pairing.owner.type_line(PASSPHRASE);
+            assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
+
+            pairing.joiner.wait_for(&format!(
+                "mahi: tester added you to thread {} as a watcher, so your agent does not run; \
+                 you watch tester's agents",
+                pairing.thread
+            ));
+            pairing.joiner.wait_for("Passphrase");
+            pairing.joiner.type_line(PASSPHRASE);
+            pairing.joiner.wait_for("agent-ready");
+            assert!(
+                !pairing.joiner.text().contains("bob-runs"),
+                "{}",
+                pairing.joiner.text()
+            );
+            let _ = pairing.joiner.child.kill();
+            let _ = pairing.joiner.child.wait();
+        }
+
+        #[test]
         fn a_teammate_the_owner_does_not_add_is_told_and_nothing_is_left_on_the_remote() {
             let fixture = fixture();
             let mut pairing = pair_until_asked(&fixture);

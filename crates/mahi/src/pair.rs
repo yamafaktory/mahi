@@ -417,17 +417,31 @@ fn owner_pairs(
     Ok(name)
 }
 
+/// What the joiner named when they joined by pairing code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinedWith {
+    Agent,
+    Nothing,
+}
+
 /// Returns what the joiner's mahi tells them once the `meta` they were added to is verified,
-/// worded as the owner's pairing confirmation, naming the thread as `thread` shows it.
+/// worded as the owner's pairing confirmation, naming the thread as `thread` shows it, and
+/// telling a watcher who named an agent that it does not run.
 pub(crate) fn added(
     owner: &ParticipantName,
     thread: impl fmt::Display,
-    role: mahi_thread::Role,
+    (role, with): (mahi_thread::Role, JoinedWith),
 ) -> String {
-    format!(
-        "{owner} added you to thread {thread} as a {}.",
-        role_name(role)
-    )
+    match (role, with) {
+        (mahi_thread::Role::Watcher, JoinedWith::Agent) => format!(
+            "{owner} added you to thread {thread} as a watcher, so your agent does not run; you watch {owner}'s agents"
+        ),
+        (mahi_thread::Role::Watcher, JoinedWith::Nothing)
+        | (mahi_thread::Role::Collaborator, JoinedWith::Agent | JoinedWith::Nothing) => format!(
+            "{owner} added you to thread {thread} as a {}.",
+            role_name(role)
+        ),
+    }
 }
 
 fn role_name(role: mahi_thread::Role) -> &'static str {
@@ -611,13 +625,21 @@ mod tests {
     fn the_joiner_is_told_the_role_as_the_owner_was_asked_it() {
         let owner: ParticipantName = "alice".parse().unwrap();
         let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let told = |role, with| added(&owner, thread, (role, with));
+        for with in [JoinedWith::Agent, JoinedWith::Nothing] {
+            assert_eq!(
+                told(mahi_thread::Role::Collaborator, with),
+                "alice added you to thread 0123456789abcdef0123456789abcdef as a collaborator."
+            );
+        }
         assert_eq!(
-            added(&owner, thread, mahi_thread::Role::Collaborator),
-            "alice added you to thread 0123456789abcdef0123456789abcdef as a collaborator."
+            told(mahi_thread::Role::Watcher, JoinedWith::Nothing),
+            "alice added you to thread 0123456789abcdef0123456789abcdef as a watcher."
         );
         assert_eq!(
-            added(&owner, thread, mahi_thread::Role::Watcher),
-            "alice added you to thread 0123456789abcdef0123456789abcdef as a watcher."
+            told(mahi_thread::Role::Watcher, JoinedWith::Agent),
+            "alice added you to thread 0123456789abcdef0123456789abcdef as a watcher, so your \
+             agent does not run; you watch alice's agents"
         );
     }
 

@@ -749,7 +749,11 @@ fn join_in_tab(
         Role::Watcher => Ok(()),
         Role::Collaborator => start_joined_agent(environment, workspace, &ticket, identity_file),
     };
-    let told = pair::added(&owner, short(&thread.to_string()), role);
+    let told = pair::added(
+        &owner,
+        short(&thread.to_string()),
+        (role, pair::JoinedWith::Nothing),
+    );
     workspace.show_thread(thread, (JOINED, &told));
     opened
 }
