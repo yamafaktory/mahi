@@ -668,12 +668,17 @@ pub struct FrameReceiver {
     challenge: Option<[u8; CHALLENGE_BYTES]>,
     requests: VecDeque<[u8; CHALLENGE_BYTES]>,
     seen_requests: HashSet<[u8; CHALLENGE_BYTES]>,
-    claims: HashMap<NodeId, ClaimsSeen>,
+    unanchored: HashMap<NodeId, UnanchoredSeen>,
 }
 
-/// The newest list of claims seen from each of a sender's latest runs, by its run's epoch.
 #[derive(Debug, Default)]
-struct ClaimsSeen {
+struct UnanchoredSeen {
+    claims: RunsSeen,
+    turn_ends: RunsSeen,
+}
+
+#[derive(Debug, Default)]
+struct RunsSeen {
     runs: VecDeque<([u8; EPOCH_BYTES], u64)>,
 }
 
@@ -698,7 +703,7 @@ impl FrameReceiver {
             challenge: None,
             requests: VecDeque::with_capacity(REMEMBERED_CHALLENGES),
             seen_requests: HashSet::with_capacity(REMEMBERED_CHALLENGES),
-            claims: HashMap::new(),
+            unanchored: HashMap::new(),
         }
     }
 
@@ -712,14 +717,8 @@ impl FrameReceiver {
         let participants = &self.participants;
         self.senders
             .retain(|node, _| participants.contains_key(node));
-        self.claims
+        self.unanchored
             .retain(|node, _| participants.contains_key(node));
-    }
-
-    /// Says whether this receiver anchored a run of any sender.
-    #[must_use]
-    pub fn anchored_any(&self) -> bool {
-        !self.senders.is_empty()
     }
 
     /// Returns a request for the agents' screens, with a new challenge that anchors the runs
@@ -844,8 +843,14 @@ impl FrameReceiver {
         if let Body::ScreenRequest { challenge } = body {
             return self.remember_request(*challenge);
         }
-        if let Body::Claims { .. } = body {
-            return self.remember_claims(sender, plain);
+        if let Body::Claims { .. } | Body::TurnEnded(_) = body {
+            let seen = self.unanchored.entry(sender).or_default();
+            let runs = if let Body::Claims { .. } = body {
+                &mut seen.claims
+            } else {
+                &mut seen.turn_ends
+            };
+            return remember_latest(runs, plain);
         }
         let state = self.senders.get(&sender).copied();
         if let Some(state) = state.filter(|state| state.epoch == plain.epoch) {
@@ -881,29 +886,6 @@ impl FrameReceiver {
         }
     }
 
-    /// Takes a list of claims only when it is newer than every list seen from the same run of
-    /// its sender, remembering its latest runs; hosts do not anchor each other, so claims are
-    /// ordered on their own, and runs cannot be ordered among themselves.
-    fn remember_claims(&mut self, sender: NodeId, plain: &WirePlain<'_>) -> Result<(), FrameError> {
-        let seen = self.claims.entry(sender).or_default();
-        if let Some((_, sequence)) = seen
-            .runs
-            .iter_mut()
-            .find(|(epoch, _)| *epoch == plain.epoch)
-        {
-            if plain.sequence <= *sequence {
-                return Err(FrameError::Replayed);
-            }
-            *sequence = plain.sequence;
-            return Ok(());
-        }
-        if seen.runs.len() == REMEMBERED_RUNS {
-            seen.runs.pop_front();
-        }
-        seen.runs.push_back((plain.epoch, plain.sequence));
-        Ok(())
-    }
-
     fn remember_request(&mut self, challenge: [u8; CHALLENGE_BYTES]) -> Result<(), FrameError> {
         if !self.seen_requests.insert(challenge) {
             return Err(FrameError::Replayed);
@@ -916,6 +898,25 @@ impl FrameReceiver {
         self.requests.push_back(challenge);
         Ok(())
     }
+}
+
+fn remember_latest(seen: &mut RunsSeen, plain: &WirePlain<'_>) -> Result<(), FrameError> {
+    if let Some((_, sequence)) = seen
+        .runs
+        .iter_mut()
+        .find(|(epoch, _)| *epoch == plain.epoch)
+    {
+        if plain.sequence <= *sequence {
+            return Err(FrameError::Replayed);
+        }
+        *sequence = plain.sequence;
+        return Ok(());
+    }
+    if seen.runs.len() == REMEMBERED_RUNS {
+        seen.runs.pop_front();
+    }
+    seen.runs.push_back((plain.epoch, plain.sequence));
+    Ok(())
 }
 
 fn check_size(rows: u16, columns: u16) -> Result<(), FrameError> {
@@ -1551,22 +1552,31 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_end_follows_the_senders_run_and_only_its_owner_announces_it() {
+    fn a_turn_end_is_ordered_within_its_run_without_anchoring_and_only_its_owner_announces_it() {
         let thread = Thread::new();
         let mut viewer = thread.receiver();
         let mut host = thread.sender(1);
         let ended = Body::TurnEnded(turn_end("alice", 7));
-        assert_eq!(
-            viewer.open(&host.seal(&ended).unwrap()),
-            Err(FrameError::Unanchored)
-        );
-        let request = viewer.request_screen().unwrap();
-        viewer
-            .open(&host.seal(&screen("alice", &request)).unwrap())
-            .unwrap();
+        let older = host.seal(&ended).unwrap();
         let frame = host.seal(&ended).unwrap();
         assert_eq!(viewer.open(&frame).unwrap().body, ended);
         assert_eq!(viewer.open(&frame), Err(FrameError::Replayed));
+        assert_eq!(viewer.open(&older), Err(FrameError::Replayed));
+        let claims = host
+            .seal(&Body::Claims {
+                claims: Vec::new(),
+                turn_ends: Vec::new(),
+                states: Vec::new(),
+            })
+            .unwrap();
+        let later = host.seal(&ended).unwrap();
+        assert_eq!(viewer.open(&later).unwrap().body, ended);
+        assert!(viewer.open(&claims).is_ok());
+        let mut restarted = thread.sender(1);
+        assert_eq!(
+            viewer.open(&restarted.seal(&ended).unwrap()).unwrap().body,
+            ended
+        );
         let mut mallory = thread.sender(3);
         assert_eq!(
             viewer.open(&mallory.seal(&ended).unwrap()),
@@ -1754,19 +1764,6 @@ mod tests {
             .open(&alice.seal(&output("alice", "x")).unwrap())
             .unwrap();
         assert!(!output.told_states);
-    }
-
-    #[test]
-    fn a_receiver_says_once_it_anchored_a_run() {
-        let thread = Thread::new();
-        let mut receiver = thread.receiver();
-        let mut alice = thread.sender(1);
-        assert!(!receiver.anchored_any());
-        let request = receiver.request_screen().unwrap();
-        receiver
-            .open(&alice.seal(&screen("alice", &request)).unwrap())
-            .unwrap();
-        assert!(receiver.anchored_any());
     }
 
     #[test]

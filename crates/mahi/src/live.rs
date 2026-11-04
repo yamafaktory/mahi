@@ -162,7 +162,6 @@ const PENDING_SCREENS: usize = 8;
 const LISTEN_PAUSE: Duration = Duration::from_millis(200);
 const UNASKED: [u8; 16] = [0; 16];
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
-const ANCHOR_EVERY: Duration = Duration::from_secs(3);
 /// How often a host sends its claims again when they did not change.
 const CLAIMS_EVERY: Duration = Duration::from_secs(10);
 
@@ -574,7 +573,7 @@ pub(crate) struct LiveHost {
     dropped: Arc<AtomicBool>,
     watch: Option<Watch>,
     #[cfg(test)]
-    anchored: Arc<AtomicBool>,
+    heard_frames: Arc<AtomicBool>,
 }
 
 /// What a host serves besides the agents the user's other mahis hand it.
@@ -752,10 +751,9 @@ impl std::fmt::Debug for Registry {
 }
 
 impl LiveHost {
-    /// Says whether this host anchored a teammate's run, for tests.
     #[cfg(test)]
-    pub(crate) fn anchored(&self) -> bool {
-        self.anchored.load(Ordering::SeqCst)
+    pub(crate) fn heard_frames(&self) -> bool {
+        self.heard_frames.load(Ordering::SeqCst)
     }
 
     /// Opens the live layer for `slot`'s agent in `thread`, whose `meta` is read from
@@ -821,7 +819,7 @@ impl LiveHost {
         let wanted = Arc::new(Mutex::new(VecDeque::with_capacity(PENDING_SCREENS)));
         let stop_broadcast = Arc::new(AtomicBool::new(false));
         let request = Arc::new(Mutex::new(Vec::new()));
-        let anchored = Arc::new(AtomicBool::new(false));
+        let heard_frames = Arc::new(AtomicBool::new(false));
         let (watch, watching) = watches.then(|| Watch::open(&request)).unzip();
         let broadcaster = Broadcaster {
             topic: Arc::clone(&topic),
@@ -847,9 +845,7 @@ impl LiveHost {
             stop: Arc::clone(&stop),
             claims: Arc::clone(&claims),
             heard,
-            request,
-            anchoring_at: None,
-            anchored: Arc::clone(&anchored),
+            heard_frames: Arc::clone(&heard_frames),
         };
         let publisher = {
             let (node, stop, config) = (Arc::clone(&node), Arc::clone(&stop), setup.config.clone());
@@ -882,7 +878,7 @@ impl LiveHost {
             dropped,
             watch,
             #[cfg(test)]
-            anchored,
+            heard_frames,
         })
     }
 
@@ -1608,9 +1604,7 @@ struct Listener {
     stop: Arc<AtomicBool>,
     claims: Arc<Claims>,
     heard: Arc<Heard>,
-    request: Arc<Mutex<Vec<Body>>>,
-    anchoring_at: Option<Instant>,
-    anchored: Arc<AtomicBool>,
+    heard_frames: Arc<AtomicBool>,
 }
 
 impl Listener {
@@ -1626,20 +1620,16 @@ impl Listener {
             if let Some(watching) = &self.watching {
                 watching.note_dropped(self.topic.dropped(), &mut dropped);
                 watching.ask_if_wanted(&mut self.receiver);
-            } else if !self.receiver.anchored_any() {
-                self.anchor();
             }
-            self.anchored
-                .store(self.receiver.anchored_any(), Ordering::SeqCst);
             let Ok(Some(frame)) = self.topic.receive(LISTEN_PAUSE) else {
                 continue;
             };
+            self.heard_frames.store(true, Ordering::SeqCst);
             let received = match self.receiver.open(&frame) {
                 Ok(received) => received,
                 Err(FrameError::Unanchored) => {
-                    match &self.watching {
-                        Some(watching) => watching.lost.store(true, Ordering::SeqCst),
-                        None => self.anchor(),
+                    if let Some(watching) = &self.watching {
+                        watching.lost.store(true, Ordering::SeqCst);
                     }
                     continue;
                 }
@@ -1690,22 +1680,6 @@ impl Listener {
                 answered.insert(received.sender, Instant::now());
             }
         }
-    }
-
-    /// Asks for the agents' screens, at most every [`ANCHOR_EVERY`] and only while `meta`
-    /// lists another collaborator, until a run is anchored and whenever a run's frames arrive
-    /// unanchored, so the runs answer and are anchored, and their states and turn ends are
-    /// taken; a host without a watch keeps no screen it gets.
-    fn anchor(&mut self) {
-        if self
-            .anchoring_at
-            .is_some_and(|at| at.elapsed() < ANCHOR_EVERY)
-            || !self.peers.has_other_collaborator(&self.owner)
-        {
-            return;
-        }
-        self.anchoring_at = Some(Instant::now());
-        queue_request(&mut self.receiver, &self.request);
     }
 
     fn hear_turn_ends(&self, participant: &ParticipantName, sender: NodeId, turn_ends: &[TurnEnd]) {
@@ -1767,17 +1741,6 @@ impl HostPeers {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// Says whether the host's `meta` lists a collaborator other than `own`, the user.
-    fn has_other_collaborator(&self, own: &ParticipantName) -> bool {
-        self.reread_if_due();
-        self.cache.lock().is_ok_and(|cache| {
-            cache
-                .collaborators
-                .iter()
-                .any(|node| cache.participants.get(node).is_some_and(|name| name != own))
-        })
     }
 
     /// Says whether `node` is a collaborator's, as the host's `meta` lists it now.
@@ -2013,31 +1976,6 @@ mod tests {
             shown_slot(&Body::ScreenRequest { challenge: [1; 16] }),
             None
         );
-    }
-
-    #[test]
-    fn a_host_asks_to_anchor_runs_only_while_meta_lists_another_collaborator() {
-        let hosted = hosted();
-        let peers = peers(&hosted, Duration::ZERO);
-        let owner = ParticipantName::new("alice").unwrap();
-        assert!(!peers.has_other_collaborator(&owner));
-        let bob = Participant::new(
-            ParticipantName::new("bob").unwrap(),
-            ParticipantKey::from_public_key(
-                PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
-                    .unwrap()
-                    .public_key(),
-            )
-            .unwrap(),
-            age::x25519::Identity::generate().to_public(),
-            NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap(),
-        )
-        .unwrap();
-        relist(&hosted, &bob, Role::Watcher);
-        assert!(!peers.has_other_collaborator(&owner));
-        relist(&hosted, &bob, Role::Collaborator);
-        assert!(peers.has_other_collaborator(&owner));
-        assert!(peers.has_other_collaborator(&ParticipantName::new("bob").unwrap()));
     }
 
     #[test]
@@ -2389,7 +2327,7 @@ mod tests {
     }
 
     #[test]
-    fn a_collaborators_host_anchors_a_teammates_run_and_takes_its_turn_end_at_once() {
+    fn a_collaborators_host_takes_a_teammates_turn_end_at_once_without_anchoring_their_run() {
         let hosted = hosted();
         let bob_signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let bob_node = NodeKey::generate().unwrap();
@@ -2437,10 +2375,12 @@ mod tests {
                 }),
             ),
         );
-        while !alice_host.anchored() {
+        let bob_tap = bob_host.tap().unwrap();
+        while !alice_host.heard_frames() {
+            bob_tap.output(b".");
             assert!(
                 started.elapsed() < Duration::from_secs(5),
-                "alice never anchored bob's run"
+                "alice never heard from bob's host"
             );
             thread::sleep(Duration::from_millis(50));
         }
