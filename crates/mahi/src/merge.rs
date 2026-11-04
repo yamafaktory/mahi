@@ -230,9 +230,8 @@ fn merge_into(
     let labels = (conflicts::label(into.slot), from.label());
     let merged = store.merge_trees(base, ours, theirs, (&labels.0, &labels.1))?;
     let waiting = held::file_for(store, into.snapshots.thread(), (into.slot, from));
-    let compared = [(ours, merged.tree), (base, theirs)];
     if settings == AgentSettings::Hold
-        && let Some(paths) = agent_settings_changed(store, ours, compared)
+        && let Some(paths) = agent_settings_changed(store, ours, (base, theirs, merged.tree))
     {
         HeldSettings::new(commit, &paths).keep(&waiting)?;
         return Err(MergeError::HoldsAgentSettings(from.clone()));
@@ -360,36 +359,35 @@ fn skip_is_base(
     Ok(reaches && newer)
 }
 
-/// Returns the paths an agent reads as its settings or instructions that a pair of trees in
-/// `compared`, the agent's tree `ours` against the merged one and the base against the
-/// teammate's, changes, either named as such or read through a settings link of `ours`, or
-/// `None` when they change none. Paths that cannot all be told give an empty list.
 fn agent_settings_changed(
     store: &Store,
     ours: ObjectId,
-    compared: [(ObjectId, ObjectId); 2],
+    (base, theirs, merged): (ObjectId, ObjectId, ObjectId),
 ) -> Option<Vec<String>> {
-    let mut paths = Vec::new();
-    let mut named = Vec::new();
+    let changed = |old, new| {
+        let changes = store.changed_paths(old, new, MAX_MERGED_PATHS).ok()?;
+        (!changes.truncated).then(|| {
+            changes
+                .paths
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<String>>()
+        })
+    };
+    let (Some(merging), Some(brought), Some(differing)) = (
+        changed(ours, merged),
+        changed(base, theirs),
+        changed(ours, theirs),
+    ) else {
+        return Some(Vec::new());
+    };
+    let differing: HashSet<String> = differing.into_iter().collect();
     let mut seen = HashSet::new();
-    for (old, new) in compared {
-        let Ok(changes) = store.changed_paths(old, new, MAX_MERGED_PATHS) else {
-            return Some(Vec::new());
-        };
-        if changes.truncated {
-            return Some(Vec::new());
-        }
-        for (path, _) in changes.paths {
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-            if is_agent_settings(&path) {
-                named.push(path);
-            } else {
-                paths.push(path);
-            }
-        }
-    }
+    let (named, paths): (Vec<String>, Vec<String>) = merging
+        .into_iter()
+        .chain(brought.into_iter().filter(|path| differing.contains(path)))
+        .filter(|path| seen.insert(path.clone()))
+        .partition(|path| is_agent_settings(path));
     if !named.is_empty() {
         return Some(named);
     }

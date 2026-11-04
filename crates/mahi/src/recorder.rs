@@ -1223,6 +1223,22 @@ mod tests {
     }
 
     #[test]
+    fn a_teammates_settings_change_the_worktree_already_has_holds_nothing() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let worktree = merging.started.worktree.clone();
+        let first = merging.bobs(&[("CLAUDE.md", "v1\n")]);
+        merger.merge(first, AgentSettings::Take).unwrap();
+        fs::write(worktree.join("CLAUDE.md"), "v2\n").unwrap();
+        let same = merging.bobs(&[("CLAUDE.md", "v2\n")]);
+        let same_commit = same.commit;
+        merger.merge(same, AgentSettings::Hold).unwrap();
+        let recorded = MergedFrom::read(&merging.store, &merging.started.snapshots).unwrap();
+        assert_eq!(recorded.of(&merging.bob), Some(same_commit));
+        merging.recorder.finish().unwrap();
+    }
+
+    #[test]
     fn a_held_merge_waits_for_a_teammates_settings_change_even_when_ours_is_kept() {
         let merging = merging();
         let merger = merging.recorder.merger();

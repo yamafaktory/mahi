@@ -444,3 +444,10 @@ landing branch's is reverted.
 Chosen by the user (#12). `first-prompt-arg` only told mahi where the first prompt asking an
 agent to read its notes goes, which only `mahi land --with` gave. It goes from the profile
 format with `mahi land`, so a profile that still sets it is refused as an unknown key is.
+
+## D063 · 2026-11-04 · A kept-ours settings change still waits
+
+Chosen by the user (#55), narrowing D047. A teammate's turn does not wait for a settings path
+the worktree already holds as that turn left it. It still waits for a settings path where the
+merge keeps the agent's side over the teammate's, so a teammate's instructions do not reach
+the agent through `read_diff` without the user.
