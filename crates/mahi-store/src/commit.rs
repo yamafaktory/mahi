@@ -161,7 +161,7 @@ impl Store {
     }
 
     /// Writes a commit of `tree` on `parent` by `identity`, its message `message` with
-    /// `trailers` added as [`Store::add_trailers`] adds them, signed by `signer`; it moves no
+    /// `trailers` joined to its trailer block, or starting one, signed by `signer`; it moves no
     /// ref.
     ///
     /// # Errors

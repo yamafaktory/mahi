@@ -253,12 +253,14 @@ mod tests {
 
     fn push_branch(store: &Store, remote: &Path, branch: &str) -> Pushed {
         store
-            .push_branch(
+            .push_branch_telling(
                 file::connect(remote.as_os_str().as_encoded_bytes(), Protocol::V1, false).unwrap(),
                 branch,
+                u64::MAX,
                 &AtomicBool::new(false),
             )
             .unwrap()
+            .0
     }
 
     #[test]
@@ -328,7 +330,7 @@ mod tests {
             Pushed::Behind
         );
         assert!(matches!(
-            setup.store.push_branch(
+            setup.store.push_branch_telling(
                 file::connect(
                     setup.remote.as_os_str().as_encoded_bytes(),
                     Protocol::V1,
@@ -336,6 +338,7 @@ mod tests {
                 )
                 .unwrap(),
                 "missing",
+                u64::MAX,
                 &AtomicBool::new(false),
             ),
             Err(mahi_store::StoreError::NoBranch(_))
@@ -418,7 +421,7 @@ mod tests {
         let branch = git(local, &["symbolic-ref", "--short", "HEAD"]);
         let pushed = setup
             .store
-            .push_branch_within(
+            .push_branch_telling(
                 file::connect(
                     setup.remote.as_os_str().as_encoded_bytes(),
                     Protocol::V1,
@@ -429,7 +432,8 @@ mod tests {
                 16 << 10,
                 &AtomicBool::new(false),
             )
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(pushed, Pushed::TooLarge(16 << 10));
         assert!(git(&setup.remote, &["for-each-ref"]).is_empty());
         assert_eq!(

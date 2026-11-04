@@ -479,38 +479,6 @@ impl Store {
         }
     }
 
-    /// Creates the local branch `name` at `commit` unless it exists, and returns where it
-    /// points.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::InvalidBranchName`] if `name` is not a branch name git takes,
-    /// [`StoreError::WrongObject`] if `commit` is not a commit, or [`StoreError::Git`] if
-    /// writing fails.
-    pub fn ensure_branch(&self, name: &str, commit: ObjectId) -> Result<ObjectId, StoreError> {
-        if let Some(tip) = self.branch_tip(name)? {
-            return Ok(tip);
-        }
-        self.require_kind(commit, Kind::Commit)?;
-        let full = branch_ref(name)?;
-        self.repo.edit_references_as(
-            Some(RefEdit::new(
-                full,
-                Change::Update {
-                    log: LogChange {
-                        mode: RefLog::AndReference,
-                        force_create_reflog: false,
-                        message: "mahi land".into(),
-                    },
-                    expected: PreviousValue::MustNotExist,
-                    new: Target::Object(commit),
-                },
-            )),
-            None,
-        )?;
-        Ok(commit)
-    }
-
     /// Returns the commit `thread_ref` points to, or `None` if it does not exist.
     ///
     /// # Errors
@@ -1305,7 +1273,6 @@ pub(crate) mod tests {
         let commit = commit_on_main(&store);
         assert_eq!(store.head_commit().unwrap(), commit);
         assert_eq!(store.head_branch().unwrap().as_deref(), Some("main"));
-        assert!(store.branch_checked_out("main").unwrap());
 
         std::fs::write(store.common_dir().join("HEAD"), format!("{commit}\n")).unwrap();
         assert_eq!(store.head_branch().unwrap(), None);

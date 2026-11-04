@@ -496,7 +496,7 @@ mod tests {
         let tree = store.write_tree(&[]).unwrap();
         let landed = store.append(&scratch, None, tree, "landed").unwrap();
         let later = store.append(&scratch, Some(landed), tree, "later").unwrap();
-        store.ensure_branch("main", landed).unwrap();
+        store.move_branch("main", None, landed, "test").unwrap();
         let mut record = BranchRecord {
             remote: "up".to_owned(),
             branch: format!("mahi/{thread}"),

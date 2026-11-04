@@ -190,75 +190,28 @@ impl Store {
 
     /// Pushes the local branch `branch` to the same branch of the remote `transport` reaches,
     /// as a fast-forward only, sending every commit the remote's branches, tags and `HEAD` do
-    /// not reach, merges included.
+    /// not reach, merges included, unless its new objects are larger than `max_bytes`, counted
+    /// as [`Store::push_refs_within`] counts them; it is then not sent, and is
+    /// [`Pushed::TooLarge`]. Returns with the outcome the link the remote sent for a new pull
+    /// request of it, when it sent one: the first link of its messages shaped as one
+    /// (`/pull/new/`, `/merge_requests/new` or `/pull-requests/new`), within 200 bytes and
+    /// without whitespace, control or invisible characters. The messages are asked for when the
+    /// remote offers `side-band-64k`, quietly when it also offers `quiet`; once the report is
+    /// read, what follows can only lose them.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidBranchName`] or [`StoreError::NoBranch`] if `branch` is
     /// not a local branch, [`StoreError::PushFailed`] if the remote does not speak the protocol
-    /// mahi needs, cannot unpack what was sent, or the branch has more new commits than mahi
-    /// sends, [`StoreError::Interrupted`] if `interrupt` is set, or [`StoreError::Git`] if the
-    /// transport or building the pack fails.
-    pub fn push_branch<T: Transport>(
-        &self,
-        transport: T,
-        branch: &str,
-        interrupt: &AtomicBool,
-    ) -> Result<Pushed, StoreError> {
-        self.push_branch_within(transport, branch, u64::MAX, interrupt)
-    }
-
-    /// Pushes `branch` as [`Store::push_branch`] does, unless its new objects are larger than
-    /// `max_bytes`, counted as [`Store::push_refs_within`] counts them; it is then not sent,
-    /// and is [`Pushed::TooLarge`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Store::push_branch`].
-    pub fn push_branch_within<T: Transport>(
-        &self,
-        transport: T,
-        branch: &str,
-        max_bytes: u64,
-        interrupt: &AtomicBool,
-    ) -> Result<Pushed, StoreError> {
-        self.push_branch_with(transport, branch, max_bytes, Sideband::Off, interrupt)
-            .map(|(pushed, _)| pushed)
-    }
-
-    /// Pushes `branch` as [`Store::push_branch_within`] does, and returns with the outcome the
-    /// link the remote sent for a new pull request of it, when it sent one: the first link of
-    /// its messages shaped as one (`/pull/new/`, `/merge_requests/new` or
-    /// `/pull-requests/new`), within 200 bytes and without whitespace, control or invisible
-    /// characters. The messages are asked for when the remote offers `side-band-64k`, quietly
-    /// when it also offers `quiet`; once the report is read, what follows can only lose them.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Store::push_branch`], and [`StoreError::PushFailed`] when the
-    /// remote reports an error before its report, or sends more than mahi reads.
+    /// mahi needs, cannot unpack what was sent, has more new commits than mahi sends, reports
+    /// an error before its report or sends more than mahi reads, [`StoreError::Interrupted`]
+    /// if `interrupt` is set, or [`StoreError::Git`] if the transport or building the pack
+    /// fails.
     pub fn push_branch_telling<T: Transport>(
-        &self,
-        transport: T,
-        branch: &str,
-        max_bytes: u64,
-        interrupt: &AtomicBool,
-    ) -> Result<(Pushed, Option<String>), StoreError> {
-        self.push_branch_with(
-            transport,
-            branch,
-            max_bytes,
-            Sideband::QuietMessages,
-            interrupt,
-        )
-    }
-
-    fn push_branch_with<T: Transport>(
         &self,
         mut transport: T,
         branch: &str,
         max_bytes: u64,
-        wanted: Sideband,
         interrupt: &AtomicBool,
     ) -> Result<(Pushed, Option<String>), StoreError> {
         let name = branch_ref(branch)?.as_bstr().to_string();
@@ -285,14 +238,10 @@ impl Store {
             finish_without_commands(&mut transport)?;
             return Ok((Pushed::TooLarge(max_bytes), None));
         }
-        let sideband = match wanted {
-            Sideband::Off => Sideband::Off,
-            Sideband::Messages | Sideband::QuietMessages => advertised.sideband,
-        };
         let (report, messages) = self.send_with(
             &mut transport,
             std::slice::from_ref(&command),
-            (advertised.atomic, &objects, sideband),
+            (advertised.atomic, &objects, advertised.sideband),
             interrupt,
         )?;
         settle(&mut outcome, &report, &name);
