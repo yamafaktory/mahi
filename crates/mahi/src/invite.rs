@@ -125,6 +125,10 @@ pub(crate) enum InviteError {
         "{0} does not report when its turns end, so a collaborator's work could not be kept in sync with it; run the thread with Claude Code or Codex, or invite a --watcher"
     )]
     NoTurnEnds(AgentSlot),
+    #[error(
+        "{0} last ran without its profile, so it did not report when its turns end; resume the thread without --no-profile, or invite a --watcher"
+    )]
+    RanWithoutProfile(AgentSlot),
 }
 
 /// Who invites, with which keys, and how the ticket finds this machine.
@@ -282,12 +286,18 @@ fn check_turn_ends(
         Role::Collaborator => {}
     }
     let agents = crate::threads::thread_agents(store, thread)?;
-    let unsynced = agents.into_iter().find(|slot| {
-        slot.participant() == owner
-            && !(Profile::reports_turn_ends_of(slot.agent().as_str())
-                && turn_end::last_run_reported(store, thread, slot))
-    });
-    unsynced.map_or(Ok(()), |slot| Err(InviteError::NoTurnEnds(slot)))
+    let owners = agents
+        .into_iter()
+        .filter(|slot| slot.participant() == owner);
+    for slot in owners {
+        if !Profile::reports_turn_ends_of(slot.agent().as_str()) {
+            return Err(InviteError::NoTurnEnds(slot));
+        }
+        if !turn_end::last_run_reported(store, thread, &slot) {
+            return Err(InviteError::RanWithoutProfile(slot));
+        }
+    }
+    Ok(())
 }
 
 /// Returns where the thread's host is: the address a running host published, since binding
@@ -471,7 +481,7 @@ mod tests {
         turn_end::record_reporting(&store, owner.thread, &claude, Reporting::Unreported).unwrap();
         assert!(matches!(
             check(Role::Collaborator),
-            Err(InviteError::NoTurnEnds(refused)) if refused == claude
+            Err(InviteError::RanWithoutProfile(refused)) if refused == claude
         ));
         turn_end::record_reporting(&store, owner.thread, &claude, Reporting::Reported).unwrap();
         assert!(check(Role::Collaborator).is_ok());

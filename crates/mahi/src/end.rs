@@ -63,6 +63,7 @@ use crate::{
         LockError,
         ThreadLock,
     },
+    turn_end,
 };
 
 const SNAPSHOT_ATTEMPTS: usize = 3;
@@ -119,7 +120,8 @@ pub(crate) enum Ended {
 
 /// Ends a thread the user owns and none of whose agents runs: records each of the user's
 /// agents' worktrees in a last snapshot, then removes the worktrees, the agents' state and the
-/// thread's locks. The thread's refs stay.
+/// thread's locks. The thread's refs stay, and so does the record of each agent whose last run
+/// did not report its turn ends.
 pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<Ended, EndError> {
     let thread = command.thread;
     let cwd = env::current_dir()
@@ -149,6 +151,10 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
     }
     load_meta(&store, thread, &owner, 0)
         .map_err(|error| EndError::NotOwner(thread, Box::new(error)))?;
+    let kept: Vec<PathBuf> = slots
+        .iter()
+        .filter_map(|slot| turn_end::unreported_record(&store, thread, slot))
+        .collect();
     let socket = environment
         .ssh_auth_sock
         .as_deref()
@@ -191,10 +197,8 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
             let _ = writeln!(report, "removed the worktree {}", worktree.display());
         }
     }
-    match fs::remove_dir_all(session::state_root(&store, thread)) {
-        Ok(()) => report.push_str("removed the agents' state\n"),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(EndError::Remove(error)),
+    if remove_all_but(&session::state_root(&store, thread), &kept).map_err(EndError::Remove)? {
+        report.push_str("removed the agents' state\n");
     }
     lock.remove().map_err(EndError::Remove)?;
     let _ = writeln!(
@@ -202,6 +206,33 @@ pub(crate) fn end(command: &EndCommand, environment: &Environment) -> Result<End
         "ended thread {thread}; its history stays in refs/threads/{thread}"
     );
     Ok(Ended::Done(report))
+}
+
+/// Removes `directory` and everything under it but the files in `kept` and the directories
+/// that hold them, and says whether `directory` was there.
+fn remove_all_but(directory: &Path, kept: &[PathBuf]) -> io::Result<bool> {
+    let entries = match fs::read_dir(directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        entries => entries?,
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let holds_kept = kept.iter().any(|file| file.starts_with(&path));
+        if entry.file_type()?.is_dir() {
+            if holds_kept {
+                remove_all_but(&path, kept)?;
+            } else {
+                fs::remove_dir_all(&path)?;
+            }
+        } else if !holds_kept {
+            fs::remove_file(&path)?;
+        }
+    }
+    if !kept.iter().any(|file| file.starts_with(directory)) {
+        fs::remove_dir(directory)?;
+    }
+    Ok(true)
 }
 
 /// What an agent's last snapshot left to do: the report so far, and the worktree to remove,
@@ -308,4 +339,46 @@ fn registered_dir(registration: &Path) -> Option<PathBuf> {
     Path::new(OsStr::from_bytes(recorded))
         .parent()
         .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ending_removes_the_state_but_the_kept_files_and_the_directories_that_hold_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        let kept = root.join("sync/alice.sh/turn-ends-unreported");
+        for file in [
+            kept.clone(),
+            root.join("sync/alice.sh/note"),
+            root.join("sync/alice.claude/held/bob.claude"),
+            root.join("alice.sh/session"),
+            root.join("loose"),
+        ] {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, "").unwrap();
+        }
+        std::os::unix::fs::symlink(&root, root.join("sync/link")).unwrap();
+        assert!(remove_all_but(&root, std::slice::from_ref(&kept)).unwrap());
+        let left: Vec<PathBuf> = walk(&root);
+        assert_eq!(left, vec![kept.clone()]);
+        assert!(remove_all_but(&root, &[]).unwrap());
+        assert!(!root.exists());
+        assert!(!remove_all_but(&root, &[kept]).unwrap());
+    }
+
+    fn walk(directory: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(walk(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
 }

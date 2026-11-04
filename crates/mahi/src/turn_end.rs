@@ -1,7 +1,11 @@
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     io,
-    path::PathBuf,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 use mahi_core::{
@@ -21,6 +25,7 @@ use mahi_store::{
 };
 
 use crate::{
+    profile::Profile,
     session::SNAPSHOT_MESSAGE,
     sync_state,
 };
@@ -49,11 +54,32 @@ pub(crate) fn record_reporting(
 }
 
 pub(crate) fn last_run_reported(store: &Store, thread: ThreadId, slot: &AgentSlot) -> bool {
-    !sync_state::may_exist(&unreported_file(store, thread, slot))
+    unreported_record(store, thread, slot).is_none()
+}
+
+/// Returns the file that records that `slot`'s last run in `thread` did not report its turn
+/// ends, unless it is surely missing.
+pub(crate) fn unreported_record(
+    store: &Store,
+    thread: ThreadId,
+    slot: &AgentSlot,
+) -> Option<PathBuf> {
+    let file = unreported_file(store, thread, slot);
+    sync_state::may_exist(&file).then_some(file)
 }
 
 fn unreported_file(store: &Store, thread: ThreadId, slot: &AgentSlot) -> PathBuf {
     sync_state::dir(store, thread, slot).join(UNREPORTED_FILE)
+}
+
+/// Returns the file name of the agent `program`, to name it in a refusal, when its profile
+/// `profile` does not report its turn ends.
+pub(crate) fn unreported_name(program: &OsStr, profile: Option<&Profile>) -> Option<String> {
+    if profile.is_some_and(Profile::reports_turn_ends) {
+        return None;
+    }
+    let name = Path::new(program).file_name().unwrap_or(program);
+    Some(name.to_string_lossy().into_owned())
 }
 
 /// Returns the message of the snapshot that ends a turn of `slot`.

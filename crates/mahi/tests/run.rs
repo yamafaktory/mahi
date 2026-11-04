@@ -4514,11 +4514,25 @@ echo stray > "$CODEX_HOME/history.jsonl"
             .unwrap();
         let stderr = String::from_utf8_lossy(&invited.stderr);
         assert_eq!(invited.status.code(), Some(1), "{stderr}");
-        assert!(
-            stderr.contains("tester.claude does not report when its turns end"),
-            "{stderr}"
-        );
+        let refusal = "tester.claude last ran without its profile, so it did not report when its \
+                       turns end; resume the thread without --no-profile, or invite a --watcher";
+        assert!(stderr.contains(refusal), "{stderr}");
         assert!(!stderr.contains("Pairing code"), "{stderr}");
+        let ended = fixture.mahi(&["end", &thread]);
+        assert_eq!(
+            ended.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&ended.stderr)
+        );
+        let invited = fixture
+            .command(&["invite", "--collaborator", &thread])
+            .env("MAHI_LIVE", "local")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&invited.stderr);
+        assert_eq!(invited.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(refusal), "{stderr}");
     }
 
     #[test]
@@ -4540,6 +4554,25 @@ echo stray > "$CODEX_HOME/history.jsonl"
         assert!(
             stderr.contains("tester.claude does not report when its turns end"),
             "{stderr}"
+        );
+    }
+
+    fn resume_without_turn_ends_is_refused(fixture: &Fixture, bob: &Teammate, thread_text: &str) {
+        let plain = script(fixture, "bob-plain", "tester.sh", "#!/bin/sh\n");
+        let mut refused = Command::new(mahi_binary());
+        refused
+            .args(["resume", thread_text, "--", plain.to_str().unwrap()])
+            .current_dir(&bob.repo);
+        teammate_env(&mut refused, bob, "bob");
+        let refused = refused.output().unwrap();
+        let text = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(1), "{text}");
+        assert!(
+            text.contains(
+                "tester.sh does not report when its turns end, so your teammates' work could not \
+                 be kept in sync with it; run Claude Code or Codex, with its profile"
+            ),
+            "{text}"
         );
     }
 
@@ -4893,6 +4926,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         assert!(snapshots.find_entry("bob.txt").is_some());
 
         let thread_text = thread.to_string();
+        resume_without_turn_ends_is_refused(&fixture, &bob, &thread_text);
         let (code, text) = teammate_in_terminal(
             &bob,
             "bob",

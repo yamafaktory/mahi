@@ -119,7 +119,10 @@ use mahi_term::{
 use mahi_thread::{
     KeyError,
     OwnerError,
+    Participant,
     ParticipantKey,
+    Role,
+    VerifiedMeta,
     load_meta,
 };
 use rustix::{
@@ -434,6 +437,17 @@ pub(crate) enum RunError {
         "this clone has a worktree for thread {0}, whose files would hide what is taken from the remote; record and remove it with mahi end, or resume without --take-remote"
     )]
     WorktreeHere(ThreadId),
+    #[error(
+        "{0} does not report when its turns end, so your teammates' work could not be kept in sync with it; run Claude Code or Codex, with its profile"
+    )]
+    NoTurnEnds(String),
+    #[error(
+        "{owner} made you a watcher in thread {thread}, so you cannot run an agent in it; watch it with mahi join <ticket>, or ask {owner} to invite you as a --collaborator"
+    )]
+    Watcher {
+        owner: ParticipantName,
+        thread: ThreadId,
+    },
 }
 
 #[derive(Debug)]
@@ -588,14 +602,19 @@ pub(crate) fn resume(
     } else {
         None
     };
-    let slot = session::pick_slot(&store, command.thread, &participant, command.agent.as_ref())?;
+    let slot =
+        match session::pick_slot(&store, command.thread, &participant, command.agent.as_ref()) {
+            Err(ResumeError::NoAgent(thread)) => {
+                return Err(no_agent(&store, thread, &owner, &own));
+            }
+            picked => picked?,
+        };
     let _agent_lock = (!command.take_remote)
         .then(|| AgentLock::acquire(&config, command.thread, slot.agent()))
         .transpose()?;
     let (program, arguments, profile) = resumed_command(command, &slot);
     let hosts = allowed_hosts(command.options.allow_hosts(), profile);
     let settings = Settings::load(&config)?;
-    let credentials = gather_credentials(&config, &command.options, profile, environment)?;
     let mut prepared = Prepared::new(
         environment,
         host,
@@ -607,7 +626,7 @@ pub(crate) fn resume(
             profile,
             hosts: &hosts,
         },
-        credentials,
+        Vec::new(),
     )?;
     prepared.apply(&settings);
     prepared.join_thread(environment, &config, owner.clone(), bootstrap)?;
@@ -618,12 +637,13 @@ pub(crate) fn resume(
         (command.thread, !command.take_remote),
         &owner,
         (&own, &participant),
-        &signing,
-        taken,
+        (&program, profile),
+        (&signing, taken),
     )? {
         Ok(commits) => commits,
         Err(signal) => return Ok(Outcome::Stopped(signal)),
     };
+    prepared.credentials = gather_credentials(&config, &command.options, profile, environment)?;
     let identity = unlocked::identity(&config.identity_file(), ask_passphrase, RunError::Unlock)?;
     let worktrees = worktree_dir(environment, &prepared.host, &prepared.git_dir)?;
     let reopen = session::Reopen {
@@ -646,39 +666,96 @@ pub(crate) fn resume(
     prepared.launch((environment, &config), started?, termination)
 }
 
-/// Checks that the thread's `meta` lists the user's key `own` under the name `participant`,
-/// fetches the thread as that participant when `fetch` is set, and
-/// returns the key that signs the user's commits: `signer`, or one made from `signing`. The
-/// inner `Err` is the signal that stopped the fetch.
+/// Checks that the thread's `meta` lists the user, fetches the thread as that participant when
+/// `fetch` is set, checks with `may_run` that the latest `meta` lets the user run the agent
+/// `program`, and returns the key that signs the user's commits: `signer`, or one made from
+/// `signing`. The inner `Err` is the signal that stopped the fetch.
 fn listed_and_fetched(
     store: &Store,
     environment: &Environment,
     (thread, fetch): (ThreadId, bool),
     owner: &ParticipantKey,
-    (own, participant): (&ParticipantKey, &ParticipantName),
-    signing: &SigningKey,
-    signer: Option<AgentSigner>,
+    user: (&ParticipantKey, &ParticipantName),
+    agent: (&OsStr, Option<&Profile>),
+    (signing, signer): (&SigningKey, Option<AgentSigner>),
 ) -> Result<Result<CommitKey, Termination>, RunError> {
     let current = load_meta(store, thread, owner, 0)
         .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
-    let me = current
-        .participants()
-        .find(|listed| listed.key() == own)
-        .filter(|listed| listed.name() == participant)
-        .ok_or_else(|| RunError::NotListed(thread, participant.clone()))?;
+    listed(&current, thread, user)?;
     let signer = match signer {
         Some(signer) => signer,
         None => agent_signer(environment, signing)?,
     };
-    if fetch {
-        let stopped = sync::fetch_until_stopped(store, environment, thread, owner, Some(me.name()));
+    let latest = if fetch {
+        let stopped = sync::fetch_until_stopped(store, environment, thread, owner, Some(user.1));
         if let Some(signal) = stopped {
             return Ok(Err(signal));
         }
         load_meta(store, thread, owner, current.generation())
-            .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?;
-    }
+            .map_err(|error| ResumeError::Meta(thread, Box::new(error)))?
+    } else {
+        current
+    };
+    may_run(&latest, thread, user, agent)?;
     Ok(Ok(CommitKey::new(signer).map_err(RunError::OwnerKey)?))
+}
+
+fn listed<'meta>(
+    meta: &'meta VerifiedMeta,
+    thread: ThreadId,
+    (own, participant): (&ParticipantKey, &ParticipantName),
+) -> Result<&'meta Participant, RunError> {
+    meta.participants()
+        .find(|listed| listed.key() == own)
+        .filter(|listed| listed.name() == participant)
+        .ok_or_else(|| RunError::NotListed(thread, participant.clone()))
+}
+
+/// Checks that `meta` lists the user's key `own` under the name `participant` as a
+/// collaborator, and that the agent `program` reports its turn ends while `meta` lists another
+/// collaborator.
+fn may_run(
+    meta: &VerifiedMeta,
+    thread: ThreadId,
+    user: (&ParticipantKey, &ParticipantName),
+    (program, profile): (&OsStr, Option<&Profile>),
+) -> Result<(), RunError> {
+    if listed(meta, thread, user)?.role() == Role::Watcher {
+        return Err(RunError::Watcher {
+            owner: meta.owner().clone(),
+            thread,
+        });
+    }
+    let teammates = meta
+        .participants()
+        .any(|listed| listed.key() != user.0 && listed.role() == Role::Collaborator);
+    if !teammates {
+        return Ok(());
+    }
+    turn_end::unreported_name(program, profile)
+        .map_or(Ok(()), |name| Err(RunError::NoTurnEnds(name)))
+}
+
+/// Returns the refusal for a user without an agent in `thread`: D043's when the `meta` held
+/// makes them a watcher.
+fn no_agent(
+    store: &Store,
+    thread: ThreadId,
+    owner: &ParticipantKey,
+    own: &ParticipantKey,
+) -> RunError {
+    let meta = load_meta(store, thread, owner, 0).ok();
+    let watcher = meta.as_ref().filter(|meta| {
+        meta.participants()
+            .any(|listed| listed.key() == own && listed.role() == Role::Watcher)
+    });
+    match watcher {
+        Some(meta) => RunError::Watcher {
+            owner: meta.owner().clone(),
+            thread,
+        },
+        None => ResumeError::NoAgent(thread).into(),
+    }
 }
 
 /// Asks for the passphrase of the user's mahi key on the terminal.
@@ -2913,6 +2990,67 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resume_refuses_a_watcher_and_an_agent_without_turn_ends_beside_a_teammate() {
+        use crate::workspace_live::tests::{
+            add_bob,
+            setup,
+            sign_participant,
+        };
+
+        let setup = setup();
+        let owner = setup.owner();
+        let alice: ParticipantName = "alice".parse().unwrap();
+        let claude = Profile::for_agent(OsStr::new("claude"));
+        assert!(claude.is_some_and(Profile::reports_turn_ends));
+        let check = |user: (&ParticipantKey, &ParticipantName), program: &str, profile| {
+            let meta = load_meta(&setup.store, setup.thread, &owner, 0).unwrap();
+            may_run(&meta, setup.thread, user, (OsStr::new(program), profile))
+        };
+        assert!(check((&owner, &alice), "/opt/tools/tester.sh", None).is_ok());
+        let bob = add_bob(&setup, Role::Watcher);
+        assert!(check((&owner, &alice), "/opt/tools/tester.sh", None).is_ok());
+        assert!(matches!(
+            check((bob.key(), bob.name()), "claude", claude),
+            Err(RunError::Watcher { owner, thread }) if owner == alice && thread == setup.thread
+        ));
+        sign_participant(&setup, bob.clone().with_role(Role::Collaborator));
+        assert!(matches!(
+            check((&owner, &alice), "/opt/tools/tester.sh", None),
+            Err(RunError::NoTurnEnds(name)) if name == "tester.sh"
+        ));
+        assert!(matches!(
+            check((bob.key(), bob.name()), "claude", None),
+            Err(RunError::NoTurnEnds(name)) if name == "claude"
+        ));
+        assert!(check((bob.key(), bob.name()), "claude", claude).is_ok());
+        assert!(check((&owner, &alice), "claude", claude).is_ok());
+        assert!(matches!(
+            check((&owner, bob.name()), "claude", claude),
+            Err(RunError::NotListed(..))
+        ));
+    }
+
+    #[test]
+    fn a_watcher_without_an_agent_is_told_they_watch() {
+        use crate::workspace_live::tests::{
+            add_bob,
+            setup,
+        };
+
+        let setup = setup();
+        let owner = setup.owner();
+        let bob = add_bob(&setup, Role::Watcher);
+        assert!(matches!(
+            no_agent(&setup.store, setup.thread, &owner, bob.key()),
+            RunError::Watcher { thread, .. } if thread == setup.thread
+        ));
+        assert!(matches!(
+            no_agent(&setup.store, setup.thread, &owner, &owner),
+            RunError::Resume(ResumeError::NoAgent(thread)) if thread == setup.thread
+        ));
+    }
 
     struct StillTerminal;
 

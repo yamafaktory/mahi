@@ -105,7 +105,6 @@ use crate::{
         self,
         PairingError,
     },
-    profile::Profile,
     prompt::{
         Prompt,
         TerminalPrompt,
@@ -137,6 +136,7 @@ use crate::{
         AgentLock,
         LockError,
     },
+    turn_end,
     viewer_palette::ViewerPalette,
 };
 
@@ -676,14 +676,8 @@ fn current_meta(
 }
 
 fn check_turn_ends(options: &LaunchOptions, program: &OsStr) -> Result<(), JoinError> {
-    if options
-        .profile_for(program)
-        .is_some_and(Profile::reports_turn_ends)
-    {
-        return Ok(());
-    }
-    let name = Path::new(program).file_name().unwrap_or(program);
-    Err(JoinError::NoTurnEnds(name.to_string_lossy().into_owned()))
+    turn_end::unreported_name(program, options.profile_for(program))
+        .map_or(Ok(()), |name| Err(JoinError::NoTurnEnds(name)))
 }
 
 fn check_role(command: &JoinCommand, meta: &VerifiedMeta, own: NodeId) -> Result<(), JoinError> {
