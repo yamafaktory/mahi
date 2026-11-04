@@ -37,6 +37,7 @@ use mahi_store::{
     Store,
     StoreError,
 };
+use mahi_thread::append_snapshot;
 use thiserror::Error;
 
 use crate::{
@@ -396,10 +397,10 @@ fn snapshot(
         SnapshotKind::Plain => SNAPSHOT_MESSAGE,
         SnapshotKind::TurnEnd { message, .. } => message,
     };
-    last.commit = store.append_signed(
+    last.commit = append_snapshot(
+        store,
         &target.snapshots,
-        Some(last.commit),
-        taken.tree,
+        (Some(last.commit), taken.tree),
         message,
         target.commits.signer(),
     )?;
@@ -553,7 +554,10 @@ mod tests {
         assert_eq!(store.parent(ended).unwrap(), Some(zero));
         assert_eq!(
             store.commit_message(ended).unwrap(),
-            format!("snapshot\n\nMahi-Turn-End: {}\n", started.slot)
+            format!(
+                "snapshot\n\nMahi-Turn-End: {}\nMahi-Thread: {}\n",
+                started.slot, started.thread
+            )
         );
         let trees = snapshot_trees(&store, &started.snapshots);
         assert_eq!(trees[0], trees[1]);
@@ -597,7 +601,10 @@ mod tests {
         fs::write(started.worktree.join("next"), "next turn").unwrap();
         events.changed();
         let plain = wait_for_new_head(&store, &started.snapshots, Some(ended));
-        assert_eq!(store.commit_message(plain).unwrap(), SNAPSHOT_MESSAGE);
+        assert_eq!(
+            store.commit_message(plain).unwrap(),
+            format!("snapshot\n\nMahi-Thread: {}\n", started.thread)
+        );
         events.turn_ended();
         let ended_again = wait_for_new_head(&store, &started.snapshots, Some(plain));
         events.turn_ended();
@@ -607,7 +614,10 @@ mod tests {
         assert_eq!(store.parent(ended_again).unwrap(), Some(plain));
         assert_eq!(
             store.commit_message(ended_again).unwrap(),
-            format!("snapshot\n\nMahi-Turn-End: {}\n", started.slot)
+            format!(
+                "snapshot\n\nMahi-Turn-End: {}\nMahi-Thread: {}\n",
+                started.slot, started.thread
+            )
         );
     }
 
@@ -671,10 +681,17 @@ mod tests {
         };
         recorder.finish().unwrap();
 
+        assert!(mahi_thread::names_thread(
+            &store.commit_message(merge_commit).unwrap(),
+            started.thread
+        ));
         let ended = store.parent(merge_commit).unwrap().unwrap();
         assert_eq!(
             store.commit_message(ended).unwrap(),
-            format!("snapshot\n\nMahi-Turn-End: {}\n", started.slot)
+            format!(
+                "snapshot\n\nMahi-Turn-End: {}\nMahi-Thread: {}\n",
+                started.slot, started.thread
+            )
         );
         let repo = gix::open(store.common_dir()).unwrap();
         let tree = repo.find_commit(ended).unwrap().tree().unwrap();

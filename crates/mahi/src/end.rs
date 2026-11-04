@@ -45,6 +45,7 @@ use mahi_thread::{
     OwnerError,
     ParticipantKey,
     ThreadError,
+    append_snapshot,
     load_meta,
 };
 use thiserror::Error;
@@ -285,15 +286,14 @@ fn record_last(
         .transpose()?
         .is_some_and(|tree| tree == taken.tree);
     if !unchanged {
-        store
-            .append_signed(
-                &snapshots,
-                head,
-                taken.tree,
-                SNAPSHOT_MESSAGE,
-                commits.signer(),
-            )
-            .map_err(EndError::Snapshot)?;
+        append_snapshot(
+            store,
+            &snapshots,
+            (head, taken.tree),
+            SNAPSHOT_MESSAGE,
+            commits.signer(),
+        )
+        .map_err(EndError::Snapshot)?;
         report.push_str("recorded the worktree's last changes\n");
     }
     Ok(Recorded {

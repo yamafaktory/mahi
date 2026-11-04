@@ -22,7 +22,10 @@ pub use card::{
 pub use commits::{
     COMMIT_NAMESPACE,
     GitSigner,
+    append_snapshot,
+    names_thread,
     signed_by,
+    snapshot_message,
 };
 pub use fetched::{
     Accepted,

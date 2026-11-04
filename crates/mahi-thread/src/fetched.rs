@@ -21,7 +21,11 @@ use crate::{
     Role,
     ThreadError,
     VerifiedMeta,
-    commits::signed_by,
+    commits::{
+        NamedThread,
+        named_thread,
+        signed_by,
+    },
     pins::Pins,
     thread::META_ENTRY,
 };
@@ -35,6 +39,9 @@ pub enum Refusal {
     /// A commit it adds is not signed by the key `meta` lists for the ref's participant.
     #[error("commit {0} is not signed by the participant's key")]
     NotSigned(ObjectId),
+    /// A snapshot it adds names another thread, or its newest names none.
+    #[error("snapshot {0} does not name this thread")]
+    OtherThread(ObjectId),
 }
 
 /// Why fetched snapshots were refused.
@@ -101,7 +108,9 @@ enum Advance {
 /// of a participant the resulting `meta` lists, other than `local`, only moves forward: behind
 /// moves to the fetched commit, ahead stays, and a history that went apart stays and is
 /// reported. Moving forward also needs every commit the ref gains to be signed by the key that
-/// `meta` lists for the participant, so that no one else can write in their name. A ref that
+/// `meta` lists for the participant, so that no one else can write in their name, and, for a
+/// snapshots ref, its new tip to name the thread in its `Mahi-Thread` trailer and no commit it
+/// gains to name another. A ref that
 /// fails its checks is refused on its own, and the others go on. All the history walks
 /// together go through at most [`MAX_HISTORY_WALK`] commits; once that is spent, the remaining
 /// refs that need a walk are refused.
@@ -254,20 +263,22 @@ fn read_document(
 /// the agent's host, on behalf of the participant `local`: only when `meta` lists the slot's
 /// participant as a collaborator other than `local`, and when every commit the ref gains is
 /// signed by the key `meta` lists for them. A ref already at or past `tip` stays, and so does
-/// one whose history went apart from it. The history walks go through at most
-/// [`MAX_HISTORY_WALK`] commits.
+/// one whose history went apart from it. `tip` must name this thread in its `Mahi-Thread`
+/// trailer, and no commit the ref gains may name another, so a participant's snapshots from
+/// another thread are refused. The history walks go through at most [`MAX_HISTORY_WALK`]
+/// commits.
 ///
 /// `meta` must be the newest the user accepted, read again for each answer, so that a
-/// collaborator made a watcher is refused from then on. Nothing in a snapshot names its
-/// thread: the caller takes the answer only from the node of the slot's participant, and only
-/// for a turn-end snapshot of that slot.
+/// collaborator made a watcher is refused from then on. The caller takes the answer only from
+/// the node of the slot's participant, and only for a turn-end snapshot of that slot.
 ///
 /// # Errors
 ///
 /// Returns [`SnapshotsRefusal::Own`] for `local`'s own slot, [`SnapshotsRefusal::NotListed`]
 /// or [`SnapshotsRefusal::Watcher`] if `meta` does not list the participant as a collaborator,
 /// or [`SnapshotsRefusal::Refused`] with [`Refusal::NotSigned`] if a commit the ref would gain
-/// is not theirs, or with [`Refusal::Store`] if the history cannot be read or the ref moved.
+/// is not theirs, with [`Refusal::OtherThread`] if one names another thread or `tip` names
+/// none, or with [`Refusal::Store`] if the history cannot be read or the ref moved.
 pub fn accept_snapshots(
     store: &Store,
     meta: &VerifiedMeta,
@@ -310,7 +321,11 @@ fn advance(
         Some(local) => store.descends_within(commit, local, budget)?,
     };
     if forward {
-        require_signed(store, commit, local, writer, budget)?;
+        let snapshots_of = match thread_ref.kind() {
+            RefKind::Snapshots(_) => Some(thread_ref.thread()),
+            RefKind::Meta | RefKind::State | RefKind::Transcript(_) | RefKind::Session(_) => None,
+        };
+        require_signed(store, (commit, local), writer, snapshots_of, budget)?;
         store.set_head(thread_ref, local, commit)?;
         return Ok(Advance::Moved);
     }
@@ -322,9 +337,9 @@ fn advance(
 
 fn require_signed(
     store: &Store,
-    tip: ObjectId,
-    until: Option<ObjectId>,
+    (tip, until): (ObjectId, Option<ObjectId>),
     writer: &ParticipantKey,
+    snapshots_of: Option<ThreadId>,
     budget: &mut usize,
 ) -> Result<(), Refusal> {
     let mut next = Some(tip);
@@ -334,6 +349,12 @@ fn require_signed(
             .ok_or(StoreError::HistoryTooLong(tip))?;
         if !signed_by(store, commit, writer)? {
             return Err(Refusal::NotSigned(commit));
+        }
+        if let Some(thread) = snapshots_of {
+            let named = named_thread(&store.commit_message(commit)?, thread);
+            if named == NamedThread::Other || (named == NamedThread::None && commit == tip) {
+                return Err(Refusal::OtherThread(commit));
+            }
         }
         next = store.parent(commit)?;
     }
@@ -370,6 +391,7 @@ mod tests {
         load_meta,
         node::tests::random_node,
         record_meta,
+        snapshot_message,
         thread::tests::{
             Setup,
             draft,
@@ -413,7 +435,13 @@ mod tests {
             .unwrap();
         setup
             .store
-            .append_signed(&scratch, parent, tree, "m", &GitSigner(signer.clone()))
+            .append_signed(
+                &scratch,
+                parent,
+                tree,
+                &snapshot_message("m", setup.thread),
+                &GitSigner(signer.clone()),
+            )
             .unwrap()
     }
 
@@ -427,7 +455,10 @@ mod tests {
             .store
             .write_tree(&[("f", EntryKind::Blob, blob)])
             .unwrap();
-        setup.store.append(&scratch, parent, tree, "m").unwrap()
+        setup
+            .store
+            .append(&scratch, parent, tree, &snapshot_message("m", setup.thread))
+            .unwrap()
     }
 
     fn snapshots(setup: &Setup, participant: &str, agent: &str) -> ThreadRef {
@@ -541,6 +572,55 @@ mod tests {
             setup.store.fetched_refs(setup.thread).unwrap(),
             [(alice, waiting)]
         );
+    }
+
+    #[test]
+    fn a_fetched_snapshots_ref_naming_another_thread_is_refused_and_other_refs_need_no_name() {
+        let setup = setup();
+        let (_, first) = created(&setup);
+        stage(&setup, &ThreadRef::new(setup.thread, RefKind::Meta), first);
+        let by_owner = |message: &str, content: &[u8]| {
+            let scratch = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
+            let blob = setup.store.write_blob(content).unwrap();
+            let tree = setup
+                .store
+                .write_tree(&[("f", EntryKind::Blob, blob)])
+                .unwrap();
+            setup
+                .store
+                .append_signed(
+                    &scratch,
+                    None,
+                    tree,
+                    message,
+                    &GitSigner(setup.owner.clone()),
+                )
+                .unwrap()
+        };
+        let slot = AgentSlot::new(
+            ParticipantName::new("alice").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+        let snapshots = ThreadRef::new(setup.thread, RefKind::Snapshots(slot.clone()));
+        let transcript = ThreadRef::new(setup.thread, RefKind::Transcript(slot));
+        let elsewhere = by_owner(
+            &snapshot_message("snapshot", ThreadId::random().unwrap()),
+            b"another thread's",
+        );
+        let unnamed = by_owner("transcript", b"turns");
+        stage(&setup, &snapshots, elsewhere);
+        stage(&setup, &transcript, unnamed);
+
+        let accepted = accept(&setup).unwrap();
+
+        assert!(accepted.updated.contains(&transcript));
+        assert!(!accepted.updated.contains(&snapshots));
+        assert!(matches!(
+            accepted.refused.as_slice(),
+            [(refused, Refusal::OtherThread(commit))] if *refused == snapshots && *commit == elsewhere
+        ));
+        assert_eq!(setup.store.head(&snapshots).unwrap(), None);
+        assert_eq!(setup.store.head(&transcript).unwrap(), Some(unnamed));
     }
 
     #[test]
@@ -695,6 +775,7 @@ mod tests {
             .map(|(thread_ref, refusal)| match refusal {
                 Refusal::NotSigned(commit) => (thread_ref.clone(), *commit),
                 Refusal::Store(error) => panic!("{thread_ref}: {error}"),
+                Refusal::OtherThread(commit) => panic!("{thread_ref}: {commit} names no thread"),
             })
             .collect();
         assert_eq!(refused.len(), 4);
@@ -844,6 +925,55 @@ mod tests {
         .with_role(role);
         add_participant(&setup.store, setup.thread, key, &setup.owner, participant).unwrap();
         signer
+    }
+
+    #[test]
+    fn a_fetched_snapshot_must_name_this_thread_and_older_ones_without_a_name_are_taken() {
+        let setup = setup();
+        let (key, _) = created(&setup);
+        let bob_key = listed(&setup, &key, "bob", Role::Collaborator);
+        let meta = load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
+        let alice = ParticipantName::new("alice").unwrap();
+        let bobs = AgentSlot::new(
+            ParticipantName::new("bob").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+        let accept = |tip: ObjectId| accept_snapshots(&setup.store, &meta, &bobs, tip, &alice);
+        let by_bob = |parent: Option<ObjectId>, message: &str, content: &[u8]| {
+            let scratch = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
+            if let Some(parent) = parent {
+                set_ref(&setup, &scratch.to_string(), parent);
+            }
+            let blob = setup.store.write_blob(content).unwrap();
+            let tree = setup
+                .store
+                .write_tree(&[("f", EntryKind::Blob, blob)])
+                .unwrap();
+            setup
+                .store
+                .append_signed(&scratch, parent, tree, message, &GitSigner(bob_key.clone()))
+                .unwrap()
+        };
+        let elsewhere = snapshot_message("snapshot", ThreadId::random().unwrap());
+        let here = snapshot_message("snapshot", setup.thread);
+
+        let unnamed_tip = by_bob(None, "snapshot", b"old");
+        assert!(matches!(
+            accept(unnamed_tip),
+            Err(SnapshotsRefusal::Refused(Refusal::OtherThread(commit))) if commit == unnamed_tip
+        ));
+        let other_tip = by_bob(Some(unnamed_tip), &elsewhere, b"other");
+        assert!(matches!(
+            accept(other_tip),
+            Err(SnapshotsRefusal::Refused(Refusal::OtherThread(commit))) if commit == other_tip
+        ));
+        let other_below = by_bob(Some(other_tip), &here, b"over another thread's");
+        assert!(matches!(
+            accept(other_below),
+            Err(SnapshotsRefusal::Refused(Refusal::OtherThread(commit))) if commit == other_tip
+        ));
+        let named = by_bob(Some(unnamed_tip), &here, b"new");
+        assert_eq!(accept(named).unwrap(), SnapshotsAccepted::Moved);
     }
 
     #[test]

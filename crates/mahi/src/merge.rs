@@ -18,6 +18,7 @@ use mahi_store::{
     Store,
     StoreError,
 };
+use mahi_thread::append_snapshot;
 use thiserror::Error;
 
 use crate::{
@@ -292,10 +293,10 @@ fn write_merge(
     } else {
         previous
     };
-    let commit = store.append_signed(
+    let commit = append_snapshot(
+        store,
         into.snapshots,
-        head,
-        tree,
+        (head, tree),
         &recorded.message(),
         into.commits.signer(),
     )?;

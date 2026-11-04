@@ -74,3 +74,4 @@ pub use store::{
     Store,
     StoreError,
 };
+pub use trailers::appended_trailers;

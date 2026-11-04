@@ -452,7 +452,10 @@ mod tests {
         let ended = store.head(&started.snapshots).unwrap().unwrap();
         assert_eq!(
             store.commit_message(ended).unwrap(),
-            format!("snapshot\n\nMahi-Turn-End: {}\n", started.slot)
+            format!(
+                "snapshot\n\nMahi-Turn-End: {}\nMahi-Thread: {}\n",
+                started.slot, started.thread
+            )
         );
         let repo = gix::open(store.common_dir()).unwrap();
         let tree = repo.find_commit(ended).unwrap().tree().unwrap();
@@ -512,7 +515,7 @@ mod tests {
         let taken = store.head(&started.snapshots).unwrap().unwrap();
         assert_eq!(
             store.commit_message(taken).unwrap(),
-            crate::session::SNAPSHOT_MESSAGE
+            format!("snapshot\n\nMahi-Thread: {}\n", started.thread)
         );
         recorder.finish().unwrap();
     }

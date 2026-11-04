@@ -7,7 +7,10 @@ use gix::bstr::{
 const CHERRY_PICKED: &[u8] = b"(cherry picked from commit ";
 const SIGNED_OFF_BY: &[u8] = b"Signed-off-by";
 
-pub(crate) fn appended_trailers(message: &BStr, trailers: &str) -> BString {
+/// Returns `message` with `trailers`, lines of `Key: value` each ending in a newline, joined to
+/// its trailer block, or starting one when its last paragraph is not one, as git reads trailers.
+#[must_use]
+pub fn appended_trailers(message: &BStr, trailers: &str) -> BString {
     let body = message.trim_end();
     let eol: &[u8] = if body.find(b"\r\n").is_some() {
         b"\r\n"

@@ -1,10 +1,15 @@
 use std::error::Error;
 
+use mahi_core::{
+    ThreadId,
+    ThreadRef,
+};
 use mahi_store::{
     CommitSigner,
     ObjectId,
     Store,
     StoreError,
+    appended_trailers,
 };
 use ssh_key::{
     HashAlg,
@@ -20,6 +25,64 @@ use crate::{
 
 /// The SSHSIG namespace git signs commits in.
 pub const COMMIT_NAMESPACE: &str = "git";
+
+const THREAD_TRAILER: &str = "Mahi-Thread: ";
+
+/// Returns `message`, a snapshot's, with the trailer that names its thread `thread`: joined to
+/// its trailer block, or starting one.
+#[must_use]
+pub fn snapshot_message(message: &str, thread: ThreadId) -> String {
+    let trailer = format!("{THREAD_TRAILER}{thread}\n");
+    appended_trailers(message.into(), &trailer).to_string()
+}
+
+/// Writes a snapshot of `tree` on `parent` in `snapshots`, signed by `signer`, its message
+/// `message` with the trailer that names the ref's thread, and returns it.
+///
+/// # Errors
+///
+/// Returns the errors of [`Store::append_signed`].
+pub fn append_snapshot(
+    store: &Store,
+    snapshots: &ThreadRef,
+    (parent, tree): (Option<ObjectId>, ObjectId),
+    message: &str,
+    signer: &dyn CommitSigner,
+) -> Result<ObjectId, StoreError> {
+    let message = snapshot_message(message, snapshots.thread());
+    store.append_signed(snapshots, parent, tree, &message, signer)
+}
+
+/// Says whether a snapshot's `message` names its thread `thread`, and no other.
+#[must_use]
+pub fn names_thread(message: &[u8], thread: ThreadId) -> bool {
+    named_thread(message, thread) == NamedThread::This
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NamedThread {
+    None,
+    This,
+    Other,
+}
+
+pub(crate) fn named_thread(message: &[u8], thread: ThreadId) -> NamedThread {
+    let mut named = NamedThread::None;
+    let lines = message.split(|byte| *byte == b'\n');
+    for line in lines {
+        let Some(value) = line.strip_prefix(THREAD_TRAILER.as_bytes()) else {
+            continue;
+        };
+        let parsed = std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| value.parse::<ThreadId>().ok());
+        if parsed != Some(thread) {
+            return NamedThread::Other;
+        }
+        named = NamedThread::This;
+    }
+    named
+}
 
 #[derive(Debug, Error)]
 #[error("the signature is not by the signing key over the commit")]
@@ -90,6 +153,59 @@ mod tests {
 
     pub(crate) fn ed25519() -> PrivateKey {
         PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_names_its_thread_in_its_trailer_block_and_only_an_exact_name_counts() {
+        let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let other: ThreadId = "fedcba9876543210fedcba9876543210".parse().unwrap();
+        let named = format!("Mahi-Thread: {thread}");
+        assert_eq!(
+            snapshot_message("snapshot", thread),
+            format!("snapshot\n\n{named}\n")
+        );
+        assert_eq!(
+            snapshot_message("snapshot\n", thread),
+            format!("snapshot\n\n{named}\n")
+        );
+        assert_eq!(
+            snapshot_message("snapshot\n\nMahi-Turn-End: alice.claude\n", thread),
+            format!("snapshot\n\nMahi-Turn-End: alice.claude\n{named}\n")
+        );
+        let cases: [(String, NamedThread); 8] = [
+            ("snapshot".to_owned(), NamedThread::None),
+            (snapshot_message("snapshot", thread), NamedThread::This),
+            (snapshot_message("snapshot", other), NamedThread::Other),
+            (
+                format!("snapshot\n\n{named}\nMahi-Thread: {other}\n"),
+                NamedThread::Other,
+            ),
+            (format!("snapshot\r\n\r\n{named}\r\n"), NamedThread::Other),
+            (format!("snapshot\n\n{named} \n"), NamedThread::Other),
+            (
+                format!(
+                    "snapshot\n\nMahi-Thread: {}\n",
+                    thread.to_string().to_uppercase()
+                ),
+                NamedThread::Other,
+            ),
+            (
+                "snapshot\n\nMahi-Thread: 0123\n".to_owned(),
+                NamedThread::Other,
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                named_thread(message.as_bytes(), thread),
+                expected,
+                "{message:?}"
+            );
+        }
+        assert!(names_thread(
+            snapshot_message("snapshot", thread).as_bytes(),
+            thread
+        ));
+        assert!(!names_thread(b"snapshot", thread));
     }
 
     #[test]

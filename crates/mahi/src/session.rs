@@ -59,9 +59,11 @@ use mahi_thread::{
     ThreadError,
     TranscriptError,
     TranscriptTip,
+    append_snapshot,
     create_thread,
     discard_thread,
     load_meta,
+    names_thread,
     read_tip,
     remembered_owner,
 };
@@ -302,7 +304,7 @@ pub(crate) fn resume(
         worktree_or_restore(store, &name, reopen.worktrees, meta.base(), head, interrupt)?;
     let first_snapshot = match head {
         Some(commit) => Recorded {
-            commit,
+            commit: named_head(store, &snapshots, commit, reopen.commits)?,
             tree: store.commit_tree(commit)?,
             cache: SnapshotCache::default(),
         },
@@ -327,6 +329,25 @@ pub(crate) fn resume(
         commits: reopen.commits.clone(),
         created: None,
     })
+}
+
+fn named_head(
+    store: &Store,
+    snapshots: &ThreadRef,
+    head: ObjectId,
+    commits: &CommitKey,
+) -> Result<ObjectId, StoreError> {
+    let message = store.commit_message(head)?;
+    if names_thread(&message, snapshots.thread()) {
+        return Ok(head);
+    }
+    append_snapshot(
+        store,
+        snapshots,
+        (Some(head), store.commit_tree(head)?),
+        &String::from_utf8_lossy(&message),
+        commits.signer(),
+    )
 }
 
 #[derive(Debug, Error)]
@@ -502,7 +523,7 @@ fn take_first_snapshot(
 ) -> Result<Recorded, StoreError> {
     let mut cache = SnapshotCache::default();
     let tree = store.snapshot(name, globals, &mut cache, interrupt)?.tree;
-    let commit = store.append_signed(snapshots, None, tree, message, commits.signer())?;
+    let commit = append_snapshot(store, snapshots, (None, tree), message, commits.signer())?;
     Ok(Recorded {
         commit,
         tree,
@@ -986,6 +1007,38 @@ pub(crate) mod tests {
                 .unwrap()
                 .next()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_resumed_head_that_names_no_thread_gets_a_named_snapshot_that_keeps_its_trailers() {
+        let (_repo, store) = repository_on_main();
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let commits = CommitKey::new(key).unwrap();
+        let thread = ThreadId::random().unwrap();
+        let snapshots = ThreadRef::new(thread, RefKind::Snapshots("alice.claude".parse().unwrap()));
+        let tree = store.write_tree(&[]).unwrap();
+        let old = store
+            .append_signed(
+                &snapshots,
+                None,
+                tree,
+                "snapshot\n\nMahi-Turn-End: alice.claude\n",
+                commits.signer(),
+            )
+            .unwrap();
+        let named = named_head(&store, &snapshots, old, &commits).unwrap();
+        assert_ne!(named, old);
+        assert_eq!(store.head(&snapshots).unwrap(), Some(named));
+        assert_eq!(store.parent(named).unwrap(), Some(old));
+        assert_eq!(store.commit_tree(named).unwrap(), tree);
+        assert_eq!(
+            store.commit_message(named).unwrap(),
+            format!("snapshot\n\nMahi-Turn-End: alice.claude\nMahi-Thread: {thread}\n")
+        );
+        assert_eq!(
+            named_head(&store, &snapshots, named, &commits).unwrap(),
+            named
         );
     }
 

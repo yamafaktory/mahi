@@ -2270,7 +2270,7 @@ mod tests {
                 &snapshots,
                 None,
                 tree,
-                &turn_end::message(&slot),
+                &mahi_thread::snapshot_message(&turn_end::message(&slot), hosted.thread),
                 commits.signer(),
             )
             .unwrap();
@@ -2394,7 +2394,7 @@ mod tests {
                 &snapshots,
                 None,
                 tree,
-                &turn_end::message(&slot),
+                &mahi_thread::snapshot_message(&turn_end::message(&slot), hosted.thread),
                 commits.signer(),
             )
             .unwrap();
@@ -2629,7 +2629,15 @@ mod tests {
                     ended = Some(
                         hosted
                             .store
-                            .append(&snapshots, None, tree, &crate::turn_end::message(&slot))
+                            .append(
+                                &snapshots,
+                                None,
+                                tree,
+                                &mahi_thread::snapshot_message(
+                                    &crate::turn_end::message(&slot),
+                                    hosted.thread,
+                                ),
+                            )
                             .unwrap(),
                     );
                 }

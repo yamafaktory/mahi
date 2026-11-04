@@ -36,10 +36,42 @@ use crate::{
     Role,
     accept_fetched,
     create_thread,
+    snapshot_message,
     thread::META_ENTRY,
 };
 
 const THREAD: [u8; 16] = [9; 16];
+const OTHER_THREAD: [u8; 16] = [7; 16];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Named {
+    This,
+    Other,
+    Nothing,
+    Both,
+}
+
+impl Named {
+    fn from_choice(choice: u8) -> Self {
+        match choice % 4 {
+            0 => Self::This,
+            1 => Self::Other,
+            2 => Self::Nothing,
+            _ => Self::Both,
+        }
+    }
+
+    fn message(self) -> String {
+        let this = ThreadId::from_bytes(THREAD);
+        let other = ThreadId::from_bytes(OTHER_THREAD);
+        match self {
+            Self::This => snapshot_message("m", this),
+            Self::Other => snapshot_message("m", other),
+            Self::Nothing => "m".to_owned(),
+            Self::Both => snapshot_message(&snapshot_message("m", this), other),
+        }
+    }
+}
 const NAMES: [&str; 3] = ["owner", "bob", "eve"];
 const LISTED: usize = 2;
 
@@ -96,6 +128,7 @@ struct History<'a> {
     made: usize,
     signed_by: HashMap<ObjectId, Option<usize>>,
     parent: HashMap<ObjectId, ObjectId>,
+    named: HashMap<ObjectId, Named>,
 }
 
 impl History<'_> {
@@ -111,8 +144,10 @@ impl History<'_> {
         people: &People,
         signer: Option<usize>,
         parent: Option<ObjectId>,
+        named: Named,
     ) -> ObjectId {
         let scratch = self.scratch();
+        let message = named.message();
         if let Some(parent) = parent {
             set_ref(self.store, &scratch.to_string(), parent);
         }
@@ -129,13 +164,14 @@ impl History<'_> {
                 &scratch,
                 parent,
                 tree,
-                "m",
+                &message,
                 &GitSigner(people.keys[who].clone()),
             ),
-            None => self.store.append(&scratch, parent, tree, "m"),
+            None => self.store.append(&scratch, parent, tree, &message),
         }
         .expect("a commit is written");
         self.signed_by.insert(commit, signer);
+        self.named.insert(commit, named);
         if let Some(parent) = parent {
             self.parent.insert(commit, parent);
         }
@@ -147,10 +183,11 @@ impl History<'_> {
         people: &People,
         signer: Option<usize>,
         mut tip: Option<ObjectId>,
-        length: usize,
+        (length, naming): (usize, u8),
     ) -> Option<ObjectId> {
-        for _ in 0..length {
-            tip = Some(self.commit(people, signer, tip));
+        for at in 0..length {
+            let choice = naming.rotate_right(u32::try_from(at * 2).unwrap_or(0));
+            tip = Some(self.commit(people, signer, tip, Named::from_choice(choice)));
         }
         tip
     }
@@ -221,6 +258,7 @@ fn slots(
     for (who, name) in NAMES.iter().enumerate() {
         let shape = next();
         let more = next();
+        let naming = next();
         let kind: fn(AgentSlot) -> RefKind = match more % 3 {
             0 => RefKind::Snapshots,
             1 => RefKind::Transcript,
@@ -237,16 +275,16 @@ fn slots(
             3 => Some(0),
             _ => None,
         };
-        let local = history.chain(people, Some(who), None, usize::from(shape % 3));
+        let local = history.chain(people, Some(who), None, (usize::from(shape % 3), 0));
         let extra = usize::from(shape / 3 % 3) + 1;
         let fetched = match shape / 9 % 5 {
             0 => None,
             1 => local,
-            2 => history.chain(people, signer, local, extra),
+            2 => history.chain(people, signer, local, (extra, naming)),
             3 => local.and_then(|tip| history.parent.get(&tip).copied()),
             _ => {
                 let from = local.and_then(|tip| history.parent.get(&tip).copied());
-                history.chain(people, signer, from, extra)
+                history.chain(people, signer, from, (extra, naming))
             }
         };
         if let Some(local) = local {
@@ -266,6 +304,15 @@ fn slots(
 }
 
 fn assert_moved_forward_by_its_participant(history: &History<'_>, slot: &Slot) {
+    let snapshots = matches!(slot.thread_ref.kind(), RefKind::Snapshots(_));
+    if snapshots {
+        assert_eq!(
+            slot.fetched
+                .and_then(|tip| history.named.get(&tip).copied()),
+            Some(Named::This),
+            "a snapshots ref moved to a tip that does not name its thread alone"
+        );
+    }
     let mut at = slot.fetched;
     while at != slot.local {
         assert!(
@@ -280,6 +327,10 @@ fn assert_moved_forward_by_its_participant(history: &History<'_>, slot: &Slot) {
             Some(slot.who),
             "a ref gained a commit its participant did not sign"
         );
+        assert!(
+            !snapshots || !matches!(history.named.get(&commit), Some(Named::Other | Named::Both)),
+            "a snapshots ref gained a commit that names another thread"
+        );
         at = history.parent.get(&commit).copied();
     }
 }
@@ -288,10 +339,12 @@ fn assert_moved_forward_by_its_participant(history: &History<'_>, slot: &Slot) {
 /// for eve, whom it does not list, then local and fetched versions of each ref related as
 /// `data` says (the same, ahead, behind, apart, signed by anyone or no one) and a fetched
 /// `meta` that is the same, a newer one that also lists eve, one eve signed, or none, and
-/// accepts what was fetched on behalf of the owner or of no one. It checks what accepting
+/// accepts what was fetched on behalf of the owner or of no one. Each fetched commit names
+/// the thread, another one, none or both in its `Mahi-Thread` trailer. It checks what accepting
 /// promises: when it fails no ref moved; a ref of the local participant, or of one the
-/// resulting `meta` does not list, never moves; and a ref that moves goes to the fetched
-/// commit, forward from where it was, through commits its participant signed.
+/// resulting `meta` does not list, never moves; a ref that moves goes to the fetched commit,
+/// forward from where it was, through commits its participant signed; and a snapshots ref
+/// that moves goes to a tip that names the thread alone, through no commit naming another.
 ///
 /// # Panics
 ///
@@ -311,6 +364,7 @@ pub fn fetched(data: &[u8]) {
         made: 0,
         signed_by: HashMap::new(),
         parent: HashMap::new(),
+        named: HashMap::new(),
     };
     let meta_ref = ThreadRef::new(thread, RefKind::Meta);
     let meta_choice = next() % 4;

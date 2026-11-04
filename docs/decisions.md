@@ -451,3 +451,16 @@ Chosen by the user (#55), narrowing D047. A teammate's turn does not wait for a 
 the worktree already holds as that turn left it. It still waits for a settings path where the
 merge keeps the agent's side over the teammate's, so a teammate's instructions do not reach
 the agent through `read_diff` without the user.
+
+## D064 · 2026-11-04 · The thread trailer and older snapshots
+
+Chosen by the user (#57), building D051. The trailer is `Mahi-Thread: <thread-id>`, shaped like
+`Mahi-Turn-End`. A fetch checks only what can carry it: the newest snapshot it takes must name
+the thread, and no snapshot it brings may name another. Older snapshots without the trailer
+are taken, since the signed newest one fixes its whole history.
+
+## D065 · 2026-11-04 · Resume names an older snapshot's thread
+
+Chosen by the user (#57). When `mahi resume` starts an agent whose newest snapshot names no
+thread, it first adds a snapshot of the same tree that keeps that snapshot's trailers and adds
+`Mahi-Thread`, so teammates fetch it again after one run of the new mahi, before any turn.
