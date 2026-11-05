@@ -373,6 +373,14 @@ pub fn trees(data: &[u8]) {
 
     if let Ok(changes) = store.changed_paths(base, theirs, MAX_LISTED) {
         assert!(changes.paths.len() <= MAX_LISTED);
+        let mut last = None;
+        for (index, bytes) in &changes.not_utf8 {
+            assert!(last < Some(*index));
+            last = Some(*index);
+            assert!(std::str::from_utf8(bytes).is_err());
+            let listed = changes.paths.get(*index).map(|(path, _)| path.as_str());
+            assert_eq!(listed, Some(String::from_utf8_lossy(bytes).as_ref()));
+        }
         for (path, _) in changes.paths.iter().take(4) {
             let _ = store.file_diff(base, theirs, path);
         }

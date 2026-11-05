@@ -1172,6 +1172,24 @@ pub(crate) mod tests {
 
     const LIMIT: usize = 1 << 20;
 
+    pub(crate) fn raw_tree<N: AsRef<[u8]>>(
+        store: &Store,
+        entries: &[(N, EntryKind, ObjectId)],
+    ) -> ObjectId {
+        let mut tree = gix::objs::Tree {
+            entries: entries
+                .iter()
+                .map(|(name, kind, oid)| gix::objs::tree::Entry {
+                    mode: (*kind).into(),
+                    filename: name.as_ref().into(),
+                    oid: *oid,
+                })
+                .collect(),
+        };
+        tree.entries.sort();
+        store.repo.write_object(&tree).unwrap().detach()
+    }
+
     pub(crate) fn tree_of(store: &Store, entries: &[(&str, EntryKind, &[u8])]) -> ObjectId {
         let mut editor = store
             .repo

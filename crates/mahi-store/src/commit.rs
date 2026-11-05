@@ -58,25 +58,27 @@ impl Store {
     ///
     /// Returns [`StoreError::WrongObject`] if `base` or `source` is not a tree, or
     /// [`StoreError::Git`] if a tree cannot be read or written.
-    pub fn tree_with_paths(
+    pub fn tree_with_paths<P: AsRef<[u8]>>(
         &self,
         base: ObjectId,
         source: ObjectId,
-        paths: &[&str],
+        paths: &[P],
     ) -> Result<ObjectId, StoreError> {
         self.require_kind(base, Kind::Tree)?;
         self.require_kind(source, Kind::Tree)?;
         let (source, old) = (self.repo.find_tree(source)?, self.repo.find_tree(base)?);
         let mut editor = self.repo.edit_tree(base)?;
-        let file = |tree: &gix::Tree<'_>, path: &str| {
-            tree.lookup_entry(path.split('/')).map(|entry| {
-                entry
-                    .filter(|entry| !entry.mode().is_tree())
-                    .map(|entry| (EntryKind::from(entry.mode()), entry.object_id()))
-            })
+        let file = |tree: &gix::Tree<'_>, path: &[u8]| {
+            tree.lookup_entry(path.split(|byte| *byte == b'/'))
+                .map(|entry| {
+                    entry
+                        .filter(|entry| !entry.mode().is_tree())
+                        .map(|entry| (EntryKind::from(entry.mode()), entry.object_id()))
+                })
         };
         let mut taken = Vec::with_capacity(paths.len());
-        for &path in paths {
+        for path in paths {
+            let path = BStr::new(path.as_ref());
             match file(&source, path)? {
                 Some(entry) => taken.push((path, entry)),
                 None if file(&old, path)?.is_some() => {
@@ -212,6 +214,7 @@ mod tests {
     use super::*;
     use crate::store::tests::{
         Recording,
+        raw_tree,
         store,
         tree_of as tree,
     };
@@ -223,6 +226,32 @@ mod tests {
             seconds: 1_793_000_000,
             offset: 3600,
         }
+    }
+
+    #[test]
+    fn a_tree_takes_named_paths_whatever_their_bytes() {
+        let (_dir, store) = store();
+        let blob = store.write_blob(b"x").unwrap();
+        let other = store.write_blob(b"y").unwrap();
+        let inner = raw_tree::<&[u8]>(&store, &[(b"x.txt", EntryKind::Blob, blob)]);
+        let base = raw_tree::<&[u8]>(
+            &store,
+            &[
+                (b"d\xff", EntryKind::Tree, inner),
+                (b"keep\xff", EntryKind::Blob, blob),
+                (b"ok.txt", EntryKind::Blob, blob),
+            ],
+        );
+        let source = raw_tree::<&[u8]>(
+            &store,
+            &[
+                (b"keep\xff", EntryKind::Blob, other),
+                (b"new\xff", EntryKind::Blob, blob),
+                (b"ok.txt", EntryKind::Blob, blob),
+            ],
+        );
+        let named: [&[u8]; 4] = [b"d\xff/x.txt", b"keep\xff", b"new\xff", b"missing\xff"];
+        assert_eq!(store.tree_with_paths(base, source, &named).unwrap(), source);
     }
 
     #[test]
@@ -267,7 +296,7 @@ mod tests {
         );
         let blob = store.write_blob(b"x").unwrap();
         assert!(matches!(
-            store.tree_with_paths(blob, source, &[]),
+            store.tree_with_paths::<&str>(blob, source, &[]),
             Err(StoreError::WrongObject { .. })
         ));
     }

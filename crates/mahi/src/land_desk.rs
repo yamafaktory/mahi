@@ -50,6 +50,7 @@ use crate::{
         self,
         Call,
         Onto,
+        Refused,
     },
     mcp::ToolError,
     note,
@@ -691,16 +692,7 @@ impl Lander {
                 Err(error) => return Err(ToolError::Failed(crate::describe(&error))),
             };
         let failed = |error: &StoreError| ToolError::Failed(crate::describe(error));
-        let behind = self
-            .query
-            .behind(store)
-            .map_err(|error| ToolError::Failed(crate::describe(&error)))?
-            .into_iter()
-            .map(|(slot, commit)| {
-                let since = self.first_seen.note(&slot, commit);
-                (slot, since)
-            })
-            .collect();
+        let behind = self.behind(store)?;
         let worktree = self.snapshot(store).map_err(|error| failed(&error))?;
         if let Some(paths) = self.unresolved(store, worktree) {
             return Ok(landing::conflicts_first(&paths));
@@ -712,15 +704,14 @@ impl Lander {
         } = self
             .last_landing(store, &remote, base)
             .map_err(|error| failed(&error))?;
-        let Some(changed) =
-            landing::changed(store, (measured, worktree)).map_err(|error| failed(&error))?
-        else {
-            return Ok(landing::TOO_MANY.to_owned());
+        let listed = store
+            .changed_paths(measured, worktree, landing::MAX_LANDED_PATHS)
+            .map_err(|error| failed(&error))?;
+        let changed = match landing::landable(listed) {
+            Ok(changed) => changed,
+            Err(refused) => return Ok(refused.text()),
         };
-        if changed.is_empty() {
-            return Ok(landing::NOTHING_CHANGED.to_owned());
-        }
-        if let Err(misplaced) = landing::check(&call, &changed) {
+        if let Err(misplaced) = landing::check(&call, &changed.paths) {
             return Ok(misplaced.text());
         }
         let parent = match on_remote {
@@ -757,18 +748,35 @@ impl Lander {
         let built = landing::build(
             store,
             (parent, merged),
+            &changed.gone,
             &mut call,
             (self.thread, &agents),
             (&identity, self.commits.signer()),
         )
         .map_err(|error| failed(&error))?;
         let Some(&tip) = built.last() else {
-            return Ok(landing::NOTHING_CHANGED.to_owned());
+            return Ok(Refused::NothingChanged.text());
         };
 
-        let pending = pending((landed, tip, worktree), call, (remote, behind));
+        let pending = pending(
+            (landed, tip, worktree),
+            (call, &changed.gone),
+            (remote, behind),
+        );
         let _offered = self.desk.offer(pending);
         Ok(landing::waiting(owner))
+    }
+
+    fn behind(&self, store: &Store) -> Result<Vec<(AgentSlot, Instant)>, ToolError> {
+        let behind = self
+            .query
+            .behind(store)
+            .map_err(|error| ToolError::Failed(crate::describe(&error)))?;
+        let dated = behind.into_iter().map(|(slot, commit)| {
+            let since = self.first_seen.note(&slot, commit);
+            (slot, since)
+        });
+        Ok(dated.collect())
     }
 
     fn last_landing(
@@ -852,10 +860,10 @@ impl Lander {
 
 fn pending(
     (landed, tip, worktree): (ObjectId, ObjectId, ObjectId),
-    call: Call,
+    (call, gone): (Call, &[Vec<u8>]),
     (remote, behind): (SyncSetup, Vec<(AgentSlot, Instant)>),
 ) -> Pending {
-    let commits = call
+    let mut commits: Vec<(String, Vec<String>)> = call
         .commits
         .into_iter()
         .map(|planned| {
@@ -868,6 +876,15 @@ fn pending(
             (first, planned.paths)
         })
         .collect();
+    if let Some((_, paths)) = commits.last_mut() {
+        let deleted = gone.iter().map(|path| {
+            format!(
+                "{} (deleted, name not UTF-8)",
+                String::from_utf8_lossy(path)
+            )
+        });
+        paths.extend(deleted);
+    }
     Pending {
         landed,
         tip,
@@ -882,6 +899,11 @@ fn pending(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(target_os = "linux")]
+    use std::{
+        ffi::OsStr,
+        os::unix::ffi::OsStrExt as _,
+    };
     use std::{
         fs,
         time::Instant,
@@ -1204,6 +1226,58 @@ pub(crate) mod tests {
         );
         assert_eq!(desk.shown(), Some(1));
         assert_eq!(store.branch_tip(&branch_of(started.thread)).unwrap(), tip);
+    }
+
+    #[test]
+    fn the_confirmation_lists_the_deleted_names_that_are_not_utf8_under_the_last_commit() {
+        let (dir, store) = repository_on_main();
+        let remote = unreachable_remote(&store, dir.path());
+        let head = store.head_commit().unwrap();
+        let mut call = landing::parse(&call(&["a.txt"])).unwrap();
+        call.commits.push(landing::Planned {
+            message: "Rename old\n\nWhy.".to_owned(),
+            paths: vec!["old.txt".to_owned()],
+        });
+        let shown = pending(
+            (head, head, head),
+            (call, &[b"old\xff".to_vec()]),
+            (remote, Vec::new()),
+        );
+        assert_eq!(
+            shown.commits.last().unwrap(),
+            &(
+                "Rename old".to_owned(),
+                vec![
+                    "old.txt".to_owned(),
+                    "old\u{fffd} (deleted, name not UTF-8)".to_owned()
+                ]
+            )
+        );
+        assert_eq!(shown.commits.first().unwrap().1, ["a.txt"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_worktree_file_whose_name_is_not_utf8_is_refused_before_the_landing_is_built() {
+        let (_dir, store) = repository_on_main();
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let started = crate::session::tests::start_with(&store, &key).unwrap();
+        let store = Store::open(store.common_dir()).unwrap();
+        unreachable_remote(&store, store.common_dir());
+        let (lander, _desk) = lander_for(&started, &store);
+        let store = Store::open(store.common_dir()).unwrap();
+        let base = store.head_commit().unwrap();
+        fs::write(started.worktree.join("a.txt"), "a\n").unwrap();
+        let odd = OsStr::from_bytes(b"caf\xe9.txt");
+        fs::write(started.worktree.join(odd), "caf\n").unwrap();
+        assert_eq!(
+            lander.land(&store, &call(&["a.txt"]), (base, &[])).unwrap(),
+            "not landed: rename these files, whose names are not UTF-8: caf\u{fffd}.txt"
+        );
     }
 
     #[test]

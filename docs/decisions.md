@@ -474,3 +474,18 @@ what waits, free or held. It replaces the `held` and `skipped` files. The `confl
 the run's set of snapshots tried and the agent's turn flags stay where they are. No release
 wrote the old files, so mahi does not read them: a held or skipped snapshot an older build
 kept is held again at the teammate's next merge, and the user is asked again.
+
+## D067 · 2026-11-05 · A landing refuses file names that are not UTF-8
+
+Chosen by the user (#38). The land tool takes its paths as JSON strings, so the agent cannot
+name a file whose name is not UTF-8. A landing whose changes hold such a name is refused with
+`not landed: rename these files, whose names are not UTF-8: <paths>`. Paths stay strings
+elsewhere: `read_diff` and the note show such names with U+FFFD, for display only.
+
+## D068 · 2026-11-05 · A landing deletes a file name that is not UTF-8 in its last commit
+
+Chosen by the user (#38), narrowing D067. A landing refuses only the names that are not UTF-8
+it would write: files added or changed. Such a file the worktree deleted, as after a rename to
+a UTF-8 name, goes out in the landing's last commit without the agent naming it, so the
+landing branch matches the worktree and the refusal can always be cleared. The confirmation
+lists each such deletion under the last commit as `<path> (deleted, name not UTF-8)`.

@@ -712,6 +712,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::store::tests::raw_tree;
 
     #[test]
     fn a_name_with_a_nul_byte_is_never_safe_to_write() {
@@ -937,21 +938,6 @@ mod tests {
         assert!(!ran.exists());
     }
 
-    fn raw_tree(repo: &Repo, entries: &[(&str, EntryKind, ObjectId)]) -> ObjectId {
-        let mut tree = gix::objs::Tree {
-            entries: entries
-                .iter()
-                .map(|(name, kind, oid)| gix::objs::tree::Entry {
-                    mode: (*kind).into(),
-                    filename: (*name).into(),
-                    oid: *oid,
-                })
-                .collect(),
-        };
-        tree.entries.sort();
-        repo.store.repo.write_object(&tree).unwrap().detach()
-    }
-
     #[test]
     fn an_unsafe_name_or_a_non_blob_entry_is_listed_and_the_rest_is_written() {
         let repo = Repo::new();
@@ -962,7 +948,7 @@ mod tests {
         let fine = repo.store.write_blob(b"fine\n").unwrap();
         let keep = repo.store.write_blob(b"k\n").unwrap();
         let theirs = raw_tree(
-            &repo,
+            &repo.store,
             &[
                 (".git", EntryKind::Blob, hook),
                 ("fake.txt", EntryKind::Blob, inner),

@@ -58,6 +58,9 @@ pub struct Changes {
     pub paths: Vec<(String, Change)>,
     /// Whether more paths changed than were listed.
     pub truncated: bool,
+    /// For each listed path whose name, or a directory's name on the way, is not UTF-8, its
+    /// index in `paths`, which shows each run of such bytes as U+FFFD, and its bytes.
+    pub not_utf8: Vec<(usize, Vec<u8>)>,
 }
 
 /// What a tree holds at a path, links not followed.
@@ -129,7 +132,7 @@ impl Store {
             most_bytes: MAX_TREE_BYTES_READ,
             changes: Changes::default(),
         };
-        walk.compare(Some(old), Some(new), "", 0)?;
+        walk.compare(Some(old), Some(new), b"", 0)?;
         Ok(walk.changes)
     }
 
@@ -430,19 +433,30 @@ impl Walk<'_> {
         self.changes.truncated
     }
 
-    fn push(&mut self, path: String, change: Change) {
+    fn push(&mut self, path: Vec<u8>, change: Change) {
         if self.changes.paths.len() >= self.limit {
             self.changes.truncated = true;
-        } else {
-            self.changes.paths.push((path, change));
+            return;
         }
+        let shown = match String::from_utf8(path) {
+            Ok(shown) => shown,
+            Err(error) => {
+                let bytes = error.into_bytes();
+                let shown = String::from_utf8_lossy(&bytes).into_owned();
+                self.changes
+                    .not_utf8
+                    .push((self.changes.paths.len(), bytes));
+                shown
+            }
+        };
+        self.changes.paths.push((shown, change));
     }
 
     fn compare(
         &mut self,
         old: Option<ObjectId>,
         new: Option<ObjectId>,
-        prefix: &str,
+        prefix: &[u8],
         depth: usize,
     ) -> Result<(), StoreError> {
         if depth >= MAX_DEPTH {
@@ -477,11 +491,12 @@ impl Walk<'_> {
             if old_entry == new_entry {
                 continue;
             }
-            let path = if prefix.is_empty() {
-                String::from_utf8_lossy(name).into_owned()
-            } else {
-                format!("{prefix}/{}", String::from_utf8_lossy(name))
-            };
+            let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+            if !prefix.is_empty() {
+                path.extend_from_slice(prefix);
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
             let subtree = |entry: Option<(EntryMode, ObjectId)>| {
                 entry.filter(|(mode, _)| mode.is_tree()).map(|(_, id)| id)
             };
@@ -508,12 +523,60 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::store::tests::raw_tree;
 
     fn store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
         gix::init(dir.path()).unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn a_changed_name_that_is_not_utf8_is_listed_shown_and_marked() {
+        let (_dir, store) = store();
+        let blob = store.write_blob(b"x").unwrap();
+        let empty = store.write_tree(&[]).unwrap();
+        let inner = raw_tree::<&[u8]>(&store, &[(b"x.txt", EntryKind::Blob, blob)]);
+        let new = raw_tree::<&[u8]>(
+            &store,
+            &[
+                (b"caf\xe9.txt", EntryKind::Blob, blob),
+                (b"caf\xef\xbf\xbd.txt", EntryKind::Blob, blob),
+                (b"d\xff", EntryKind::Tree, inner),
+                (b"ok.txt", EntryKind::Blob, blob),
+            ],
+        );
+        let changes = store.changed_paths(empty, new, 10).unwrap();
+        let shown: Vec<&str> = changes
+            .paths
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "caf\u{fffd}.txt",
+                "caf\u{fffd}.txt",
+                "d\u{fffd}/x.txt",
+                "ok.txt"
+            ]
+        );
+        assert_eq!(
+            changes.not_utf8,
+            [(0, b"caf\xe9.txt".to_vec()), (2, b"d\xff/x.txt".to_vec())]
+        );
+        let cut = store.changed_paths(empty, new, 1).unwrap();
+        assert!(cut.truncated);
+        assert_eq!(cut.not_utf8, [(0, b"caf\xe9.txt".to_vec())]);
+        let deleted = store.changed_paths(new, empty, 10).unwrap();
+        assert_eq!(deleted.not_utf8.len(), 2);
+        assert!(
+            deleted
+                .paths
+                .iter()
+                .all(|(_, change)| *change == Change::Deleted)
+        );
     }
 
     #[test]
