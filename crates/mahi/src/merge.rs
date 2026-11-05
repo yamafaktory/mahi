@@ -138,8 +138,8 @@ pub(crate) fn merge_now(
     let theirs = merged_by(store, request.commit);
     let own = head.map(|head| (into.slot, head));
     let base = merge_base(store, (&merged_from, own), (request, &theirs))?;
-    let skipped = held::skipped_file(store, into.snapshots.thread(), (into.slot, &request.from));
-    let base = match held::skipped(&skipped) {
+    let kept = held::file(store, into.snapshots.thread(), (into.slot, &request.from));
+    let base = match held::skipped(&kept) {
         Some(skipped)
             if skip_is_base(store, skipped, (merged_from.of(&request.from), request))? =>
         {

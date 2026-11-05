@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs,
     io,
     path::{
@@ -23,11 +24,9 @@ use crate::{
     sync_state,
 };
 
-const HELD_DIR: &str = "held";
-const LANDING_HELD: &str = "landing";
-const SKIPPED_DIR: &str = "skipped";
-const MAX_SKIPPED_BYTES: u64 = 128;
-const MAX_HELD_BYTES: u64 = 64 * 1024;
+const TEAMMATES_DIR: &str = "teammates";
+const LANDING_FILE: &str = "landing";
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_HELD_PATHS: usize = 20;
 const LONGEST_PATH: usize = 200;
 
@@ -41,28 +40,41 @@ pub(crate) struct HeldSettings {
     pub(crate) changed: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SyncRecord {
+    pub(crate) skipped: Option<ObjectId>,
+    pub(crate) waits: Waits,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum Waits {
+    #[default]
+    Free,
+    Held(HeldSettings),
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum HeldError {
-    #[error("cannot keep the snapshot that waits for the user in {0}")]
+    #[error("cannot read or write the sync record {0}")]
     Io(PathBuf, #[source] io::Error),
-    #[error("the snapshot kept in {0} cannot be read; remove the file to merge it again")]
+    #[error("the sync record {0} is not one mahi wrote")]
     Malformed(PathBuf),
 }
 
-/// Returns where the snapshot of `from` that waits for the user is kept, for `into`'s worktree
-/// in `thread`: the agent's sync directory, then `held/<participant>.<agent>` of `from`.
+/// Returns where sync keeps its record of `from` for `into`'s worktree in `thread`: the
+/// agent's sync directory, then `teammates/<participant>.<agent>` of `from`.
 pub(crate) fn file(
     store: &Store,
     thread: ThreadId,
     (into, from): (&AgentSlot, &AgentSlot),
 ) -> PathBuf {
     sync_state::dir(store, thread, into)
-        .join(HELD_DIR)
+        .join(TEAMMATES_DIR)
         .join(from.to_string())
 }
 
-/// Returns where the merge from `from` that waits for the user is kept, for `into`'s worktree
-/// in `thread`: [`file`] for a teammate's agent, and `held/landing` for the landing branch.
+/// Returns where sync keeps its record of `from` for `into`'s worktree in `thread`: [`file`]
+/// for a teammate's agent, and `landing` in the agent's sync directory for the landing branch.
 pub(crate) fn file_for(
     store: &Store,
     thread: ThreadId,
@@ -70,29 +82,14 @@ pub(crate) fn file_for(
 ) -> PathBuf {
     match from {
         Source::Agent(from) => file(store, thread, (into, from)),
-        Source::Landing(_) => sync_state::dir(store, thread, into)
-            .join(HELD_DIR)
-            .join(LANDING_HELD),
+        Source::Landing(_) => sync_state::dir(store, thread, into).join(LANDING_FILE),
     }
 }
 
-/// Returns where the snapshot of `from` the user skipped is kept, for `into`'s worktree in
-/// `thread`: the agent's sync directory, then `skipped/<participant>.<agent>` of `from`.
-pub(crate) fn skipped_file(
-    store: &Store,
-    thread: ThreadId,
-    (into, from): (&AgentSlot, &AgentSlot),
-) -> PathBuf {
-    sync_state::dir(store, thread, into)
-        .join(SKIPPED_DIR)
-        .join(from.to_string())
-}
-
 /// Returns the snapshot of a teammate the user skipped, kept in `file`, which their next turns
-/// merge from, or `None` when there is none or it cannot be read.
+/// merge from, or `None` when there is none or the record cannot be read.
 pub(crate) fn skipped(file: &Path) -> Option<ObjectId> {
-    let bytes = sync_state::read(file, MAX_SKIPPED_BYTES).ok()??;
-    ObjectId::from_hex(&bytes).ok()
+    SyncRecord::load(file).ok()?.skipped
 }
 
 /// Every snapshot that waits for the user in `into`'s worktree in `thread`, with the teammate
@@ -102,7 +99,7 @@ pub(crate) fn list(
     thread: ThreadId,
     into: &AgentSlot,
 ) -> Vec<(AgentSlot, HeldSettings)> {
-    let dir = sync_state::dir(store, thread, into).join(HELD_DIR);
+    let dir = sync_state::dir(store, thread, into).join(TEAMMATES_DIR);
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -110,7 +107,10 @@ pub(crate) fn list(
         .flatten()
         .filter_map(|entry| {
             let from: AgentSlot = entry.file_name().to_str()?.parse().ok()?;
-            let record = HeldSettings::load(&dir.join(from.to_string())).ok()??;
+            let Waits::Held(record) = SyncRecord::load(&dir.join(from.to_string())).ok()?.waits
+            else {
+                return None;
+            };
             Some((from, record))
         })
         .collect();
@@ -118,10 +118,80 @@ pub(crate) fn list(
     held
 }
 
-/// Says whether a snapshot of a teammate waits in `file`, or may: only a file surely missing
-/// lets the teammate's turns be merged.
+/// Says whether a snapshot of a teammate waits in `file`, or may: only a record that surely
+/// holds none lets the teammate's turns be merged.
 pub(crate) fn waits(file: &Path) -> bool {
-    sync_state::may_exist(file)
+    !matches!(
+        SyncRecord::load(file),
+        Ok(SyncRecord {
+            waits: Waits::Free,
+            ..
+        })
+    )
+}
+
+impl SyncRecord {
+    pub(crate) fn load(file: &Path) -> Result<Self, HeldError> {
+        let malformed = || HeldError::Malformed(file.to_path_buf());
+        let bytes = match sync_state::read(file, MAX_RECORD_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(Self::default()),
+            Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(malformed()),
+            Err(error) => return Err(HeldError::Io(file.to_path_buf(), error)),
+        };
+        let text = String::from_utf8(bytes).map_err(|_| malformed())?;
+        let mut fields = text.strip_suffix('\0').ok_or_else(malformed)?.split('\0');
+        let skipped = match fields.next().ok_or_else(malformed)? {
+            "" => None,
+            hex => Some(ObjectId::from_hex(hex.as_bytes()).map_err(|_| malformed())?),
+        };
+        let Some(commit) = fields.next() else {
+            return Ok(Self {
+                skipped,
+                waits: Waits::Free,
+            });
+        };
+        let commit = ObjectId::from_hex(commit.as_bytes()).map_err(|_| malformed())?;
+        let changed = fields
+            .next()
+            .and_then(|changed| changed.parse().ok())
+            .ok_or_else(malformed)?;
+        let paths: Vec<String> = fields.map(str::to_owned).collect();
+        if paths.len() > MAX_HELD_PATHS
+            || paths.len() > changed
+            || paths.iter().any(String::is_empty)
+        {
+            return Err(malformed());
+        }
+        Ok(Self {
+            skipped,
+            waits: Waits::Held(HeldSettings {
+                commit,
+                paths,
+                changed,
+            }),
+        })
+    }
+
+    pub(crate) fn save(&self, file: &Path) -> Result<(), HeldError> {
+        let io = |error| HeldError::Io(file.to_path_buf(), error);
+        if *self == Self::default() {
+            return sync_state::remove(file).map_err(io);
+        }
+        let mut text = String::new();
+        if let Some(skipped) = self.skipped {
+            let _ = write!(text, "{}", skipped.to_hex());
+        }
+        text.push('\0');
+        if let Waits::Held(held) = &self.waits {
+            let _ = write!(text, "{}\0{}\0", held.commit.to_hex(), held.changed);
+            for path in &held.paths {
+                text.push_str(path);
+                text.push('\0');
+            }
+        }
+        sync_state::write(file, text.as_bytes()).map_err(io)
+    }
 }
 
 impl HeldSettings {
@@ -147,107 +217,82 @@ impl HeldSettings {
         }
     }
 
-    /// Reads the snapshot kept in `file`, or `None` when none waits.
+    /// Reads the snapshot that waits in the record kept in `file`, or `None` when none waits.
     pub(crate) fn load(file: &Path) -> Result<Option<Self>, HeldError> {
-        let malformed = || HeldError::Malformed(file.to_path_buf());
-        let bytes = match sync_state::read(file, MAX_HELD_BYTES) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
-            Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(malformed()),
-            Err(error) => return Err(HeldError::Io(file.to_path_buf(), error)),
-        };
-        let text = String::from_utf8(bytes).map_err(|_| malformed())?;
-        let mut records = text.strip_suffix('\0').ok_or_else(malformed)?.split('\0');
-        let commit = records
-            .next()
-            .and_then(|commit| ObjectId::from_hex(commit.as_bytes()).ok())
-            .ok_or_else(malformed)?;
-        let changed = records
-            .next()
-            .and_then(|changed| changed.parse().ok())
-            .ok_or_else(malformed)?;
-        let paths: Vec<String> = records.map(str::to_owned).collect();
-        if paths.len() > MAX_HELD_PATHS
-            || paths.len() > changed
-            || paths.iter().any(String::is_empty)
-        {
-            return Err(malformed());
-        }
-        Ok(Some(Self {
-            commit,
-            paths,
-            changed,
-        }))
+        Ok(match SyncRecord::load(file)?.waits {
+            Waits::Free => None,
+            Waits::Held(held) => Some(held),
+        })
     }
 
-    /// Writes this snapshot to `file`, unless one already waits there, so the first one held
-    /// stays first.
+    /// Makes this snapshot wait in the record kept in `file`, unless one already waits there,
+    /// or may, so the first one held stays first.
     pub(crate) fn keep(&self, file: &Path) -> Result<(), HeldError> {
-        if waits(file) {
+        let Ok(mut record) = SyncRecord::load(file) else {
+            return Ok(());
+        };
+        if record.waits != Waits::Free {
             return Ok(());
         }
-        let mut text = format!("{}\0{}\0", self.commit.to_hex(), self.changed);
-        for path in &self.paths {
-            text.push_str(path);
-            text.push('\0');
-        }
-        sync_state::write(file, text.as_bytes())
-            .map_err(|error| HeldError::Io(file.to_path_buf(), error))
+        record.waits = Waits::Held(self.clone());
+        record.save(file)
     }
 
-    /// Stops holding the snapshot kept in `file`.
-    pub(crate) fn release(file: &Path) -> Result<(), HeldError> {
-        sync_state::remove(file).map_err(|error| HeldError::Io(file.to_path_buf(), error))
-    }
-
-    /// Skips the snapshot kept in `file`: keeps it in `skipped`, so the teammate's next turns
-    /// merge from it and its change stays out, then stops holding it.
-    pub(crate) fn skip(&self, (file, skipped): (&Path, &Path)) -> Result<(), HeldError> {
-        sync_state::write(skipped, self.commit.to_hex().to_string().as_bytes())
-            .map_err(|error| HeldError::Io(skipped.to_path_buf(), error))?;
-        Self::release(file)
+    /// Skips this snapshot, which waits in the record kept in `file`: keeps it as skipped, so
+    /// the teammate's next turns merge from it and its change stays out, and stops holding it,
+    /// in one write.
+    pub(crate) fn skip(&self, file: &Path) -> Result<(), HeldError> {
+        let mut record = SyncRecord::load(file)?;
+        record.skipped = Some(self.commit);
+        record.waits = Waits::Free;
+        record.save(file)
     }
 }
 
 /// Stops holding, or keeping as skipped, each snapshot kept for `into`'s worktree in `thread`
 /// that `merged`, what the agent's snapshots record as merged, now holds: that snapshot or a
-/// later one of its agent. A held record that cannot be read or removed stays, so its
-/// teammate keeps waiting.
+/// later one of its agent. A record that cannot be read or written stays, so its teammate
+/// keeps waiting.
 pub(crate) fn release_merged(
     store: &Store,
     thread: ThreadId,
     into: &AgentSlot,
     merged: &MergedFrom,
 ) {
-    let sync = sync_state::dir(store, thread, into);
-    for kind in [HELD_DIR, SKIPPED_DIR] {
-        let dir = sync.join(kind);
-        let Ok(entries) = fs::read_dir(&dir) else {
+    let dir = sync_state::dir(store, thread, into).join(TEAMMATES_DIR);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(from) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<AgentSlot>().ok())
+        else {
             continue;
         };
-        for entry in entries.flatten() {
-            let Some(from) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<AgentSlot>().ok())
-            else {
-                continue;
-            };
-            let file = dir.join(from.to_string());
-            let kept = if kind == HELD_DIR {
-                HeldSettings::load(&file)
-                    .ok()
-                    .flatten()
-                    .map(|held| held.commit)
-            } else {
-                skipped(&file)
-            };
-            let (Some(kept), Some(taken)) = (kept, merged.of(&from)) else {
-                continue;
-            };
-            if taken == kept || store.descends_from(taken, kept).unwrap_or(false) {
-                let _ = sync_state::remove(&file);
-            }
+        let Some(taken) = merged.of(&from) else {
+            continue;
+        };
+        let file = dir.join(from.to_string());
+        let Ok(mut record) = SyncRecord::load(&file) else {
+            continue;
+        };
+        let holds =
+            |kept: ObjectId| taken == kept || store.descends_from(taken, kept).unwrap_or(false);
+        let mut changed = false;
+        if record.skipped.is_some_and(holds) {
+            record.skipped = None;
+            changed = true;
+        }
+        if let Waits::Held(held) = &record.waits
+            && holds(held.commit)
+        {
+            record.waits = Waits::Free;
+            changed = true;
+        }
+        if changed {
+            let _ = record.save(&file);
         }
     }
 }
@@ -263,7 +308,7 @@ mod tests {
     #[test]
     fn a_held_snapshot_reads_back_as_kept_and_the_first_one_kept_stays() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("sync/alice.claude/held/bob.codex");
+        let file = dir.path().join("sync/alice.claude/teammates/bob.codex");
         assert_eq!(HeldSettings::load(&file).unwrap(), None);
         assert!(!waits(&file));
         let paths: Vec<String> = (0..25).map(|index| format!(".claude/{index}")).collect();
@@ -274,9 +319,39 @@ mod tests {
         assert!(waits(&file));
         HeldSettings::new(commit(2), &[]).keep(&file).unwrap();
         assert_eq!(HeldSettings::load(&file).unwrap(), Some(held));
-        HeldSettings::release(&file).unwrap();
+        SyncRecord::default().save(&file).unwrap();
         assert!(!waits(&file));
-        HeldSettings::release(&file).unwrap();
+        assert!(!file.exists());
+        SyncRecord::default().save(&file).unwrap();
+    }
+
+    #[test]
+    fn a_skipped_snapshot_stays_the_base_beside_a_later_one_held_in_the_same_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sync/alice.claude/teammates/bob.codex");
+        let first = HeldSettings::new(commit(1), &["CLAUDE.md".to_owned()]);
+        first.keep(&file).unwrap();
+        first.skip(&file).unwrap();
+        assert!(!waits(&file));
+        assert_eq!(skipped(&file), Some(commit(1)));
+        let later = HeldSettings::new(commit(2), &["AGENTS.md".to_owned()]);
+        later.keep(&file).unwrap();
+        assert!(waits(&file));
+        assert_eq!(
+            SyncRecord::load(&file).unwrap(),
+            SyncRecord {
+                skipped: Some(commit(1)),
+                waits: Waits::Held(later.clone()),
+            }
+        );
+        later.skip(&file).unwrap();
+        assert_eq!(
+            SyncRecord::load(&file).unwrap(),
+            SyncRecord {
+                skipped: Some(commit(2)),
+                waits: Waits::Free,
+            }
+        );
     }
 
     #[test]
@@ -293,26 +368,69 @@ mod tests {
     }
 
     #[test]
-    fn a_held_snapshot_file_that_is_not_one_mahi_wrote_is_refused() {
+    fn a_merge_releases_only_the_part_of_a_record_it_took() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path().join("repo")).unwrap();
+        let store = Store::open(&dir.path().join("repo")).unwrap();
+        let thread = ThreadId::random().unwrap();
+        let (into, bob): (AgentSlot, AgentSlot) = (
+            "alice.claude".parse().unwrap(),
+            "bob.codex".parse().unwrap(),
+        );
+        let kept = file(&store, thread, (&into, &bob));
+        let held = HeldSettings::new(commit(2), &["AGENTS.md".to_owned()]);
+        SyncRecord {
+            skipped: Some(commit(1)),
+            waits: Waits::Held(held.clone()),
+        }
+        .save(&kept)
+        .unwrap();
+        let mut merged = MergedFrom::default();
+        merged.record(bob.clone(), commit(1));
+        release_merged(&store, thread, &into, &merged);
+        assert_eq!(
+            SyncRecord::load(&kept).unwrap(),
+            SyncRecord {
+                skipped: None,
+                waits: Waits::Held(held),
+            }
+        );
+        merged.record(bob, commit(2));
+        release_merged(&store, thread, &into, &merged);
+        assert!(!kept.exists());
+    }
+
+    #[test]
+    fn a_sync_record_that_is_not_one_mahi_wrote_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("held");
         let hex = commit(1).to_hex().to_string();
         for text in [
             String::new(),
-            format!("{hex}\0"),
-            format!("{hex}\0x\0"),
-            "not a commit\x000\0".to_owned(),
-            format!("{hex}\x000\0CLAUDE.md\0"),
-            format!("{hex}\x001\0\0"),
-            format!("{hex}\x001"),
+            "not a commit\0".to_owned(),
+            format!("\0{hex}\0"),
+            format!("\0{hex}\0x\0"),
+            "\0not a commit\x000\0".to_owned(),
+            format!("\0{hex}\x000\0CLAUDE.md\0"),
+            format!("\0{hex}\x001\0\0"),
+            format!("\0{hex}\x001"),
         ] {
             fs::write(&file, &text).unwrap();
             assert!(
-                matches!(HeldSettings::load(&file), Err(HeldError::Malformed(_))),
+                matches!(SyncRecord::load(&file), Err(HeldError::Malformed(_))),
                 "{text:?}"
             );
+            assert!(waits(&file), "{text:?}");
         }
-        fs::write(&file, format!("{hex}\x002\0CLAUDE.md\0")).unwrap();
+        fs::write(&file, format!("\0{hex}\x002\0CLAUDE.md\0")).unwrap();
         assert!(HeldSettings::load(&file).unwrap().is_some());
+        fs::write(&file, format!("{hex}\0")).unwrap();
+        assert_eq!(
+            SyncRecord::load(&file).unwrap(),
+            SyncRecord {
+                skipped: Some(commit(1)),
+                waits: Waits::Free,
+            }
+        );
     }
 }

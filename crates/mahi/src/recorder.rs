@@ -1428,10 +1428,9 @@ mod tests {
         let thread = merging.started.thread;
         let into = &merging.started.slot;
         let waiting = crate::held::file(&merging.store, thread, (into, &merging.bob));
-        let skip = crate::held::skipped_file(&merging.store, thread, (into, &merging.bob));
         let record = crate::held::HeldSettings::load(&waiting).unwrap().unwrap();
-        record.skip((&waiting, &skip)).unwrap();
-        assert_eq!(crate::held::skipped(&skip), Some(skipped_commit));
+        record.skip(&waiting).unwrap();
+        assert_eq!(crate::held::skipped(&waiting), Some(skipped_commit));
         let next = merging.bobs(&[
             ("CLAUDE.md", "obey bob\n"),
             ("a.txt", "a\n"),
@@ -1442,7 +1441,7 @@ mod tests {
         assert!(!worktree.join("a.txt").exists());
         assert!(!worktree.join("CLAUDE.md").exists());
         assert!(!crate::held::waits(&waiting));
-        assert_eq!(crate::held::skipped(&skip), None);
+        assert_eq!(crate::held::skipped(&waiting), None);
         let taken = merging.bobs(&[
             ("CLAUDE.md", "obey bob\n"),
             ("a.txt", "a\n"),
@@ -1465,9 +1464,8 @@ mod tests {
         let thread = merging.started.thread;
         let into = &merging.started.slot;
         let waiting = crate::held::file(&merging.store, thread, (into, &merging.bob));
-        let skip = crate::held::skipped_file(&merging.store, thread, (into, &merging.bob));
         let record = crate::held::HeldSettings::load(&waiting).unwrap().unwrap();
-        record.skip((&waiting, &skip)).unwrap();
+        record.skip(&waiting).unwrap();
         let held = merging.bobs(&[
             ("CLAUDE.md", "obey bob\n"),
             ("a.txt", "a\n"),

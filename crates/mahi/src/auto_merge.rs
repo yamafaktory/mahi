@@ -40,6 +40,8 @@ use crate::{
         self,
         HeldError,
         HeldSettings,
+        SyncRecord,
+        Waits,
     },
     held_queue::{
         Choice,
@@ -162,14 +164,17 @@ impl AutoMerge {
             }) else {
                 continue;
             };
-            if held::waits(&held::file(store, self.thread, (&self.own, slot))) {
+            let Ok(SyncRecord {
+                skipped,
+                waits: Waits::Free,
+            }) = SyncRecord::load(&held::file(store, self.thread, (&self.own, slot)))
+            else {
                 continue;
-            }
+            };
             let Some(tip) = turn_end::latest(store, slot, *head).filter(|tip| !tried.contains(tip))
             else {
                 continue;
             };
-            let skipped = held::skipped(&held::skipped_file(store, self.thread, (&self.own, slot)));
             let taken = [merged.of(slot), skipped]
                 .into_iter()
                 .flatten()
@@ -211,8 +216,7 @@ impl AutoMerge {
         let waiting = held::file(store, self.thread, (&self.own, slot));
         match choice {
             Choice::Skip => {
-                let skipped = held::skipped_file(store, self.thread, (&self.own, slot));
-                let _ = record.skip((&waiting, &skipped));
+                let _ = record.skip(&waiting);
                 true
             }
             Choice::Take => {
@@ -758,7 +762,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        held::HeldSettings::release(&waiting).unwrap();
+        held::SyncRecord::default().save(&waiting).unwrap();
         let due = auto.unmerged(&team.store, &HashSet::new()).unwrap();
         assert_eq!(due.len(), 1, "{due:?}");
         assert_eq!(due[0].commit, later);

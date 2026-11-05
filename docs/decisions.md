@@ -464,3 +464,13 @@ are taken, since the signed newest one fixes its whole history.
 Chosen by the user (#57). When `mahi resume` starts an agent whose newest snapshot names no
 thread, it first adds a snapshot of the same tree that keeps that snapshot's trailers and adds
 `Mahi-Thread`, so teammates fetch it again after one run of the new mahi, before any turn.
+
+## D066 · 2026-11-05 · One sync record per teammate holds the held and the skipped snapshot
+
+Chosen by the user (#58), building D052. A teammate can be held and skipped at once: after a
+skip of X, a held Y still merges from X as its base. So one record per teammate, at
+`sync/<participant>.<agent>/teammates/<teammate's slot>`, holds the skipped snapshot next to
+what waits, free or held. It replaces the `held` and `skipped` files. The `conflicts` record,
+the run's set of snapshots tried and the agent's turn flags stay where they are. No release
+wrote the old files, so mahi does not read them: a held or skipped snapshot an older build
+kept is held again at the teammate's next merge, and the user is asked again.

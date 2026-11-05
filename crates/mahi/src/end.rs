@@ -351,7 +351,7 @@ mod tests {
         for file in [
             kept.clone(),
             root.join("sync/alice.sh/note"),
-            root.join("sync/alice.claude/held/bob.claude"),
+            root.join("sync/alice.claude/teammates/bob.claude"),
             root.join("alice.sh/session"),
             root.join("loose"),
         ] {
