@@ -6238,6 +6238,30 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             );
         }
 
+        fn notice_restored_branch(
+            fixture: &Fixture,
+            (thread, tip): (&str, &str),
+            agent: &Path,
+            remote: &Path,
+        ) {
+            git(remote, &["branch", &format!("mahi/{thread}"), tip]);
+            let (code, output) = resume_quietly(fixture, thread, agent);
+            assert_eq!(code, 0, "{output}");
+            assert!(!output.contains("is gone from up"), "{output}");
+            let listed = fixture.mahi(&["threads"]);
+            assert!(
+                !String::from_utf8_lossy(&listed.stdout).contains("gone from the remote"),
+                "{listed:?}"
+            );
+            git(remote, &["branch", "-D", &format!("mahi/{thread}")]);
+            let (code, output) = resume_quietly(fixture, thread, agent);
+            assert_eq!(code, 0, "{output}");
+            assert!(
+                output.contains(&format!("the branch mahi/{thread} is gone from up")),
+                "{output}"
+            );
+        }
+
         fn purge_on_remote(fixture: &Fixture, thread: &str, remote: &Path) {
             let purged = fixture.mahi(&["purge", thread, "--yes"]);
             let stderr = String::from_utf8_lossy(&purged.stderr);
@@ -6303,7 +6327,9 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
                 "{output}"
             );
             fs::remove_file(config_dir(&fixture.home).settings_file()).unwrap();
+            let tip = git(&remote, &["rev-parse", &format!("mahi/{thread}")]);
             notice_gone_branch(&fixture, &thread, &quiet, &remote);
+            notice_restored_branch(&fixture, (&thread, tip.trim()), &quiet, &remote);
             purge_on_remote(&fixture, &thread, &remote);
         }
     }

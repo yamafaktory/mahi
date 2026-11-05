@@ -489,15 +489,16 @@ fn fetch_bounded<R>(
     fetched
 }
 
-/// Notes, and says, when the thread branch a landing pushed is gone from the remote.
+/// Notes, and says, when the thread branch a landing pushed is gone from the remote, and
+/// clears that note when the remote has the branch again.
 fn check_branch(
     store: &Store,
     thread: ThreadId,
     (access, url, name): (&Access, &RemoteUrl, &RemoteName),
     interrupt: &Arc<AtomicBool>,
 ) {
-    let Some(record) = BranchRecord::read(store, thread)
-        .filter(|record| !record.gone && record.remote == name.as_str())
+    let Some(record) =
+        BranchRecord::read(store, thread).filter(|record| record.remote == name.as_str())
     else {
         return;
     };
@@ -509,15 +510,12 @@ fn check_branch(
                 .remote_branch_tip(transport, &record.branch)
                 .map_err(|_| ())
         });
-    if let Ok(None) = found {
-        let marked = BranchRecord::update(store, thread, |now| {
-            let same = now.tip == record.tip && now.branch == record.branch && !now.gone;
-            now.gone |= same;
-            same
-        });
-        if let Ok(false) = marked {
-            return;
-        }
+    let Ok(found) = found else {
+        return;
+    };
+    let gone = found.is_none();
+    let marked = BranchRecord::update(store, thread, |now| now.note_gone(&record, gone));
+    if gone && !matches!(marked, Ok(false)) {
         eprintln!(
             "mahi: the branch {} is gone from {name}, merged or closed; mahi purge {thread} \
              removes the thread",

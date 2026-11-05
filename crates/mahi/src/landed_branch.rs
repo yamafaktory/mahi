@@ -94,6 +94,14 @@ impl BranchRecord {
         Ok(true)
     }
 
+    pub(crate) fn note_gone(&mut self, seen: &Self, gone: bool) -> bool {
+        let same = self.tip == seen.tip && self.branch == seen.branch && self.gone != gone;
+        if same {
+            self.gone = gone;
+        }
+        same
+    }
+
     fn write_unlocked(&self, store: &Store, thread: ThreadId) -> io::Result<()> {
         let target = path(store, thread);
         let directory = target
@@ -149,6 +157,36 @@ fn path(store: &Store, thread: ThreadId) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_branch_is_noted_gone_or_back_only_on_the_record_that_was_checked() {
+        let seen = BranchRecord {
+            remote: "up".to_owned(),
+            branch: "mahi/t".to_owned(),
+            tip: ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
+            landing: "main".to_owned(),
+            worktree: None,
+            gone: false,
+        };
+        let mut now = seen.clone();
+        assert!(now.note_gone(&seen, true));
+        assert!(now.gone);
+        assert!(!now.note_gone(&seen, true));
+        assert!(now.note_gone(&seen, false));
+        assert!(!now.gone);
+        let mut landed = BranchRecord {
+            tip: ObjectId::from_hex(b"89abcdef0123456789abcdef0123456789abcdef").unwrap(),
+            ..seen.clone()
+        };
+        assert!(!landed.note_gone(&seen, true));
+        assert!(!landed.gone);
+        let mut renamed = BranchRecord {
+            branch: "mahi/u".to_owned(),
+            ..seen.clone()
+        };
+        assert!(!renamed.note_gone(&seen, true));
+        assert!(!renamed.gone);
+    }
 
     #[test]
     fn a_record_is_written_read_back_marked_gone_and_removed() {
