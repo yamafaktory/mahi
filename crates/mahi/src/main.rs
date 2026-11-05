@@ -30,7 +30,6 @@ mod network;
 mod note;
 mod pair;
 mod palette;
-mod pane;
 mod profile;
 mod prompt;
 mod purge;

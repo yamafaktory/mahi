@@ -63,47 +63,6 @@ const OPEN_GUARD: Duration = Duration::from_millis(500);
 const CLEAR: &[u8] = b"\x1b[2J";
 const REPAINT_PAUSE: Duration = Duration::from_millis(100);
 
-/// Where the screen writes the agent's output and mahi's palette: straight to the user's
-/// terminal, or into a pane mahi draws.
-pub(crate) trait ScreenOut: Write {
-    /// Takes the agent's terminal's new `size` before the agent draws for it.
-    fn resize(&mut self, _size: WindowSize) {}
-
-    /// Stops drawing, since the agent ended: what comes later is dropped.
-    fn finish(&mut self) {}
-
-    /// Returns whether the palette is drawn over the agent's screen as a layer of its own,
-    /// so the agent keeps drawing beneath it and nothing has to be redrawn when it closes.
-    fn overlays(&self) -> bool {
-        false
-    }
-
-    /// Returns where the palette is drawn.
-    fn palette_out(&mut self) -> &mut dyn Write
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    /// Takes the palette away from the screen, where it is a layer of its own.
-    fn close_palette(&mut self) {}
-
-    /// Sends mahi's own `bytes` to the user's terminal, past the agent's screen, such as a copy
-    /// to the clipboard.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error writing to the terminal gives.
-    fn pass_through(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.write_all(bytes)
-    }
-}
-
-impl ScreenOut for io::Stdout {}
-
-impl ScreenOut for Vec<u8> {}
-
 /// The user's terminal as the palette needs it: its size, and a way to make the agent redraw
 /// its screen.
 pub(crate) trait AgentTerminal {
@@ -126,12 +85,7 @@ impl Repainter {
     /// Gives the agent's terminal the user's terminal's size, and returns it; `None` when the
     /// agent's terminal is gone.
     pub(crate) fn follow(&self) -> Option<WindowSize> {
-        self.follow_to(crate::ui::agent_size())
-    }
-
-    /// Gives the agent's terminal `size`, and returns it; `None` when the agent's terminal is
-    /// gone.
-    pub(crate) fn follow_to(&self, size: WindowSize) -> Option<WindowSize> {
+        let size = crate::terminal::size();
         let resizer = self.0.lock().ok()?;
         resizer.resize(size).ok()?;
         Some(size)
@@ -140,12 +94,12 @@ impl Repainter {
 
 impl AgentTerminal for Repainter {
     fn size(&self) -> WindowSize {
-        crate::ui::agent_size()
+        crate::terminal::size()
     }
 
     fn repaint(&self) {
         if let Ok(resizer) = self.0.lock() {
-            let size = crate::ui::agent_size();
+            let size = crate::terminal::size();
             let _ = resizer.resize(WindowSize {
                 rows: size.rows.saturating_sub(1).max(1),
                 cols: size.cols,
@@ -208,7 +162,7 @@ enum Mode {
     Open,
 }
 
-impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
+impl<W: Write, T: AgentTerminal> Screen<W, T> {
     /// Starts a screen that writes to `out`, with the palette closed.
     pub(crate) fn new(out: W, terminal: T, key: PaletteKey) -> Self {
         Self {
@@ -263,11 +217,6 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
     /// Returns the error writing to the screen gives.
     pub(crate) fn output(&self, bytes: &[u8]) -> io::Result<()> {
         let mut state = self.lock()?;
-        if state.out.overlays() {
-            state.tracker.feed(bytes);
-            state.out.write_all(bytes)?;
-            return state.out.flush();
-        }
         match state.mode {
             Mode::Agent => {
                 state.tracker.feed(bytes);
@@ -313,7 +262,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         if state.mode != Mode::Agent {
             return Ok(());
         }
-        if state.out.overlays() || state.tracker.can_draw() {
+        if state.tracker.can_draw() {
             state.mode = Mode::Open;
             self.draw(&mut state)?;
         } else {
@@ -506,11 +455,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
     pub(crate) fn resized(&self) -> io::Result<()> {
         let mut state = self.lock()?;
         if state.mode == Mode::Open {
-            if state.out.overlays() {
-                state.out.close_palette();
-            } else {
-                state.out.write_all(CLEAR)?;
-            }
+            state.out.write_all(CLEAR)?;
             self.draw(&mut state)?;
         }
         state.out.flush()
@@ -529,35 +474,6 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         state.out.flush()
     }
 
-    /// Closes the palette and stops drawing for good, since the agent ended.
-    ///
-    /// # Errors
-    ///
-    /// Returns the error writing to the screen gives.
-    pub(crate) fn finish(&self) -> io::Result<()> {
-        let closed = self.close();
-        let mut state = self.lock()?;
-        state.out.finish();
-        closed
-    }
-
-    /// Gives the output the agent's terminal's new `size` and then, under the same lock, lets
-    /// `follow` resize the agent's terminal, so every byte the agent writes for the new size
-    /// is read at that size; returns what `follow` returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the screen's lock is poisoned.
-    pub(crate) fn follow_size<R>(
-        &self,
-        size: WindowSize,
-        follow: impl FnOnce() -> R,
-    ) -> io::Result<R> {
-        let mut state = self.lock()?;
-        state.out.resize(size);
-        Ok(follow())
-    }
-
     fn release(&self, state: &mut State<W>) -> io::Result<()> {
         let was_open = state.mode == Mode::Open;
         let held = std::mem::take(&mut state.held);
@@ -571,8 +487,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
         state.keys = PaletteKeys::default();
         state.guard = Guard::Off;
         state.out.write_all(&held)?;
-        state.out.close_palette();
-        if was_open && !state.out.overlays() {
+        if was_open {
             self.terminal.repaint();
         }
         Ok(())
@@ -587,7 +502,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
             if let Some(copied) = self.desk.as_ref().and_then(|desk| desk.take_clipboard()) {
                 state
                     .out
-                    .pass_through(&crate::ui::clipboard_sequence(&copied))?;
+                    .write_all(&crate::ui::clipboard_sequence(&copied))?;
             }
             if state.landing_drawn != Some(landing.generation) {
                 state.landing_drawn = Some(landing.generation);
@@ -606,7 +521,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
                 }),
                 true_color: crate::ui::true_color(),
             };
-            let drawn = view.draw(size.rows, size.cols, &mut state.out.palette_out())?;
+            let drawn = view.draw(size.rows, size.cols, &mut state.out)?;
             state.page = drawn.page;
             state.scroll = state.scroll.min(drawn.lines.saturating_sub(drawn.page));
             return Ok(());
@@ -659,7 +574,7 @@ impl<W: ScreenOut, T: AgentTerminal> Screen<W, T> {
             }),
             true_color: crate::ui::true_color(),
         };
-        let drawn = view.draw(size.rows, size.cols, &mut state.out.palette_out())?;
+        let drawn = view.draw(size.rows, size.cols, &mut state.out)?;
         state.page = drawn.page;
         state.scroll = state.scroll.min(drawn.lines.saturating_sub(drawn.page));
         if text.is_some() && drawn.page > 0 && drawn.shows_end(state.scroll) {
@@ -783,7 +698,7 @@ fn contains_ignoring_case(text: &str, part: &str) -> bool {
             .any(|window| window.eq_ignore_ascii_case(part.as_bytes()))
 }
 
-impl<W: ScreenOut, T: AgentTerminal> AgentInput for Screen<W, T> {
+impl<W: Write, T: AgentTerminal> AgentInput for Screen<W, T> {
     fn palette_open(&self) -> bool {
         self.is_open()
     }
@@ -839,116 +754,6 @@ mod tests {
 
     fn has_box(bytes: &[u8]) -> bool {
         String::from_utf8_lossy(bytes).contains('╭')
-    }
-
-    #[derive(Debug, Default)]
-    struct Recording {
-        drawn: Vec<u8>,
-        events: Arc<Mutex<Vec<String>>>,
-        finished: bool,
-        overlay: Option<Vec<u8>>,
-        overlays: bool,
-    }
-
-    impl Write for Recording {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if !self.finished {
-                self.drawn.extend_from_slice(bytes);
-            }
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl ScreenOut for Recording {
-        fn resize(&mut self, size: WindowSize) {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("resize {}x{}", size.rows, size.cols));
-        }
-
-        fn finish(&mut self) {
-            self.finished = true;
-            self.events.lock().unwrap().push("finish".to_owned());
-        }
-
-        fn overlays(&self) -> bool {
-            self.overlays
-        }
-
-        fn palette_out(&mut self) -> &mut dyn Write {
-            if self.overlays {
-                self.overlay.get_or_insert_with(Vec::new)
-            } else {
-                self
-            }
-        }
-
-        fn close_palette(&mut self) {
-            self.overlay = None;
-        }
-    }
-
-    #[test]
-    fn a_palette_drawn_over_the_agent_lets_it_draw_and_closes_without_a_repaint() {
-        let terminal = FakeTerminal::default();
-        let screen = Screen::new(
-            Recording {
-                overlays: true,
-                ..Recording::default()
-            },
-            &terminal,
-            PaletteKey::CTRL_SPACE,
-        );
-        screen.output(b"\x1b]2;unfinished").unwrap();
-        screen.open().unwrap();
-        assert!(!screen.is_opening());
-        assert!(screen.is_open());
-        screen.output(b"\x07more").unwrap();
-        {
-            let state = screen.lock().unwrap();
-            assert_eq!(state.out.drawn, b"\x1b]2;unfinished\x07more");
-            assert!(has_box(state.out.overlay.as_deref().unwrap()));
-        }
-        screen.resized().unwrap();
-        assert!(has_box(
-            screen.lock().unwrap().out.overlay.as_deref().unwrap()
-        ));
-        screen.typed(b"\x1b").unwrap();
-        assert!(!screen.is_open());
-        assert!(screen.lock().unwrap().out.overlay.is_none());
-        assert_eq!(terminal.repaints.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn a_resize_reaches_the_screen_before_the_agent_and_nothing_is_drawn_after_finish() {
-        let terminal = FakeTerminal::default();
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let screen = Screen::new(
-            Recording {
-                events: Arc::clone(&events),
-                ..Recording::default()
-            },
-            &terminal,
-            PaletteKey::CTRL_SPACE,
-        );
-        screen.output(b"agent").unwrap();
-        let followed = screen
-            .follow_size(WindowSize { rows: 3, cols: 4 }, || {
-                events.lock().unwrap().push("follow".to_owned());
-                7
-            })
-            .unwrap();
-        assert_eq!(followed, 7);
-        assert_eq!(screen.lock().unwrap().out.drawn, b"agent");
-        screen.finish().unwrap();
-        screen.output(b"late").unwrap();
-        assert_eq!(screen.lock().unwrap().out.drawn, b"agent");
-        assert_eq!(*events.lock().unwrap(), ["resize 3x4", "follow", "finish"]);
     }
 
     #[test]

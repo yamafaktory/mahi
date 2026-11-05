@@ -30,10 +30,8 @@ use base64::Engine as _;
 use mahi_sandbox::{
     InputWait,
     TerminationSignals,
-    WindowSize,
 };
 use mahi_term::{
-    AgentFrame,
     AnsiBackend,
     Answer,
     Dialog,
@@ -293,17 +291,6 @@ pub(crate) fn keep_backdrop(frame: &Buffer) {
     if let Ok(mut kept) = BACKDROP.lock() {
         *kept = Some(frame.clone());
     }
-}
-
-/// Returns the size of the agent's terminal: the user's whole terminal, or, while the home
-/// screen owns it, the pane the agent is drawn in.
-pub(crate) fn agent_size() -> WindowSize {
-    let size = terminal::size();
-    if !is_showing() {
-        return size;
-    }
-    let (rows, cols) = AgentFrame::agent_size(size.rows, size.cols);
-    WindowSize { rows, cols }
 }
 
 /// Says whether the terminal draws 24-bit colour, as `COLORTERM` tells; dialogs then draw

@@ -8,7 +8,11 @@ use ratatui_core::{
         Position,
         Rect,
     },
-    style::Style,
+    style::{
+        Color,
+        Modifier,
+        Style,
+    },
     text::{
         Line,
         Span,
@@ -24,7 +28,6 @@ use crate::{
     Theme,
     dialog::shown,
     key_hints,
-    pane::draw_screen,
 };
 
 const TOP_ROWS: u16 = 1;
@@ -544,7 +547,7 @@ impl ThreadView<'_> {
         let inner = block.inner(pane);
         block.render(pane, buffer);
         if let Some(screen) = screen {
-            draw_screen(screen, inner, buffer, false);
+            draw_screen(screen, inner, buffer);
         } else if let Some((frame, text)) = self.waiting {
             let middle = Rect {
                 y: inner.y.saturating_add(inner.height / 2),
@@ -615,6 +618,59 @@ impl WorkspaceAgent<'_> {
             ),
             None => format!("Show agent {} ({state})", shown(self.name)),
         }
+    }
+}
+
+fn draw_screen(screen: &vt100::Screen, area: Rect, buffer: &mut Buffer) {
+    let (rows, columns) = screen.size();
+    for row in 0..rows.min(area.height) {
+        for column in 0..columns.min(area.width) {
+            let Some(cell) = screen.cell(row, column) else {
+                continue;
+            };
+            let Some(target) = buffer.cell_mut((area.x + column, area.y + row)) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                target.reset();
+                continue;
+            }
+            let wide_at_edge = cell.is_wide() && column + 1 >= area.width;
+            let symbol = cell.contents();
+            if symbol.is_empty() || wide_at_edge {
+                target.set_symbol(" ");
+            } else {
+                target.set_symbol(symbol);
+            }
+            target.set_style(style_of(cell));
+        }
+    }
+}
+
+fn style_of(cell: &vt100::Cell) -> Style {
+    let mut modifier = Modifier::empty();
+    for (on, flag) in [
+        (cell.bold(), Modifier::BOLD),
+        (cell.dim(), Modifier::DIM),
+        (cell.italic(), Modifier::ITALIC),
+        (cell.underline(), Modifier::UNDERLINED),
+        (cell.inverse(), Modifier::REVERSED),
+    ] {
+        if on {
+            modifier |= flag;
+        }
+    }
+    Style::new()
+        .fg(color_of(cell.fgcolor()))
+        .bg(color_of(cell.bgcolor()))
+        .add_modifier(modifier)
+}
+
+fn color_of(color: vt100::Color) -> Color {
+    match color {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(index) => Color::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 
@@ -1071,5 +1127,55 @@ mod tests {
     fn the_agent_gets_what_the_tab_bar_the_borders_the_status_line_and_the_hints_leave() {
         assert_eq!(ThreadView::agent_size(40, 120), (35, 118));
         assert_eq!(ThreadView::agent_size(3, 10), (2, 8));
+    }
+
+    fn drawn_screen(parser: &vt100::Parser, area: Rect) -> Buffer {
+        let mut buffer = Buffer::empty(area);
+        draw_screen(parser.screen(), area, &mut buffer);
+        buffer
+    }
+
+    fn screen_row(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_agents_screen_is_drawn_with_its_colours() {
+        let area = Rect::new(0, 0, 10, 2);
+        let mut parser = vt100::Parser::new(area.height, area.width, 0);
+        parser.process(b"hello\r\n\x1b[1;31mred\x1b[0m \x1b[38;2;1;2;3mrgb\x1b[0m");
+        let buffer = drawn_screen(&parser, area);
+        assert_eq!(screen_row(&buffer, 0), "hello     ");
+        assert_eq!(screen_row(&buffer, 1), "red rgb   ");
+        let red = &buffer[(0, 1)];
+        assert_eq!(red.fg, Color::Indexed(1));
+        assert!(red.modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer[(4, 1)].fg, Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn wide_characters_take_two_cells_and_one_cut_at_the_edge_is_left_blank() {
+        let area = Rect::new(0, 0, 6, 2);
+        let mut parser = vt100::Parser::new(area.height, area.width, 0);
+        parser.process("界a\r\n".as_bytes());
+        let buffer = drawn_screen(&parser, area);
+        assert_eq!(buffer[(0, 0)].symbol(), "界");
+        assert_eq!(buffer[(2, 0)].symbol(), "a");
+        let mut wider = vt100::Parser::new(area.height, area.width + 4, 0);
+        wider.process("abcde界".as_bytes());
+        assert_eq!(screen_row(&drawn_screen(&wider, area), 0), "abcde ");
+    }
+
+    #[test]
+    fn a_screen_of_any_size_draws_into_an_area_of_any_size_without_panicking() {
+        for (rows, columns) in [(2, 2), (4, 4)] {
+            let mut parser = vt100::Parser::new(rows, columns, 0);
+            parser.process(b"xxxx");
+            for (width, height) in [(0, 0), (1, 1), (2, 3), (3, 5)] {
+                drawn_screen(&parser, Rect::new(0, 0, width, height));
+            }
+        }
     }
 }

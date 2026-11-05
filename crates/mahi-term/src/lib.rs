@@ -10,7 +10,6 @@ mod key;
 mod mouse;
 mod notify;
 mod output;
-mod pane;
 mod report;
 mod scan;
 mod screen;
@@ -58,7 +57,6 @@ pub use notify::{
     TerminalHints,
 };
 pub use output::OutputTracker;
-pub use pane::AgentFrame;
 pub use report::{
     Report,
     ReportReader,
