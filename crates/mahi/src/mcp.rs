@@ -66,7 +66,6 @@ use mahi_store::{
 };
 use mahi_thread::{
     ParticipantKey,
-    Role,
     load_meta,
     walk_turns,
 };
@@ -401,8 +400,7 @@ impl ThreadTools {
                 })
                 .collect(),
             collaborators: meta
-                .participants()
-                .filter(|listed| listed.role() == Role::Collaborator)
+                .collaborators()
                 .map(|listed| listed.name().clone())
                 .collect(),
             base: meta.base(),

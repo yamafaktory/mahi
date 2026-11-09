@@ -85,7 +85,6 @@ use mahi_store::{
 use mahi_thread::{
     NodeId,
     ParticipantKey,
-    Role,
     ThreadError,
     load_meta_document,
 };
@@ -1800,8 +1799,7 @@ fn read(git_dir: &Path, thread: ThreadId, owner: &ParticipantKey) -> Result<Cach
             .map(|participant| (*participant.node(), participant.name().clone()))
             .collect(),
         collaborators: meta
-            .participants()
-            .filter(|participant| participant.role() == Role::Collaborator)
+            .collaborators()
             .map(|participant| *participant.node())
             .collect(),
         document,
@@ -1858,6 +1856,7 @@ mod tests {
     use mahi_term::TeammateState;
     use mahi_thread::{
         Participant,
+        Role,
         VerifiedMeta,
         add_participant,
     };

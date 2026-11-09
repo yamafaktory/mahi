@@ -39,7 +39,6 @@ use mahi_store::{
 use mahi_thread::{
     NodeId,
     ParticipantKey,
-    Role,
     SnapshotsAccepted,
     SnapshotsRefusal,
     ThreadError,
@@ -326,10 +325,7 @@ fn holds(store: &Store, held: Option<ObjectId>, announced: ObjectId) -> bool {
 }
 
 fn require_collaborator(meta: &VerifiedMeta, name: &ParticipantName) -> Result<(), CatchUpError> {
-    if meta
-        .participants()
-        .any(|listed| listed.name() == name && listed.role() == Role::Collaborator)
-    {
+    if meta.collaborator(name).is_some() {
         Ok(())
     } else {
         Err(CatchUpError::NotCollaborator(name.clone()))
@@ -341,6 +337,7 @@ mod tests {
     use mahi_live::Relays;
     use mahi_thread::{
         Participant,
+        Role,
         add_participant,
     };
     use ssh_key::{

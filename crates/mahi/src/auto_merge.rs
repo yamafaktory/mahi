@@ -16,7 +16,6 @@ use std::{
 
 use mahi_core::{
     AgentSlot,
-    ParticipantName,
     RefKind,
     ThreadId,
     ThreadRef,
@@ -28,7 +27,6 @@ use mahi_store::{
 };
 use mahi_thread::{
     ParticipantKey,
-    Role,
     ThreadError,
     load_meta,
     signed_by,
@@ -103,11 +101,7 @@ impl AutoMerge {
         store: &Store,
     ) -> Result<Vec<(AgentSlot, ObjectId)>, UnmergedError> {
         let meta = load_meta(store, self.thread, &self.owner, 0)?;
-        let collaborates = |slot: &AgentSlot| {
-            meta.participants().any(|listed| {
-                listed.name() == slot.participant() && listed.role() == Role::Collaborator
-            })
-        };
+        let collaborates = |slot: &AgentSlot| meta.collaborator(slot.participant()).is_some();
         let mut behind: Vec<(AgentSlot, ObjectId)> = self
             .unmerged(store, &HashSet::new())?
             .into_iter()
@@ -143,10 +137,7 @@ impl AutoMerge {
         tried: &HashSet<ObjectId>,
     ) -> Result<Vec<MergeRequest>, UnmergedError> {
         let meta = load_meta(store, self.thread, &self.owner, 0)?;
-        let collaborates = meta.participants().any(|listed| {
-            listed.name() == self.own.participant() && listed.role() == Role::Collaborator
-        });
-        if !collaborates {
+        if meta.collaborator(self.own.participant()).is_none() {
             return Ok(Vec::new());
         }
         let own = ThreadRef::new(self.thread, RefKind::Snapshots(self.own.clone()));
@@ -159,9 +150,7 @@ impl AutoMerge {
             if thread_ref.thread() != self.thread || slot.participant() == self.own.participant() {
                 continue;
             }
-            let Some(writer) = meta.participants().find(|listed| {
-                listed.name() == slot.participant() && listed.role() == Role::Collaborator
-            }) else {
+            let Some(writer) = meta.collaborator(slot.participant()) else {
                 continue;
             };
             let Ok(SyncRecord {
@@ -322,12 +311,8 @@ impl AutoMerge {
         commit: ObjectId,
     ) -> Option<MergeRequest> {
         let meta = load_meta(store, self.thread, &self.owner, 0).ok()?;
-        let collaborator = |name: &ParticipantName| {
-            meta.participants()
-                .find(|listed| listed.name() == name && listed.role() == Role::Collaborator)
-        };
-        collaborator(self.own.participant())?;
-        let writer = collaborator(from.participant())?;
+        meta.collaborator(self.own.participant())?;
+        let writer = meta.collaborator(from.participant())?;
         signed_by(store, commit, writer.key())
             .unwrap_or(false)
             .then(|| MergeRequest {
@@ -540,6 +525,7 @@ mod tests {
     };
     use mahi_thread::{
         Participant,
+        Role,
         add_participant,
     };
     use ssh_key::{

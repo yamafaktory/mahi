@@ -164,15 +164,7 @@ pub fn accept_fetched(
         };
         let writer = slot
             .filter(|slot| Some(slot.participant()) != local)
-            .and_then(|slot| {
-                current.as_ref()?.participants().find(|listed| {
-                    listed.name() == slot.participant()
-                        && match listed.role() {
-                            Role::Collaborator => true,
-                            Role::Watcher => false,
-                        }
-                })
-            });
+            .and_then(|slot| current.as_ref()?.collaborator(slot.participant()));
         let Some(writer) = writer else {
             accepted.skipped.push(thread_ref);
             continue;

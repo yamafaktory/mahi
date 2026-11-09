@@ -720,9 +720,7 @@ fn may_run(
             thread,
         });
     }
-    let teammates = meta
-        .participants()
-        .any(|listed| listed.key() != user.0 && listed.role() == Role::Collaborator);
+    let teammates = meta.collaborators().any(|listed| listed.key() != user.0);
     if !teammates {
         return Ok(());
     }

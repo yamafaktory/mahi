@@ -831,6 +831,20 @@ impl VerifiedMeta {
         self.participants.iter().map(|(participant, _)| participant)
     }
 
+    /// Returns the participants the document lists as collaborators.
+    pub fn collaborators(&self) -> impl Iterator<Item = &Participant> {
+        self.participants().filter(|listed| match listed.role {
+            Role::Collaborator => true,
+            Role::Watcher => false,
+        })
+    }
+
+    /// Returns the participant named `name` when the document lists them as a collaborator.
+    #[must_use]
+    pub fn collaborator(&self, name: &ParticipantName) -> Option<&Participant> {
+        self.collaborators().find(|listed| &listed.name == name)
+    }
+
     /// Recovers the thread key wrapped for participant `name`, using their `identity`.
     ///
     /// # Errors
@@ -1200,6 +1214,36 @@ mod tests {
                 ("carol", Role::Collaborator)
             ]
         );
+    }
+
+    #[test]
+    fn only_a_listed_collaborator_is_found_as_one() {
+        let (alice, bob, carol) = (
+            Person::new("alice"),
+            Person::new("bob"),
+            Person::new("carol"),
+        );
+        let mut draft = draft(&alice, &[&bob]);
+        draft
+            .participants
+            .push(carol.participant().with_role(Role::Collaborator));
+        let encoded = draft.sign(&ThreadKey::generate(), &alice.private).unwrap();
+        let meta = VerifiedMeta::decode(&encoded, draft.thread, &alice.key()).unwrap();
+        let name = |name: &str| ParticipantName::new(name).unwrap();
+        for listed in ["alice", "carol"] {
+            assert_eq!(
+                meta.collaborator(&name(listed)).map(Participant::name),
+                Some(&name(listed))
+            );
+        }
+        for missing in ["bob", "dave"] {
+            assert!(meta.collaborator(&name(missing)).is_none());
+        }
+        let collaborators: Vec<&str> = meta
+            .collaborators()
+            .map(|listed| listed.name().as_str())
+            .collect();
+        assert_eq!(collaborators, ["alice", "carol"]);
     }
 
     #[test]
