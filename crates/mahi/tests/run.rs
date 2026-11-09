@@ -5852,6 +5852,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             let lander = script(&fixture, "landing", "claude", LANDER);
             let owner_config = fixture.home.join(".config");
             let env = owner_env(&fixture, &owner_config);
+            let base_tree = git(&fixture.repo, &["rev-parse", "HEAD^{tree}"]);
             let mut first = Driven::start(mahi_in_terminal(
                 &fixture.repo,
                 &["run", lander.to_str().unwrap()],
@@ -5868,6 +5869,18 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             );
             let branch = branches.trim().to_owned();
             let thread = branch.strip_prefix("mahi/").unwrap().to_owned();
+            let measured_from = git(
+                &fixture.repo,
+                &["rev-parse", &format!("refs/mahi/landed-from/{thread}")],
+            );
+            assert_eq!(measured_from, base_tree);
+            let record =
+                fs::read_to_string(fixture.repo.join(format!(".git/mahi/branches/{thread}")))
+                    .unwrap();
+            assert!(
+                record.contains(&format!("\nfrom {}\n", base_tree.trim())),
+                "{record}"
+            );
 
             let main = forge_merges_and_deletes(&fixture, &remote, &branch);
 

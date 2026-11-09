@@ -71,6 +71,7 @@ pub use store::{
     COMMITTER_NAME,
     CommitSignature,
     CommitSigner,
+    LandedTree,
     Store,
     StoreError,
 };

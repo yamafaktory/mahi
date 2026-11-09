@@ -26,8 +26,8 @@ const MAX_RECORD_BYTES: u64 = 4096;
 
 /// What a landing left on the remote for a thread: the thread branch, the commit it pushed
 /// there, the landing branch it is meant for and, when the `land` tool pushed it, the tree of
-/// the owner's worktree it landed; and whether a later fetch found the thread branch gone from
-/// the remote.
+/// the owner's worktree it landed and the tree it measured its changed paths from; and whether
+/// a later fetch found the thread branch gone from the remote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchRecord {
     pub(crate) remote: String,
@@ -35,6 +35,7 @@ pub(crate) struct BranchRecord {
     pub(crate) tip: ObjectId,
     pub(crate) landing: String,
     pub(crate) worktree: Option<ObjectId>,
+    pub(crate) from: Option<ObjectId>,
     pub(crate) gone: bool,
 }
 
@@ -57,6 +58,13 @@ impl BranchRecord {
             }
             None => None,
         };
+        let from = match next.and_then(|line| line.strip_prefix("from ")) {
+            Some(hex) => {
+                next = lines.next();
+                Some(ObjectId::from_hex(hex.as_bytes()).ok()?)
+            }
+            None => None,
+        };
         let gone = next == Some("gone");
         let valid =
             |name: &str| !name.is_empty() && name.chars().all(|character| !character.is_control());
@@ -66,6 +74,7 @@ impl BranchRecord {
             tip,
             landing,
             worktree,
+            from,
             gone,
         })
     }
@@ -115,6 +124,9 @@ impl BranchRecord {
         );
         if let Some(worktree) = self.worktree {
             let _ = writeln!(text, "worktree {worktree}");
+        }
+        if let Some(from) = self.from {
+            let _ = writeln!(text, "from {from}");
         }
         if self.gone {
             text.push_str("gone\n");
@@ -166,6 +178,7 @@ mod tests {
             tip: ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
             landing: "main".to_owned(),
             worktree: None,
+            from: None,
             gone: false,
         };
         let mut now = seen.clone();
@@ -201,6 +214,7 @@ mod tests {
             tip: ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
             landing: "main".to_owned(),
             worktree: None,
+            from: None,
             gone: false,
         };
         record.write(&store, thread).unwrap();
@@ -212,7 +226,12 @@ mod tests {
             Some(ObjectId::from_hex(b"89abcdef0123456789abcdef0123456789abcdef").unwrap());
         record.write(&store, thread).unwrap();
         assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
+        record.from =
+            Some(ObjectId::from_hex(b"fedcba9876543210fedcba9876543210fedcba98").unwrap());
+        record.write(&store, thread).unwrap();
+        assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
         record.gone = false;
+        record.worktree = None;
         record.write(&store, thread).unwrap();
         assert_eq!(BranchRecord::read(&store, thread), Some(record));
         BranchRecord::remove(&store, thread).unwrap();

@@ -1057,6 +1057,7 @@ mod tests {
             tip: head,
             landing: "main".to_owned(),
             worktree: Some(measured),
+            from: None,
             gone: false,
         };
         record.write(store, thread).unwrap();
@@ -1119,13 +1120,16 @@ mod tests {
             });
             merging.activity.saw(HookKind::TurnEnd, b"");
             thread::sleep(Duration::from_millis(1500));
-            store.keep_landed_tree(thread, Some(measured)).unwrap();
+            store
+                .keep_landed_tree((thread, mahi_store::LandedTree::Measured), Some(measured))
+                .unwrap();
             BranchRecord {
                 remote: "up".to_owned(),
                 branch: format!("mahi/{thread}"),
                 tip,
                 landing: "main".to_owned(),
                 worktree: Some(measured),
+                from: None,
                 gone: false,
             }
             .write(&store, thread)

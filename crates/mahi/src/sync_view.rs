@@ -242,6 +242,7 @@ mod tests {
             tip,
             landing: "main".to_owned(),
             worktree: Some(measured),
+            from: None,
             gone: false,
         };
         let landing = Source::Landing(LandingBranch::new("up", "main").unwrap());

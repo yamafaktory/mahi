@@ -73,6 +73,27 @@ pub const COMMITTER_EMAIL: &str = "mahi@mahi.invalid";
 /// The prefix of the refs that keep the tree each thread's last landing measured, as
 /// `refs/mahi/landed/<thread-id>`.
 pub(crate) const LANDED_PREFIX: &str = "refs/mahi/landed/";
+const LANDED_FROM_PREFIX: &str = "refs/mahi/landed-from/";
+
+/// Which tree of a thread's last landing a ref keeps reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandedTree {
+    /// The tree of the worktree the landing measured, under `refs/mahi/landed/<thread-id>`.
+    Measured,
+    /// The tree the landing measured its changed paths from, under
+    /// `refs/mahi/landed-from/<thread-id>`.
+    From,
+}
+
+impl LandedTree {
+    fn name(self, thread: ThreadId) -> Result<FullName, StoreError> {
+        let prefix = match self {
+            Self::Measured => LANDED_PREFIX,
+            Self::From => LANDED_FROM_PREFIX,
+        };
+        Ok(FullName::try_from(format!("{prefix}{thread}")).map_err(gix::Error::from_error)?)
+    }
+}
 
 const MAX_ENTRY_NAME_BYTES: usize = 255;
 pub(crate) const MAX_COMMIT_BYTES: u64 = 64 * 1024;
@@ -382,9 +403,8 @@ impl Store {
         }
     }
 
-    /// Keeps `tree`, the tree of a thread's worktree that its last landing measured, reachable
-    /// for git's garbage collection under `refs/mahi/landed/<thread-id>`, or removes that ref
-    /// when `tree` is `None`.
+    /// Keeps `tree`, the `which` tree of a thread's last landing, reachable for git's garbage
+    /// collection under its ref, or removes that ref when `tree` is `None`.
     ///
     /// # Errors
     ///
@@ -392,11 +412,10 @@ impl Store {
     /// the ref cannot be written.
     pub fn keep_landed_tree(
         &self,
-        thread: ThreadId,
+        (thread, which): (ThreadId, LandedTree),
         tree: Option<ObjectId>,
     ) -> Result<(), StoreError> {
-        let name = FullName::try_from(format!("{LANDED_PREFIX}{thread}"))
-            .map_err(gix::Error::from_error)?;
+        let name = which.name(thread)?;
         let change = match tree {
             Some(tree) => {
                 self.require_kind(tree, Kind::Tree)?;
@@ -421,15 +440,14 @@ impl Store {
         Ok(())
     }
 
-    /// Removes the ref [`Store::keep_landed_tree`] keeps for `thread`, only while it keeps
-    /// `tree`, so a tree a later landing keeps there stays.
+    /// Removes the ref [`Store::keep_landed_tree`] keeps for the tree `thread`'s last landing
+    /// measured, only while it keeps `tree`, so a tree a later landing keeps there stays.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Git`] if the ref keeps another tree or cannot be removed.
     pub fn release_landed_tree(&self, thread: ThreadId, tree: ObjectId) -> Result<(), StoreError> {
-        let name = FullName::try_from(format!("{LANDED_PREFIX}{thread}"))
-            .map_err(gix::Error::from_error)?;
+        let name = LandedTree::Measured.name(thread)?;
         self.repo.edit_references_as(
             Some(RefEdit::new(
                 name,
@@ -1612,6 +1630,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_tree_a_landing_measured_from_is_kept_under_a_ref_of_its_own() {
+        let (_dir, store) = store();
+        let thread = ThreadId::random().unwrap();
+        let kept = |prefix: &str| {
+            store
+                .repo
+                .try_find_reference(format!("{prefix}{thread}").as_str())
+                .unwrap()
+                .map(|mut found| found.peel_to_id().unwrap().detach())
+        };
+        let measured = empty_tree(&store);
+        let from = store
+            .write_tree(&[("a", EntryKind::Blob, store.write_blob(b"a").unwrap())])
+            .unwrap();
+        store
+            .keep_landed_tree((thread, LandedTree::Measured), Some(measured))
+            .unwrap();
+        store
+            .keep_landed_tree((thread, LandedTree::From), Some(from))
+            .unwrap();
+        assert_eq!(kept("refs/mahi/landed/"), Some(measured));
+        assert_eq!(kept("refs/mahi/landed-from/"), Some(from));
+        store.release_landed_tree(thread, measured).unwrap();
+        assert_eq!(kept("refs/mahi/landed/"), None);
+        assert_eq!(kept("refs/mahi/landed-from/"), Some(from));
+        store
+            .keep_landed_tree((thread, LandedTree::From), None)
+            .unwrap();
+        assert_eq!(kept("refs/mahi/landed-from/"), None);
+    }
+
+    #[test]
     fn a_landed_tree_is_kept_under_its_ref_until_it_is_let_go() {
         let (_dir, store) = store();
         let thread = ThreadId::random().unwrap();
@@ -1623,24 +1673,34 @@ pub(crate) mod tests {
                 .unwrap()
                 .map(|mut found| found.peel_to_id().unwrap().detach())
         };
-        store.keep_landed_tree(thread, None).unwrap();
+        store
+            .keep_landed_tree((thread, LandedTree::Measured), None)
+            .unwrap();
         assert_eq!(kept(), None);
-        store.keep_landed_tree(thread, Some(tree)).unwrap();
+        store
+            .keep_landed_tree((thread, LandedTree::Measured), Some(tree))
+            .unwrap();
         assert_eq!(kept(), Some(tree));
-        store.keep_landed_tree(thread, Some(tree)).unwrap();
-        store.keep_landed_tree(thread, None).unwrap();
+        store
+            .keep_landed_tree((thread, LandedTree::Measured), Some(tree))
+            .unwrap();
+        store
+            .keep_landed_tree((thread, LandedTree::Measured), None)
+            .unwrap();
         assert_eq!(kept(), None);
         let other = store
             .write_tree(&[("a", EntryKind::Blob, store.write_blob(b"a").unwrap())])
             .unwrap();
-        store.keep_landed_tree(thread, Some(other)).unwrap();
+        store
+            .keep_landed_tree((thread, LandedTree::Measured), Some(other))
+            .unwrap();
         assert!(store.release_landed_tree(thread, tree).is_err());
         assert_eq!(kept(), Some(other));
         store.release_landed_tree(thread, other).unwrap();
         assert_eq!(kept(), None);
         let blob = store.write_blob(b"x").unwrap();
         assert!(matches!(
-            store.keep_landed_tree(thread, Some(blob)),
+            store.keep_landed_tree((thread, LandedTree::Measured), Some(blob)),
             Err(StoreError::WrongObject { .. })
         ));
     }

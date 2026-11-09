@@ -31,6 +31,7 @@ use mahi_core::{
 use mahi_store::{
     GlobalPatterns,
     Identity,
+    LandedTree,
     ObjectId,
     Pushed,
     SnapshotCache,
@@ -102,10 +103,16 @@ enum Stage {
     },
 }
 
-pub(crate) struct Pending {
+#[derive(Clone, Copy)]
+struct Built {
     landed: ObjectId,
     tip: ObjectId,
     worktree: ObjectId,
+    from: ObjectId,
+}
+
+pub(crate) struct Pending {
+    built: Built,
     commits: Vec<(String, Vec<String>)>,
     title: String,
     description: String,
@@ -272,7 +279,7 @@ impl Desk {
         else {
             return;
         };
-        let built = (pending.landed, pending.tip, pending.worktree);
+        let built = pending.built;
         let count = pending.commits.len();
         let remote = pending.remote.clone();
         let description = std::mem::take(&mut pending.description);
@@ -325,7 +332,12 @@ impl Desk {
     fn push(
         &self,
         remote: &SyncSetup,
-        (landed, tip, worktree): (ObjectId, ObjectId, ObjectId),
+        Built {
+            landed,
+            tip,
+            worktree,
+            from,
+        }: Built,
         description: &str,
         interrupt: &Arc<AtomicBool>,
     ) -> Result<Landed, String> {
@@ -377,10 +389,12 @@ impl Desk {
             tip,
             landing: self.landing.clone(),
             worktree: apart,
+            from: Some(from),
             gone: false,
         };
         let unremembered = store
-            .keep_landed_tree(self.thread, apart)
+            .keep_landed_tree((self.thread, LandedTree::Measured), apart)
+            .and_then(|()| store.keep_landed_tree((self.thread, LandedTree::From), Some(from)))
             .map_err(|error| described(&error))
             .and_then(|()| {
                 record
@@ -759,7 +773,12 @@ impl Lander {
         };
 
         let pending = pending(
-            (landed, tip, worktree),
+            Built {
+                landed,
+                tip,
+                worktree,
+                from: measured,
+            },
             (call, &changed.gone),
             (remote, behind),
         );
@@ -859,7 +878,7 @@ impl Lander {
 }
 
 fn pending(
-    (landed, tip, worktree): (ObjectId, ObjectId, ObjectId),
+    built: Built,
     (call, gone): (Call, &[Vec<u8>]),
     (remote, behind): (SyncSetup, Vec<(AgentSlot, Instant)>),
 ) -> Pending {
@@ -886,9 +905,7 @@ fn pending(
         paths.extend(deleted);
     }
     Pending {
-        landed,
-        tip,
-        worktree,
+        built,
         commits,
         title: call.title,
         description: landing::printable(&call.description),
@@ -971,9 +988,12 @@ pub(crate) mod tests {
             "main".to_owned(),
         ));
         let pending = Pending {
-            landed,
-            tip,
-            worktree: tree,
+            built: Built {
+                landed,
+                tip,
+                worktree: tree,
+                from: tree,
+            },
             commits: vec![
                 (
                     "Retry failed requests in the client".to_owned(),
@@ -1002,10 +1022,14 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn offer_again(landing: &Landing) -> bool {
+        let tree = landing.store.commit_tree(landing.tip).unwrap();
         landing.desk.offer(Pending {
-            landed: landing.landed,
-            tip: landing.tip,
-            worktree: landing.store.commit_tree(landing.tip).unwrap(),
+            built: Built {
+                landed: landing.landed,
+                tip: landing.tip,
+                worktree: tree,
+                from: tree,
+            },
             commits: vec![("Again".to_owned(), Vec::new())],
             title: "Again".to_owned(),
             description: String::new(),
@@ -1086,13 +1110,15 @@ pub(crate) mod tests {
             .store
             .move_branch(&branch, None, landing.tip, "elsewhere")
             .unwrap();
+        let tree = landing.store.commit_tree(landing.tip).unwrap();
         let moved = landing.desk.push(
             &unreachable_remote(&landing.store, landing.repo.path()),
-            (
-                landing.landed,
-                landing.tip,
-                landing.store.commit_tree(landing.tip).unwrap(),
-            ),
+            Built {
+                landed: landing.landed,
+                tip: landing.tip,
+                worktree: tree,
+                from: tree,
+            },
             "",
             &Arc::new(AtomicBool::new(false)),
         );
@@ -1251,7 +1277,12 @@ pub(crate) mod tests {
             paths: vec!["old.txt".to_owned()],
         });
         let shown = pending(
-            (head, head, head),
+            Built {
+                landed: head,
+                tip: head,
+                worktree: head,
+                from: head,
+            },
             (call, &[b"old\xff".to_vec()]),
             (remote, Vec::new()),
         );
@@ -1323,6 +1354,7 @@ pub(crate) mod tests {
             tip: pushed_tip,
             landing: "main".to_owned(),
             worktree: None,
+            from: None,
             gone: false,
         };
         record.write(&store, started.thread).unwrap();
@@ -1346,6 +1378,49 @@ pub(crate) mod tests {
             land(&["a.txt", "b.txt"]),
             landing::waiting(started.slot.participant())
         );
+    }
+
+    #[test]
+    fn a_landing_measures_from_the_worktree_tree_the_last_one_recorded_or_its_tip() {
+        let (_dir, store) = repository_on_main();
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let started = crate::session::tests::start_with(&store, &key).unwrap();
+        let store = Store::open(store.common_dir()).unwrap();
+        unreachable_remote(&store, store.common_dir());
+        let (lander, desk) = lander_for(&started, &store);
+        let store = Store::open(store.common_dir()).unwrap();
+        let base = store.head_commit().unwrap();
+        let base_tree = store.commit_tree(base).unwrap();
+        fs::write(started.worktree.join("m.txt"), "m\n").unwrap();
+        let measured = lander.snapshot(&store).unwrap();
+        let mut record = BranchRecord {
+            remote: "up".to_owned(),
+            branch: branch_of(started.thread),
+            tip: base,
+            landing: "main".to_owned(),
+            worktree: Some(measured),
+            from: None,
+            gone: false,
+        };
+        record.write(&store, started.thread).unwrap();
+        fs::write(started.worktree.join("a.txt"), "a\n").unwrap();
+        let from = |paths: &[&str]| {
+            lander.land(&store, &call(paths), (base, &[])).unwrap();
+            let Stage::Waiting { pending, .. } =
+                std::mem::replace(&mut *desk.stage().unwrap(), Stage::Idle)
+            else {
+                panic!("the landing waits for the owner");
+            };
+            pending.built.from
+        };
+        assert_eq!(from(&["a.txt"]), measured);
+        record.worktree = None;
+        record.write(&store, started.thread).unwrap();
+        assert_eq!(from(&["a.txt", "m.txt"]), base_tree);
     }
 
     pub(crate) fn done_with_clipboard(desk: &Desk, copied: &str) {

@@ -32,6 +32,7 @@ use mahi_sandbox::{
     TerminationSignals,
 };
 use mahi_store::{
+    LandedTree,
     Pushed,
     Store,
     StoreError,
@@ -206,8 +207,9 @@ pub(crate) fn purge(
     let forgotten = BranchRecord::remove(&store, thread)
         .map_err(|error| error.to_string())
         .and_then(|()| {
-            store
-                .keep_landed_tree(thread, None)
+            [LandedTree::Measured, LandedTree::From]
+                .into_iter()
+                .try_for_each(|which| store.keep_landed_tree((thread, which), None))
                 .map_err(|error| crate::describe(&error))
         });
     if let Err(error) = forgotten {
@@ -503,6 +505,7 @@ mod tests {
             tip: landed,
             landing: "main".to_owned(),
             worktree: None,
+            from: None,
             gone: true,
         };
         record.write(&store, thread).unwrap();

@@ -575,3 +575,11 @@ Chosen by the user (#98). The report of D077 prints at once while no agent runs,
 workspace. `mahi run` holds the report from the moment its host starts and prints it after the
 agent exits, so it never lands on the agent's screen. A later publish that succeeds resets the
 report: the next failure is reported again, once.
+
+## D080 · 2026-11-09 · A landing records the tree it measured from
+
+Chosen by the user (#62), settling D072's open point. Each landing's record keeps one more tree:
+the worktree tree that landing measured its changed paths from. On `y`, the next landing measures
+from that tree again, so the last landing's paths count as changed and merge onto the landing
+branch's tip. The other choice was to walk back `mahi/<thread-id>` to the commit the last landing
+built on and measure from its tree, which could land paths that landing did not hold.
