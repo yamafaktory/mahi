@@ -227,6 +227,7 @@ impl WorkspaceLive {
             owner: owner.clone(),
             relays: self.relays,
             bootstrap: live::bootstrap(&store, thread),
+            reports: live::Reports::default(),
         };
         let host = LiveHost::start_on(
             (&shared, lock),

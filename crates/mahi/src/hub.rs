@@ -996,6 +996,7 @@ mod tests {
                 owner: mahi_thread::ParticipantKey::from_public_key(owner.public_key()).unwrap(),
                 relays: mahi_live::Relays::Disabled,
                 bootstrap: Vec::new(),
+                reports: crate::live::Reports::default(),
             },
             git_dir: dir.path().to_path_buf(),
             slot: slot("alice", "claude"),

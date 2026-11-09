@@ -186,6 +186,7 @@ use crate::{
         self,
         HostError,
         LiveSetup,
+        Reports,
     },
     mcp::{
         self,
@@ -774,6 +775,7 @@ fn live_setup(
         owner,
         relays,
         bootstrap,
+        reports: Reports::default(),
     }))
 }
 
@@ -1255,6 +1257,11 @@ impl Prepared {
             approvals: self.settings.agent_approvals,
         };
         let (sandbox, network) = (self.sandbox, self.network);
+        let reports = self
+            .live
+            .as_ref()
+            .map_or_else(Reports::default, |setup| setup.reports.clone());
+        reports.hold();
         let live = start_live(self.live.take(), &self.git_dir, &started);
         let store = &self.store;
         let launched = started.launch(store, || {
@@ -1267,6 +1274,7 @@ impl Prepared {
                 if let Some(live) = live {
                     live.stop();
                 }
+                reports.release();
                 return Err(error);
             }
         };
@@ -1320,6 +1328,7 @@ impl Prepared {
             proxy,
             live,
         );
+        reports.release();
         tools.store(false, Ordering::SeqCst);
         keep_hook_trust(self.profile, state, config.path());
         outcome

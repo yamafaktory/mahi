@@ -568,3 +568,10 @@ Chosen by the user (#102). Nothing changes: when mahi's input ends, mahi sends o
 and only while the agent's terminal is in line mode, as it does today. An agent that reads its terminal in raw mode waits, as it
 would with no keys typed. The other choices were to hang up the terminal, or to send the end of
 file once line mode comes back.
+
+## D079 · 2026-11-09 · When the host prints the unpublished address report
+
+Chosen by the user (#98). The report of D077 prints at once while no agent runs, such as in the
+workspace. `mahi run` holds the report from the moment its host starts and prints it after the
+agent exits, so it never lands on the agent's screen. A later publish that succeeds resets the
+report: the next failure is reported again, once.

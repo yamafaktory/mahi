@@ -3871,6 +3871,30 @@ echo stray > "$CODEX_HOME/history.jsonl"
     }
 
     #[test]
+    fn an_unpublished_live_address_is_reported_after_the_agent_exits() {
+        let fixture = fixture();
+        let config = config_dir(&fixture.home);
+        fs::write(config.path().join("live"), "not a directory").unwrap();
+        let log = fixture.root.join("mahi.log");
+        let output = fs::File::create(&log).unwrap();
+        let status = fixture
+            .command(&["run", "sh", "-c", "printf 'agent output'"])
+            .env("MAHI_LIVE", "local")
+            .stdin(Stdio::null())
+            .stderr(output.try_clone().unwrap())
+            .stdout(output)
+            .status()
+            .unwrap();
+        let printed = fs::read_to_string(&log).unwrap();
+        assert!(status.success(), "{printed}");
+        let report = "mahi: mahi invite cannot find this thread's live address: \
+                      the live directory is not a private directory\n";
+        let agent = printed.find("agent output").expect(&printed);
+        assert_eq!(printed.matches(report).count(), 1, "{printed}");
+        assert!(printed.find(report).unwrap() > agent, "{printed}");
+    }
+
+    #[test]
     fn an_invited_participant_watches_the_agent_live_over_the_local_network() {
         use mahi_live::{
             Body,

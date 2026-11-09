@@ -4,6 +4,7 @@ use std::{
         HashSet,
         VecDeque,
     },
+    fmt::Display,
     fs::{
         self,
         File,
@@ -11,6 +12,7 @@ use std::{
     io::{
         self,
         Read,
+        Write,
     },
     os::fd::OwnedFd,
     path::{
@@ -194,6 +196,7 @@ pub(crate) struct LiveSetup {
     pub(crate) owner: ParticipantKey,
     pub(crate) relays: Relays,
     pub(crate) bootstrap: Vec<HostAddress>,
+    pub(crate) reports: Reports,
 }
 
 fn published_dir(config: &ConfigDir) -> io::Result<OwnedFd> {
@@ -846,11 +849,11 @@ impl LiveHost {
             heard,
             heard_frames: Arc::clone(&heard_frames),
         };
-        let publisher = {
-            let (node, stop, config) = (Arc::clone(&node), Arc::clone(&stop), setup.config.clone());
-            let (git_dir, peers) = (git_dir.to_path_buf(), Arc::clone(&peers));
-            thread::spawn(move || publish(&node, &stop, (&config, &git_dir), (thread, &peers)))
-        };
+        let publisher = spawn_publish(
+            (Arc::clone(&node), Arc::clone(&stop)),
+            (setup, git_dir),
+            (thread, Arc::clone(&peers)),
+        );
         Ok(Self {
             _hosting: hosting,
             shared,
@@ -1243,23 +1246,106 @@ fn private_socket(runtime: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(socket)
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Reports(Arc<Mutex<Option<Vec<String>>>>);
+
+impl Reports {
+    pub(crate) fn hold(&self) {
+        if let Ok(mut held) = self.0.lock() {
+            held.get_or_insert_with(Vec::new);
+        }
+    }
+
+    fn tell(&self, line: String) {
+        let Ok(mut held) = self.0.lock() else {
+            return eprintln!("{line}");
+        };
+        match held.as_mut() {
+            Some(held) => held.push(line),
+            None => eprintln!("{line}"),
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.release_into(&mut io::stderr());
+    }
+
+    fn release_into(&self, errors: &mut impl Write) {
+        let held = self.0.lock().ok().and_then(|mut held| held.take());
+        for line in held.into_iter().flatten() {
+            let _ = writeln!(errors, "{line}");
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Publisher {
+    published: Option<HostAddress>,
+    reported: bool,
+}
+
+impl Publisher {
+    fn publish(
+        &mut self,
+        address: Result<HostAddress, LiveError>,
+        (config, thread): (&ConfigDir, ThreadId),
+        reports: &Reports,
+    ) {
+        match address {
+            Ok(address) if self.published.as_ref() == Some(&address) => {}
+            Ok(address) => match publish_address(config, thread, &address) {
+                Ok(()) => {
+                    self.published = Some(address);
+                    self.reported = false;
+                }
+                Err(error) => self.report(&error, reports),
+            },
+            Err(error) => self.report(&error, reports),
+        }
+    }
+
+    fn report(&mut self, failure: &dyn Display, reports: &Reports) {
+        if !self.reported {
+            self.reported = true;
+            reports.tell(format!(
+                "mahi: mahi invite cannot find this thread's live address: {failure}"
+            ));
+        }
+    }
+}
+
+fn spawn_publish(
+    (node, stop): (Arc<LiveNode>, Arc<AtomicBool>),
+    (setup, git_dir): (&LiveSetup, &Path),
+    (thread, peers): (ThreadId, Arc<HostPeers>),
+) -> JoinHandle<()> {
+    let (config, reports, git_dir) = (
+        setup.config.clone(),
+        setup.reports.clone(),
+        git_dir.to_path_buf(),
+    );
+    thread::spawn(move || {
+        publish(
+            &node,
+            &stop,
+            (&config, &git_dir, &reports),
+            (thread, &peers),
+        );
+    })
+}
+
 /// Keeps the host's published address current, the relay it reaches and its direct
 /// addresses, and remembers where each of the thread's participants is reached.
 fn publish(
     node: &LiveNode,
     stop: &AtomicBool,
-    (config, git_dir): (&ConfigDir, &Path),
+    (config, git_dir, reports): (&ConfigDir, &Path, &Reports),
     (thread, peers): (ThreadId, &HostPeers),
 ) {
-    let mut published: Option<HostAddress> = None;
+    let mut publisher = Publisher::default();
     let mut remembered: HashMap<NodeId, HostAddress> = HashMap::new();
     while !stop.load(Ordering::SeqCst) {
-        if let Ok(address) = node.address(Duration::ZERO)
-            && published.as_ref() != Some(&address)
-            && publish_address(config, thread, &address).is_ok()
-        {
-            published = Some(address);
-        }
+        publisher.publish(node.address(Duration::ZERO), (config, thread), reports);
         for (participant, _) in peers.participants() {
             if let Some(address) = node.reached(&participant)
                 && remembered.get(&participant) != Some(&address)
@@ -2081,6 +2167,7 @@ mod tests {
                 owner: hosted.owner.clone(),
                 relays: Relays::Disabled,
                 bootstrap: Vec::new(),
+                reports: Reports::default(),
             };
             let lock = LiveLock::try_acquire(&config, hosted.thread)
                 .unwrap()
@@ -2141,6 +2228,7 @@ mod tests {
                 owner: hosted.owner.clone(),
                 relays: Relays::Disabled,
                 bootstrap: Vec::new(),
+                reports: Reports::default(),
             };
             let lock = LiveLock::try_acquire(&config, hosted.thread)
                 .unwrap()
@@ -2212,6 +2300,7 @@ mod tests {
             owner: hosted.owner.clone(),
             relays: Relays::Disabled,
             bootstrap,
+            reports: Reports::default(),
         };
         let lock = LiveLock::try_acquire(&config, hosted.thread)
             .unwrap()
@@ -3253,6 +3342,65 @@ mod tests {
             vec!["192.0.2.7:50000".parse().unwrap()],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_failed_publish_is_reported_once_and_a_later_one_publishes() {
+        let (_dir, config) = private_config();
+        let thread = ThreadId::random().unwrap();
+        profile::create_private_dir(config.path()).unwrap();
+        let live = config.path().join(PUBLISHED);
+        fs::write(&live, "").unwrap();
+        let mut publisher = Publisher::default();
+        let reports = Reports::default();
+        reports.hold();
+
+        publisher.publish(Ok(some_address()), (&config, thread), &reports);
+        publisher.publish(Ok(some_address()), (&config, thread), &reports);
+        publisher.publish(Err(LiveError::Closed), (&config, thread), &reports);
+        fs::remove_file(&live).unwrap();
+        let address = some_address();
+        publisher.publish(Ok(address.clone()), (&config, thread), &reports);
+
+        assert_eq!(published_address(&config, thread), Some(address));
+        assert_eq!(
+            released(&reports),
+            "mahi: mahi invite cannot find this thread's live address: \
+             the live directory is not a private directory\n"
+        );
+    }
+
+    fn released(reports: &Reports) -> String {
+        let mut errors = Vec::new();
+        reports.release_into(&mut errors);
+        String::from_utf8(errors).unwrap()
+    }
+
+    #[test]
+    fn a_failure_after_a_publish_is_reported_again() {
+        let (_dir, config) = private_config();
+        let thread = ThreadId::random().unwrap();
+        let mut publisher = Publisher::default();
+        let reports = Reports::default();
+        reports.hold();
+
+        publisher.publish(Err(LiveError::Closed), (&config, thread), &reports);
+        publisher.publish(Ok(some_address()), (&config, thread), &reports);
+        publisher.publish(Err(LiveError::Closed), (&config, thread), &reports);
+
+        let line =
+            "mahi: mahi invite cannot find this thread's live address: the live node is closed\n";
+        assert_eq!(released(&reports), line.repeat(2));
+    }
+
+    #[test]
+    fn released_reports_print_at_once_until_held_again() {
+        let reports = Reports::default();
+        reports.hold();
+        reports.tell("first".to_owned());
+        assert_eq!(released(&reports), "first\n");
+        reports.tell("not held".to_owned());
+        assert_eq!(released(&reports), "");
     }
 
     #[test]
