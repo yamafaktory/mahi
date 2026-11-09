@@ -506,3 +506,65 @@ start, so it merges the teammates' latest turn ends that it holds before the fir
 the user prompts first, and the next prompt carries the note. The join no longer asks the host
 for the snapshots, retrying for about 30 s, and merges them before the agent starts, as the
 design said before. The code already worked this way, so only the design text changed.
+
+## D071 · 2026-11-09 · Invisible and text direction characters in a landing's commit message
+
+Chosen by the user (#61). The land tool refuses a commit message that holds invisible or text
+direction characters, such as U+200B (zero width space) or U+202E (right to left override), as
+D033 refuses control characters, with a refusal of its own: `not landed: the message of commit
+2 holds invisible or text direction characters; write it without them`. The other choices were
+to remove them, to show them escaped in the confirmation, or to keep them.
+
+## D072 · 2026-11-09 · Ask whether a deleted thread branch's pull request was merged
+
+Chosen by the user (#62), replacing D056. When a fetch finds that `mahi/<thread-id>` is gone
+from the remote since the last landing, the landing confirmation first asks the owner about that
+pull request. Body: `The last landing's branch is gone from <remote>. If its pull request was closed
+without a merge, its changes can land again.` Hint: `y lands them again  n they were merged  Esc
+cancels`. On `y`, the changes of the last landing land again. On `n`, the landing goes on as it
+does today. How `y` finds those changes is open. The other choice was to find the changed paths
+from the tree of `mahi/<thread-id>`.
+
+## D073 · 2026-11-09 · The status line shows a held merge of the landing branch
+
+Chosen by the user (#65). A merge of the landing branch into the owner's worktree that waits
+for the keypress shows as the status line's first item, before the conflicts: `main · a merge
+waits for you: changes agent settings`, with the landing branch's name in place of `main`. This
+changes DESIGN.md's One view, where the conflicts came first, once #65 is built.
+
+## D074 · 2026-11-09 · The D040 refusal names the agent instead of --no-profile
+
+Chosen by the user (#71), replacing D040's advice. D040's invite refusal ends with `resume the
+thread with Claude Code and its profile, or invite a --watcher`, with the agent the slot's
+profile names, so it holds after a run of another program in the slot too. DESIGN.md quotes
+D040's text and changes with it. Which name a profile without a known agent shows is open.
+
+## D075 · 2026-11-09 · A code join refuses when the role turned to watcher during its fetch
+
+Chosen by the user (#72), narrowing D042. A join by pairing code with an agent reads `meta` again after its
+fetch, as a ticket join does, and refuses before the agent starts when the user is now a
+watcher: `alice made you a watcher in thread <id> while you joined, so your agent does not run;
+ask alice for a new code to watch`. The other choice was to watch, as D042 does, which needs the
+live node again.
+
+## D076 · 2026-11-09 · The reasons a held turn's take fails before a merge
+
+Chosen by the user (#76), building on D045. Under a held turn whose take fails before any merge,
+the palette shows one reason per case, with the teammate's name in place of `bob`:
+
+- `meta` cannot be read: `Not taken: cannot read the thread's members`.
+- The user is no longer a collaborator: `Not taken: you are no longer a collaborator`.
+- The teammate is no longer a collaborator: `Not taken: bob is no longer a collaborator`.
+- The teammate did not sign the snapshot: `Not taken: bob did not sign this turn`.
+
+## D077 · 2026-11-09 · Report a host address that cannot be published
+
+Chosen by the user (#98). A host that cannot publish its address reports the first failure
+once on standard error: `mahi: mahi invite cannot find this thread's live address: <error>`.
+
+## D078 · 2026-11-09 · An agent in raw mode is not told that mahi's input ended
+
+Chosen by the user (#102). Nothing changes: when mahi's input ends, mahi sends one end of file,
+and only while the agent's terminal is in line mode, as it does today. An agent that reads its terminal in raw mode waits, as it
+would with no keys typed. The other choices were to hang up the terminal, or to send the end of
+file once line mode comes back.
