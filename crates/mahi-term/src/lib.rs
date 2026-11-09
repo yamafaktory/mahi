@@ -78,6 +78,7 @@ pub use workspace::{
     Header,
     StatusAgent,
     StatusConflicts,
+    StatusLanding,
     StatusLine,
     TabBar,
     TabHit,

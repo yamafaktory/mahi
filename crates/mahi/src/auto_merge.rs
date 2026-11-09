@@ -260,7 +260,7 @@ impl AutoMerge {
         (running, pace): (&AtomicBool, Pace),
     ) -> bool {
         let waiting = held::file_for(store, self.thread, (&self.own, from));
-        let Some(wanted) = self.pending_landing(store).filter(
+        let Some(wanted) = pending_landing(store, self.thread).filter(
             |wanted| matches!(wanted, Wanted::Landing { tip, .. } if *tip == record.commit),
         ) else {
             let _ = sync_state::remove(&waiting);
@@ -274,7 +274,7 @@ impl AutoMerge {
             || {
                 let still = Store::open(&self.git_dir)
                     .ok()
-                    .and_then(|store| self.pending_landing(&store))
+                    .and_then(|store| pending_landing(&store, self.thread))
                     .as_ref()
                     == Some(&wanted);
                 still.then(|| merger.merge_wanted(wanted.clone(), AgentSettings::Take))
@@ -306,16 +306,7 @@ impl AutoMerge {
             .into_iter()
             .map(|(slot, record)| (Source::Agent(slot), record))
             .collect();
-        let landing = self.pending_landing(store).and_then(|wanted| {
-            let Wanted::Landing { landing, tip, .. } = wanted else {
-                return None;
-            };
-            let from = Source::Landing(landing);
-            let file = held::file_for(store, self.thread, (&self.own, &from));
-            let record = HeldSettings::load(&file).ok()??;
-            (record.commit == tip).then_some((from, record))
-        });
-        held.extend(landing);
+        held.extend(held_landing(store, self.thread, &self.own));
         held
     }
 
@@ -349,7 +340,7 @@ impl AutoMerge {
     /// worktree tree it measured, while no merge of it waits for the user; a held merge of an
     /// earlier landing's tip is dropped, since this one brings what it did.
     fn landing_due(&self, store: &Store) -> Option<Wanted> {
-        let wanted = self.pending_landing(store)?;
+        let wanted = pending_landing(store, self.thread)?;
         let Wanted::Landing { landing, tip, .. } = &wanted else {
             return None;
         };
@@ -364,19 +355,6 @@ impl AutoMerge {
             }
         }
         Some(wanted)
-    }
-
-    /// Returns what the last landing brought from the landing branch, while the record says
-    /// the agent's worktree has not taken it.
-    fn pending_landing(&self, store: &Store) -> Option<Wanted> {
-        let record = BranchRecord::read(store, self.thread)?;
-        let measured = record.worktree?;
-        let landing = LandingBranch::new(&record.remote, &record.landing)?;
-        Some(Wanted::Landing {
-            landing,
-            measured,
-            tip: record.tip,
-        })
     }
 
     /// Forgets the worktree tree the last landing measured once the agent's worktree took all
@@ -530,6 +508,31 @@ impl AutoMerge {
         }
         true
     }
+}
+
+fn pending_landing(store: &Store, thread: ThreadId) -> Option<Wanted> {
+    let record = BranchRecord::read(store, thread)?;
+    let measured = record.worktree?;
+    let landing = LandingBranch::new(&record.remote, &record.landing)?;
+    Some(Wanted::Landing {
+        landing,
+        measured,
+        tip: record.tip,
+    })
+}
+
+pub(crate) fn held_landing(
+    store: &Store,
+    thread: ThreadId,
+    own: &AgentSlot,
+) -> Option<(Source, HeldSettings)> {
+    let Wanted::Landing { landing, tip, .. } = pending_landing(store, thread)? else {
+        return None;
+    };
+    let from = Source::Landing(landing);
+    let file = held::file_for(store, thread, (own, &from));
+    let record = HeldSettings::load(&file).ok()??;
+    (record.commit == tip).then_some((from, record))
 }
 
 #[cfg(test)]

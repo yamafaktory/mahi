@@ -159,10 +159,21 @@ pub struct StatusConflicts<'a> {
     pub more: usize,
 }
 
-/// The row under the pane in the one view: the conflicts to resolve first, then each
-/// teammate's agent.
+/// A merge of the landing branch into the user's worktree that waits for the user's keypress.
+#[derive(Debug, Clone, Copy)]
+pub struct StatusLanding<'a> {
+    /// The landing branch, such as `main`.
+    pub branch: &'a str,
+    /// What the merge changes, such as `changes agent settings`.
+    pub waits: &'a str,
+}
+
+/// The row under the pane in the one view: a held merge of the landing branch, the conflicts
+/// to resolve, then each teammate's agent.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatusLine<'a> {
+    /// The merge of the landing branch that waits for the user's keypress, when one does.
+    pub landing: Option<StatusLanding<'a>>,
     /// The conflicts left in the user's worktree, by the agent they came from.
     pub conflicts: &'a [StatusConflicts<'a>],
     /// The teammates' agents.
@@ -184,10 +195,10 @@ impl<'a> Item<'a> {
 }
 
 impl<'a> StatusLine<'a> {
-    /// Returns the line for a row `width` columns wide: whole when it fits, otherwise
-    /// without the files merges brought, then with the last agents left out and counted as
-    /// `+N more`, then with the conflicts' paths cut short, each list ending with `and N
-    /// more`.
+    /// Returns the line for a row `width` columns wide, the held merge of the landing branch
+    /// always first: whole when it fits, otherwise without the files merges brought, then
+    /// with the last agents left out and counted as `+N more`, then with the conflicts' paths
+    /// cut short, each list ending with `and N more`.
     #[must_use]
     pub fn line(&self, width: u16) -> Line<'a> {
         let width = usize::from(width);
@@ -207,29 +218,37 @@ impl<'a> StatusLine<'a> {
             .map(|conflicts| conflicts.paths.len())
             .max()
             .unwrap_or(0);
+        let mut kept: Vec<Item<'a>> = self
+            .landing
+            .as_ref()
+            .map(landing_item)
+            .into_iter()
+            .collect();
+        let landing = kept.len();
         let mut listed = most_paths;
         loop {
-            let conflicts: Vec<Item<'a>> = self
-                .conflicts
-                .iter()
-                .map(|conflicts| conflicts_item(conflicts, listed))
-                .collect();
-            if let Some(line) = fitting(&conflicts, (&whole, &short), width) {
+            kept.truncate(landing);
+            kept.extend(
+                self.conflicts
+                    .iter()
+                    .map(|conflicts| conflicts_item(conflicts, listed)),
+            );
+            if let Some(line) = fitting(&kept, (&whole, &short), width) {
                 return line;
             }
             if listed <= 1 {
-                return joined(conflicts.iter().chain(&more(self.agents.len())));
+                return joined(kept.iter().chain(&more(self.agents.len())));
             }
             listed -= 1;
         }
     }
 }
 
-/// Returns the line of the `conflicts` and the agents, `whole` or `short`, that fits in
-/// `width`, as the line leaves things out; `None` when even the conflicts and the count of
-/// every agent do not fit.
+/// Returns the line of the `kept` items, the held landing merge and the conflicts, and the
+/// agents, `whole` or `short`, that fits in `width`, as the line leaves things out; `None` when
+/// even the kept items and the count of every agent do not fit.
 fn fitting<'a>(
-    conflicts: &[Item<'a>],
+    kept: &[Item<'a>],
     (whole, short): (&[Item<'a>], &[Item<'a>]),
     width: usize,
 ) -> Option<Line<'a>> {
@@ -238,17 +257,17 @@ fn fitting<'a>(
         items.iter().map(|item| item.width).sum::<usize>() + gaps
     };
     for agents in [whole, short] {
-        let items: Vec<&Item<'a>> = conflicts.iter().chain(agents).collect();
+        let items: Vec<&Item<'a>> = kept.iter().chain(agents).collect();
         if wide(&items) <= width {
             return Some(joined(items));
         }
     }
     let shown = (0..short.len()).rev();
-    for kept in shown {
-        let more = more(short.len() - kept);
-        let items: Vec<&Item<'a>> = conflicts
+    for listed_agents in shown {
+        let more = more(short.len() - listed_agents);
+        let items: Vec<&Item<'a>> = kept
             .iter()
-            .chain(short.iter().take(kept))
+            .chain(short.iter().take(listed_agents))
             .chain(&more)
             .collect();
         if wide(&items) <= width {
@@ -295,6 +314,16 @@ fn agent_item<'a>(agent: &StatusAgent<'a>, brought: Brought) -> Item<'a> {
         push_paths(&mut spans, agent.brought, Style::new());
     }
     Item::new(spans)
+}
+
+fn landing_item<'a>(landing: &StatusLanding<'a>) -> Item<'a> {
+    let warn = Style::new().fg(Theme::WARN);
+    Item::new(vec![
+        Span::styled(shown(landing.branch), Theme::title()),
+        Span::styled(" · ", Theme::muted()),
+        Span::styled("a merge waits for you: ", warn),
+        Span::styled(shown(landing.waits), warn),
+    ])
 }
 
 /// Returns the item of `conflicts`, listing at most `listed` of its paths, at least one.
@@ -858,6 +887,7 @@ mod tests {
             hints: &[("ctrl-space", "workspace")],
             waiting: None,
             status: StatusLine {
+                landing: None,
                 conflicts: &[],
                 agents: &agents,
             },
@@ -978,6 +1008,7 @@ mod tests {
             },
         ];
         let status = StatusLine {
+            landing: None,
             conflicts: &conflicts,
             agents: &agents,
         };
@@ -1011,12 +1042,57 @@ mod tests {
             more: 5,
         }];
         let status = StatusLine {
+            landing: None,
             conflicts: &counted,
             agents: &[],
         };
         assert_eq!(
             status_text(&status, 80),
             "conflicts from bob.claude: src/a.rs and 5 more"
+        );
+    }
+
+    #[test]
+    fn the_status_line_names_a_held_landing_merge_first_and_never_leaves_it_out() {
+        let conflicts = [StatusConflicts {
+            from: "bob.claude",
+            paths: &owned(&["src/a.rs", "src/b.rs"]),
+            more: 0,
+        }];
+        let agents = [StatusAgent {
+            slot: "bob.claude",
+            state: TeammateState::Done,
+            waits: None,
+            brought: &[],
+        }];
+        let status = StatusLine {
+            landing: Some(StatusLanding {
+                branch: "main",
+                waits: "changes agent settings",
+            }),
+            conflicts: &conflicts,
+            agents: &agents,
+        };
+        assert_eq!(
+            status_text(&status, 200),
+            "main · a merge waits for you: changes agent settings  conflicts from bob.claude: \
+             src/a.rs, src/b.rs  bob.claude done"
+        );
+        assert_eq!(
+            status_text(&status, 10),
+            "main · a merge waits for you: changes agent settings  conflicts from bob.claude: \
+             src/a.rs and 1 more  +1 more"
+        );
+        let status = StatusLine {
+            landing: Some(StatusLanding {
+                branch: "ma\x1b[2Jin",
+                waits: "changes agent settings",
+            }),
+            ..StatusLine::default()
+        };
+        assert_eq!(
+            status_text(&status, 80),
+            "ma?[2Jin · a merge waits for you: changes agent settings"
         );
     }
 
@@ -1029,6 +1105,7 @@ mod tests {
             brought: &owned(&["src/\u{202e}evil.rs"]),
         }];
         let status = StatusLine {
+            landing: None,
             conflicts: &[],
             agents: &agents,
         };

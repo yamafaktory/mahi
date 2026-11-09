@@ -6,6 +6,7 @@ use mahi_store::Store;
 use mahi_term::StatusConflicts;
 
 use crate::{
+    auto_merge,
     conflicts::{
         self,
         KeptConflicts,
@@ -19,11 +20,13 @@ use crate::{
 
 const SHOWN_PATHS: usize = 20;
 
-/// What the sync state of the user's agent holds that the status line shows: the teammates'
-/// agents whose turn waits for the user's keypress, the paths a merge left with conflict
-/// markers, and the files each teammate's merges brought since the user's last prompt.
+/// What the sync state of the user's agent holds that the status line shows: the landing
+/// branch whose merge waits for the user's keypress, the teammates' agents whose turn does,
+/// the paths a merge left with conflict markers, and the files each teammate's merges brought
+/// since the user's last prompt.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct SyncView {
+    landing: Option<String>,
     held: Vec<String>,
     conflicts: Option<Kept>,
     brought: Vec<(String, Vec<String>)>,
@@ -69,10 +72,15 @@ impl SyncView {
             })
             .unwrap_or_default();
         Self {
+            landing: auto_merge::held_landing(store, thread, own).map(|(from, _)| from.shown()),
             held,
             conflicts,
             brought,
         }
+    }
+
+    pub(crate) fn landing(&self) -> Option<&str> {
+        self.landing.as_deref()
     }
 
     /// Says whether a turn of the teammate's agent `slot` waits for the user's keypress.
@@ -120,9 +128,13 @@ mod tests {
     use super::*;
     use crate::{
         held::HeldSettings,
+        landed_branch::BranchRecord,
         note::Merged,
         palette::HELD_DETAIL,
-        source::Source,
+        source::{
+            LandingBranch,
+            Source,
+        },
         teammates::Teammates,
     };
 
@@ -210,6 +222,39 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn the_view_names_the_landing_branch_while_its_held_merge_is_the_last_landings() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let thread = ThreadId::random().unwrap();
+        let own: AgentSlot = "alice.claude".parse().unwrap();
+        let (tip, measured, later) = (
+            ObjectId::from_bytes_or_panic(&[1; 20]),
+            ObjectId::from_bytes_or_panic(&[2; 20]),
+            ObjectId::from_bytes_or_panic(&[3; 20]),
+        );
+        let record = |tip| BranchRecord {
+            remote: "up".to_owned(),
+            branch: format!("mahi/{thread}"),
+            tip,
+            landing: "main".to_owned(),
+            worktree: Some(measured),
+            gone: false,
+        };
+        let landing = Source::Landing(LandingBranch::new("up", "main").unwrap());
+        HeldSettings::new(tip, &paths(&["CLAUDE.md"]))
+            .keep(&held::file_for(&store, thread, (&own, &landing)))
+            .unwrap();
+        assert_eq!(SyncView::read(&store, thread, &own).landing(), None);
+        record(tip).write(&store, thread).unwrap();
+        let view = SyncView::read(&store, thread, &own);
+        assert_eq!(view.landing(), Some("main"));
+        assert_eq!(view.named().count(), 0);
+        record(later).write(&store, thread).unwrap();
+        assert_eq!(SyncView::read(&store, thread, &own).landing(), None);
     }
 
     #[test]

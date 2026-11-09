@@ -53,6 +53,7 @@ use mahi_term::{
     Segment,
     StatusAgent,
     StatusConflicts,
+    StatusLanding,
     StatusLine,
     TabBar,
     TabHit,
@@ -83,6 +84,7 @@ use crate::{
         REPORT_FD,
     },
     join::WAITING_FOR_HOST,
+    palette::HELD_DETAIL,
     sync_view::SyncView,
     teammates::Teammates,
     ui::{
@@ -1783,6 +1785,10 @@ impl Workspace {
             },
             waiting: self.waiting(),
             status: StatusLine {
+                landing: tab.sync.landing().map(|branch| StatusLanding {
+                    branch,
+                    waits: HELD_DETAIL,
+                }),
                 conflicts: &conflicts,
                 agents: &status,
             },
