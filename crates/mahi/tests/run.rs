@@ -5301,11 +5301,18 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             with_secrets_in_the_git_directory(&fixture);
             let script = "echo changed >> README; git status --short; echo status=$?; \
                           git log --oneline -1 >/dev/null; echo log=$?; \
-                          git remote -v; git config --list --show-origin; echo listed=$?";
+                          git remote -v; \
+                          git --no-pager config --list --show-origin; echo listed=$?";
             let output = fixture.mahi(&["run", "sh", "-c", script]);
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert_eq!(output.status.code(), Some(0), "{stdout}");
-            for expected in [" M README", "status=0", "log=0", "listed=0"] {
+            for expected in [
+                " M README",
+                "status=0",
+                "log=0",
+                "core.repositoryformatversion",
+                "listed=0",
+            ] {
                 assert!(stdout.contains(expected), "{expected} missing: {stdout}");
             }
             assert!(!stdout.contains(LEAKED_TOKEN), "{stdout}");
