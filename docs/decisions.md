@@ -497,3 +497,12 @@ transcript, session) as those of a participant `meta` does not list: they go in 
 never move. Refs already accepted stay. A teammate who never fetched them then does not see a
 former collaborator's past work. The other choices were to keep taking them, since sync never
 merges a watcher's work, or to refuse and report them.
+
+## D070 · 2026-11-09 · A joining collaborator's agent starts before the merges
+
+Chosen by the user (#88). `mahi join` starts the collaborator's agent at once, in a worktree at
+the thread's base, after its fetch from the remote. Sync counts the agent as idle from its
+start, so it merges the teammates' latest turn ends that it holds before the first turn, unless
+the user prompts first, and the next prompt carries the note. The join no longer asks the host
+for the snapshots, retrying for about 30 s, and merges them before the agent starts, as the
+design said before. The code already worked this way, so only the design text changed.
