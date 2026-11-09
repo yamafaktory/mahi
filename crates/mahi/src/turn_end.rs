@@ -71,7 +71,7 @@ fn unreported_file(store: &Store, thread: ThreadId, slot: &AgentSlot) -> PathBuf
 }
 
 pub(crate) fn unreported_name(program: &OsStr, profile: Option<&Profile>) -> Option<String> {
-    if profile.is_some_and(Profile::reports_turn_ends) {
+    if profile.and_then(Profile::turn_end_agent).is_some() {
         return None;
     }
     let name = Path::new(program).file_name().unwrap_or(program);

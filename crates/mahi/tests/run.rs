@@ -4545,7 +4545,8 @@ echo stray > "$CODEX_HOME/history.jsonl"
         let stderr = String::from_utf8_lossy(&invited.stderr);
         assert_eq!(invited.status.code(), Some(1), "{stderr}");
         let refusal = "tester.claude last ran without its profile, so it did not report when its \
-                       turns end; resume the thread without --no-profile, or invite a --watcher";
+                       turns end; resume the thread with Claude Code and its profile, or invite a \
+                       --watcher";
         assert!(stderr.contains(refusal), "{stderr}");
         assert!(!stderr.contains("Pairing code"), "{stderr}");
         let ended = fixture.mahi(&["end", &thread]);

@@ -1223,7 +1223,7 @@ impl Prepared {
     /// profile's hooks report its turns.
     fn first_state(&self) -> Option<TurnState> {
         self.profile
-            .filter(|profile| profile.reports_turn_ends())
+            .and_then(Profile::turn_end_agent)
             .map(|_| TurnState::Done)
     }
 
@@ -1472,7 +1472,7 @@ fn auto_merge(
     owner: Option<&ParticipantKey>,
     (git_dir, started): (&Path, &Started),
 ) -> Option<AutoMerge> {
-    profile.filter(|profile| profile.reports_turn_ends())?;
+    profile.and_then(Profile::turn_end_agent)?;
     Some(AutoMerge {
         git_dir: git_dir.to_path_buf(),
         thread: started.thread,
@@ -2963,7 +2963,7 @@ mod tests {
         let owner = setup.owner();
         let alice: ParticipantName = "alice".parse().unwrap();
         let claude = Profile::for_agent(OsStr::new("claude"));
-        assert!(claude.is_some_and(Profile::reports_turn_ends));
+        assert!(claude.and_then(Profile::turn_end_agent).is_some());
         let check = |user: (&ParticipantKey, &ParticipantName), program: &str, profile| {
             let meta = load_meta(&setup.store, setup.thread, &owner, 0).unwrap();
             may_run(&meta, setup.thread, user, (OsStr::new(program), profile))

@@ -126,9 +126,9 @@ pub(crate) enum InviteError {
     )]
     NoTurnEnds(AgentSlot),
     #[error(
-        "{0} last ran without its profile, so it did not report when its turns end; resume the thread without --no-profile, or invite a --watcher"
+        "{0} last ran without its profile, so it did not report when its turns end; resume the thread with {1} and its profile, or invite a --watcher"
     )]
-    RanWithoutProfile(AgentSlot),
+    RanWithoutProfile(AgentSlot, &'static str),
 }
 
 /// Who invites, with which keys, and how the ticket finds this machine.
@@ -290,11 +290,11 @@ fn check_turn_ends(
         .into_iter()
         .filter(|slot| slot.participant() == owner);
     for slot in owners {
-        if !Profile::reports_turn_ends_of(slot.agent().as_str()) {
+        let Some(agent) = Profile::turn_end_agent_of(slot.agent().as_str()) else {
             return Err(InviteError::NoTurnEnds(slot));
-        }
+        };
         if !turn_end::last_run_reported(store, thread, &slot) {
-            return Err(InviteError::RanWithoutProfile(slot));
+            return Err(InviteError::RanWithoutProfile(slot, agent));
         }
     }
     Ok(())
@@ -481,9 +481,18 @@ mod tests {
         turn_end::record_reporting(&store, owner.thread, &claude, Reporting::Unreported).unwrap();
         assert!(matches!(
             check(Role::Collaborator),
-            Err(InviteError::RanWithoutProfile(refused)) if refused == claude
+            Err(InviteError::RanWithoutProfile(refused, "Claude Code")) if refused == claude
         ));
         turn_end::record_reporting(&store, owner.thread, &claude, Reporting::Reported).unwrap();
+        assert!(check(Role::Collaborator).is_ok());
+        add_agent("alice.codex");
+        let codex = "alice.codex".parse().unwrap();
+        turn_end::record_reporting(&store, owner.thread, &codex, Reporting::Unreported).unwrap();
+        assert!(matches!(
+            check(Role::Collaborator),
+            Err(InviteError::RanWithoutProfile(refused, "Codex")) if refused == codex
+        ));
+        turn_end::record_reporting(&store, owner.thread, &codex, Reporting::Reported).unwrap();
         assert!(check(Role::Collaborator).is_ok());
         add_agent("bob.sh");
         assert!(check(Role::Collaborator).is_ok());

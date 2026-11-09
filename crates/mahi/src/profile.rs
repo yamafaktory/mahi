@@ -145,11 +145,11 @@ impl Profile {
         }
     }
 
-    /// Says whether the agent's hooks report its turn ends: the built-in profiles' do.
-    pub(crate) fn reports_turn_ends(&self) -> bool {
+    pub(crate) fn turn_end_agent(&self) -> Option<&'static str> {
         match self.install {
-            Install::ClaudeCode | Install::Codex => true,
-            Install::Files(_) => false,
+            Install::ClaudeCode => Some("Claude Code"),
+            Install::Codex => Some("Codex"),
+            Install::Files(_) => None,
         }
     }
 }
@@ -435,8 +435,8 @@ impl Profile {
         profiles().iter().map(|profile| profile.program.as_str())
     }
 
-    pub(crate) fn reports_turn_ends_of(program: &str) -> bool {
-        Self::for_agent(OsStr::new(program)).is_some_and(Self::reports_turn_ends)
+    pub(crate) fn turn_end_agent_of(program: &str) -> Option<&'static str> {
+        Self::for_agent(OsStr::new(program)).and_then(Self::turn_end_agent)
     }
 
     /// Returns the profile for the agent program `program`, found by its file name.

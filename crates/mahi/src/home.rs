@@ -1168,7 +1168,7 @@ impl Agents {
     fn offers(self, program: &str) -> bool {
         match self {
             Self::Any => true,
-            Self::ReportingTurnEnds => Profile::reports_turn_ends_of(program),
+            Self::ReportingTurnEnds => Profile::turn_end_agent_of(program).is_some(),
         }
     }
 
