@@ -323,7 +323,6 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 const PALETTE_WAIT: Duration = Duration::from_millis(200);
 const PALETTE_POLL: Duration = Duration::from_millis(10);
 const OUTPUT_READ: usize = 8192;
-const OUTPUT_BATCH: usize = 8 * OUTPUT_READ;
 const PALETTE_TICK: Duration = Duration::from_secs(1);
 const BROKEN_PIPE_CODE: i32 = 128 + 13;
 
@@ -2528,7 +2527,7 @@ fn copy_output(
     tap: Option<&OutputTap>,
     screen: (&Screen<impl Write, impl AgentTerminal>, &Activity),
 ) -> io::Result<()> {
-    let mut buffer = vec![0_u8; OUTPUT_BATCH];
+    let mut buffer = [0_u8; OUTPUT_READ];
     loop {
         match wait_for_output(reader, stop)? {
             Ready::Output => {
@@ -2551,7 +2550,7 @@ fn copy_output(
 }
 
 fn copy_chunk(
-    reader: &mut (impl Read + AsFd),
+    reader: &mut impl Read,
     buffer: &mut [u8],
     (progress, tap, (screen, activity)): (
         &AtomicU64,
@@ -2559,33 +2558,15 @@ fn copy_chunk(
         (&Screen<impl Write, impl AgentTerminal>, &Activity),
     ),
 ) -> io::Result<bool> {
-    let mut filled = 0;
-    while let Some(free) = buffer.get_mut(filled..(filled + OUTPUT_READ).min(buffer.len())) {
-        let read = match reader.read(free) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if filled > 0 => {
-                screen.output(buffer.get(..filled).unwrap_or_default())?;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-        if let Some(tap) = tap
-            && let Some(piece) = buffer.get(filled..filled + read)
-        {
-            tap.output(piece);
-        }
-        filled += read;
-        if filled + OUTPUT_READ > buffer.len() || !output_waiting(reader).unwrap_or(false) {
-            break;
-        }
-    }
-    let Some(chunk) = buffer.get(..filled).filter(|chunk| !chunk.is_empty()) else {
+    let read = reader.read(buffer)?;
+    let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
         return Ok(false);
     };
     activity.touched();
     screen.output(chunk)?;
+    if let Some(tap) = tap {
+        tap.output(chunk);
+    }
     progress.fetch_add(1, Ordering::Relaxed);
     Ok(true)
 }
@@ -3084,6 +3065,40 @@ mod tests {
 
         assert_eq!(outcome, Outcome::Exited(0));
         assert_eq!(*written.lock().unwrap(), b"first last words");
+    }
+
+    #[test]
+    fn output_longer_than_one_read_reaches_the_screen_whole_and_in_order() {
+        let (mut agent, mut terminal) = UnixStream::pair().unwrap();
+        let (_stop, stopped) = UnixStream::pair().unwrap();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let screen = Screen::new(
+            StallingOnce {
+                written: Arc::clone(&written),
+                stall: None,
+            },
+            StillTerminal,
+            PaletteKey::default(),
+        );
+        let sent: Vec<u8> = (0..OUTPUT_READ * 5 + 7)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let writer = {
+            let sent = sent.clone();
+            thread::spawn(move || agent.write_all(&sent).unwrap())
+        };
+        let progress = AtomicU64::new(0);
+
+        copy_output(
+            (&mut terminal, &stopped),
+            &progress,
+            None,
+            (&screen, &Activity::default()),
+        )
+        .unwrap();
+
+        writer.join().unwrap();
+        assert_eq!(*written.lock().unwrap(), sent);
     }
 
     fn executable(path: &Path) {
