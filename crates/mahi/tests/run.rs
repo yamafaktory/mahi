@@ -2279,7 +2279,8 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         parser.process(seen);
         let top = parser.screen().rows(0, 200).next().unwrap();
         let column = top.chars().position(|cell| cell == '+').unwrap() + 1;
-        write!(terminal, "\x1b[<0;{column};1M\x1b[<0;{column};1m").unwrap();
+        let click = format!("\x1b[<0;{column};1M\x1b[<0;{column};1m");
+        terminal.write_all(click.as_bytes()).unwrap();
     }
 
     #[test]
