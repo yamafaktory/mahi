@@ -3889,12 +3889,13 @@ echo stray > "$CODEX_HOME/history.jsonl"
             "printf 'first screen'; until [ -e go ]; do sleep 0.1; done; \
              printf ' then live output'; until [ -e done ]; do sleep 0.1; done",
         ]);
+        let host_log = fixture.root.join("host.log");
         let mahi = KillOnDrop(
             command
                 .env("MAHI_LIVE", "local")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(fs::File::create(&host_log).unwrap())
                 .spawn()
                 .unwrap(),
         );
@@ -3905,7 +3906,11 @@ echo stray > "$CODEX_HOME/history.jsonl"
             .path()
             .join("live")
             .join(thread.to_string());
-        wait_until("the host to publish its address", || published.exists());
+        assert!(
+            waited(WAIT, || published.exists()),
+            "timed out waiting for the host to publish its address; the host said:\n{}",
+            fs::read_to_string(&host_log).unwrap_or_default()
+        );
         let host = mahi_live::HostAddress::from_bytes(&fs::read(&published).unwrap()).unwrap();
         assert_eq!(host.node(), address.node());
         let viewer = LiveNode::bind_live(
@@ -5127,12 +5132,19 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         wait_until_within(what, WAIT, done);
     }
 
-    fn wait_until_within(what: &str, wait: Duration, mut done: impl FnMut() -> bool) {
+    fn waited(wait: Duration, mut done: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + wait;
         while !done() {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            if Instant::now() >= deadline {
+                return false;
+            }
             thread::sleep(Duration::from_millis(20));
         }
+        true
+    }
+
+    fn wait_until_within(what: &str, wait: Duration, done: impl FnMut() -> bool) {
+        assert!(waited(wait, done), "timed out waiting for {what}");
     }
 
     struct KillOnDrop(std::process::Child);
