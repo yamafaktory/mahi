@@ -671,8 +671,8 @@ impl Lander {
     ) -> Result<String, ToolError> {
         let mut call = landing::parse(arguments)?;
         let owner = self.me.participant();
-        if let Some(commit) = landing::controlled_commit(&call) {
-            return Ok(landing::control_characters(commit));
+        if let Some(refusal) = landing::message_refusal(&call) {
+            return Ok(refusal);
         }
         if self.desk.is_busy() {
             return Ok(landing::waiting(owner));
@@ -1191,7 +1191,19 @@ pub(crate) mod tests {
         };
         assert_eq!(
             lander.land(&store, &escaped, (base, &[])).unwrap(),
-            landing::control_characters(2)
+            "not landed: the message of commit 2 holds control characters; write it without them"
+        );
+        let Value::Object(reordered) = serde_json::json!({
+            "commits": [{ "message": "Add\u{202E}txt", "paths": [] }],
+            "title": "t",
+            "description": "d"
+        }) else {
+            panic!("the arguments are an object");
+        };
+        assert_eq!(
+            lander.land(&store, &reordered, (base, &[])).unwrap(),
+            "not landed: the message of commit 1 holds invisible or text direction characters; \
+             write it without them"
         );
 
         fs::write(

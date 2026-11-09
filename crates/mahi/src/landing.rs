@@ -237,12 +237,6 @@ pub(crate) fn identity_unset(key: &str, owner: &ParticipantName) -> String {
     )
 }
 
-pub(crate) fn control_characters(commit: usize) -> String {
-    format!(
-        "not landed: the message of commit {commit} holds control characters; write it without them"
-    )
-}
-
 pub(crate) fn no_landing_branch(landing: &str, remote: &impl Display) -> String {
     format!("the landing branch {landing} does not exist on {remote}")
 }
@@ -291,11 +285,19 @@ pub(crate) fn printable(text: &str) -> String {
         .collect()
 }
 
-pub(crate) fn controlled_commit(call: &Call) -> Option<usize> {
-    call.commits
-        .iter()
-        .position(|commit| commit.message.chars().any(is_control))
-        .map(|index| index + 1)
+pub(crate) fn message_refusal(call: &Call) -> Option<String> {
+    call.commits.iter().zip(1..).find_map(|(commit, number)| {
+        let held = if commit.message.chars().any(is_control) {
+            "control characters"
+        } else if commit.message.chars().any(mahi_core::is_invisible) {
+            "invisible or text direction characters"
+        } else {
+            return None;
+        };
+        Some(format!(
+            "not landed: the message of commit {number} holds {held}; write it without them"
+        ))
+    })
 }
 
 fn is_control(character: char) -> bool {
@@ -551,21 +553,48 @@ mod tests {
     }
 
     #[test]
-    fn the_first_commit_whose_message_holds_a_control_character_is_named() {
+    fn the_first_commit_whose_message_holds_a_control_or_invisible_character_is_refused() {
+        let control = |commit| {
+            format!(
+                "not landed: the message of commit {commit} holds control characters; write it \
+                 without them"
+            )
+        };
+        let invisible = |commit| {
+            format!(
+                "not landed: the message of commit {commit} holds invisible or text direction \
+                 characters; write it without them"
+            )
+        };
         assert_eq!(
-            controlled_commit(&call(&[("Add\n\n\tWhy.", &[]), ("Fix", &[])])),
+            message_refusal(&call(&[("Add\n\n\tWhy.", &[]), ("Fix é 中", &[])])),
             None
         );
         assert_eq!(
-            controlled_commit(&call(&[
+            message_refusal(&call(&[
                 ("Add", &[]),
                 ("Fix\u{1b}[2J", &[]),
                 ("Bell\u{7}", &[])
             ])),
-            Some(2)
+            Some(control(2))
         );
-        assert_eq!(controlled_commit(&call(&[("C1\u{9b}", &[])])), Some(1));
-        assert_eq!(controlled_commit(&call(&[("Line\r", &[])])), Some(1));
+        assert_eq!(
+            message_refusal(&call(&[("C1\u{9b}", &[])])),
+            Some(control(1))
+        );
+        assert_eq!(message_refusal(&call(&[("Line\r", &[])])), Some(control(1)));
+        assert_eq!(
+            message_refusal(&call(&[("Zero\u{200B}width", &[])])),
+            Some(invisible(1))
+        );
+        assert_eq!(
+            message_refusal(&call(&[("Add", &[]), ("Flip\u{202E}txt", &[])])),
+            Some(invisible(2))
+        );
+        assert_eq!(
+            message_refusal(&call(&[("Both\u{202E}\u{7}", &[])])),
+            Some(control(1))
+        );
     }
 
     #[test]
