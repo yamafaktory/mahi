@@ -1,6 +1,5 @@
 use gix::{
     ObjectId,
-    object::Kind,
     objs::tree::EntryMode,
 };
 use gix_imara_diff::{
@@ -12,7 +11,6 @@ use gix_imara_diff::{
 };
 
 use crate::store::{
-    MAX_TREE_BYTES,
     Store,
     StoreError,
 };
@@ -108,32 +106,18 @@ impl Store {
         {
             return Ok(Found::NotAFile);
         }
-        let mut current = tree;
-        for (index, part) in parts.iter().enumerate() {
-            self.bounded_size(current, Kind::Tree, MAX_TREE_BYTES)?;
-            let found = self.repo.find_tree(current)?;
-            let Some(entry) = found.find_entry(*part) else {
-                return Ok(Found::Missing);
-            };
-            let (mode, id) = (entry.mode(), entry.object_id());
-            if index + 1 < parts.len() {
-                if !mode.is_tree() {
-                    return Ok(Found::Missing);
-                }
-                current = id;
-                continue;
-            }
-            if !mode.is_blob_or_symlink() {
-                return Ok(Found::NotAFile);
-            }
-            return Ok(match self.read_blob(id, MAX_DIFFED_BYTES) {
-                Ok(bytes) => Found::File(bytes, mode),
-                Err(StoreError::TooLarge { .. }) => Found::TooLarge,
-                Err(StoreError::WrongObject { .. }) => Found::NotAFile,
-                Err(error) => return Err(error),
-            });
+        let Some((mode, id)) = self.tree_entry(tree, parts)? else {
+            return Ok(Found::Missing);
+        };
+        if !mode.is_blob_or_symlink() {
+            return Ok(Found::NotAFile);
         }
-        Ok(Found::NotAFile)
+        Ok(match self.read_blob(id, MAX_DIFFED_BYTES) {
+            Ok(bytes) => Found::File(bytes, mode),
+            Err(StoreError::TooLarge { .. }) => Found::TooLarge,
+            Err(StoreError::WrongObject { .. }) => Found::NotAFile,
+            Err(error) => return Err(error),
+        })
     }
 }
 

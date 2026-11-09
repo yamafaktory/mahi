@@ -12,7 +12,10 @@ use std::{
 use gix::{
     ObjectId,
     bstr::ByteSlice,
-    object::Kind,
+    object::{
+        Kind,
+        tree::EntryKind,
+    },
     objs::tree::EntryMode,
 };
 
@@ -221,34 +224,43 @@ impl Store {
     /// Returns [`StoreError::TooLarge`] if a tree is larger than 1 MiB or a link's target
     /// longer than 4096 bytes, or [`StoreError::Git`] if reading fails.
     pub fn entry_at(&self, tree: ObjectId, parts: &[&[u8]]) -> Result<PathEntry, StoreError> {
+        let Some((mode, id)) = self.tree_entry(tree, parts)? else {
+            return Ok(PathEntry::Missing);
+        };
+        Ok(if mode.is_tree() {
+            PathEntry::Directory
+        } else if mode.is_link() {
+            PathEntry::Link(self.read_blob(id, MAX_LINK_BYTES)?)
+        } else if mode.is_commit() {
+            PathEntry::Gitlink
+        } else {
+            PathEntry::File
+        })
+    }
+
+    pub(crate) fn tree_entry<P: AsRef<[u8]>>(
+        &self,
+        tree: ObjectId,
+        parts: impl IntoIterator<Item = P>,
+    ) -> Result<Option<(EntryMode, ObjectId)>, StoreError> {
         let mut current = tree;
-        let mut parts = parts.iter().peekable();
+        let mut parts = parts.into_iter().peekable();
         while let Some(part) = parts.next() {
             self.bounded_size(current, Kind::Tree, MAX_TREE_BYTES)?;
             let found = self.repo.find_tree(current)?;
-            let Some(entry) = found.find_entry(*part) else {
-                return Ok(PathEntry::Missing);
+            let Some(entry) = found.find_entry(part.as_ref()) else {
+                return Ok(None);
             };
             let (mode, id) = (entry.mode(), entry.object_id());
-            if mode.is_tree() {
-                current = id;
-                if parts.peek().is_none() {
-                    return Ok(PathEntry::Directory);
-                }
-                continue;
+            if parts.peek().is_none() {
+                return Ok(Some((mode, id)));
             }
-            if parts.peek().is_some() {
-                return Ok(PathEntry::Missing);
+            if !mode.is_tree() {
+                return Ok(None);
             }
-            return Ok(if mode.is_link() {
-                PathEntry::Link(self.read_blob(id, MAX_LINK_BYTES)?)
-            } else if mode.is_commit() {
-                PathEntry::Gitlink
-            } else {
-                PathEntry::File
-            });
+            current = id;
         }
-        Ok(PathEntry::Directory)
+        Ok(Some((EntryKind::Tree.into(), tree)))
     }
 
     /// Returns the `/`-separated path of every link in the tree `tree`, or `None` when the tree is deeper than [`MAX_SNAPSHOT_DEPTH`] or holds more

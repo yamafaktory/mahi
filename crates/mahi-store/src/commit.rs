@@ -56,7 +56,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::WrongObject`] if `base` or `source` is not a tree, or
+    /// Returns [`StoreError::WrongObject`] if `base` or `source`, or a directory on a path, is
+    /// not a tree, [`StoreError::TooLarge`] if a tree on a path is larger than 1 MiB, or
     /// [`StoreError::Git`] if a tree cannot be read or written.
     pub fn tree_with_paths<P: AsRef<[u8]>>(
         &self,
@@ -66,22 +67,21 @@ impl Store {
     ) -> Result<ObjectId, StoreError> {
         self.require_kind(base, Kind::Tree)?;
         self.require_kind(source, Kind::Tree)?;
-        let (source, old) = (self.repo.find_tree(source)?, self.repo.find_tree(base)?);
         let mut editor = self.repo.edit_tree(base)?;
-        let file = |tree: &gix::Tree<'_>, path: &[u8]| {
-            tree.lookup_entry(path.split(|byte| *byte == b'/'))
+        let file = |tree: ObjectId, path: &[u8]| {
+            self.tree_entry(tree, path.split(|byte| *byte == b'/'))
                 .map(|entry| {
                     entry
-                        .filter(|entry| !entry.mode().is_tree())
-                        .map(|entry| (EntryKind::from(entry.mode()), entry.object_id()))
+                        .filter(|(mode, _)| !mode.is_tree())
+                        .map(|(mode, id)| (EntryKind::from(mode), id))
                 })
         };
         let mut taken = Vec::with_capacity(paths.len());
         for path in paths {
             let path = BStr::new(path.as_ref());
-            match file(&source, path)? {
+            match file(source, path)? {
                 Some(entry) => taken.push((path, entry)),
-                None if file(&old, path)?.is_some() => {
+                None if file(base, path)?.is_some() => {
                     editor.remove(path)?;
                 }
                 None => {}
@@ -99,7 +99,8 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::WrongObject`] if `base` or `source` is not a tree, or
+    /// Returns [`StoreError::WrongObject`] if `base` or `source`, or a directory on a path, is
+    /// not a tree, [`StoreError::TooLarge`] if a tree on a path is larger than 1 MiB, or
     /// [`StoreError::Git`] if a tree cannot be read.
     pub fn kind_clashes<'path>(
         &self,
@@ -109,19 +110,18 @@ impl Store {
     ) -> Result<Vec<(&'path str, &'path str)>, StoreError> {
         self.require_kind(base, Kind::Tree)?;
         self.require_kind(source, Kind::Tree)?;
-        let (source, base) = (self.repo.find_tree(source)?, self.repo.find_tree(base)?);
         let mut file_at: HashMap<&str, bool> = HashMap::new();
         let mut clashes = Vec::new();
         for &path in paths {
-            let is_file = source
-                .lookup_entry(path.split('/'))?
-                .is_some_and(|entry| !entry.mode().is_tree());
+            let is_file = self
+                .tree_entry(source, path.split('/'))?
+                .is_some_and(|(mode, _)| !mode.is_tree());
             if !is_file {
                 continue;
             }
-            let mut clash = base
-                .lookup_entry(path.split('/'))?
-                .is_some_and(|entry| entry.mode().is_tree())
+            let mut clash = self
+                .tree_entry(base, path.split('/'))?
+                .is_some_and(|(mode, _)| mode.is_tree())
                 .then_some(path);
             let parents = path.match_indices('/').map(|(end, _)| &path[..end]);
             for parent in parents {
@@ -131,9 +131,9 @@ impl Store {
                 let is_file = if let Some(&known) = file_at.get(parent) {
                     known
                 } else {
-                    let known = base
-                        .lookup_entry(parent.split('/'))?
-                        .is_some_and(|entry| !entry.mode().is_tree());
+                    let known = self
+                        .tree_entry(base, parent.split('/'))?
+                        .is_some_and(|(mode, _)| !mode.is_tree());
                     file_at.insert(parent, known);
                     known
                 };
@@ -151,15 +151,12 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::WrongObject`] if `tree` is not a tree, or [`StoreError::Git`] if a
-    /// tree cannot be read.
+    /// Returns [`StoreError::WrongObject`] if `tree`, or a directory on `path`, is not a tree,
+    /// [`StoreError::TooLarge`] if a tree on `path` is larger than 1 MiB, or
+    /// [`StoreError::Git`] if a tree cannot be read.
     pub fn object_at(&self, tree: ObjectId, path: &str) -> Result<Option<ObjectId>, StoreError> {
         self.require_kind(tree, Kind::Tree)?;
-        Ok(self
-            .repo
-            .find_tree(tree)?
-            .lookup_entry(path.split('/'))?
-            .map(|entry| entry.object_id()))
+        Ok(self.tree_entry(tree, path.split('/'))?.map(|(_, id)| id))
     }
 
     /// Writes a commit of `tree` on `parent` by `identity`, its message `message` with
@@ -324,6 +321,37 @@ mod tests {
         let gone = store.tree_with_paths(nested, flat, &["a/c"]).unwrap();
         assert_eq!(gone, tree(&store, &[]));
         assert_eq!(store.tree_with_paths(gone, flat, &["a"]).unwrap(), flat);
+    }
+
+    #[test]
+    fn a_directory_that_became_a_gitlink_lands_without_the_file_it_held() {
+        let (_dir, store) = store();
+        let foreign = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        let directory = tree(&store, &[("sub/x", EntryKind::Blob, b"x")]);
+        let gitlink = raw_tree(&store, &[("sub", EntryKind::Commit, foreign)]);
+        let paths = ["sub", "sub/x"];
+        assert_eq!(
+            store.tree_with_paths(directory, gitlink, &paths).unwrap(),
+            gitlink
+        );
+        assert_eq!(
+            store.tree_with_paths(gitlink, directory, &paths).unwrap(),
+            directory
+        );
+        assert_eq!(
+            store.tree_with_paths(gitlink, gitlink, &paths).unwrap(),
+            gitlink
+        );
+        assert_eq!(
+            store.kind_clashes(gitlink, directory, &paths).unwrap(),
+            [("sub/x", "sub")]
+        );
+        assert_eq!(
+            store.kind_clashes(directory, gitlink, &paths).unwrap(),
+            [("sub", "sub")]
+        );
+        assert_eq!(store.object_at(gitlink, "sub/x").unwrap(), None);
+        assert_eq!(store.object_at(gitlink, "sub").unwrap(), Some(foreign));
     }
 
     #[test]

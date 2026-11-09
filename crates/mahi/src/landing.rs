@@ -484,6 +484,26 @@ mod tests {
         }
     }
 
+    fn alice() -> Identity {
+        Identity {
+            name: "Alice".to_owned(),
+            email: "alice@example.com".to_owned(),
+            seconds: 1_793_000_000,
+            offset: 0,
+        }
+    }
+
+    fn base_on_head(store: &Store, base: ObjectId) -> ObjectId {
+        store
+            .write_commit(
+                (base, store.head_commit().unwrap()),
+                ("Base", ""),
+                &alice(),
+                &Signing,
+            )
+            .unwrap()
+    }
+
     fn owned(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|path| (*path).to_owned()).collect()
     }
@@ -627,20 +647,7 @@ mod tests {
         let changed = changed(&store, (base, worktree)).unwrap();
         assert_eq!(changed.paths, owned(&["a.txt", "old.txt"]));
         assert_eq!(changed.gone, [b"old\xff".to_vec()]);
-        let identity = Identity {
-            name: "Alice".to_owned(),
-            email: "alice@example.com".to_owned(),
-            seconds: 1_793_000_000,
-            offset: 0,
-        };
-        let landed = store
-            .write_commit(
-                (base, store.head_commit().unwrap()),
-                ("Base", ""),
-                &identity,
-                &Signing,
-            )
-            .unwrap();
+        let (identity, landed) = (alice(), base_on_head(&store, base));
         let mut planned = call(&[("Edit a", &["a.txt"]), ("Rename old", &["old.txt"])]);
         let built = build(
             &store,
@@ -655,6 +662,65 @@ mod tests {
         let first = store.commit_tree(built[0]).unwrap();
         assert_eq!(store.changed_paths(base, first, 10).unwrap().paths.len(), 1);
         assert_eq!(store.commit_tree(built[1]).unwrap(), worktree);
+    }
+
+    #[test]
+    fn a_directory_that_became_a_gitlink_lands_without_the_file_it_held() {
+        let (_dir, store) = repository_on_main();
+        let foreign = ObjectId::from_hex(b"1111111111111111111111111111111111111111").unwrap();
+        let x = store.write_blob(b"x").unwrap();
+        let sub = store.write_tree(&[("x", EntryKind::Blob, x)]).unwrap();
+        let base = store.write_tree(&[("sub", EntryKind::Tree, sub)]).unwrap();
+        let worktree = store
+            .write_tree(&[("sub", EntryKind::Commit, foreign)])
+            .unwrap();
+        let (identity, landed) = (alice(), base_on_head(&store, base));
+        let landable = changed(&store, (base, worktree)).unwrap();
+        let named: Vec<&str> = landable.paths.iter().map(String::as_str).collect();
+        let mut planned = call(&[("Make sub a submodule", &named)]);
+        let built = build(
+            &store,
+            (landed, worktree),
+            &[],
+            &mut planned,
+            (ThreadId::random().unwrap(), &[]),
+            (&identity, &Signing),
+        )
+        .unwrap();
+        assert_eq!(built.len(), 1);
+        assert_eq!(store.commit_tree(built[0]).unwrap(), worktree);
+
+        let other = store.write_blob(b"upstream").unwrap();
+        let parent = store
+            .write_tree(&[
+                ("other.txt", EntryKind::Blob, other),
+                ("sub", EntryKind::Tree, sub),
+            ])
+            .unwrap();
+        let expected = store
+            .write_tree(&[
+                ("other.txt", EntryKind::Blob, other),
+                ("sub", EntryKind::Commit, foreign),
+            ])
+            .unwrap();
+        assert_eq!(
+            onto(&store, (base, parent, worktree), &landable).unwrap(),
+            Onto::Merged(worktree)
+        );
+        assert_eq!(
+            store.tree_with_paths(parent, worktree, &named).unwrap(),
+            expected
+        );
+
+        let edited = store.write_blob(b"x upstream").unwrap();
+        let edited = store.write_tree(&[("x", EntryKind::Blob, edited)]).unwrap();
+        let parent = store
+            .write_tree(&[("sub", EntryKind::Tree, edited)])
+            .unwrap();
+        assert_eq!(
+            onto(&store, (base, parent, worktree), &landable).unwrap(),
+            Onto::Conflicts(owned(&["sub", "sub/x"]))
+        );
     }
 
     #[test]
@@ -682,12 +748,7 @@ mod tests {
             "alice.claude".parse().unwrap(),
             "bob.codex".parse().unwrap(),
         ];
-        let identity = Identity {
-            name: "Alice".to_owned(),
-            email: "alice@example.com".to_owned(),
-            seconds: 1_793_000_000,
-            offset: 0,
-        };
+        let identity = alice();
         let mut planned = planned;
         let built = build(
             &store,
