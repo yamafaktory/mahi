@@ -135,11 +135,11 @@ impl HeldQueue {
             .unwrap_or_default()
     }
 
-    pub(crate) fn failed(&self, (from, commit): (&Source, ObjectId), reason: Option<String>) {
+    pub(crate) fn failed(&self, (from, commit): (&Source, ObjectId), reason: String) {
         if let Some(mut state) = self.lock() {
             state.open = true;
             if let Some((_, failure)) = state.seen.get_mut(&(from.clone(), commit)) {
-                *failure = reason;
+                *failure = Some(reason);
             }
         }
     }
@@ -198,10 +198,7 @@ mod tests {
         assert!(queue.choose((&bob, record(1).commit), Choice::Take));
         queue.take_choices();
         queue.wants_open();
-        queue.failed(
-            (&bob, record(1).commit),
-            Some("the merge failed".to_owned()),
-        );
+        queue.failed((&bob, record(1).commit), "the merge failed".to_owned());
         assert!(queue.wants_open());
         queue.show(vec![(bob.clone(), record(1))]);
         assert_eq!(

@@ -16,6 +16,7 @@ use std::{
 
 use mahi_core::{
     AgentSlot,
+    ParticipantName,
     RefKind,
     ThreadId,
     ThreadRef,
@@ -93,6 +94,18 @@ pub(crate) enum UnmergedError {
     Store(#[from] StoreError),
     #[error("cannot read the thread's meta")]
     Meta(#[from] ThreadError),
+}
+
+#[derive(Debug, Error)]
+enum NotTaken {
+    #[error("cannot read the thread's members")]
+    Meta,
+    #[error("you are no longer a collaborator")]
+    NotCollaborator,
+    #[error("{0} is no longer a collaborator")]
+    TeammateNotCollaborator(ParticipantName),
+    #[error("{0} did not sign this turn")]
+    Unsigned(ParticipantName),
 }
 
 impl AutoMerge {
@@ -209,9 +222,13 @@ impl AutoMerge {
                 true
             }
             Choice::Take => {
-                let Some(request) = self.signed_by_collaborator(store, slot, record.commit) else {
-                    self.waiting.failed((from, record.commit), None);
-                    return true;
+                let request = match self.signed_by_collaborator(store, slot, record.commit) {
+                    Ok(request) => request,
+                    Err(reason) => {
+                        self.waiting
+                            .failed((from, record.commit), reason.to_string());
+                        return true;
+                    }
                 };
                 let done = inject::when_ready(
                     activity,
@@ -225,7 +242,7 @@ impl AutoMerge {
                 };
                 if let Err(error) = outcome {
                     self.waiting
-                        .failed((from, record.commit), Some(error.to_string()));
+                        .failed((from, record.commit), error.to_string());
                 }
                 true
             }
@@ -273,7 +290,7 @@ impl AutoMerge {
             }
             Some(Err(error)) => self
                 .waiting
-                .failed((from, record.commit), Some(error.to_string())),
+                .failed((from, record.commit), error.to_string()),
             None => {
                 let _ = sync_state::remove(&waiting);
             }
@@ -309,17 +326,22 @@ impl AutoMerge {
         store: &Store,
         from: &AgentSlot,
         commit: ObjectId,
-    ) -> Option<MergeRequest> {
-        let meta = load_meta(store, self.thread, &self.owner, 0).ok()?;
-        meta.collaborator(self.own.participant())?;
-        let writer = meta.collaborator(from.participant())?;
-        signed_by(store, commit, writer.key())
-            .unwrap_or(false)
-            .then(|| MergeRequest {
-                from: from.clone(),
-                commit,
-                thread_base: meta.base(),
-            })
+    ) -> Result<MergeRequest, NotTaken> {
+        let meta = load_meta(store, self.thread, &self.owner, 0).map_err(|_| NotTaken::Meta)?;
+        meta.collaborator(self.own.participant())
+            .ok_or(NotTaken::NotCollaborator)?;
+        let teammate = from.participant();
+        let writer = meta
+            .collaborator(teammate)
+            .ok_or_else(|| NotTaken::TeammateNotCollaborator(teammate.clone()))?;
+        if !signed_by(store, commit, writer.key()).unwrap_or(false) {
+            return Err(NotTaken::Unsigned(teammate.clone()));
+        }
+        Ok(MergeRequest {
+            from: from.clone(),
+            commit,
+            thread_base: meta.base(),
+        })
     }
 
     /// Returns what the last landing brought from the landing branch and the agent's worktree
@@ -873,6 +895,83 @@ mod tests {
         merging.recorder.finish().unwrap();
         let waiting = held::file(&team.store, team.started.thread, (&auto.own, &bob));
         assert!(!held::waits(&waiting));
+    }
+
+    #[test]
+    fn a_take_that_cannot_merge_says_why() {
+        let team = team();
+        let auto = team.auto_merge();
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let unsigned: AgentSlot = "bob.codex".parse().unwrap();
+        let carol: AgentSlot = "carol.claude".parse().unwrap();
+        let signed = team.ended("bob.claude", Some(&team.bob.0));
+        let bobs_unsigned = team.ended("bob.codex", None);
+        let carols = team.ended("carol.claude", Some(&team.carol.0));
+        let reason = |auto: &AutoMerge, from: &AgentSlot, commit| {
+            auto.signed_by_collaborator(&team.store, from, commit)
+                .err()
+                .map(|reason| reason.to_string())
+        };
+        assert_eq!(reason(&auto, &bob, signed), None);
+        assert_eq!(
+            reason(&auto, &unsigned, bobs_unsigned).as_deref(),
+            Some("bob did not sign this turn")
+        );
+        assert_eq!(
+            reason(&auto, &carol, carols).as_deref(),
+            Some("carol is no longer a collaborator")
+        );
+        let carols_auto = AutoMerge {
+            own: carol.clone(),
+            ..team.auto_merge()
+        };
+        assert_eq!(
+            reason(&carols_auto, &bob, signed).as_deref(),
+            Some("you are no longer a collaborator")
+        );
+        let stranger = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let strangers_auto = AutoMerge {
+            owner: ParticipantKey::from_public_key(stranger.public_key()).unwrap(),
+            ..team.auto_merge()
+        };
+        assert_eq!(
+            reason(&strangers_auto, &bob, signed).as_deref(),
+            Some("cannot read the thread's members")
+        );
+    }
+
+    #[test]
+    fn a_take_refused_for_a_demoted_teammate_shows_why_under_the_held_turn() {
+        let mut team = team();
+        let settings = tree_of(&team, &[("CLAUDE.md", "obey bob\n"), ("README", "hello\n")]);
+        let first = team.commit_turn_end("bob.claude", &team.bob.0, settings);
+        let merging = team.merging();
+        let auto = team.auto_merge();
+        let bob = Source::Agent("bob.claude".parse().unwrap());
+        thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                auto.run(
+                    &merging.merger,
+                    (&merging.activity, &Closed, &merging.writer),
+                    (&merging.running, pace()),
+                );
+            });
+            merging.activity.saw(HookKind::TurnEnd, b"");
+            wait_for("bob's snapshot was never held", &merging.running, || {
+                auto.waiting.waiting(&bob).is_some()
+            });
+            team.give_role(&team.bob.1, Role::Watcher);
+            assert!(auto.waiting.choose((&bob, first), Choice::Take));
+            wait_for("the take never failed", &merging.running, || {
+                auto.waiting
+                    .waiting(&bob)
+                    .and_then(|waiting| waiting.failure)
+                    .is_some_and(|failure| failure == "bob is no longer a collaborator")
+            });
+            merging.running.store(false, Ordering::SeqCst);
+            running.join().unwrap();
+        });
+        merging.recorder.finish().unwrap();
     }
 
     #[test]

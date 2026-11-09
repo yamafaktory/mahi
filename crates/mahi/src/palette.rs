@@ -1024,7 +1024,7 @@ mod tests {
         waiting.show(vec![(bob.clone(), record.clone())]);
         waiting.failed(
             (&bob, record.commit),
-            Some("the merge write went over its limit".to_owned()),
+            "the merge write went over its limit".to_owned(),
         );
         waiting.show(vec![(bob, record)]);
         screen.open().unwrap();
