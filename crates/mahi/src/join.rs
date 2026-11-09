@@ -232,6 +232,10 @@ pub(crate) enum JoinError {
         "{0} added you to thread {1} as a collaborator, so you join it with your agent: mahi join <ticket> -- claude, or -- codex"
     )]
     CollaboratorWithoutAgent(ParticipantName, ThreadId),
+    #[error(
+        "{0} made you a watcher in thread {1} while you joined, so your agent does not run; ask {0} for a new code to watch"
+    )]
+    WatcherWhileJoining(ParticipantName, ThreadId),
 }
 
 /// What a viewer shows: the screen of one agent of the participant it follows, rebuilt in its
@@ -672,8 +676,13 @@ fn current_meta(
 ) -> Result<VerifiedMeta, JoinError> {
     let meta = load_meta(store, ticket.thread(), ticket.owner(), joined.generation())
         .map_err(JoinError::Pin)?;
-    joining(command, &meta, own)?;
-    Ok(meta)
+    match joining(command, &meta, own)? {
+        Joining::Agent => Ok(meta),
+        Joining::Watch => Err(JoinError::WatcherWhileJoining(
+            meta.owner().clone(),
+            meta.thread(),
+        )),
+    }
 }
 
 fn check_turn_ends(options: &LaunchOptions, program: &OsStr) -> Result<(), JoinError> {
@@ -1554,15 +1563,28 @@ mod tests {
             joined.generation(),
             *bob.node(),
         );
-        let command = join_command(&[&ticket.to_string(), "--", "claude"]);
-        let current = |joined: &VerifiedMeta| {
-            current_meta(&command, (&setup.store, &ticket), joined, *bob.node())
+        let with_ticket = join_command(&[&ticket.to_string(), "--", "claude"]);
+        let with_code = join_command(&["--", "claude"]);
+        let current = |command: &JoinCommand, joined: &VerifiedMeta| {
+            current_meta(command, (&setup.store, &ticket), joined, *bob.node())
         };
-        assert!(current(&joined).is_ok());
+        assert!(current(&with_ticket, &joined).is_ok());
+        assert!(current(&with_code, &joined).is_ok());
         sign_participant(&setup, bob.clone().with_role(Role::Watcher));
         assert!(matches!(
-            current(&joined),
+            current(&with_ticket, &joined),
             Err(JoinError::WatcherWithAgent(..))
         ));
+        let refused = current(&with_code, &joined).unwrap_err().to_string();
+        assert_eq!(
+            refused,
+            format!(
+                "{} made you a watcher in thread {} while you joined, so your agent does not run; \
+                 ask {} for a new code to watch",
+                joined.owner(),
+                setup.thread,
+                joined.owner()
+            )
+        );
     }
 }
