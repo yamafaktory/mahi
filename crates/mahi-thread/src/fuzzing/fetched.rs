@@ -80,7 +80,7 @@ struct People {
     participants: [Participant; 3],
 }
 
-fn person(seed: u8, name: &str) -> (PrivateKey, Participant) {
+fn person(seed: u8, name: &str, role: Role) -> (PrivateKey, Participant) {
     let key = PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]));
     let public = ParticipantKey::from_public_key(key.public_key()).expect("an ed25519 key");
     let node = NodeId::from_bytes(
@@ -97,14 +97,14 @@ fn person(seed: u8, name: &str) -> (PrivateKey, Participant) {
         node,
     )
     .expect("a valid participant")
-    .with_role(Role::Collaborator);
+    .with_role(role);
     (key, participant)
 }
 
-fn people() -> People {
-    let (owner_key, owner) = person(1, NAMES[0]);
-    let (bob_key, bob) = person(2, NAMES[1]);
-    let (eve_key, eve) = person(3, NAMES[2]);
+fn people(roles: [Role; 3]) -> People {
+    let (owner_key, owner) = person(1, NAMES[0], roles[0]);
+    let (bob_key, bob) = person(2, NAMES[1], roles[1]);
+    let (eve_key, eve) = person(3, NAMES[2], roles[2]);
     People {
         keys: [owner_key, bob_key, eve_key],
         participants: [owner, bob, eve],
@@ -235,7 +235,18 @@ fn fetched_meta(
             1,
             ObjectId::null(gix_hash::Kind::Sha1),
             ParticipantName::new(NAMES[2]).expect("a valid name"),
-            people.participants.to_vec(),
+            people
+                .participants
+                .iter()
+                .cloned()
+                .map(|listed| {
+                    if listed.name().as_str() == NAMES[2] {
+                        listed.with_role(Role::Collaborator)
+                    } else {
+                        listed
+                    }
+                })
+                .collect(),
             PrivateMeta::new("fuzz", "main").expect("a valid title"),
         )
         .expect("a valid draft")
@@ -336,14 +347,15 @@ fn assert_moved_forward_by_its_participant(history: &History<'_>, slot: &Slot) {
 }
 
 /// Builds a thread whose `meta` lists its owner and bob, with agent histories for them and
-/// for eve, whom it does not list, then local and fetched versions of each ref related as
-/// `data` says (the same, ahead, behind, apart, signed by anyone or no one) and a fetched
+/// for eve, whom it does not list. The first byte makes bob and eve each a collaborator or a
+/// watcher. Then it builds local and fetched versions of each ref related as `data` says
+/// (the same, ahead, behind, apart, signed by anyone or no one) and a fetched
 /// `meta` that is the same, a newer one that also lists eve, one eve signed, or none, and
 /// accepts what was fetched on behalf of the owner or of no one. Each fetched commit names
 /// the thread, another one, none or both in its `Mahi-Thread` trailer. It checks what accepting
 /// promises: when it fails no ref moved; a ref of the local participant, or of one the
-/// resulting `meta` does not list, never moves; a ref that moves goes to the fetched commit,
-/// forward from where it was, through commits its participant signed; and a snapshots ref
+/// resulting `meta` does not list or lists as a watcher, never moves; a ref that moves goes
+/// to the fetched commit, forward from where it was, through commits its participant signed; and a snapshots ref
 /// that moves goes to a tip that names the thread alone, through no commit naming another.
 ///
 /// # Panics
@@ -354,7 +366,20 @@ pub fn fetched(data: &[u8]) {
     let mut input = data.iter().copied();
     let mut next = || input.next().unwrap_or(0);
     let store = scratch_store();
-    let people = people();
+    let role = |collaborates: bool| {
+        if collaborates {
+            Role::Collaborator
+        } else {
+            Role::Watcher
+        }
+    };
+    let choice = next();
+    let roles = [
+        Role::Collaborator,
+        role(choice & 1 == 0),
+        role(choice & 2 == 0),
+    ];
+    let people = people(roles);
     let thread = ThreadId::from_bytes(THREAD);
     let key = ThreadKey::generate();
     let first = draft(&people, 0, LISTED);
@@ -412,6 +437,7 @@ pub fn fetched(data: &[u8]) {
             slot.who < LISTED || eve_listed,
             "an unlisted participant's ref moved"
         );
+        assert_eq!(roles[slot.who], Role::Collaborator, "a watcher's ref moved");
         assert_eq!(
             now, slot.fetched,
             "a ref moved somewhere other than the fetched commit"

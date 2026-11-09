@@ -81,7 +81,8 @@ pub struct Accepted {
     /// The thread refs whose local and fetched histories went apart; the local one is kept.
     pub diverged: Vec<ThreadRef>,
     /// The fetched refs left alone: the local participant's own, those of a participant the
-    /// signed `meta` does not list, and `state`, whose writers are not settled yet.
+    /// signed `meta` does not list or lists as a watcher, and `state`, whose writers are not
+    /// settled yet.
     pub skipped: Vec<ThreadRef>,
     /// The fetched refs that could not be checked or moved, or that add a commit their
     /// participant did not sign, with why.
@@ -99,21 +100,21 @@ enum Advance {
 
 /// Accepts the refs [`Store::fetch_thread`] fetched for `thread`, after checking them, on
 /// behalf of the participant `local`, whose own refs are left alone; with no `local`, as when
-/// the user takes their own refs from another machine, every listed participant's are taken.
+/// the user takes their own refs from another machine, every collaborator's are taken.
 ///
 /// The fetched `meta` comes first. Its document must be the thread's and signed by
 /// `trusted_owner`; a newer generation than the local one, or the same document, then becomes
 /// the local `meta`, under the pin's lock, which refuses another document of a generation
 /// already seen. An older fetched document leaves the local one in place. Then each agent ref
-/// of a participant the resulting `meta` lists, other than `local`, only moves forward: behind
-/// moves to the fetched commit, ahead stays, and a history that went apart stays and is
-/// reported. Moving forward also needs every commit the ref gains to be signed by the key that
-/// `meta` lists for the participant, so that no one else can write in their name, and, for a
-/// snapshots ref, its new tip to name the thread in its `Mahi-Thread` trailer and no commit it
-/// gains to name another. A ref that
-/// fails its checks is refused on its own, and the others go on. All the history walks
-/// together go through at most [`MAX_HISTORY_WALK`] commits; once that is spent, the remaining
-/// refs that need a walk are refused.
+/// of a participant the resulting `meta` lists as a collaborator, other than `local`, only
+/// moves forward: behind moves to the fetched commit, ahead stays, and a history that went
+/// apart stays and is reported. Moving forward also needs every commit the ref gains to be
+/// signed by the key that `meta` lists for the participant, so that no one else can write in
+/// their name, and, for a snapshots ref, its new tip to name the thread in its `Mahi-Thread`
+/// trailer and no commit it gains to name another. A ref that fails its checks is refused on
+/// its own, and the others go on. All the history walks together go through at most
+/// [`MAX_HISTORY_WALK`] commits; once that is spent, the remaining refs that need a walk are
+/// refused.
 ///
 /// # Errors
 ///
@@ -164,10 +165,13 @@ pub fn accept_fetched(
         let writer = slot
             .filter(|slot| Some(slot.participant()) != local)
             .and_then(|slot| {
-                current
-                    .as_ref()?
-                    .participants()
-                    .find(|listed| listed.name() == slot.participant())
+                current.as_ref()?.participants().find(|listed| {
+                    listed.name() == slot.participant()
+                        && match listed.role() {
+                            Role::Collaborator => true,
+                            Role::Watcher => false,
+                        }
+                })
             });
         let Some(writer) = writer else {
             accepted.skipped.push(thread_ref);
@@ -791,6 +795,70 @@ mod tests {
             setup.store.head(&old_plain).unwrap(),
             Some(signed_over_unsigned)
         );
+    }
+
+    #[test]
+    fn a_watchers_fetched_agent_refs_are_skipped_and_a_collaborators_are_taken() {
+        let setup = setup();
+        let (key, _) = created(&setup);
+        let carol = listed(&setup, &key, "carol", Role::Watcher);
+        let dave = listed(&setup, &key, "dave", Role::Collaborator);
+        let meta = ThreadRef::new(setup.thread, RefKind::Meta);
+        stage(&setup, &meta, setup.store.head(&meta).unwrap().unwrap());
+        let (watched, worked) = (
+            snapshots(&setup, "carol", "claude"),
+            snapshots(&setup, "dave", "claude"),
+        );
+        let transcript = ThreadRef::new(
+            setup.thread,
+            RefKind::Transcript(AgentSlot::new(
+                ParticipantName::new("carol").unwrap(),
+                AgentName::new("claude").unwrap(),
+            )),
+        );
+        stage(
+            &setup,
+            &watched,
+            commit_by(&setup, &carol, None, "f", b"carol"),
+        );
+        stage(
+            &setup,
+            &transcript,
+            commit_by(&setup, &carol, None, "t", b"carol"),
+        );
+        let first = commit_by(&setup, &dave, None, "f", b"dave");
+        stage(&setup, &worked, first);
+
+        let accepted = accept(&setup).unwrap();
+
+        assert_eq!(accepted.updated, std::slice::from_ref(&worked));
+        assert_eq!(accepted.skipped, [watched.clone(), transcript.clone()]);
+        assert!(accepted.refused.is_empty());
+        assert_eq!(setup.store.head(&watched).unwrap(), None);
+        assert_eq!(setup.store.head(&transcript).unwrap(), None);
+
+        let current = load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
+        let demoted = current
+            .participants()
+            .find(|listed| listed.name().as_str() == "dave")
+            .unwrap()
+            .clone()
+            .with_role(Role::Watcher);
+        let before = setup.store.head(&meta).unwrap().unwrap();
+        add_participant(&setup.store, setup.thread, &key, &setup.owner, demoted).unwrap();
+        stage(&setup, &meta, setup.store.head(&meta).unwrap().unwrap());
+        set_ref(&setup, &meta.to_string(), before);
+        stage(
+            &setup,
+            &worked,
+            commit_by(&setup, &dave, Some(first), "f", b"later"),
+        );
+
+        let accepted = accept(&setup).unwrap();
+
+        assert_eq!(accepted.updated, std::slice::from_ref(&meta));
+        assert!(accepted.skipped.contains(&worked));
+        assert_eq!(setup.store.head(&worked).unwrap(), Some(first));
     }
 
     #[test]

@@ -489,3 +489,11 @@ it would write: files added or changed. Such a file the worktree deleted, as aft
 a UTF-8 name, goes out in the landing's last commit without the agent naming it, so the
 landing branch matches the worktree and the refusal can always be cleared. The confirmation
 lists each such deletion under the last commit as `<path> (deleted, name not UTF-8)`.
+
+## D069 · 2026-11-09 · A fetch from the remote skips a watcher's agent refs
+
+Chosen by the user (#87). A fetch from the remote treats a watcher's agent refs (snapshots,
+transcript, session) as those of a participant `meta` does not list: they go in `skipped` and
+never move. Refs already accepted stay. A teammate who never fetched them then does not see a
+former collaborator's past work. The other choices were to keep taking them, since sync never
+merges a watcher's work, or to refuse and report them.
