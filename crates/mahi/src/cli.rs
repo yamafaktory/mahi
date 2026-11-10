@@ -169,7 +169,8 @@ pub(crate) struct HookCommand {
     /// What happened.
     #[arg(value_parser = hook_kind())]
     pub(crate) kind: HookKind,
-    /// Prints, as Claude Code's prompt hook reads it, what mahi adds as context to the prompt.
+    /// Prints, as Claude Code's and Codex's prompt hooks read it, what mahi adds as context to
+    /// the prompt.
     #[arg(long)]
     pub(crate) context: bool,
 }

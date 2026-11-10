@@ -136,8 +136,9 @@ struct Approvals {
 }
 
 impl Profile {
-    /// Says how the agent gets the note of what came into its worktree: Claude Code's prompt
-    /// hook adds it to the user's prompt, and any other agent calls `list_agents`.
+    /// Says how the agent's instructions tell it to get the note of what came into its
+    /// worktree: Claude Code's prompt hook adds it to the user's prompt, and any other agent
+    /// calls `list_agents`, Codex too, whose prompt hook adds it only once the user approved it.
     pub(crate) fn note_by(&self) -> NoteBy {
         match self.install {
             Install::ClaudeCode => NoteBy::PromptHook,
@@ -857,7 +858,15 @@ const CLAUDE_CODE_SETTINGS: &str = r#"{
 const CODEX_HOOKS: &str = r#"{
   "hooks": {
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook prompt" }] }
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$MAHI_BIN\" hook prompt --context",
+            "additionalContextLimit": 0
+          }
+        ]
+      }
     ],
     "PostToolUse": [
       { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook tool" }] }
@@ -1712,7 +1721,7 @@ content = "first\n"
     }
 
     #[test]
-    fn codex_hooks_report_prompts_tools_and_turn_ends_to_mahi() {
+    fn codex_hooks_report_prompts_tools_and_turn_ends_and_take_the_note() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         fs::create_dir(&state).unwrap();
@@ -1726,7 +1735,7 @@ content = "first\n"
         let hooks: serde_json::Value =
             serde_json::from_slice(&fs::read(state.join("hooks.json")).unwrap()).unwrap();
         for (event, kind) in [
-            ("UserPromptSubmit", "prompt"),
+            ("UserPromptSubmit", "prompt --context"),
             ("PostToolUse", "tool"),
             ("Stop", "turn-end"),
         ] {
@@ -1734,11 +1743,19 @@ content = "first\n"
             assert_eq!(hook["type"], "command");
             assert_eq!(hook["command"], format!("\"$MAHI_BIN\" hook {kind}"));
         }
+        let prompt = &hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0];
+        assert_eq!(prompt["additionalContextLimit"], 0);
         let mode = fs::metadata(state.join("hooks.json"))
             .unwrap()
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn codex_is_told_to_call_list_agents_since_its_prompt_hook_waits_for_approval() {
+        assert_eq!(codex_profile().note_by(), NoteBy::ListAgents);
+        assert_eq!(claude_code_profile().note_by(), NoteBy::PromptHook);
     }
 
     #[test]

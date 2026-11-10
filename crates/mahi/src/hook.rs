@@ -28,14 +28,17 @@ use std::{
     },
 };
 
-use mahi_agent::hook::{
-    self,
-    MAX_MESSAGE_BYTES,
-};
 pub(crate) use mahi_agent::hook::{
     HookKind,
     HookMessage,
     MAX_PAYLOAD_BYTES,
+};
+use mahi_agent::{
+    hook::{
+        self,
+        MAX_MESSAGE_BYTES,
+    },
+    payload,
 };
 use rustix::event::{
     PollFd,
@@ -129,8 +132,8 @@ fn asked(
     stream.write_all(&[1]).ok()
 }
 
-/// Returns `context` as Claude Code's `UserPromptSubmit` hook prints it, to add it to the
-/// user's prompt.
+/// Returns `context` as Claude Code's and Codex's `UserPromptSubmit` hooks print it, to add it
+/// to the user's prompt.
 pub(crate) fn prompt_context(context: &str) -> String {
     serde_json::json!({
         "hookSpecificOutput": {
@@ -230,6 +233,7 @@ fn serve_connections(
         activity.saw(message.kind, &message.payload);
         if message.kind == HookKind::Prompt
             && let Some(context) = context
+            && !payload::from_subagent(&message.payload)
         {
             answer(&mut stream, context);
         }
@@ -483,6 +487,33 @@ mod tests {
     }
 
     #[test]
+    fn a_subagents_prompt_hook_gets_no_context_and_leaves_it_for_the_agent() {
+        let kept = Arc::new(Kept::default());
+        *kept.text.lock().unwrap() = Some("merged bob.claude: ` a.rs `".to_owned());
+        let server = context_server(&kept);
+        let subagent = br#"{"prompt":"look","agent_id":"agent-1","agent_type":"explorer"}"#;
+        let started = Instant::now();
+        assert!(!ask(
+            &server.socket,
+            (HookKind::Prompt, &subagent[..]),
+            |_| Ok(())
+        ));
+        assert!(started.elapsed() < CONTEXT_WAIT);
+        assert_eq!(next(&server), message(HookKind::Prompt, subagent));
+        assert!(kept.taken.lock().unwrap().is_empty());
+        assert!(ask(
+            &server.socket,
+            (HookKind::Prompt, &br#"{"prompt":"fix"}"#[..]),
+            |_| Ok(())
+        ));
+        assert_eq!(
+            next(&server),
+            message(HookKind::Prompt, br#"{"prompt":"fix"}"#)
+        );
+        assert_eq!(*kept.taken.lock().unwrap(), ["merged bob.claude: ` a.rs `"]);
+    }
+
+    #[test]
     fn a_context_the_hook_could_not_print_or_did_not_confirm_is_not_taken() {
         let kept = Arc::new(Kept::default());
         *kept.text.lock().unwrap() = Some("merged bob.claude: ` a.rs `".to_owned());
@@ -512,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn the_context_prints_as_claude_codes_prompt_hook_reads_it() {
+    fn the_context_prints_as_the_prompt_hooks_read_it() {
         let printed: serde_json::Value =
             serde_json::from_str(&prompt_context("a \"quoted\" `note`\n")).unwrap();
         assert_eq!(

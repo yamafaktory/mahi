@@ -1,6 +1,6 @@
 //! The JSON payloads agents' hooks send mahi, in the shape Claude Code's and Codex's share: a
-//! prompt's `prompt`, a tool call's `tool_name` and `tool_input`, and Claude Code's
-//! notification's `notification_type`.
+//! prompt's `prompt`, a tool call's `tool_name` and `tool_input`, Claude Code's
+//! notification's `notification_type`, and Codex's `agent_id` for a subagent.
 
 use std::borrow::Cow;
 
@@ -96,6 +96,14 @@ pub fn asks_user(payload: &[u8]) -> bool {
     })
 }
 
+/// Returns whether a hook payload comes from a subagent the agent spawned, which Codex marks
+/// with an `agent_id`.
+#[must_use]
+pub fn from_subagent(payload: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(payload)
+        .is_ok_and(|value| value.get("agent_id").is_some_and(Value::is_string))
+}
+
 fn lossy(payload: &[u8]) -> String {
     kept(&String::from_utf8_lossy(payload))
 }
@@ -107,6 +115,14 @@ fn kept(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_payload_with_an_agent_id_comes_from_a_subagent() {
+        assert!(from_subagent(br#"{"prompt":"look","agent_id":"agent-1"}"#));
+        assert!(!from_subagent(br#"{"prompt":"fix"}"#));
+        assert!(!from_subagent(br#"{"prompt":"fix","agent_id":null}"#));
+        assert!(!from_subagent(b"not json"));
+    }
 
     #[test]
     fn prompts_and_tool_calls_are_read_from_hook_payloads() {

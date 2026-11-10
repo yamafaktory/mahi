@@ -613,3 +613,12 @@ Chosen by the user (#109). A code join from the home screen starts its agent as
 agent's tab refuses with D075's text: `alice made you a watcher in thread <id> while you joined,
 so your agent does not run; ask alice for a new code to watch`. The other choice was to keep
 D021's ticket text, which names a ticket the user never saw.
+
+## D085 · 2026-11-10 · Codex keeps calling `list_agents` for the note
+
+Chosen by the user (#59), building on D053. Codex's prompt hook now adds the note to the user's
+prompt, as Claude Code's does. Codex runs a changed hook only once the user approves it again, so
+its server instructions keep asking it to call `list_agents` at the start of each turn, and
+whichever comes first takes the note. The other choice was to give Codex Claude Code's
+instructions, which say that the user's next prompt carries the note, so the note would wait
+until the user approved the hook.
