@@ -5365,17 +5365,11 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
 
         fn serve_remote(fixture: &Fixture) -> (openssh::OpenSsh, PathBuf) {
             let server = openssh::start("ssh-ed25519", &[]);
-            let forced = server.dir.path().join("forced.sh");
-            let mut authorized =
-                fs::read_to_string(server.dir.path().join("authorized_keys")).unwrap();
-            let public = fixture.owner.to_openssh();
-            writeln!(authorized, "command=\"{}\" {public}", forced.display()).unwrap();
-            fs::write(server.dir.path().join("authorized_keys"), authorized).unwrap();
-            let host = fs::read_to_string(server.dir.path().join("host_key.pub")).unwrap();
+            server.authorize(fixture.owner.to_openssh());
             fs::create_dir_all(fixture.home.join(".ssh")).unwrap();
             fs::write(
                 fixture.home.join(".ssh/known_hosts"),
-                format!("[127.0.0.1]:{} {host}", server.port),
+                openssh::known_hosts_line(server.dir.path(), server.port),
             )
             .unwrap();
             let remote = fixture.root.join("remote.git");
@@ -5503,16 +5497,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             let (thread, _claude) = worked_thread(fixture);
             let (server, remote) = serve_remote(fixture);
             let bob = teammate(fixture, "bob");
-            let mut authorized =
-                fs::read_to_string(server.dir.path().join("authorized_keys")).unwrap();
-            writeln!(
-                authorized,
-                "command=\"{}\" {}",
-                server.dir.path().join("forced.sh").display(),
-                bob.key.to_openssh()
-            )
-            .unwrap();
-            fs::write(server.dir.path().join("authorized_keys"), authorized).unwrap();
+            server.authorize(bob.key.to_openssh());
             fs::create_dir_all(bob.home.join(".ssh")).unwrap();
             fs::copy(
                 fixture.home.join(".ssh/known_hosts"),

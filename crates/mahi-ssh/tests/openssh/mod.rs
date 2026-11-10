@@ -106,12 +106,11 @@ fn write_keys(dir: &Path, host_key_type: &str) {
     )
     .unwrap();
     std::fs::set_permissions(&forced, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let user_public = std::fs::read_to_string(user_key.with_extension("pub")).unwrap();
-    std::fs::write(
-        dir.join("authorized_keys"),
-        format!("command=\"{}\" {user_public}", forced.display()),
-    )
-    .unwrap();
+}
+
+pub(crate) fn known_hosts_line(dir: &Path, port: u16) -> String {
+    let host_public = std::fs::read_to_string(dir.join("host_key.pub")).unwrap();
+    format!("[127.0.0.1]:{port} {host_public}")
 }
 
 fn write_config(dir: &Path, port: u16, options: &[(&str, &str)]) {
@@ -173,10 +172,10 @@ pub(crate) fn start(host_key_type: &str, options: &[(&str, &str)]) -> OpenSsh {
         &[("SSH_AUTH_SOCK", &agent)],
     );
     wait_for("sshd", || TcpStream::connect(("127.0.0.1", port)).is_ok());
-    let host_public = std::fs::read_to_string(path("host_key.pub")).unwrap();
-    let known_hosts = KnownHosts::parse(&format!("[127.0.0.1]:{port} {host_public}"));
+    let known_hosts = KnownHosts::parse(&known_hosts_line(dir.path(), port));
     let user = run("id", &["-un"], &[]).trim().to_owned();
-    OpenSsh {
+    let user_public = std::fs::read_to_string(path("user_key.pub")).unwrap();
+    let server = OpenSsh {
         dir,
         port,
         known_hosts,
@@ -184,10 +183,26 @@ pub(crate) fn start(host_key_type: &str, options: &[(&str, &str)]) -> OpenSsh {
         user,
         sshd,
         ssh_agent,
-    }
+    };
+    server.authorize(&user_public);
+    server
 }
 
 impl OpenSsh {
+    pub(crate) fn authorize(&self, public: &str) {
+        let file = self.dir.path().join("authorized_keys");
+        let mut keys = std::fs::read_to_string(&file).unwrap_or_default();
+        let forced = self.dir.path().join("forced.sh");
+        writeln!(
+            keys,
+            "command=\"{}\" {}",
+            forced.display(),
+            public.trim_end()
+        )
+        .unwrap();
+        std::fs::write(file, keys).unwrap();
+    }
+
     pub(crate) fn url(&self, path: &Path) -> String {
         format!(
             "ssh://{}@127.0.0.1:{}{}",

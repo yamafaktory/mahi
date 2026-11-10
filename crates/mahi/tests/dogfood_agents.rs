@@ -4,6 +4,11 @@
 #![cfg(unix)]
 
 #[cfg(test)]
+#[path = "../../mahi-ssh/tests/openssh/mod.rs"]
+#[expect(dead_code, reason = "mahi-ssh's own tests use the rest of this helper")]
+mod openssh;
+
+#[cfg(test)]
 mod tests {
     use std::{
         env,
@@ -36,6 +41,8 @@ mod tests {
         exit_code,
     };
 
+    use super::openssh;
+
     const PASSPHRASE: &str = "dogfood-passphrase";
     const PASSPHRASE_PROMPT: &str = "Passphrase for your mahi key:";
     const SIZE: WindowSize = WindowSize {
@@ -45,6 +52,9 @@ mod tests {
     const CLAUDE_TASK: &str = "Add a subtract(a, b) function to calc.py, and a test_calc.py that \
                                checks add and subtract with plain asserts. Run it with python3 \
                                test_calc.py, then say in one sentence what you did.";
+    const LAND_TASK: &str = "Add a subtract(a, b) function to calc.py. Then land the thread with \
+                             mahi's land tool, as one commit with a short message, a title and a \
+                             description, and say in one sentence what you did.";
     const KEY_GAP: Duration = Duration::from_secs(2);
 
     struct World {
@@ -87,6 +97,18 @@ mod tests {
                 .env("USER", "tester")
                 .env("TERM", "xterm-256color")
                 .env("MAHI_LIVE", "off")
+        }
+
+        fn plain_command(&self, arguments: &[&str]) -> Command {
+            let mut command = Command::new(mahi_binary());
+            command
+                .args(arguments)
+                .current_dir(self.repo())
+                .env_clear()
+                .env("PATH", required_env("PATH"))
+                .env("HOME", self.home())
+                .env("XDG_CONFIG_HOME", self.home().join(".config"));
+            command
         }
 
         fn worktree(&self, thread: &str, agent: &str) -> PathBuf {
@@ -164,17 +186,24 @@ mod tests {
             &["add", "."],
             &["commit", "-q", "-m", "Start a tiny calculator"],
         ] {
-            run(Command::new("git")
-                .args(arguments)
-                .current_dir(&repo)
-                .env("HOME", &home)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1"));
+            git(&repo, arguments);
         }
         World {
             root,
             _agent: agent,
         }
+    }
+
+    fn git(dir: &Path, arguments: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {arguments:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
     }
 
     fn run(command: &mut Command) {
@@ -353,13 +382,8 @@ mod tests {
             false
         });
         init.quit(&[]);
-        let mut store = Command::new(mahi_binary())
-            .args(["credential", "add", "claude"])
-            .current_dir(world.repo())
-            .env_clear()
-            .env("PATH", required_env("PATH"))
-            .env("HOME", world.home())
-            .env("XDG_CONFIG_HOME", world.home().join(".config"))
+        let mut store = world
+            .plain_command(&["credential", "add", "claude"])
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
@@ -385,6 +409,68 @@ mod tests {
         thread
     }
 
+    fn serve_remote(world: &World, server: &openssh::OpenSsh) -> PathBuf {
+        server.authorize(&fs::read_to_string(world.root.path().join("id_dogfood.pub")).unwrap());
+        fs::create_dir_all(world.home().join(".ssh")).unwrap();
+        fs::write(
+            world.home().join(".ssh/known_hosts"),
+            openssh::known_hosts_line(server.dir.path(), server.port),
+        )
+        .unwrap();
+        let remote = world.root.path().join("remote.git");
+        fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-q", "--bare", "-b", "main"]);
+        git(
+            &world.repo(),
+            &["push", "-q", remote.to_str().unwrap(), "main"],
+        );
+        git(
+            &world.repo(),
+            &["remote", "add", "up", &server.url(&remote)],
+        );
+        let chosen = world
+            .plain_command(&["remote", "up", "--private"])
+            .status()
+            .unwrap();
+        assert!(chosen.success());
+        remote
+    }
+
+    fn claude_lands_a_new_thread(world: &World) -> String {
+        let mut claude = Terminal::start(world.command(&["run", "claude", LAND_TASK]));
+        let mut thread = String::new();
+        let (mut confirming, mut result, mut closed) = (None, None, false);
+        claude.drive(Duration::from_mins(15), |terminal| {
+            if thread.is_empty() && terminal.raw_text().contains("mahi: thread ") {
+                thread = thread_of(&terminal.raw_text());
+            }
+            let screen = terminal.screen();
+            assert!(
+                !screen.contains("Not pushed:"),
+                "the landing was not pushed; the screen was:\n{screen}"
+            );
+            if screen.contains("Enter pushes  Esc cancels") && shown_past_guard(&mut confirming) {
+                terminal.send("\r");
+            }
+            let pushed = screen.contains("Pushed ") && screen.contains("Esc closes");
+            if pushed && shown_past_guard(&mut result) {
+                closed |= terminal.send("\x1b");
+            }
+            closed && terminal.quiet_for(Duration::from_secs(20))
+        });
+        assert!(
+            !thread.is_empty(),
+            "mahi named no thread; the screen was:\n{}",
+            claude.screen()
+        );
+        claude.quit(&["/exit", "\r"]);
+        thread
+    }
+
+    fn shown_past_guard(since: &mut Option<Instant>) -> bool {
+        since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(1)
+    }
+
     fn its_work_passes_its_tests(world: &World, thread: &str) {
         let worktree = world.worktree(thread, ".claude");
         let tested = Command::new("python3")
@@ -401,22 +487,47 @@ mod tests {
         }
     }
 
-    #[test]
-    fn claude_works_in_a_new_thread_whose_tests_pass() {
+    fn claude_token() -> Vec<u8> {
         let file = env::var_os("MAHI_DOGFOOD_CLAUDE_TOKEN").map_or_else(
             || PathBuf::from(required_env("HOME")).join(".config/mahi-test-token"),
             PathBuf::from,
         );
-        let token = fs::read(&file).unwrap_or_else(|error| {
+        fs::read(&file).unwrap_or_else(|error| {
             panic!(
                 "cannot read a Claude Code setup token at {}: {error}; put one there with \
                  claude setup-token, or name its file in MAHI_DOGFOOD_CLAUDE_TOKEN",
                 file.display()
             )
-        });
+        })
+    }
+
+    #[test]
+    fn claude_works_in_a_new_thread_whose_tests_pass() {
+        let token = claude_token();
         let world = world();
         init_with_claude_token(&world, &token);
         let thread = claude_works_in_a_new_thread(&world);
         its_work_passes_its_tests(&world, &thread);
+    }
+
+    #[test]
+    fn claude_lands_its_thread_through_the_land_tool() {
+        let token = claude_token();
+        let world = world();
+        let server = openssh::start("ssh-ed25519", &[]);
+        init_with_claude_token(&world, &token);
+        let remote = serve_remote(&world, &server);
+        let thread = claude_lands_a_new_thread(&world);
+        let branch = format!("mahi/{thread}");
+        let main = git(&remote, &["rev-parse", "main"]);
+        assert_eq!(git(&remote, &["rev-parse", &format!("{branch}~1")]), main);
+        let message = git(&remote, &["log", "-1", "--format=%B", &branch]);
+        assert!(
+            message.contains(&format!("Thread: {thread}\n")),
+            "{message}"
+        );
+        assert!(message.contains("Agent: tester.claude\n"), "{message}");
+        let landed = git(&remote, &["show", &format!("{branch}:calc.py")]);
+        assert!(landed.contains("def subtract("), "{landed}");
     }
 }
