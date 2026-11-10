@@ -102,6 +102,11 @@ impl Activity {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_turn_open(&self) -> bool {
+        self.turn_open.load(Ordering::SeqCst)
+    }
+
     /// Notes output from the agent or keys from the user.
     pub(crate) fn touched(&self) {
         if let Ok(mut last) = self.last.lock() {

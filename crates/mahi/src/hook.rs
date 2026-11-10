@@ -230,10 +230,12 @@ fn serve_connections(
             dropped += 1;
             continue;
         };
+        if message.kind == HookKind::Prompt && payload::from_subagent(&message.payload) {
+            continue;
+        }
         activity.saw(message.kind, &message.payload);
         if message.kind == HookKind::Prompt
             && let Some(context) = context
-            && !payload::from_subagent(&message.payload)
         {
             answer(&mut stream, context);
         }
@@ -487,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subagents_prompt_hook_gets_no_context_and_leaves_it_for_the_agent() {
+    fn a_subagents_prompt_is_left_out_and_leaves_the_context_for_the_agent() {
         let kept = Arc::new(Kept::default());
         *kept.text.lock().unwrap() = Some("merged bob.claude: ` a.rs `".to_owned());
         let server = context_server(&kept);
@@ -499,7 +501,6 @@ mod tests {
             |_| Ok(())
         ));
         assert!(started.elapsed() < CONTEXT_WAIT);
-        assert_eq!(next(&server), message(HookKind::Prompt, subagent));
         assert!(kept.taken.lock().unwrap().is_empty());
         assert!(ask(
             &server.socket,
@@ -511,6 +512,27 @@ mod tests {
             message(HookKind::Prompt, br#"{"prompt":"fix"}"#)
         );
         assert_eq!(*kept.taken.lock().unwrap(), ["merged bob.claude: ` a.rs `"]);
+    }
+
+    #[test]
+    fn a_subagents_prompt_leaves_a_closed_turn_closed() {
+        let activity = Activity::default();
+        let (sender, deliveries) = mpsc::sync_channel(4);
+        let prompt = |payload: &[u8]| {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let length = u32::try_from(payload.len()).unwrap();
+            client
+                .write_all(&framed(b"prompt", length, payload))
+                .unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+            serve_connections(std::iter::once(Ok(server)), &sender, (&activity, None));
+        };
+        prompt(br#"{"prompt":"look","agent_id":"agent-1"}"#);
+        assert!(!activity.is_turn_open());
+        assert!(deliveries.try_recv().is_err());
+        prompt(br#"{"prompt":"fix"}"#);
+        assert!(activity.is_turn_open());
+        assert!(deliveries.try_recv().is_ok());
     }
 
     #[test]

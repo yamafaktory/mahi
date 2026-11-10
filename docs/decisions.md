@@ -622,3 +622,10 @@ its server instructions keep asking it to call `list_agents` at the start of eac
 whichever comes first takes the note. The other choice was to give Codex Claude Code's
 instructions, which say that the user's next prompt carries the note, so the note would wait
 until the user approved the hook.
+
+## D087 · 2026-11-10 · A Codex subagent's prompt is left out
+
+Chosen by the user (#115). Codex fires its prompt hook for each subagent it spawns, with an
+`agent_id` in the payload. mahi leaves such a prompt out: it is not recorded as the user's ask,
+changes no state and gets no note. The agent's own turn covers the subagent's work. The other choice
+was to record it marked as the subagent's prompt, which would change the transcript format.
