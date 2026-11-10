@@ -403,6 +403,7 @@ mod tests {
             worktree: None,
             from: None,
             gone: true,
+            answer: None,
         }
         .write(&store, thread)
         .unwrap();

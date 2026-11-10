@@ -507,6 +507,7 @@ mod tests {
             worktree: None,
             from: None,
             gone: true,
+            answer: None,
         };
         record.write(&store, thread).unwrap();
         assert_eq!(unmerged_work(&store, thread), None);

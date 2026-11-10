@@ -583,3 +583,25 @@ the worktree tree that landing measured its changed paths from. On `y`, the next
 from that tree again, so the last landing's paths count as changed and merge onto the landing
 branch's tip. The other choice was to walk back `mahi/<thread-id>` to the commit the last landing
 built on and measure from its tree, which could land paths that landing did not hold.
+
+## D081 · 2026-11-10 · `y` cancels the landing and tells the agent to land again
+
+Chosen by the user (#62), settling how D072's `y` lands the changes again. The agent's pending
+`land` call names commits for the new paths only, so `y` cancels it. The record notes the answer,
+and the agent's note reads: `<owner> cancelled your landing: the last landing's pull request was
+closed without a merge, so its paths count as changed again; call land again with commits that
+place them.` The next `land` call measures from the last landing's tree (D080). The other choice
+was to measure again at once and refuse the call with the paths its commits do not place.
+
+## D082 · 2026-11-10 · mahi remembers an `n` answer
+
+Chosen by the user (#62). On `n`, the record notes that the pull request was merged. Later `land`
+calls then skip the question until a landing pushes. A push writes a new record without the
+answer. A fetch that finds the branch back on the remote also clears the answer. The other choice
+was to ask on each call until a push.
+
+## D083 · 2026-11-10 · The question shows after the landing is built
+
+Chosen by the user (#62). A `land` call builds its landing first, with the fetch of the landing
+branch, and shows the question after. A refusal or a failed fetch therefore shows without the
+question. The other choice was to show the question at once and build the landing after `n`.

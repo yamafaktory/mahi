@@ -5838,6 +5838,100 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             git(remote, &["rev-parse", "main"])
         }
 
+        const LANDER_RELANDING: &str = r#"#!/bin/sh
+rm -f done relanded
+echo other > other.txt
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"land","arguments":{"commits":[{"message":"Add other","paths":["other.txt"]}],"title":"Add other","description":"Why."}}}' \
+  | "$MAHI_BIN" mcp
+start=$(date +%s)
+until [ -e relanded ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
+rm -f relanded
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"land","arguments":{"commits":[{"message":"Add the feature","paths":["feature.txt"]},{"message":"Add other","paths":["other.txt"]}],"title":"Add the feature again","description":"Why."}}}' \
+  | "$MAHI_BIN" mcp
+until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
+"#;
+
+        #[test]
+        fn y_after_a_pull_request_closed_without_a_merge_lands_its_paths_again() {
+            let fixture = fixture();
+            save_identity(&fixture);
+            let (_server, remote) = serve_remote(&fixture);
+            git(&fixture.repo, &["config", "user.name", "Alice Example"]);
+            git(
+                &fixture.repo,
+                &["config", "user.email", "alice@example.com"],
+            );
+            let lander = script(&fixture, "landing", "claude", LANDER);
+            let owner_config = fixture.home.join(".config");
+            let env = owner_env(&fixture, &owner_config);
+            let mut first = Driven::start(mahi_in_terminal(
+                &fixture.repo,
+                &["run", lander.to_str().unwrap()],
+                &env,
+            ));
+            land_with_enter(&mut first, &fixture, None);
+            let branches = git(
+                &remote,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "refs/heads/mahi/",
+                ],
+            );
+            let branch = branches.trim().to_owned();
+            let thread = branch.strip_prefix("mahi/").unwrap().to_owned();
+            git(
+                &fixture.repo,
+                &["push", "-q", remote.to_str().unwrap(), "main:main"],
+            );
+            let main = git(&remote, &["rev-parse", "main"]);
+            git(
+                &remote,
+                &["update-ref", "-d", &format!("refs/heads/{branch}")],
+            );
+
+            let relander = script(&fixture, "relanding", "claude", LANDER_RELANDING);
+            let mut second = Driven::start(mahi_in_terminal(
+                &fixture.repo,
+                &["resume", &thread, "--", relander.to_str().unwrap()],
+                &env,
+            ));
+            second.wait_for("Passphrase");
+            second.type_line(PASSPHRASE);
+            second.wait_for("y lands them again  n they were merged  Esc cancels");
+            thread::sleep(Duration::from_millis(700));
+            second.terminal.write_all(b"y").unwrap();
+            let note = fixture
+                .repo
+                .join(format!(".git/mahi/state/{thread}/sync/tester.claude/note"));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !fs::read_to_string(&note)
+                .is_ok_and(|note| note.contains("so its paths count as changed again"))
+            {
+                assert!(Instant::now() < deadline, "{}", second.text());
+                thread::sleep(Duration::from_millis(50));
+            }
+            let worktree = worktree_named(&fixture, &format!("{thread}.claude"));
+            fs::write(worktree.join("relanded"), "").unwrap();
+            second.wait_for("Enter pushes  Esc cancels");
+            thread::sleep(Duration::from_millis(700));
+            second.terminal.write_all(b"\r").unwrap();
+            second.wait_for("Pushed 2 commits on mahi/");
+            thread::sleep(Duration::from_millis(700));
+            second.terminal.write_all(b"\x1b").unwrap();
+            end_lander(&mut second, &fixture, Some(&thread));
+            let parent = git(&remote, &["rev-parse", &format!("{branch}~2")]);
+            assert_eq!(parent, main);
+            let files = git(&remote, &["ls-tree", "--name-only", &branch]);
+            for landed in ["feature.txt", "other.txt"] {
+                assert!(files.lines().any(|file| file == landed), "{files}");
+            }
+        }
+
         #[test]
         fn a_landing_after_the_forge_merged_and_deleted_the_branch_starts_from_the_landing_branch()
         {
@@ -5893,6 +5987,9 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             second.wait_for("Passphrase");
             second.type_line(PASSPHRASE);
             second.wait_for(&format!("the branch {branch} is gone from up"));
+            second.wait_for("y lands them again  n they were merged  Esc cancels");
+            thread::sleep(Duration::from_millis(700));
+            second.terminal.write_all(b"n").unwrap();
             push_with_enter(&mut second);
             let landed_tree = format!("refs/mahi/landed/{thread}");
             assert!(!git(&fixture.repo, &["for-each-ref", &landed_tree]).is_empty());

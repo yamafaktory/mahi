@@ -1059,6 +1059,7 @@ mod tests {
             worktree: Some(measured),
             from: None,
             gone: false,
+            answer: None,
         };
         record.write(store, thread).unwrap();
         let landing = LandingBranch::new("up", "main").unwrap();
@@ -1131,6 +1132,7 @@ mod tests {
                 worktree: Some(measured),
                 from: None,
                 gone: false,
+                answer: None,
             }
             .write(&store, thread)
             .unwrap();

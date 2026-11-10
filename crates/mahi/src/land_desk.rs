@@ -46,7 +46,10 @@ use serde_json::{
 use crate::{
     auto_merge::AutoMerge,
     conflicts,
-    landed_branch::BranchRecord,
+    landed_branch::{
+        Answer,
+        BranchRecord,
+    },
     landing::{
         self,
         Call,
@@ -69,6 +72,7 @@ const WATCH_EVERY: Duration = Duration::from_secs(1);
 const PUSH_WAIT: Duration = Duration::from_secs(180);
 const FETCH_WAIT: Duration = Duration::from_secs(60);
 const PUSHES: &str = "Enter pushes  Esc cancels";
+const ASKS: &str = "y lands them again  n they were merged  Esc cancels";
 const CLOSES: &str = "Esc closes";
 const DESCRIPTION_FILE: &str = "PR.md";
 const LANDING_DIR: &str = "landing";
@@ -86,6 +90,12 @@ pub(crate) struct Desk {
 
 enum Stage {
     Idle,
+    Asking {
+        merged: Result<Pending, String>,
+        remote: String,
+        shown: bool,
+        generation: u64,
+    },
     Waiting {
         pending: Pending,
         shown: bool,
@@ -109,6 +119,15 @@ struct Built {
     tip: ObjectId,
     worktree: ObjectId,
     from: ObjectId,
+}
+
+impl Stage {
+    fn is_busy(&self) -> bool {
+        match self {
+            Self::Asking { .. } | Self::Waiting { .. } | Self::Pushing { .. } => true,
+            Self::Idle | Self::Done { .. } => false,
+        }
+    }
 }
 
 pub(crate) struct Pending {
@@ -159,24 +178,37 @@ impl Desk {
 
     #[must_use]
     fn offer(&self, pending: Pending) -> bool {
-        let Some(mut stage) = self.stage() else {
-            return false;
-        };
-        if matches!(*stage, Stage::Waiting { .. } | Stage::Pushing { .. }) {
-            return false;
-        }
-        let generation = self.offers.fetch_add(1, Ordering::SeqCst) + 1;
-        *stage = Stage::Waiting {
+        self.open(|generation| Stage::Waiting {
             pending,
             shown: false,
             generation,
+        })
+    }
+
+    #[must_use]
+    fn ask(&self, merged: Result<Pending, String>, remote: String) -> bool {
+        self.open(|generation| Stage::Asking {
+            merged,
+            remote,
+            shown: false,
+            generation,
+        })
+    }
+
+    fn open(&self, stage_at: impl FnOnce(u64) -> Stage) -> bool {
+        let Some(mut stage) = self.stage() else {
+            return false;
         };
+        if stage.is_busy() {
+            return false;
+        }
+        let generation = self.offers.fetch_add(1, Ordering::SeqCst) + 1;
+        *stage = stage_at(generation);
         true
     }
 
     fn is_busy(&self) -> bool {
-        self.stage()
-            .is_none_or(|stage| matches!(*stage, Stage::Waiting { .. } | Stage::Pushing { .. }))
+        self.stage().is_none_or(|stage| stage.is_busy())
     }
 
     pub(crate) fn wants_open(&self) -> bool {
@@ -184,13 +216,19 @@ impl Desk {
             return false;
         };
         match &mut *stage {
-            Stage::Waiting { shown, .. } | Stage::Done { shown, .. } if !*shown => {
+            Stage::Asking { shown, .. }
+            | Stage::Waiting { shown, .. }
+            | Stage::Done { shown, .. }
+                if !*shown =>
+            {
                 *shown = true;
                 true
             }
-            Stage::Idle | Stage::Waiting { .. } | Stage::Pushing { .. } | Stage::Done { .. } => {
-                false
-            }
+            Stage::Idle
+            | Stage::Asking { .. }
+            | Stage::Waiting { .. }
+            | Stage::Pushing { .. }
+            | Stage::Done { .. } => false,
         }
     }
 
@@ -198,7 +236,8 @@ impl Desk {
         let stage = self.stage()?;
         match &*stage {
             Stage::Idle => None,
-            Stage::Waiting { generation, .. }
+            Stage::Asking { generation, .. }
+            | Stage::Waiting { generation, .. }
             | Stage::Pushing { generation, .. }
             | Stage::Done { generation, .. } => Some(*generation),
         }
@@ -208,6 +247,16 @@ impl Desk {
         let stage = self.stage()?;
         match &*stage {
             Stage::Idle => None,
+            Stage::Asking {
+                remote, generation, ..
+            } => Some(LandingView {
+                title: self.title(),
+                body: format!(
+                    "The last landing's branch is gone from {remote}. If its pull request was closed without a merge, its changes can land again."
+                ),
+                hint: ASKS.to_owned(),
+                generation: *generation,
+            }),
             Stage::Waiting {
                 pending,
                 generation,
@@ -271,12 +320,14 @@ impl Desk {
         let Some(mut stage) = self.stage() else {
             return;
         };
+        let taken = std::mem::replace(&mut *stage, Stage::Idle);
         let Stage::Waiting {
             mut pending,
             generation,
             ..
-        } = std::mem::replace(&mut *stage, Stage::Idle)
+        } = taken
         else {
+            *stage = taken;
             return;
         };
         let built = pending.built;
@@ -301,14 +352,75 @@ impl Desk {
             return;
         };
         match &*stage {
-            Stage::Waiting { .. } => {
+            Stage::Asking { .. } | Stage::Waiting { .. } => {
                 *stage = Stage::Idle;
                 drop(stage);
-                let line = format!("{} cancelled your landing; nothing was pushed.", self.owner);
-                let _ = note::record_landing(&self.note, &line);
+                let _ = note::record_landing(&self.note, &self.cancelled());
             }
             Stage::Done { .. } => *stage = Stage::Idle,
             Stage::Idle | Stage::Pushing { .. } => {}
+        }
+    }
+
+    pub(crate) fn land_again(&self) {
+        let Some(mut stage) = self.stage() else {
+            return;
+        };
+        if !matches!(*stage, Stage::Asking { .. }) {
+            return;
+        }
+        *stage = Stage::Idle;
+        drop(stage);
+        let line = if self.note_answer(Answer::LandAgain) {
+            format!(
+                "{} cancelled your landing: the last landing's pull request was closed without a merge, so its paths count as changed again; call land again with commits that place them.",
+                self.owner
+            )
+        } else {
+            self.cancelled()
+        };
+        let _ = note::record_landing(&self.note, &line);
+    }
+
+    fn note_answer(&self, answer: Answer) -> bool {
+        Store::open(&self.git_dir).is_ok_and(|store| {
+            BranchRecord::update(&store, self.thread, |record| record.note_answer(answer))
+                .unwrap_or(false)
+        })
+    }
+
+    fn cancelled(&self) -> String {
+        format!("{} cancelled your landing; nothing was pushed.", self.owner)
+    }
+
+    pub(crate) fn merged(&self) {
+        let Some(mut stage) = self.stage() else {
+            return;
+        };
+        let taken = std::mem::replace(&mut *stage, Stage::Idle);
+        let Stage::Asking { merged, .. } = taken else {
+            *stage = taken;
+            return;
+        };
+        let generation = self.offers.fetch_add(1, Ordering::SeqCst) + 1;
+        let _noted = self.note_answer(Answer::Merged);
+        match merged {
+            Ok(pending) => {
+                *stage = Stage::Waiting {
+                    pending,
+                    shown: true,
+                    generation,
+                };
+            }
+            Err(refusal) => {
+                let _ = note::record_landing(&self.note, &refusal);
+                *stage = Stage::Done {
+                    text: refusal,
+                    shown: true,
+                    generation,
+                    clipboard: None,
+                };
+            }
         }
     }
 
@@ -316,7 +428,9 @@ impl Desk {
         let mut stage = self.stage()?;
         match &mut *stage {
             Stage::Done { clipboard, .. } => clipboard.take(),
-            Stage::Idle | Stage::Waiting { .. } | Stage::Pushing { .. } => None,
+            Stage::Idle | Stage::Asking { .. } | Stage::Waiting { .. } | Stage::Pushing { .. } => {
+                None
+            }
         }
     }
 
@@ -391,6 +505,7 @@ impl Desk {
             worktree: apart,
             from: Some(from),
             gone: false,
+            answer: None,
         };
         let unremembered = store
             .keep_landed_tree((self.thread, LandedTree::Measured), apart)
@@ -569,6 +684,7 @@ struct LastLanding {
     tip: ObjectId,
     measured: ObjectId,
     on_remote: OnRemote,
+    ask: bool,
 }
 
 fn branch_of(thread: ThreadId) -> String {
@@ -683,7 +799,7 @@ impl Lander {
         arguments: &Map<String, Value>,
         (base, collaborators): (ObjectId, &[ParticipantName]),
     ) -> Result<String, ToolError> {
-        let mut call = landing::parse(arguments)?;
+        let call = landing::parse(arguments)?;
         let owner = self.me.participant();
         if let Some(refusal) = landing::message_refusal(&call) {
             return Ok(refusal);
@@ -711,22 +827,53 @@ impl Lander {
         if let Some(paths) = self.unresolved(store, worktree) {
             return Ok(landing::conflicts_first(&paths));
         }
+        let last = self
+            .last_landing(store, &remote, base)
+            .map_err(|error| failed(&error))?;
+        let ask = last.ask;
+        let gone_from = remote.name.to_string();
+        let identity = Identity::now(name.clone(), email.clone());
+        let prepared = self.prepare(
+            store,
+            (call, worktree, last),
+            (remote, behind),
+            (&identity, collaborators),
+        )?;
+        match (ask, prepared) {
+            (true, prepared) => {
+                let _asked = self.desk.ask(prepared, gone_from);
+            }
+            (false, Ok(pending)) => {
+                let _offered = self.desk.offer(pending);
+            }
+            (false, Err(refusal)) => return Ok(refusal),
+        }
+        Ok(landing::waiting(owner))
+    }
+
+    fn prepare(
+        &self,
+        store: &Store,
+        (mut call, worktree, last): (Call, ObjectId, LastLanding),
+        (remote, behind): (SyncSetup, Vec<(AgentSlot, Instant)>),
+        (identity, collaborators): (&Identity, &[ParticipantName]),
+    ) -> Result<Result<Pending, String>, ToolError> {
+        let failed = |error: &StoreError| ToolError::Failed(crate::describe(error));
         let LastLanding {
             tip: landed,
             measured,
             on_remote,
-        } = self
-            .last_landing(store, &remote, base)
-            .map_err(|error| failed(&error))?;
+            ..
+        } = last;
         let listed = store
             .changed_paths(measured, worktree, landing::MAX_LANDED_PATHS)
             .map_err(|error| failed(&error))?;
         let changed = match landing::landable(listed) {
             Ok(changed) => changed,
-            Err(refused) => return Ok(refused.text()),
+            Err(refused) => return Ok(Err(refused.text())),
         };
         if let Err(misplaced) = landing::check(&call, &changed.paths) {
-            return Ok(misplaced.text());
+            return Ok(Err(misplaced.text()));
         }
         let parent = match on_remote {
             OnRemote::Gone => self
@@ -746,11 +893,11 @@ impl Lander {
         {
             Onto::Merged(merged) => merged,
             Onto::Conflicts(paths) => {
-                return Ok(landing::changed_upstream(
+                return Ok(Err(landing::changed_upstream(
                     &BranchRecord::shown(&self.desk.landing),
                     &remote.name,
                     &paths,
-                ));
+                )));
             }
         };
         let agents = crate::threads::thread_agents(store, self.thread)
@@ -758,21 +905,20 @@ impl Lander {
             .into_iter()
             .filter(|slot| collaborators.contains(slot.participant()))
             .collect::<Vec<_>>();
-        let identity = Identity::now(name.clone(), email.clone());
         let built = landing::build(
             store,
             (parent, merged),
             &changed.gone,
             &mut call,
             (self.thread, &agents),
-            (&identity, self.commits.signer()),
+            (identity, self.commits.signer()),
         )
         .map_err(|error| failed(&error))?;
         let Some(&tip) = built.last() else {
-            return Ok(Refused::NothingChanged.text());
+            return Ok(Err(Refused::NothingChanged.text()));
         };
 
-        let pending = pending(
+        Ok(Ok(pending(
             Built {
                 landed,
                 tip,
@@ -781,9 +927,7 @@ impl Lander {
             },
             (call, &changed.gone),
             (remote, behind),
-        );
-        let _offered = self.desk.offer(pending);
-        Ok(landing::waiting(owner))
+        )))
     }
 
     fn behind(&self, store: &Store) -> Result<Vec<(AgentSlot, Instant)>, ToolError> {
@@ -812,11 +956,12 @@ impl Lander {
                 tip: base,
                 measured: store.commit_tree(base)?,
                 on_remote: OnRemote::Kept,
+                ask: false,
             });
         };
-        let measured = match record.worktree {
-            Some(tree) => tree,
-            None => store.commit_tree(record.tip)?,
+        let measured = match (record.landing_again_from(), record.worktree) {
+            (Some(tree), _) | (None, Some(tree)) => tree,
+            (None, None) => store.commit_tree(record.tip)?,
         };
         let on_remote = if record.gone {
             OnRemote::Gone
@@ -827,6 +972,7 @@ impl Lander {
             tip: record.tip,
             measured,
             on_remote,
+            ask: record.asks(),
         })
     }
 
@@ -1019,6 +1165,212 @@ pub(crate) mod tests {
             landed,
             tip,
         }
+    }
+
+    pub(crate) fn push_now(landing: &Landing) {
+        let mut stage = landing.desk.stage().unwrap();
+        let Stage::Waiting {
+            pending,
+            generation,
+            ..
+        } = std::mem::replace(&mut *stage, Stage::Idle)
+        else {
+            panic!("the landing waits for the owner");
+        };
+        *stage = Stage::Pushing {
+            pending,
+            generation,
+        };
+    }
+
+    pub(crate) fn ask_about(landing: &Landing) {
+        let mut stage = landing.desk.stage().unwrap();
+        let Stage::Waiting {
+            pending,
+            generation,
+            ..
+        } = std::mem::replace(&mut *stage, Stage::Idle)
+        else {
+            panic!("the landing waits for the owner");
+        };
+        *stage = Stage::Asking {
+            merged: Ok(pending),
+            remote: "up".to_owned(),
+            shown: false,
+            generation,
+        };
+    }
+
+    #[test]
+    fn a_gone_branch_is_asked_about_first_and_n_goes_on_with_the_landing() {
+        let landing = waiting_landing();
+        ask_about(&landing);
+        let asked = landing.desk.view().unwrap();
+        assert_eq!(
+            asked.body,
+            "The last landing's branch is gone from up. If its pull request was closed without a \
+             merge, its changes can land again."
+        );
+        assert_eq!(
+            asked.hint,
+            "y lands them again  n they were merged  Esc cancels"
+        );
+        assert!(landing.desk.is_busy());
+        landing.desk.confirm();
+        assert_eq!(landing.desk.view().unwrap().hint, asked.hint);
+        landing.desk.merged();
+        let confirmation = landing.desk.view().unwrap();
+        assert_eq!(confirmation.hint, "Enter pushes  Esc cancels");
+        assert_ne!(confirmation.generation, asked.generation);
+        assert!(
+            confirmation
+                .body
+                .contains("Retry failed requests in the client")
+        );
+        assert_eq!(crate::note::take(&landing.note).unwrap(), None);
+    }
+
+    #[test]
+    fn n_is_remembered_so_the_next_landing_does_not_ask_again() {
+        let landing = waiting_landing();
+        let tree = landing.store.commit_tree(landing.tip).unwrap();
+        let mut record = BranchRecord {
+            remote: "up".to_owned(),
+            branch: branch_of(landing.thread),
+            tip: landing.tip,
+            landing: "main".to_owned(),
+            worktree: None,
+            from: Some(tree),
+            gone: true,
+            answer: None,
+        };
+        record.write(&landing.store, landing.thread).unwrap();
+        ask_about(&landing);
+        landing.desk.merged();
+        record.answer = Some(Answer::Merged);
+        let read = BranchRecord::read(&landing.store, landing.thread).unwrap();
+        assert!(!read.asks());
+        assert_eq!(read, record);
+    }
+
+    #[test]
+    fn n_on_a_refused_landing_shows_the_refusal_and_tells_the_agent() {
+        let landing = waiting_landing();
+        *landing.desk.stage().unwrap() = Stage::Asking {
+            merged: Err(landing::NOTHING_CHANGED.to_owned()),
+            remote: "up".to_owned(),
+            shown: true,
+            generation: 3,
+        };
+        landing.desk.merged();
+        let done = landing.desk.view().unwrap();
+        assert_eq!(done.body, "nothing changed since the last landing");
+        assert_eq!(done.hint, "Esc closes");
+        assert!(!landing.desk.is_busy());
+        let note = crate::note::take(&landing.note).unwrap().unwrap();
+        assert!(
+            note.contains("nothing changed since the last landing"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn y_marks_the_record_and_tells_the_agent_to_land_its_paths_again() {
+        let landing = waiting_landing();
+        let tree = landing.store.commit_tree(landing.tip).unwrap();
+        let mut record = BranchRecord {
+            remote: "up".to_owned(),
+            branch: branch_of(landing.thread),
+            tip: landing.tip,
+            landing: "main".to_owned(),
+            worktree: None,
+            from: Some(tree),
+            gone: true,
+            answer: None,
+        };
+        record.write(&landing.store, landing.thread).unwrap();
+        ask_about(&landing);
+        landing.desk.land_again();
+        assert!(landing.desk.view().is_none());
+        record.answer = Some(Answer::LandAgain);
+        assert_eq!(
+            BranchRecord::read(&landing.store, landing.thread),
+            Some(record)
+        );
+        let note = crate::note::take(&landing.note).unwrap().unwrap();
+        assert!(
+            note.contains(
+                "alice cancelled your landing: the last landing's pull request was closed without \
+                 a merge, so its paths count as changed again; call land again with commits that \
+                 place them."
+            ),
+            "{note}"
+        );
+        assert!(offer_again(&landing));
+        landing.desk.land_again();
+        assert_eq!(
+            landing.desk.view().unwrap().hint,
+            "Enter pushes  Esc cancels"
+        );
+    }
+
+    #[test]
+    fn the_last_landing_asks_once_its_branch_is_gone_and_lands_from_its_start_after_y() {
+        let (_dir, store) = repository_on_main();
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let started = crate::session::tests::start_with(&store, &key).unwrap();
+        let store = Store::open(store.common_dir()).unwrap();
+        let remote = unreachable_remote(&store, store.common_dir());
+        let (lander, _desk) = lander_for(&started, &store);
+        let store = Store::open(store.common_dir()).unwrap();
+        let base = store.head_commit().unwrap();
+        let base_tree = store.commit_tree(base).unwrap();
+        let (measured, from) = (
+            store
+                .write_tree(&[(
+                    "m",
+                    mahi_store::EntryKind::Blob,
+                    store.write_blob(b"m").unwrap(),
+                )])
+                .unwrap(),
+            store
+                .write_tree(&[(
+                    "f",
+                    mahi_store::EntryKind::Blob,
+                    store.write_blob(b"f").unwrap(),
+                )])
+                .unwrap(),
+        );
+        let mut record = BranchRecord {
+            remote: "up".to_owned(),
+            branch: branch_of(started.thread),
+            tip: base,
+            landing: "main".to_owned(),
+            worktree: Some(measured),
+            from: Some(from),
+            gone: false,
+            answer: None,
+        };
+        let last = |record: &BranchRecord| {
+            record.write(&store, started.thread).unwrap();
+            let last = lander.last_landing(&store, &remote, base).unwrap();
+            (last.measured, last.on_remote == OnRemote::Gone, last.ask)
+        };
+        assert_eq!(last(&record), (measured, false, false));
+        record.gone = true;
+        assert_eq!(last(&record), (measured, true, true));
+        record.answer = Some(Answer::LandAgain);
+        assert_eq!(last(&record), (from, true, false));
+        record.answer = Some(Answer::Merged);
+        assert_eq!(last(&record), (measured, true, false));
+        record.from = None;
+        record.answer = None;
+        record.worktree = None;
+        assert_eq!(last(&record), (base_tree, true, false));
     }
 
     pub(crate) fn offer_again(landing: &Landing) -> bool {
@@ -1356,6 +1708,7 @@ pub(crate) mod tests {
             worktree: None,
             from: None,
             gone: false,
+            answer: None,
         };
         record.write(&store, started.thread).unwrap();
         let land = |paths: &[&str]| lander.land(&store, &call(paths), (base, &[])).unwrap();
@@ -1405,6 +1758,7 @@ pub(crate) mod tests {
             worktree: Some(measured),
             from: None,
             gone: false,
+            answer: None,
         };
         record.write(&store, started.thread).unwrap();
         fs::write(started.worktree.join("a.txt"), "a\n").unwrap();

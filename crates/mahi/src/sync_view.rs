@@ -244,6 +244,7 @@ mod tests {
             worktree: Some(measured),
             from: None,
             gone: false,
+            answer: None,
         };
         let landing = Source::Landing(LandingBranch::new("up", "main").unwrap());
         HeldSettings::new(tip, &paths(&["CLAUDE.md"]))

@@ -413,6 +413,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         desk: &Arc<Desk>,
     ) -> io::Result<usize> {
         let (mut escaped, mut confirmed) = (false, false);
+        let mut answered = None;
         let State {
             keys, scroll, page, ..
         } = state;
@@ -422,6 +423,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
                 PaletteInput::Enter => confirmed = true,
                 PaletteInput::PageDown => *scroll = scroll.saturating_add((*page).max(1)),
                 PaletteInput::PageUp => *scroll = scroll.saturating_sub((*page).max(1)),
+                PaletteInput::Text(answer @ ('y' | 'n')) => answered = Some(answer),
                 PaletteInput::Text(_)
                 | PaletteInput::Pasted(_)
                 | PaletteInput::Backspace
@@ -437,8 +439,15 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
         if confirmed {
             desk.confirm();
         }
+        match answered {
+            Some('y') => desk.land_again(),
+            Some(_) => desk.merged(),
+            None => {}
+        }
         if escaped {
             desk.cancel();
+        }
+        if escaped || desk.view().is_none() {
             self.release(state)?;
         } else if state.mode == Mode::Open {
             self.draw(state)?;
@@ -1189,6 +1198,66 @@ mod tests {
         assert!(!screen.is_open());
         assert!(desk.view().is_none());
         assert!(crate::note::take(&landing.note).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_question_about_a_gone_branch_takes_n_to_go_on_and_y_to_land_again() {
+        let terminal = FakeTerminal::default();
+        let landing = crate::land_desk::tests::waiting_landing();
+        crate::land_desk::tests::ask_about(&landing);
+        let desk = Arc::clone(&landing.desk);
+        let screen = screen(&terminal).with_desk(Arc::clone(&desk));
+        screen.open().unwrap();
+        let text = shown(&written(&screen));
+        assert!(
+            text.contains("y lands them again  n they were merged  Esc cancels"),
+            "{text}"
+        );
+        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"x\r").unwrap();
+        assert_eq!(
+            desk.view().unwrap().hint,
+            "y lands them again  n they were merged  Esc cancels"
+        );
+        screen.typed(b"n").unwrap();
+        assert_eq!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
+        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"\x1b").unwrap();
+        assert!(crate::land_desk::tests::offer_again(&landing));
+        crate::land_desk::tests::ask_about(&landing);
+        screen.open().unwrap();
+        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"y").unwrap();
+        assert!(desk.view().is_none());
+        assert!(!screen.is_open());
+    }
+
+    #[test]
+    fn escape_closes_the_palette_while_the_landing_pushes() {
+        let terminal = FakeTerminal::default();
+        let landing = crate::land_desk::tests::waiting_landing();
+        let desk = Arc::clone(&landing.desk);
+        let screen = screen(&terminal).with_desk(Arc::clone(&desk));
+        screen.open().unwrap();
+        crate::land_desk::tests::push_now(&landing);
+        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"\x1b").unwrap();
+        assert!(desk.view().is_some());
+        assert!(!screen.is_open());
+    }
+
+    #[test]
+    fn the_confirmation_after_n_takes_no_enter_before_it_shows_for_the_guard() {
+        let terminal = FakeTerminal::default();
+        let landing = crate::land_desk::tests::waiting_landing();
+        crate::land_desk::tests::ask_about(&landing);
+        let desk = Arc::clone(&landing.desk);
+        let screen = screen(&terminal).with_desk(Arc::clone(&desk));
+        screen.open().unwrap();
+        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        screen.typed(b"n").unwrap();
+        screen.typed(b"\r").unwrap();
+        assert_eq!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
     }
 
     #[test]

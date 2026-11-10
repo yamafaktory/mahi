@@ -26,8 +26,9 @@ const MAX_RECORD_BYTES: u64 = 4096;
 
 /// What a landing left on the remote for a thread: the thread branch, the commit it pushed
 /// there, the landing branch it is meant for and, when the `land` tool pushed it, the tree of
-/// the owner's worktree it landed and the tree it measured its changed paths from; and whether
-/// a later fetch found the thread branch gone from the remote.
+/// the owner's worktree it landed and the tree it measured its changed paths from; whether a
+/// later fetch found the thread branch gone from the remote; and how the owner answered the question
+/// about its pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchRecord {
     pub(crate) remote: String,
@@ -37,9 +38,46 @@ pub(crate) struct BranchRecord {
     pub(crate) worktree: Option<ObjectId>,
     pub(crate) from: Option<ObjectId>,
     pub(crate) gone: bool,
+    pub(crate) answer: Option<Answer>,
+}
+
+/// How the owner answered whether the pull request of a gone thread branch was merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    LandAgain,
+    Merged,
+}
+
+impl Answer {
+    fn line(self) -> &'static str {
+        match self {
+            Self::LandAgain => "again",
+            Self::Merged => "merged",
+        }
+    }
 }
 
 impl BranchRecord {
+    pub(crate) fn may_land_again(&self) -> bool {
+        self.gone && self.from.is_some()
+    }
+
+    pub(crate) fn asks(&self) -> bool {
+        self.may_land_again() && self.answer.is_none()
+    }
+
+    pub(crate) fn landing_again_from(&self) -> Option<ObjectId> {
+        self.from.filter(|_| self.answer == Some(Answer::LandAgain))
+    }
+
+    pub(crate) fn note_answer(&mut self, answer: Answer) -> bool {
+        let asked = self.may_land_again();
+        if asked {
+            self.answer = Some(answer);
+        }
+        asked
+    }
+
     /// Reads `thread`'s record, or `None` when there is none or it cannot be read.
     pub(crate) fn read(store: &Store, thread: ThreadId) -> Option<Self> {
         let file = fs::File::open(path(store, thread)).ok()?;
@@ -66,6 +104,12 @@ impl BranchRecord {
             None => None,
         };
         let gone = next == Some("gone");
+        if gone {
+            next = lines.next();
+        }
+        let answer = [Answer::LandAgain, Answer::Merged]
+            .into_iter()
+            .find(|answer| next == Some(answer.line()));
         let valid =
             |name: &str| !name.is_empty() && name.chars().all(|character| !character.is_control());
         (valid(&remote) && valid(&branch) && valid(&landing)).then_some(Self {
@@ -76,6 +120,7 @@ impl BranchRecord {
             worktree,
             from,
             gone,
+            answer,
         })
     }
 
@@ -107,6 +152,7 @@ impl BranchRecord {
         let same = self.tip == seen.tip && self.branch == seen.branch && self.gone != gone;
         if same {
             self.gone = gone;
+            self.answer = self.answer.filter(|_| gone);
         }
         same
     }
@@ -130,6 +176,9 @@ impl BranchRecord {
         }
         if self.gone {
             text.push_str("gone\n");
+        }
+        if let Some(answer) = self.answer {
+            let _ = writeln!(text, "{}", answer.line());
         }
         fs::write(&staged, text)?;
         fs::rename(&staged, target)
@@ -180,6 +229,7 @@ mod tests {
             worktree: None,
             from: None,
             gone: false,
+            answer: None,
         };
         let mut now = seen.clone();
         assert!(now.note_gone(&seen, true));
@@ -202,6 +252,24 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_back_on_the_remote_forgets_the_answer_to_land_again() {
+        let seen = BranchRecord {
+            remote: "up".to_owned(),
+            branch: "mahi/t".to_owned(),
+            tip: ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap(),
+            landing: "main".to_owned(),
+            worktree: None,
+            from: Some(ObjectId::from_hex(b"fedcba9876543210fedcba9876543210fedcba98").unwrap()),
+            gone: true,
+            answer: Some(Answer::LandAgain),
+        };
+        let mut now = seen.clone();
+        assert!(now.note_gone(&seen, false));
+        assert_eq!(now.answer, None);
+        assert_eq!(now.landing_again_from(), None);
+    }
+
+    #[test]
     fn a_record_is_written_read_back_marked_gone_and_removed() {
         let dir = tempfile::tempdir().unwrap();
         gix::init(dir.path()).unwrap();
@@ -216,6 +284,7 @@ mod tests {
             worktree: None,
             from: None,
             gone: false,
+            answer: None,
         };
         record.write(&store, thread).unwrap();
         assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
@@ -228,6 +297,12 @@ mod tests {
         assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
         record.from =
             Some(ObjectId::from_hex(b"fedcba9876543210fedcba9876543210fedcba98").unwrap());
+        record.write(&store, thread).unwrap();
+        assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
+        record.answer = Some(Answer::LandAgain);
+        record.write(&store, thread).unwrap();
+        assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
+        record.answer = Some(Answer::Merged);
         record.write(&store, thread).unwrap();
         assert_eq!(BranchRecord::read(&store, thread), Some(record.clone()));
         record.gone = false;
