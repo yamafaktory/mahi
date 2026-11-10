@@ -508,6 +508,8 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
         }
         None => {}
     }
+    let connected = crate::report::connected();
+    let invited = invited_by(command, connected);
     let ticket = &command
         .ticket
         .clone()
@@ -526,11 +528,11 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
     };
     let store = Store::discover(&cwd)?;
     let signer = match signer {
-        Some(signer) if crate::report::connected() => {
+        Some(signer) if connected => {
             let meta = recorded_meta(ticket, &store, own)?;
-            joining(command, &meta, own)?;
+            agent_joins(command, invited, &meta, own)?;
             return join_with_agent(
-                command,
+                (command, invited),
                 environment,
                 (ticket, &store, &config, own),
                 signer,
@@ -546,7 +548,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
         Arc::clone(&peers) as Arc<dyn Peers>,
     )?;
     let joined = joined_meta(&node, ticket, &store, own)
-        .and_then(|meta| joining(command, &meta, own).map(|joining| (meta, joining)));
+        .and_then(|meta| joining(command, invited, &meta, own).map(|joining| (meta, joining)));
     let (meta, joining) = match joined {
         Ok(joined) => joined,
         Err(error) => {
@@ -554,11 +556,11 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
             return Err(error);
         }
     };
-    tell_added(command, &meta, own);
+    tell_added((command, invited), &meta, own);
     if let (Joining::Agent, Some(signer)) = (joining, signer) {
         let _ = node.close();
         return join_with_agent(
-            command,
+            (command, invited),
             environment,
             (ticket, &store, &config, own),
             signer,
@@ -576,7 +578,7 @@ pub(crate) fn join(command: &JoinCommand, environment: &Environment) -> Result<O
 /// Runs `command`'s agent in the thread `ticket` invites to, whose `meta` the user is listed
 /// in, as `mahi join <ticket> -- <agent>` does.
 fn join_with_agent(
-    command: &JoinCommand,
+    (command, invited): (&JoinCommand, Invited),
     environment: &Environment,
     (ticket, store, config, own): (&Ticket, &Store, &ConfigDir, NodeId),
     signer: AgentSigner,
@@ -600,7 +602,7 @@ fn join_with_agent(
             if let Some(signal) = stopped {
                 return Ok(Outcome::Stopped(signal));
             }
-            current_meta(command, (store, ticket), &meta, own)?
+            current_meta((command, invited), (store, ticket), &meta, own)?
         }
         None => meta,
     };
@@ -669,15 +671,25 @@ fn own_entry(meta: &VerifiedMeta, own: NodeId) -> Option<&Participant> {
 }
 
 fn current_meta(
-    command: &JoinCommand,
+    (command, invited): (&JoinCommand, Invited),
     (store, ticket): (&Store, &Ticket),
     joined: &VerifiedMeta,
     own: NodeId,
 ) -> Result<VerifiedMeta, JoinError> {
     let meta = load_meta(store, ticket.thread(), ticket.owner(), joined.generation())
         .map_err(JoinError::Pin)?;
-    match joining(command, &meta, own)? {
-        Joining::Agent => Ok(meta),
+    agent_joins(command, invited, &meta, own)?;
+    Ok(meta)
+}
+
+fn agent_joins(
+    command: &JoinCommand,
+    invited: Invited,
+    meta: &VerifiedMeta,
+    own: NodeId,
+) -> Result<(), JoinError> {
+    match joining(command, invited, meta, own)? {
+        Joining::Agent => Ok(()),
         Joining::Watch => Err(JoinError::WatcherWhileJoining(
             meta.owner().clone(),
             meta.thread(),
@@ -696,14 +708,33 @@ enum Joining {
     Watch,
 }
 
-fn joining(command: &JoinCommand, meta: &VerifiedMeta, own: NodeId) -> Result<Joining, JoinError> {
-    let refusal = match (role_of(meta, own), command.agent(), &command.ticket) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Invited {
+    ByTicket,
+    ByCode,
+}
+
+fn invited_by(command: &JoinCommand, connected: bool) -> Invited {
+    if command.ticket.is_none() || connected {
+        Invited::ByCode
+    } else {
+        Invited::ByTicket
+    }
+}
+
+fn joining(
+    command: &JoinCommand,
+    invited: Invited,
+    meta: &VerifiedMeta,
+    own: NodeId,
+) -> Result<Joining, JoinError> {
+    let refusal = match (role_of(meta, own), command.agent(), invited) {
         (Role::Collaborator, Some(_), _) => return Ok(Joining::Agent),
-        (Role::Watcher, None, _) | (Role::Collaborator | Role::Watcher, _, None) => {
+        (Role::Watcher, None, _) | (Role::Collaborator | Role::Watcher, _, Invited::ByCode) => {
             return Ok(Joining::Watch);
         }
-        (Role::Watcher, Some(_), Some(_)) => JoinError::WatcherWithAgent,
-        (Role::Collaborator, None, Some(_)) => JoinError::CollaboratorWithoutAgent,
+        (Role::Watcher, Some(_), Invited::ByTicket) => JoinError::WatcherWithAgent,
+        (Role::Collaborator, None, Invited::ByTicket) => JoinError::CollaboratorWithoutAgent,
     };
     Err(refusal(meta.owner().clone(), meta.thread()))
 }
@@ -715,8 +746,8 @@ fn role_of(meta: &VerifiedMeta, own: NodeId) -> Role {
 
 /// Tells the user who added them to the thread of `meta` and as what, when they joined
 /// through a pairing code rather than a ticket, and that a watcher's agent does not run.
-fn tell_added(command: &JoinCommand, meta: &VerifiedMeta, own: NodeId) {
-    if command.ticket.is_some() {
+fn tell_added((command, invited): (&JoinCommand, Invited), meta: &VerifiedMeta, own: NodeId) {
+    if invited == Invited::ByTicket {
         return;
     }
     let with = match command.agent() {
@@ -1506,11 +1537,11 @@ mod tests {
         let with_agent = join_command(&[&ticket, "--", "claude"]);
 
         assert_eq!(
-            joining(&watching, &meta, *watcher.node()).unwrap(),
+            joining(&watching, Invited::ByTicket, &meta, *watcher.node()).unwrap(),
             Joining::Watch
         );
         assert_eq!(
-            joining(&with_agent, &meta, *watcher.node())
+            joining(&with_agent, Invited::ByTicket, &meta, *watcher.node())
                 .unwrap_err()
                 .to_string(),
             format!(
@@ -1518,23 +1549,31 @@ mod tests {
             )
         );
 
-        assert_eq!(joining(&with_agent, &meta, alice).unwrap(), Joining::Agent);
         assert_eq!(
-            joining(&watching, &meta, alice).unwrap_err().to_string(),
+            joining(&with_agent, Invited::ByTicket, &meta, alice).unwrap(),
+            Joining::Agent
+        );
+        assert_eq!(
+            joining(&watching, Invited::ByTicket, &meta, alice)
+                .unwrap_err()
+                .to_string(),
             format!(
                 "{owner} added you to thread {thread} as a collaborator, so you join it with your agent: mahi join <ticket> -- claude, or -- codex"
             )
         );
 
         let (code, code_with_agent) = (join_command(&[]), join_command(&["--", "claude"]));
-        assert_eq!(joining(&code, &meta, alice).unwrap(), Joining::Watch);
         assert_eq!(
-            joining(&code_with_agent, &meta, alice).unwrap(),
+            joining(&code, Invited::ByCode, &meta, alice).unwrap(),
+            Joining::Watch
+        );
+        assert_eq!(
+            joining(&code_with_agent, Invited::ByCode, &meta, alice).unwrap(),
             Joining::Agent
         );
         for command in [&code, &code_with_agent] {
             assert_eq!(
-                joining(command, &meta, *watcher.node()).unwrap(),
+                joining(command, Invited::ByCode, &meta, *watcher.node()).unwrap(),
                 Joining::Watch
             );
         }
@@ -1565,26 +1604,42 @@ mod tests {
         );
         let with_ticket = join_command(&[&ticket.to_string(), "--", "claude"]);
         let with_code = join_command(&["--", "claude"]);
-        let current = |command: &JoinCommand, joined: &VerifiedMeta| {
-            current_meta(command, (&setup.store, &ticket), joined, *bob.node())
+        let current = |command: &JoinCommand, joined: &VerifiedMeta, connected: bool| {
+            current_meta(
+                (command, invited_by(command, connected)),
+                (&setup.store, &ticket),
+                joined,
+                *bob.node(),
+            )
         };
-        assert!(current(&with_ticket, &joined).is_ok());
-        assert!(current(&with_code, &joined).is_ok());
+        assert!(current(&with_ticket, &joined, false).is_ok());
+        assert!(current(&with_code, &joined, false).is_ok());
+        assert!(current(&with_ticket, &joined, true).is_ok());
         sign_participant(&setup, bob.clone().with_role(Role::Watcher));
         assert!(matches!(
-            current(&with_ticket, &joined),
+            current(&with_ticket, &joined, false),
             Err(JoinError::WatcherWithAgent(..))
         ));
-        let refused = current(&with_code, &joined).unwrap_err().to_string();
-        assert_eq!(
-            refused,
-            format!(
-                "{} made you a watcher in thread {} while you joined, so your agent does not run; \
-                 ask {} for a new code to watch",
-                joined.owner(),
-                setup.thread,
-                joined.owner()
-            )
+        let while_joining = format!(
+            "{} made you a watcher in thread {} while you joined, so your agent does not run; ask \
+             {} for a new code to watch",
+            joined.owner(),
+            setup.thread,
+            joined.owner()
         );
+        let refused = current(&with_code, &joined, false).unwrap_err().to_string();
+        assert_eq!(refused, while_joining);
+        let from_home = current(&with_ticket, &joined, true)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(from_home, while_joining);
+        let watching = load_meta(&setup.store, setup.thread, &owner, 0).unwrap();
+        let recorded = agent_joins(
+            &with_ticket,
+            invited_by(&with_ticket, true),
+            &watching,
+            *bob.node(),
+        );
+        assert_eq!(recorded.unwrap_err().to_string(), while_joining);
     }
 }

@@ -605,3 +605,11 @@ was to ask on each call until a push.
 Chosen by the user (#62). A `land` call builds its landing first, with the fetch of the landing
 branch, and shows the question after. A refusal or a failed fetch therefore shows without the
 question. The other choice was to show the question at once and build the landing after `n`.
+
+## D084 · 2026-11-10 · A home screen code join refuses with D075's text
+
+Chosen by the user (#109). A code join from the home screen starts its agent as
+`mahi join <ticket> -- <agent>`. When the owner makes the user a watcher during that join, the
+agent's tab refuses with D075's text: `alice made you a watcher in thread <id> while you joined,
+so your agent does not run; ask alice for a new code to watch`. The other choice was to keep
+D021's ticket text, which names a ticket the user never saw.
