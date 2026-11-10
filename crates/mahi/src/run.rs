@@ -58,7 +58,10 @@ use age::secrecy::{
     ExposeSecret,
     SecretString,
 };
-use mahi_agent::profile::ProfileCredential;
+use mahi_agent::{
+    codex::HookTrust,
+    profile::ProfileCredential,
+};
 use mahi_core::{
     AgentSlot,
     NameError,
@@ -1253,6 +1256,7 @@ impl Prepared {
             host: &self.host,
             profile: self.profile,
             state: state.clone(),
+            config: config.path(),
             credentials: &self.credentials,
             approvals: self.settings.agent_approvals,
         };
@@ -1268,7 +1272,7 @@ impl Prepared {
             turn_end::record_reporting(store, thread, &slot, reporting).map_err(RunError::State)?;
             launch.spawn(sandbox, network)
         });
-        let (child, raw, proxy) = match launched {
+        let spawned = match launched {
             Ok(launched) => launched,
             Err(error) => {
                 if let Some(live) = live {
@@ -1297,7 +1301,7 @@ impl Prepared {
         let note_by = self.profile.map_or(NoteBy::ListAgents, Profile::note_by);
         let landing = landing_desk(
             (&self.store, environment, &self.git_dir, &self.settings),
-            (self.owner.as_ref(), key.as_deref(), raw.is_some()),
+            (self.owner.as_ref(), key.as_deref(), spawned.raw.is_some()),
             (&started, globals),
         );
         let tools = serve_tools(
@@ -1311,8 +1315,8 @@ impl Prepared {
             ),
         );
         let outcome = finish_run(
-            child,
-            raw,
+            spawned.child,
+            spawned.raw,
             &UserSide {
                 palette_key: self.settings.palette_key,
                 activity,
@@ -1325,29 +1329,28 @@ impl Prepared {
                 pusher,
                 auto_merge,
             },
-            proxy,
+            spawned.proxy,
             live,
         );
         reports.release();
         tools.store(false, Ordering::SeqCst);
-        keep_hook_trust(self.profile, state, config.path());
+        keep_hook_trust(self.profile, spawned.hook_trust.as_ref(), config.path());
         outcome
     }
 }
 
 /// Keeps in the user's configuration directory, for their later threads, the approvals of
-/// mahi's hooks the agent recorded in its state directory, when it has a profile and one.
-fn keep_hook_trust(profile: Option<&Profile>, state: Option<PathBuf>, config: &Path) {
-    let (Some(profile), Some(state)) = (profile, state) else {
+/// mahi's hooks the agent recorded in its state directory, `hook_trust`'s path, since those
+/// it recorded at launch, when it has a profile and one.
+fn keep_hook_trust(
+    profile: Option<&Profile>,
+    hook_trust: Option<&(PathBuf, HookTrust)>,
+    config: &Path,
+) {
+    let (Some(profile), Some((state, launched))) = (profile, hook_trust) else {
         return;
     };
-    let (Some(parent), Some(name)) = (state.parent(), state.file_name()) else {
-        return;
-    };
-    let Ok(parent) = fs::canonicalize(parent) else {
-        return;
-    };
-    if let Err(error) = profile.keep_hook_trust(&parent.join(name), config) {
+    if let Err(error) = profile.keep_hook_trust(state, config, launched) {
         crate::report_with("the approval of mahi's hooks was not kept", &error);
     }
 }
@@ -1938,6 +1941,7 @@ struct Launch<'a> {
     profile: Option<&'static Profile>,
     approvals: AgentApprovals,
     state: Option<PathBuf>,
+    config: &'a Path,
     arguments: &'a [OsString],
     environment: &'a Environment,
     agent: &'a Agent,
@@ -2056,9 +2060,9 @@ impl Launch<'_> {
         Ok(())
     }
 
-    fn prepare_state(&self) -> Result<Option<PathBuf>, RunError> {
+    fn prepare_state(&self) -> Result<(Option<PathBuf>, Option<HookTrust>), RunError> {
         let (Some(profile), Some(state)) = (self.profile, &self.state) else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let not_private = || RunError::StateNotPrivate(state.clone());
         let (Some(parent), Some(name)) = (state.parent(), state.file_name()) else {
@@ -2087,14 +2091,14 @@ impl Launch<'_> {
                 crate::describe(&error)
             );
         }
-        if let Ok(config) = ConfigDir::resolve(
-            self.environment.home.as_deref(),
-            self.environment.xdg_config_home.as_deref(),
-        ) && let Err(error) = profile.seed_hook_trust(&directory, &state_path, config.path())
-        {
-            crate::report_with("the approval of mahi's hooks was not carried over", &error);
-        }
-        Ok(Some(state_path))
+        let launched = match profile.seed_hook_trust(&directory, &state_path, self.config) {
+            Ok(launched) => Some(launched),
+            Err(error) => {
+                crate::report_with("the approval of mahi's hooks was not carried over", &error);
+                None
+            }
+        };
+        Ok((Some(state_path), launched))
     }
 
     /// Shows the agent the repository's configuration cleaned of what it must not read, which
@@ -2129,11 +2133,7 @@ impl Launch<'_> {
         self.place_git_config(sandbox)
     }
 
-    fn spawn(
-        &self,
-        mut sandbox: Sandbox,
-        network: Option<Network>,
-    ) -> Result<(PtyChild, Option<RawMode>, Option<Running>), RunError> {
+    fn spawn(&self, mut sandbox: Sandbox, network: Option<Network>) -> Result<Spawned, RunError> {
         let git_file = self.worktree.join(".git");
         for (path, access) in binds(
             self.worktree,
@@ -2160,7 +2160,7 @@ impl Launch<'_> {
         sandbox.allow_connect(self.hook_socket)?;
         sandbox.allow_connect(self.mcp_socket)?;
         let git_common_dir = self.give_git_config(&mut sandbox)?;
-        let state = self.prepare_state()?;
+        let (state, launched) = self.prepare_state()?;
         if let Some(state) = &state {
             self.restore_session(state);
             self.bind_state(&mut sandbox, state)?;
@@ -2225,11 +2225,35 @@ impl Launch<'_> {
         }
         let pty = pty.sandbox(sandbox);
         let raw = RawMode::enable().map_err(RunError::Terminal)?;
-        let mut child = pty.spawn()?;
+        Spawned::start(pty.spawn()?, raw, network, state.zip(launched))
+    }
+}
+
+/// The agent a launch started, with the terminal mode and proxy it runs with, and its state
+/// directory with the approvals of mahi's hooks it recorded at launch.
+struct Spawned {
+    child: PtyChild,
+    raw: Option<RawMode>,
+    proxy: Option<Running>,
+    hook_trust: Option<(PathBuf, HookTrust)>,
+}
+
+impl Spawned {
+    fn start(
+        mut child: PtyChild,
+        raw: Option<RawMode>,
+        network: Option<Network>,
+        hook_trust: Option<(PathBuf, HookTrust)>,
+    ) -> Result<Self, RunError> {
         let proxy = network
             .map(|network| network.start(child.take_loopback_listener()))
             .transpose()?;
-        Ok((child, raw, proxy))
+        Ok(Self {
+            child,
+            raw,
+            proxy,
+            hook_trust,
+        })
     }
 }
 

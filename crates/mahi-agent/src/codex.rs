@@ -149,6 +149,20 @@ impl HookTrust {
         self.0.iter().all(Option::is_some)
     }
 
+    /// Returns the approvals to keep for later threads, hook by hook: the one a thread records
+    /// now when it differs from `launched`, the one it recorded at launch, since Codex then
+    /// recorded a new approval; otherwise the one `kept` holds; otherwise the thread's own.
+    #[must_use]
+    pub fn into_kept(mut self, launched: &Self, kept: &Self) -> Self {
+        let hooks = self.0.iter_mut().zip(&launched.0).zip(&kept.0);
+        for ((now, at_launch), kept) in hooks {
+            if now == at_launch && kept.is_some() {
+                now.clone_from(kept);
+            }
+        }
+        self
+    }
+
     /// Returns `config` with an approval record added for each of mahi's hooks in the file
     /// `hooks_json` that has none yet, leaving any record Codex or the user wrote as it is;
     /// `None` when there is nothing to add, `config` does not parse, `hooks_json` cannot be
@@ -252,6 +266,22 @@ mod tests {
         );
         let long = format!("# {}\n", "x".repeat(MAX_CONFIG_BYTES));
         assert_eq!(HookTrust::recorded(&long, HOOKS), HookTrust::default());
+    }
+
+    #[test]
+    fn approvals_to_keep_take_what_codex_recorded_in_the_run_then_what_was_kept() {
+        let kept = HookTrust([Some(hash('4')), Some(hash('5')), None]);
+        let launched = HookTrust([Some(hash('1')), Some(hash('2')), Some(hash('3'))]);
+        let now = HookTrust([Some(hash('1')), Some(hash('6')), Some(hash('3'))]);
+        assert_eq!(
+            now.into_kept(&launched, &kept),
+            HookTrust([Some(hash('4')), Some(hash('6')), Some(hash('3'))])
+        );
+        assert_eq!(
+            launched.clone().into_kept(&launched, &HookTrust::default()),
+            launched
+        );
+        assert_eq!(launched.clone().into_kept(&launched, &trust()), trust());
     }
 
     #[test]

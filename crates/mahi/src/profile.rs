@@ -568,7 +568,7 @@ impl Profile {
     /// When the agent is Codex, adds to its `config.toml` in the state directory `state`, found
     /// at `state_path`, the approvals of mahi's hooks the user gave in an earlier thread and
     /// mahi kept in `config`, so Codex does not ask for them again; a hook already recorded
-    /// there is left as it is.
+    /// there is left as it is. Returns the approvals the state directory then records.
     ///
     /// # Errors
     ///
@@ -578,39 +578,51 @@ impl Profile {
         state: &OwnedFd,
         state_path: &Path,
         config: &Path,
-    ) -> io::Result<()> {
+    ) -> io::Result<HookTrust> {
         let (Install::Codex, Some(hooks)) = (&self.install, codex_hooks_path(state_path)) else {
-            return Ok(());
+            return Ok(HookTrust::default());
         };
-        let Some(config_dir) = open_owned_dir(config)? else {
-            return Ok(());
-        };
-        let Small::Read(saved) = read_small(&config_dir, CODEX_TRUST, MAX_SAVED_BYTES)? else {
-            return Ok(());
-        };
-        let trust = HookTrust::from_saved(&String::from_utf8_lossy(&saved));
         let current = match read_small(state, CODEX_CONFIG, MAX_CONFIG_BYTES)? {
             Small::Missing => Vec::new(),
             Small::Read(current) => current,
-            Small::Unusable => return Ok(()),
+            Small::Unusable => return Ok(HookTrust::default()),
         };
         let Ok(current) = String::from_utf8(current) else {
-            return Ok(());
+            return Ok(HookTrust::default());
         };
-        match trust.added_to(&current, &hooks) {
-            Some(seeded) => replace(state, CODEX_CONFIG, seeded.as_bytes()),
-            None => Ok(()),
+        let saved = match open_owned_dir(config)? {
+            Some(config_dir) => match read_small(&config_dir, CODEX_TRUST, MAX_SAVED_BYTES)? {
+                Small::Read(saved) => Some(HookTrust::from_saved(&String::from_utf8_lossy(&saved))),
+                Small::Missing | Small::Unusable => None,
+            },
+            None => None,
+        };
+        let seeded = saved.and_then(|trust| trust.added_to(&current, &hooks));
+        if let Some(seeded) = &seeded {
+            replace(state, CODEX_CONFIG, seeded.as_bytes())?;
         }
+        Ok(HookTrust::recorded(
+            seeded.as_deref().unwrap_or(&current),
+            &hooks,
+        ))
     }
 
     /// When the agent is Codex, keeps in `config` the approvals of all of mahi's hooks that
-    /// Codex recorded in its state directory at `state_path`, for the user's later threads;
-    /// the directory itself is opened without following a link the agent may have put there.
+    /// Codex recorded in its state directory at `state_path`, for the user's later threads,
+    /// hook by hook: one Codex recorded since `launched`, those the thread recorded at launch,
+    /// replaces the kept one, and the thread's fills a hook none is kept for, so an old approval
+    /// left in the thread never replaces a newer one; the directory itself is opened without
+    /// following a link the agent may have put there.
     ///
     /// # Errors
     ///
     /// Returns an error if a file cannot be read or written.
-    pub(crate) fn keep_hook_trust(&self, state_path: &Path, config: &Path) -> io::Result<()> {
+    pub(crate) fn keep_hook_trust(
+        &self,
+        state_path: &Path,
+        config: &Path,
+        launched: &HookTrust,
+    ) -> io::Result<()> {
         let (Install::Codex, Some(hooks)) = (&self.install, codex_hooks_path(state_path)) else {
             return Ok(());
         };
@@ -629,14 +641,16 @@ impl Profile {
         let Small::Read(current) = read_small(&state, CODEX_CONFIG, MAX_CONFIG_BYTES)? else {
             return Ok(());
         };
-        let trust = HookTrust::recorded(&String::from_utf8_lossy(&current), &hooks);
-        if !trust.is_complete() {
-            return Ok(());
-        }
+        let kept = match read_small(&config_dir, CODEX_TRUST, MAX_SAVED_BYTES)? {
+            Small::Read(kept) => kept,
+            Small::Missing | Small::Unusable => Vec::new(),
+        };
+        let trust = HookTrust::recorded(&String::from_utf8_lossy(&current), &hooks).into_kept(
+            launched,
+            &HookTrust::from_saved(&String::from_utf8_lossy(&kept)),
+        );
         let saved = trust.to_saved();
-        if let Small::Read(kept) = read_small(&config_dir, CODEX_TRUST, MAX_SAVED_BYTES)?
-            && kept == saved.as_bytes()
-        {
+        if !trust.is_complete() || kept == saved.as_bytes() {
             return Ok(());
         }
         replace(&config_dir, CODEX_TRUST, saved.as_bytes())
@@ -1823,10 +1837,14 @@ content = "first\n"
             private_dir(path);
         }
         let codex = codex_profile();
-        codex.keep_hook_trust(&first, &config).unwrap();
+        codex
+            .keep_hook_trust(&first, &config, &HookTrust::default())
+            .unwrap();
         assert!(!config.join(CODEX_TRUST).exists());
         fs::write(first.join(CODEX_CONFIG), approvals_in(&first)).unwrap();
-        codex.keep_hook_trust(&first, &config).unwrap();
+        codex
+            .keep_hook_trust(&first, &config, &HookTrust::default())
+            .unwrap();
         let mode = fs::metadata(config.join(CODEX_TRUST))
             .unwrap()
             .permissions()
@@ -1861,6 +1879,97 @@ content = "first\n"
     }
 
     #[test]
+    fn an_old_approval_left_in_a_thread_does_not_replace_a_newer_one_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, config) = (dir.path().join("old"), dir.path().join("config"));
+        for path in [&old, &config] {
+            private_dir(path);
+        }
+        let codex = codex_profile();
+        let newer = approvals_in(&old).replace("sha256:1", "sha256:4");
+        let newer = HookTrust::recorded(&newer, codex_hooks_path(&old).as_deref().unwrap());
+        fs::write(config.join(CODEX_TRUST), newer.to_saved()).unwrap();
+        fs::write(old.join(CODEX_CONFIG), approvals_in(&old)).unwrap();
+        codex
+            .install(&open_dir(&old), &old, Path::new(""), None)
+            .unwrap();
+        let launched = codex
+            .seed_hook_trust(&open_dir(&old), &old, &config)
+            .unwrap();
+        codex.keep_hook_trust(&old, &config, &launched).unwrap();
+        assert_eq!(
+            fs::read_to_string(config.join(CODEX_TRUST)).unwrap(),
+            newer.to_saved()
+        );
+        fs::write(
+            old.join(CODEX_CONFIG),
+            approvals_in(&old).replace("sha256:2", "sha256:5"),
+        )
+        .unwrap();
+        codex.keep_hook_trust(&old, &config, &launched).unwrap();
+        let approved = HookTrust::recorded(
+            &approvals_in(&old)
+                .replace("sha256:1", "sha256:4")
+                .replace("sha256:2", "sha256:5"),
+            codex_hooks_path(&old).as_deref().unwrap(),
+        );
+        assert_eq!(
+            fs::read_to_string(config.join(CODEX_TRUST)).unwrap(),
+            approved.to_saved()
+        );
+    }
+
+    #[test]
+    fn a_lost_keep_file_comes_back_from_a_thread_that_holds_every_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (thread, config) = (dir.path().join("thread"), dir.path().join("config"));
+        for path in [&thread, &config] {
+            private_dir(path);
+        }
+        let codex = codex_profile();
+        fs::write(thread.join(CODEX_CONFIG), approvals_in(&thread)).unwrap();
+        codex
+            .install(&open_dir(&thread), &thread, Path::new(""), None)
+            .unwrap();
+        let launched = codex
+            .seed_hook_trust(&open_dir(&thread), &thread, &config)
+            .unwrap();
+        assert!(launched.is_complete());
+        codex.keep_hook_trust(&thread, &config, &launched).unwrap();
+        assert_eq!(
+            fs::read_to_string(config.join(CODEX_TRUST)).unwrap(),
+            launched.to_saved()
+        );
+    }
+
+    #[test]
+    fn a_first_approval_in_a_new_thread_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (thread, config) = (dir.path().join("thread"), dir.path().join("config"));
+        for path in [&thread, &config] {
+            private_dir(path);
+        }
+        let codex = codex_profile();
+        codex
+            .install(&open_dir(&thread), &thread, Path::new(""), None)
+            .unwrap();
+        let launched = codex
+            .seed_hook_trust(&open_dir(&thread), &thread, &config)
+            .unwrap();
+        assert_eq!(launched, HookTrust::default());
+        fs::write(thread.join(CODEX_CONFIG), approvals_in(&thread)).unwrap();
+        codex.keep_hook_trust(&thread, &config, &launched).unwrap();
+        let approved = HookTrust::recorded(
+            &approvals_in(&thread),
+            codex_hooks_path(&thread).as_deref().unwrap(),
+        );
+        assert_eq!(
+            fs::read_to_string(config.join(CODEX_TRUST)).unwrap(),
+            approved.to_saved()
+        );
+    }
+
+    #[test]
     fn only_codex_carries_approvals_and_planted_links_or_shared_dirs_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let (first, second, config) = (
@@ -1873,7 +1982,7 @@ content = "first\n"
         }
         fs::write(first.join(CODEX_CONFIG), approvals_in(&first)).unwrap();
         claude_code_profile()
-            .keep_hook_trust(&first, &config)
+            .keep_hook_trust(&first, &config, &HookTrust::default())
             .unwrap();
         assert!(!config.join(CODEX_TRUST).exists());
 
@@ -1881,16 +1990,22 @@ content = "first\n"
         fs::write(&outside, approvals_in(&first)).unwrap();
         fs::remove_file(first.join(CODEX_CONFIG)).unwrap();
         std::os::unix::fs::symlink(&outside, first.join(CODEX_CONFIG)).unwrap();
-        codex_profile().keep_hook_trust(&first, &config).unwrap();
+        codex_profile()
+            .keep_hook_trust(&first, &config, &HookTrust::default())
+            .unwrap();
         assert!(!config.join(CODEX_TRUST).exists());
 
         fs::remove_file(first.join(CODEX_CONFIG)).unwrap();
         fs::write(first.join(CODEX_CONFIG), approvals_in(&first)).unwrap();
         fs::set_permissions(&config, fs::Permissions::from_mode(0o777)).unwrap();
-        codex_profile().keep_hook_trust(&first, &config).unwrap();
+        codex_profile()
+            .keep_hook_trust(&first, &config, &HookTrust::default())
+            .unwrap();
         assert!(!config.join(CODEX_TRUST).exists());
         fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
-        codex_profile().keep_hook_trust(&first, &config).unwrap();
+        codex_profile()
+            .keep_hook_trust(&first, &config, &HookTrust::default())
+            .unwrap();
         assert!(config.join(CODEX_TRUST).exists());
 
         let before = "[tui]\n";
@@ -1916,7 +2031,9 @@ content = "first\n"
             private_dir(path);
         }
         fs::write(real.join(CODEX_CONFIG), approvals_in(&real)).unwrap();
-        codex_profile().keep_hook_trust(&real, &config).unwrap();
+        codex_profile()
+            .keep_hook_trust(&real, &config, &HookTrust::default())
+            .unwrap();
         assert!(config.join(CODEX_TRUST).exists());
 
         let codex = codex_profile();
@@ -1928,7 +2045,9 @@ content = "first\n"
                 Mode::from_raw_mode(0o600),
             )
             .unwrap();
-            codex.keep_hook_trust(&state, &config).unwrap();
+            codex
+                .keep_hook_trust(&state, &config, &HookTrust::default())
+                .unwrap();
             codex
                 .seed_hook_trust(&open_dir(&state), &state, &config)
                 .unwrap();
@@ -1953,7 +2072,9 @@ content = "first\n"
         fs::remove_file(config.join(CODEX_TRUST)).unwrap();
         let linked = dir.path().join("linked");
         std::os::unix::fs::symlink(&real, &linked).unwrap();
-        codex.keep_hook_trust(&linked, &config).unwrap();
+        codex
+            .keep_hook_trust(&linked, &config, &HookTrust::default())
+            .unwrap();
         assert!(!config.join(CODEX_TRUST).exists());
     }
 }
