@@ -638,3 +638,11 @@ do not land again, and the agent's note reads `alice cancelled your landing: the
 branch is on up again, so its paths do not land again; call land again.`, with the owner's name
 and the remote. The other choice was to keep the plain line `alice cancelled your landing; nothing
 was pushed.`.
+
+## D089 · 2026-11-11 · No fix for an `n` answer after the branch came back
+
+Chosen by the user (#120). Only a fetch while the landing confirmation asks can find the gone
+branch back. Only a second mahi process in the same clone that starts another of the owner's
+agents fetches then, through `mahi join` or `mahi resume --agent`. mahi leaves `n` as it is in
+that case. The other choices were to cancel the landing with a note, as D088 does for `y`, or to
+refuse such a second process before it fetches.
