@@ -664,3 +664,23 @@ Claude's turn is merged into Codex's worktree, then types the task. Codex then s
 Claude's work, without a conflict, and the test checks D070's merge before the first turn. The
 other choice was to pass the task on the command line, as the user prompting first, and to type
 a second prompt so that mahi's note makes Codex resolve the conflict markers.
+
+## D092 · 2026-11-11 · Transcript turns travel live with the turn-end snapshots
+
+Chosen by the user (#125). A host's answer to a request for an agent's turn-end snapshots also
+holds that agent's transcript turns since the last one the asker holds, so `read_transcript`
+shows a teammate's turns during the session. The protocol becomes `mahi/snapshots/2`, and turn-end
+and claims frames gain a field, so a peer on an older mahi gets no live sync, and its claims frames
+are refused, until both sides upgrade. The other choice was a separate protocol,
+`mahi/transcript/1`, which keeps live snapshot sync with an older peer but adds a second handler
+with its own limits and checks.
+
+## D093 · 2026-11-11 · Turn-end frames name the transcript's newest commit
+
+Chosen by the user (#125). A turn that changes no file adds no turn-end snapshot, so nothing would
+ask for its transcript turns. Turn-end and claims frames now name the agent's newest transcript
+commit beside its latest turn-end snapshot, and the asker asks when it lacks either one. A
+transcript that moved without a turn end is named in the next claims frame, within 10 s, rather
+than in a turn-end frame of its own, so a turn that ends with a snapshot is fetched once. The
+other choice was to add a turn-end snapshot at every turn end, even with no file change, which adds
+an empty commit for each question and still sends nothing while conflicts are unresolved.

@@ -80,6 +80,7 @@ pub use pair::{
     place_bytes,
 };
 pub use snapshots::{
+    HistoryPack,
     MAX_SNAPSHOTS_REQUEST_BYTES,
     SNAPSHOTS_ALPN,
     SnapshotsAnswer,

@@ -388,8 +388,9 @@ impl LiveNode {
             .map_err(|_| LiveError::TimedOut)?
     }
 
-    /// Asks the host at `host` for the turn-end snapshots `request` names, reading at most
-    /// `max_bytes` of its answer, within a minute and a half.
+    /// Asks the host at `host` for the turn-end snapshots `request` names, reading at most its
+    /// `limit` bytes of packs and `ANSWER_FRAMING_BYTES` more, within a minute and a
+    /// half.
     ///
     /// The answer is returned unchecked: the caller takes the pack in as a history and checks
     /// who signed it.
@@ -398,20 +399,19 @@ impl LiveNode {
     ///
     /// Returns [`LiveError::Refused`] if the host refuses, [`LiveError::Unavailable`] if it is
     /// busy or asked too soon, [`LiveError::TimedOut`] if it does not answer in time,
-    /// [`LiveError::TooLarge`] if it sends more than `max_bytes`, [`LiveError::Malformed`] if
+    /// [`LiveError::TooLarge`] if it sends more than that, [`LiveError::Malformed`] if
     /// its answer is not one, or another [`LiveError`] if it cannot be reached.
     pub fn fetch_snapshots(
         &self,
         host: &HostAddress,
         request: &SnapshotsRequest,
-        max_bytes: usize,
     ) -> Result<SnapshotsAnswer, LiveError> {
         outside_runtime()?;
         self.runtime()?
             .block_on(async {
                 tokio::time::timeout(
                     SNAPSHOTS_WAIT,
-                    snapshots::fetch(&self.endpoint, host, request, max_bytes),
+                    snapshots::fetch(&self.endpoint, host, request),
                 )
                 .await
             })

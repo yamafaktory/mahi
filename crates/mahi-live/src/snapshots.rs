@@ -48,12 +48,18 @@ use crate::{
     meta::endpoint_address,
 };
 
-/// The ALPN of the protocol a host serves its agents' turn-end snapshots on.
-pub const SNAPSHOTS_ALPN: &[u8] = b"mahi/snapshots/1";
+/// The ALPN of the protocol a host serves its agents' turn-end snapshots and transcript turns
+/// on.
+pub const SNAPSHOTS_ALPN: &[u8] = b"mahi/snapshots/2";
 /// The largest request for snapshots, in bytes.
 pub const MAX_SNAPSHOTS_REQUEST_BYTES: usize = 256;
 
+/// The most bytes an answer holds beyond its two packs.
+pub(crate) const ANSWER_FRAMING_BYTES: usize = HEADER_BYTES + COMMIT_BYTES;
+
 const THREAD_ID_BYTES: usize = 16;
+const LENGTH_BYTES: usize = 4;
+const HEADER_BYTES: usize = COMMIT_BYTES + LENGTH_BYTES;
 const REQUEST_WAIT: Duration = Duration::from_secs(5);
 const ANSWER_WAIT: Duration = Duration::from_secs(60);
 const DELIVERY_WAIT: Duration = Duration::from_secs(10);
@@ -64,30 +70,47 @@ const UNAVAILABLE: u32 = 2;
 const BUILDERS: usize = 2;
 
 /// What a collaborator asks a host for: the turn-end snapshots of the agent `slot`, after
-/// `since`, the last commit of that agent they hold, if any.
+/// `since`, the last snapshot of that agent they hold, if any, and its transcript turns after
+/// `transcript_since`, the last transcript commit of that agent they hold, if any, both packs
+/// within `limit` bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotsRequest {
     /// The thread.
     pub thread: ThreadId,
     /// The agent whose snapshots are asked for.
     pub slot: AgentSlot,
-    /// The last commit of that agent the asker holds.
+    /// The last snapshot of that agent the asker holds.
     pub since: Option<[u8; COMMIT_BYTES]>,
+    /// The last transcript commit of that agent the asker holds.
+    pub transcript_since: Option<[u8; COMMIT_BYTES]>,
+    /// The most bytes the asker reads of the two packs.
+    pub limit: u64,
 }
 
-/// A host's answer: the latest turn-end snapshot of the agent asked for, and a pack of its
-/// history since the commit the request named.
-#[derive(Clone, PartialEq, Eq)]
+/// A host's answer: the agent's snapshots up to its latest turn end since the snapshot the
+/// request named, then, when the host sends them, its transcript turns since the transcript
+/// commit the request named.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotsAnswer {
-    /// The latest turn-end snapshot.
+    /// The snapshots, up to the latest turn end.
+    pub snapshots: HistoryPack,
+    /// The transcript turns.
+    pub transcript: Option<HistoryPack>,
+}
+
+/// A history an answer holds: its newest commit and a pack of the commits since the one the
+/// request named.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HistoryPack {
+    /// The newest commit.
     pub tip: [u8; COMMIT_BYTES],
     /// The pack.
     pub pack: Vec<u8>,
 }
 
-impl std::fmt::Debug for SnapshotsAnswer {
+impl std::fmt::Debug for HistoryPack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SnapshotsAnswer")
+        f.debug_struct("HistoryPack")
             .field("pack_bytes", &self.pack.len())
             .finish_non_exhaustive()
     }
@@ -98,6 +121,8 @@ struct WireRequest<'a> {
     thread: [u8; THREAD_ID_BYTES],
     slot: &'a str,
     since: Option<[u8; COMMIT_BYTES]>,
+    transcript_since: Option<[u8; COMMIT_BYTES]>,
+    limit: u64,
 }
 
 impl SnapshotsRequest {
@@ -113,6 +138,8 @@ impl SnapshotsRequest {
             thread: *self.thread.as_bytes(),
             slot: &slot,
             since: self.since,
+            transcript_since: self.transcript_since,
+            limit: self.limit,
         })
         .map_err(|_| LiveError::Malformed)?;
         if bytes.len() > MAX_SNAPSHOTS_REQUEST_BYTES {
@@ -140,23 +167,92 @@ impl SnapshotsRequest {
             thread: ThreadId::from_bytes(wire.thread),
             slot: wire.slot.parse().map_err(|_| LiveError::Malformed)?,
             since: wire.since,
+            transcript_since: wire.transcript_since,
+            limit: wire.limit,
         })
     }
 }
 
 impl SnapshotsAnswer {
-    /// Decodes an answer a host sent, the tip's id then the pack, keeping the pack where it
-    /// already is.
+    /// Returns the answer as a host sends it, in order: a header of the snapshots' tip and
+    /// their pack's length as four big-endian bytes, their pack, then, with transcript turns,
+    /// the transcript's tip and its pack; a part that is not sent is empty.
     ///
     /// # Errors
     ///
-    /// Returns [`LiveError::Malformed`] if `bytes` is too short to hold the tip.
+    /// Returns [`LiveError::TooLarge`] if the snapshots' pack takes more than four bytes can
+    /// count.
+    pub(crate) fn parts(&self) -> Result<([u8; HEADER_BYTES], [&[u8]; 3]), LiveError> {
+        let length = u32::try_from(self.snapshots.pack.len()).map_err(|_| LiveError::TooLarge)?;
+        let mut header = [0; HEADER_BYTES];
+        let (tip, counted) = header.split_at_mut(COMMIT_BYTES);
+        tip.copy_from_slice(&self.snapshots.tip);
+        counted.copy_from_slice(&length.to_be_bytes());
+        let (transcript_tip, transcript_pack) = self
+            .transcript
+            .as_ref()
+            .map_or((&[][..], &[][..]), |history| {
+                (&history.tip[..], history.pack.as_slice())
+            });
+        Ok((
+            header,
+            [&self.snapshots.pack, transcript_tip, transcript_pack],
+        ))
+    }
+
+    /// Returns the bytes [`SnapshotsAnswer::parts`] lays out, joined.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`SnapshotsAnswer::parts`].
+    #[cfg(any(test, fuzzing, feature = "fuzzing"))]
+    pub fn to_bytes(&self) -> Result<Vec<u8>, LiveError> {
+        let (header, parts) = self.parts()?;
+        let mut bytes = header.to_vec();
+        for part in parts {
+            bytes.extend_from_slice(part);
+        }
+        Ok(bytes)
+    }
+
+    /// Decodes an answer a host sent, as [`SnapshotsAnswer::parts`] lays it out, moving the
+    /// snapshots' pack within `bytes` and copying only the transcript's pack.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiveError::Malformed`] if `bytes` is too short to hold the header, the pack
+    /// its header counts, or, when more follows, the transcript's tip.
     pub fn from_bytes(mut bytes: Vec<u8>) -> Result<Self, LiveError> {
-        let tip = *bytes
-            .first_chunk::<COMMIT_BYTES>()
+        let header = bytes
+            .first_chunk::<HEADER_BYTES>()
             .ok_or(LiveError::Malformed)?;
-        bytes.drain(..COMMIT_BYTES);
-        Ok(Self { tip, pack: bytes })
+        let (tip, counted) = header.split_at(COMMIT_BYTES);
+        let tip: [u8; COMMIT_BYTES] = tip.try_into().map_err(|_| LiveError::Malformed)?;
+        let counted: [u8; LENGTH_BYTES] = counted.try_into().map_err(|_| LiveError::Malformed)?;
+        let length =
+            usize::try_from(u32::from_be_bytes(counted)).map_err(|_| LiveError::Malformed)?;
+        let end = HEADER_BYTES
+            .checked_add(length)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(LiveError::Malformed)?;
+        let transcript = match bytes.get(end..) {
+            Some([]) | None => None,
+            Some(rest) => {
+                let transcript_tip = *rest
+                    .first_chunk::<COMMIT_BYTES>()
+                    .ok_or(LiveError::Malformed)?;
+                Some(HistoryPack {
+                    tip: transcript_tip,
+                    pack: bytes.split_off(end + COMMIT_BYTES),
+                })
+            }
+        };
+        bytes.truncate(end);
+        bytes.drain(..HEADER_BYTES);
+        Ok(Self {
+            snapshots: HistoryPack { tip, pack: bytes },
+            transcript,
+        })
     }
 }
 
@@ -287,12 +383,15 @@ impl SnapshotsHandler {
         .await
         .map_err(|_| Failure::Unavailable)?
         .ok_or(Failure::Refused)?;
-        send.write_all(&answer.tip)
+        let (header, parts) = answer.parts().map_err(|_| Failure::Unavailable)?;
+        send.write_all(&header)
             .await
             .map_err(|_| Failure::Unavailable)?;
-        send.write_all(&answer.pack)
-            .await
-            .map_err(|_| Failure::Unavailable)?;
+        for part in parts {
+            send.write_all(part)
+                .await
+                .map_err(|_| Failure::Unavailable)?;
+        }
         send.finish().map_err(|_| Failure::Unavailable)
     }
 }
@@ -312,15 +411,17 @@ impl ProtocolHandler for SnapshotsHandler {
     }
 }
 
-/// Asks the host at `host` for the snapshots `request` names, reading at most `max_bytes` of
-/// its answer, as the node `endpoint` speaks as.
+/// Asks the host at `host` for the snapshots `request` names, reading at most its `limit`
+/// bytes of packs and [`ANSWER_FRAMING_BYTES`] more, as the node `endpoint` speaks as.
 pub(crate) async fn fetch(
     endpoint: &Endpoint,
     host: &HostAddress,
     request: &SnapshotsRequest,
-    max_bytes: usize,
 ) -> Result<SnapshotsAnswer, LiveError> {
     let bytes = request.to_bytes()?;
+    let max_bytes = usize::try_from(request.limit)
+        .unwrap_or(usize::MAX)
+        .saturating_add(ANSWER_FRAMING_BYTES);
     let connection = endpoint
         .connect(endpoint_address(host)?, SNAPSHOTS_ALPN)
         .await
@@ -425,10 +526,16 @@ mod tests {
                 gate.lock().unwrap().recv_timeout(WAIT).unwrap();
             }
             (request.slot.agent().as_str() == "claude").then(|| SnapshotsAnswer {
-                tip: [7; COMMIT_BYTES],
-                pack: request
-                    .since
-                    .map_or(b"whole".to_vec(), |_| b"since".to_vec()),
+                snapshots: HistoryPack {
+                    tip: [7; COMMIT_BYTES],
+                    pack: request
+                        .since
+                        .map_or(b"whole".to_vec(), |_| b"since".to_vec()),
+                },
+                transcript: Some(HistoryPack {
+                    tip: [8; COMMIT_BYTES],
+                    pack: b"turns".to_vec(),
+                }),
             })
         }
     }
@@ -488,7 +595,7 @@ mod tests {
         }
 
         fn fetch(&self, node: &LiveNode, slot: &str) -> Result<SnapshotsAnswer, LiveError> {
-            node.fetch_snapshots(&self.address, &request(slot, None), 1024)
+            node.fetch_snapshots(&self.address, &request(slot, None))
         }
 
         fn wait_for_a_build(&self) {
@@ -514,12 +621,17 @@ mod tests {
             thread: ThreadId::from_bytes([1; THREAD_ID_BYTES]),
             slot: slot.parse().unwrap(),
             since,
+            transcript_since: None,
+            limit: 1024,
         }
     }
 
     #[test]
     fn a_request_reads_back_the_same_and_odd_bytes_are_refused() {
-        let asked = request("alice.claude", Some([3; COMMIT_BYTES]));
+        let asked = SnapshotsRequest {
+            transcript_since: Some([4; COMMIT_BYTES]),
+            ..request("alice.claude", Some([3; COMMIT_BYTES]))
+        };
         let bytes = asked.to_bytes().unwrap();
         assert_eq!(SnapshotsRequest::from_bytes(&bytes).unwrap(), asked);
         let mut longer = bytes.clone();
@@ -531,12 +643,59 @@ mod tests {
             thread: [1; THREAD_ID_BYTES],
             slot: "no dot here",
             since: None,
+            transcript_since: None,
+            limit: 0,
         })
         .unwrap();
         assert!(SnapshotsRequest::from_bytes(&odd_slot).is_err());
-        assert!(SnapshotsAnswer::from_bytes(vec![0; COMMIT_BYTES - 1]).is_err());
-        let answer = SnapshotsAnswer::from_bytes(vec![9; COMMIT_BYTES + 2]).unwrap();
-        assert_eq!((answer.tip, answer.pack), ([9; COMMIT_BYTES], vec![9, 9]));
+    }
+
+    fn sent(answer: &SnapshotsAnswer) -> Vec<u8> {
+        answer.to_bytes().unwrap()
+    }
+
+    #[test]
+    fn an_answer_reads_back_the_same_with_or_without_transcript_turns() {
+        let mut answer = SnapshotsAnswer {
+            snapshots: HistoryPack {
+                tip: [9; COMMIT_BYTES],
+                pack: vec![1, 2],
+            },
+            transcript: None,
+        };
+        assert_eq!(SnapshotsAnswer::from_bytes(sent(&answer)).unwrap(), answer);
+        answer.transcript = Some(HistoryPack {
+            tip: [5; COMMIT_BYTES],
+            pack: vec![3],
+        });
+        assert_eq!(SnapshotsAnswer::from_bytes(sent(&answer)).unwrap(), answer);
+        answer.transcript = Some(HistoryPack {
+            tip: [5; COMMIT_BYTES],
+            pack: Vec::new(),
+        });
+        assert_eq!(SnapshotsAnswer::from_bytes(sent(&answer)).unwrap(), answer);
+    }
+
+    #[test]
+    fn an_answer_shorter_than_its_header_counts_is_refused() {
+        let answer = SnapshotsAnswer {
+            snapshots: HistoryPack {
+                tip: [9; COMMIT_BYTES],
+                pack: vec![1, 2],
+            },
+            transcript: Some(HistoryPack {
+                tip: [5; COMMIT_BYTES],
+                pack: vec![3],
+            }),
+        };
+        let bytes = sent(&answer);
+        assert!(SnapshotsAnswer::from_bytes(bytes[..HEADER_BYTES - 1].to_vec()).is_err());
+        assert!(SnapshotsAnswer::from_bytes(bytes[..=HEADER_BYTES].to_vec()).is_err());
+        let before_the_tip_ends = HEADER_BYTES + 2 + COMMIT_BYTES;
+        assert!(SnapshotsAnswer::from_bytes(bytes[..before_the_tip_ends - 1].to_vec()).is_err());
+        let mut counted_past_the_end = bytes[..HEADER_BYTES].to_vec();
+        counted_past_the_end[COMMIT_BYTES..].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(SnapshotsAnswer::from_bytes(counted_past_the_end).is_err());
     }
 
     #[test]
@@ -546,8 +705,18 @@ mod tests {
             .fetch(hosted.collaborator(0), "alice.claude")
             .unwrap();
         assert_eq!(
-            (whole.tip, whole.pack.as_slice()),
-            ([7; COMMIT_BYTES], b"whole".as_slice())
+            whole.snapshots,
+            HistoryPack {
+                tip: [7; COMMIT_BYTES],
+                pack: b"whole".to_vec(),
+            }
+        );
+        assert_eq!(
+            whole.transcript,
+            Some(HistoryPack {
+                tip: [8; COMMIT_BYTES],
+                pack: b"turns".to_vec(),
+            })
         );
         for (node, slot) in [
             (&hosted.stranger, "alice.claude"),
@@ -561,7 +730,6 @@ mod tests {
         let since = hosted.collaborator(0).fetch_snapshots(
             &hosted.address,
             &request("alice.gemini", Some([1; COMMIT_BYTES])),
-            1024,
         );
         assert!(matches!(since, Err(LiveError::Refused)), "{since:?}");
         assert_eq!(hosted.served(), 3);
@@ -576,10 +744,9 @@ mod tests {
             .fetch_snapshots(
                 &hosted.address,
                 &request("alice.claude", Some([1; COMMIT_BYTES])),
-                1024,
             )
             .unwrap();
-        assert_eq!(since.pack, b"since");
+        assert_eq!(since.snapshots.pack, b"since");
         hosted.close();
     }
 
@@ -651,8 +818,10 @@ mod tests {
         let hosted = hosted(false);
         let fetched = hosted.collaborator(0).fetch_snapshots(
             &hosted.address,
-            &request("alice.claude", None),
-            COMMIT_BYTES + 2,
+            &SnapshotsRequest {
+                limit: 2,
+                ..request("alice.claude", None)
+            },
         );
         assert!(matches!(fetched, Err(LiveError::TooLarge)), "{fetched:?}");
         hosted.close();

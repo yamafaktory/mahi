@@ -61,6 +61,7 @@ use mahi_live::{
     FrameError,
     FrameReceiver,
     FrameSender,
+    HistoryPack,
     HostAddress,
     LiveError,
     LiveKeys,
@@ -1049,23 +1050,60 @@ impl Hosting {
         let snapshots = ThreadRef::new(request.thread, RefKind::Snapshots(request.slot.clone()));
         let head = store.head(&snapshots).ok()??;
         let tip = turn_end::latest(&store, &request.slot, head)?;
-        let since = match request.since {
-            Some(since) => Some(ObjectId::try_from(since.as_slice()).ok()?),
-            None => None,
+        let bytes = self.fetch_limit.min(MAX_SERVED_BYTES).min(request.limit);
+        let since = request.since.map(ObjectId::from);
+        let ahead = || {
+            let mut budget = MAX_SERVED_COMMITS;
+            since.is_some_and(|since| {
+                store
+                    .descends_within(since, tip, &mut budget)
+                    .unwrap_or(false)
+            })
         };
-        let mut pack = Vec::new();
-        let limits = HistoryLimits {
-            commits: MAX_SERVED_COMMITS,
-            bytes: self.fetch_limit.min(MAX_SERVED_BYTES),
-        };
-        store
-            .write_history_pack(since, tip, limits, &mut pack, &AtomicBool::new(false))
-            .ok()?;
+        let pack = history_pack(&store, (since, tip), bytes).or_else(|| ahead().then(Vec::new));
+        let used = pack.as_ref().map_or(0, Vec::len);
+        let room = bytes.saturating_sub(u64::try_from(used).ok()?);
+        let transcript = transcript_pack(&store, request, room);
+        if pack.is_none() && transcript.is_none() {
+            return None;
+        }
         Some(SnapshotsAnswer {
-            tip: tip.as_bytes().try_into().ok()?,
-            pack,
+            snapshots: HistoryPack {
+                tip: turn_end::wire(tip)?,
+                pack: pack.unwrap_or_default(),
+            },
+            transcript,
         })
     }
+}
+
+fn history_pack(
+    store: &Store,
+    (since, tip): (Option<ObjectId>, ObjectId),
+    bytes: u64,
+) -> Option<Vec<u8>> {
+    let mut pack = Vec::new();
+    let limits = HistoryLimits {
+        commits: MAX_SERVED_COMMITS,
+        bytes,
+    };
+    store
+        .write_history_pack(since, tip, limits, &mut pack, &AtomicBool::new(false))
+        .ok()?;
+    Some(pack)
+}
+
+fn transcript_pack(store: &Store, request: &SnapshotsRequest, room: u64) -> Option<HistoryPack> {
+    let transcript = ThreadRef::new(request.thread, RefKind::Transcript(request.slot.clone()));
+    let tip = store.head(&transcript).ok()??;
+    let since = request.transcript_since.map(ObjectId::from);
+    if since == Some(tip) {
+        return None;
+    }
+    Some(HistoryPack {
+        tip: turn_end::wire(tip)?,
+        pack: history_pack(store, (since, tip), room)?,
+    })
 }
 
 impl HostedThreads {
@@ -2899,11 +2937,13 @@ mod tests {
             thread: hosted.thread,
             slot: slot.clone(),
             since: None,
+            transcript_since: None,
+            limit: 1 << 20,
         };
 
         assert!(threads.serves_snapshots(&bob_id, &ask(&served)));
         let answer = threads.snapshots_for(&bob_id, &ask(&served)).unwrap();
-        assert_eq!(answer.tip.as_slice(), ended.as_bytes());
+        assert_eq!(answer.snapshots.tip.as_slice(), ended.as_bytes());
         assert!(!threads.serves_snapshots(&bob_id, &ask(&other)));
         assert!(threads.snapshots_for(&bob_id, &ask(&other)).is_none());
 
@@ -2925,6 +2965,8 @@ mod tests {
             thread: hosted.thread,
             slot: served,
             since: None,
+            transcript_since: None,
+            limit: 1 << 20,
         };
         assert!(threads.snapshots_for(&bob_id, &ask).is_some());
 
@@ -2965,13 +3007,28 @@ mod tests {
             thread: hosted.thread,
             slot: slot.clone(),
             since: since.map(|since| since.as_bytes().try_into().unwrap()),
+            transcript_since: None,
+            limit: 1 << 20,
         };
 
         let same = threads
             .snapshots_for(&bob_id, &ask(&served, Some(ended)))
             .unwrap();
-        assert_eq!(same.tip.as_slice(), ended.as_bytes());
-        assert!(same.pack.is_empty());
+        assert_eq!(same.snapshots.tip.as_slice(), ended.as_bytes());
+        assert!(same.snapshots.pack.is_empty());
+        let after_the_turn_end = hosted
+            .store
+            .head(&ThreadRef::new(
+                hosted.thread,
+                RefKind::Snapshots(served.clone()),
+            ))
+            .unwrap()
+            .unwrap();
+        let ahead = threads
+            .snapshots_for(&bob_id, &ask(&served, Some(after_the_turn_end)))
+            .unwrap();
+        assert_eq!(ahead.snapshots.tip.as_slice(), ended.as_bytes());
+        assert!(ahead.snapshots.pack.is_empty());
         let unrelated = hosted.store.write_tree(&[]).unwrap();
         let elsewhere = hosted
             .store
@@ -2991,6 +3048,23 @@ mod tests {
             threads
                 .snapshots_for(&bob_id, &ask(&unfinished, None))
                 .is_none()
+        );
+        let turns = hosted
+            .store
+            .append(
+                &ThreadRef::new(hosted.thread, RefKind::Transcript(served.clone())),
+                None,
+                tree,
+                "turn 0",
+            )
+            .unwrap();
+        let only_turns = threads
+            .snapshots_for(&bob_id, &ask(&served, Some(elsewhere)))
+            .unwrap();
+        assert!(only_turns.snapshots.pack.is_empty());
+        assert_eq!(
+            only_turns.transcript.unwrap().tip.as_slice(),
+            turns.as_bytes()
         );
     }
 
@@ -3024,8 +3098,9 @@ mod tests {
                 thread,
                 slot: slot.clone(),
                 since: None,
+                transcript_since: None,
+                limit: 1 << 20,
             },
-            1 << 20,
         );
         node.close().unwrap();
         answer
@@ -3045,6 +3120,16 @@ mod tests {
             AgentName::new("claude").unwrap(),
         );
         let ended = ended_snapshots(&hosted, &slot);
+        let transcript = ThreadRef::new(hosted.thread, RefKind::Transcript(slot.clone()));
+        let turn = hosted.store.write_blob(b"bob's turn").unwrap();
+        let turn = hosted
+            .store
+            .write_tree(&[("turn", EntryKind::Blob, turn)])
+            .unwrap();
+        let turns = hosted
+            .store
+            .append(&transcript, None, turn, "turn 0")
+            .unwrap();
         let own = OwnAgent {
             slot: slot.clone(),
             size: WindowSize { rows: 4, cols: 40 },
@@ -3071,20 +3156,77 @@ mod tests {
             "{not_served:?}"
         );
         let answer = ask_as(&alice, &address, (hosted.thread, &slot)).unwrap();
-        assert_eq!(answer.tip.as_slice(), ended.as_bytes());
+        assert_eq!(answer.snapshots.tip.as_slice(), ended.as_bytes());
         let (_elsewhere, clone) = repository_on_main();
         let limits = TakeLimits {
             commits: 16,
             object_bytes: 1 << 20,
         };
         clone
-            .take_history_pack(&answer.pack, None, ended, limits, &AtomicBool::new(false))
+            .take_history_pack(
+                &answer.snapshots.pack,
+                None,
+                ended,
+                limits,
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert_eq!(
             clone.read_entry(ended, "README", 64).unwrap().as_deref(),
             Some(b"bob's work".as_slice())
         );
+        let held = answer.transcript.unwrap();
+        assert_eq!(held.tip.as_slice(), turns.as_bytes());
+        clone
+            .take_history_pack(&held.pack, None, turns, limits, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(
+            clone.read_entry(turns, "turn", 64).unwrap().as_deref(),
+            Some(b"bob's turn".as_slice())
+        );
         bob_host.stop();
+    }
+
+    #[test]
+    fn a_transcript_pack_holds_the_turns_the_asker_lacks_within_the_room_left() {
+        let hosted = hosted();
+        let slot = AgentSlot::new(
+            ParticipantName::new("bob").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+        let transcript = ThreadRef::new(hosted.thread, RefKind::Transcript(slot.clone()));
+        let asked = |transcript_since: Option<ObjectId>| SnapshotsRequest {
+            thread: hosted.thread,
+            slot: slot.clone(),
+            since: None,
+            transcript_since: transcript_since.map(|tip| tip.as_bytes().try_into().unwrap()),
+            limit: 1 << 20,
+        };
+        assert_eq!(transcript_pack(&hosted.store, &asked(None), 1 << 20), None);
+        let turn = hosted.store.write_blob(&[7; 4096]).unwrap();
+        let turn = hosted
+            .store
+            .write_tree(&[("turn", EntryKind::Blob, turn)])
+            .unwrap();
+        let first = hosted
+            .store
+            .append(&transcript, None, turn, "turn 0")
+            .unwrap();
+        let second = hosted
+            .store
+            .append(&transcript, Some(first), turn, "turn 1")
+            .unwrap();
+
+        let whole = transcript_pack(&hosted.store, &asked(None), 1 << 20).unwrap();
+        assert_eq!(whole.tip.as_slice(), second.as_bytes());
+        let since = transcript_pack(&hosted.store, &asked(Some(first)), 1 << 20).unwrap();
+        assert_eq!(since.tip.as_slice(), second.as_bytes());
+        assert!(since.pack.len() < whole.pack.len());
+        assert_eq!(
+            transcript_pack(&hosted.store, &asked(Some(second)), 1 << 20),
+            None
+        );
+        assert_eq!(transcript_pack(&hosted.store, &asked(None), 64), None);
     }
 
     fn watching(queue: usize) -> (Watching, Receiver<Received>) {

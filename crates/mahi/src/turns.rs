@@ -104,7 +104,16 @@ pub(crate) fn record(
             .session
             .as_ref()
             .map(|source| scope.spawn(move || record_sessions(transcript, source, &woken, pushes)));
-        let mut summary = record_turns(&store, transcript, inputs, events, pushes, &wake);
+        let told = |kind: HookKind| {
+            if let Some(events) = events {
+                match kind {
+                    HookKind::Tool => events.changed(),
+                    HookKind::TurnEnd => events.turn_ended(),
+                    HookKind::Prompt | HookKind::Asks => {}
+                }
+            }
+        };
+        let mut summary = record_turns(&store, transcript, inputs, &told, (pushes, &wake));
         drop(wake);
         if let Some(sessions) = sessions {
             match sessions.join() {
@@ -157,9 +166,8 @@ fn record_turns(
     store: &Store,
     transcript: &Transcript,
     inputs: &Receiver<Delivery>,
-    events: Option<&AgentEvents>,
-    pushes: Option<&PushPoker>,
-    sessions: &SyncSender<()>,
+    told: &dyn Fn(HookKind),
+    (pushes, sessions): (Option<&PushPoker>, &SyncSender<()>),
 ) -> Summary {
     let mut turns = Turns::after(transcript.tip);
     while let Ok(delivery) = inputs.recv() {
@@ -171,18 +179,12 @@ fn record_turns(
             }
         };
         let ends = message.kind == HookKind::TurnEnd;
-        if let Some(events) = events {
-            match message.kind {
-                HookKind::Tool => events.changed(),
-                HookKind::TurnEnd => events.turn_ended(),
-                HookKind::Prompt | HookKind::Asks => {}
-            }
-        }
         turns.push(&message);
         if ends && turns.seal_or_note(store, transcript) {
             let _ = sessions.try_send(());
             pushes.inspect(|pushes| pushes.poke());
         }
+        told(message.kind);
     }
     turns.seal_or_note(store, transcript);
     turns.summary
@@ -460,6 +462,42 @@ mod tests {
         let repo = gix::open(store.common_dir()).unwrap();
         let tree = repo.find_commit(ended).unwrap().tree().unwrap();
         assert!(tree.find_entry("done").is_some());
+    }
+
+    #[test]
+    fn a_turn_is_in_the_transcript_before_its_turn_end_asks_for_a_snapshot() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut started = start_with(&store, &signer).unwrap();
+        let transcript = Transcript {
+            git_dir: store.common_dir().to_path_buf(),
+            key: Arc::new(started.key.take().unwrap()),
+            thread: started.thread,
+            slot: started.slot.clone(),
+            tip: None,
+            commits: started.commits.clone(),
+            session: None,
+        };
+        let turns = mahi_core::ThreadRef::new(
+            started.thread,
+            mahi_core::RefKind::Transcript(started.slot.clone()),
+        );
+        let held_at_turn_end = std::cell::Cell::new(None);
+        let told = |kind: HookKind| {
+            if kind == HookKind::TurnEnd {
+                held_at_turn_end.set(Some(store.head(&turns).unwrap()));
+            }
+        };
+        let (sender, inputs) = mpsc::channel();
+        sender.send(hook(HookKind::Prompt, b"ask")).unwrap();
+        sender.send(hook(HookKind::TurnEnd, b"")).unwrap();
+        sender.send(Delivery::End { dropped: 0 }).unwrap();
+        let (wake, _woken) = mpsc::sync_channel(1);
+
+        let summary = record_turns(&store, &transcript, &inputs, &told, (None, &wake));
+        assert!(summary.error.is_none());
+        let held = held_at_turn_end.take();
+        assert!(matches!(held, Some(Some(_))), "{held:?}");
     }
 
     #[test]

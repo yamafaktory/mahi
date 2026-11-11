@@ -44,11 +44,20 @@ pub enum Refusal {
     OtherThread(ObjectId),
 }
 
-/// Why fetched snapshots were refused.
+/// Which history of an agent [`accept_live`] takes from the agent's host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveHistory {
+    /// Its snapshots.
+    Snapshots,
+    /// Its transcript turns.
+    Transcript,
+}
+
+/// Why a history fetched from an agent's host was refused.
 #[derive(Debug, Error)]
-pub enum SnapshotsRefusal {
-    /// They are the local participant's own, which no one else writes.
-    #[error("the snapshots are the user's own")]
+pub enum LiveRefusal {
+    /// It is the local participant's own, which no one else writes.
+    #[error("the history is the user's own")]
     Own,
     /// Their participant is not listed in `meta`.
     #[error("{0} is not a participant of the thread")]
@@ -61,9 +70,9 @@ pub enum SnapshotsRefusal {
     Refused(#[from] Refusal),
 }
 
-/// What [`accept_snapshots`] did to the agent's snapshots ref.
+/// What [`accept_live`] did to the agent's ref.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotsAccepted {
+pub enum LiveAccepted {
     /// The ref moved forward to the fetched commit.
     Moved,
     /// The ref is already at or past the fetched commit.
@@ -255,14 +264,14 @@ fn read_document(
     Ok(MetaDocument::decode(&encoded, thread, trusted_owner)?)
 }
 
-/// Moves the snapshots ref of `slot` in `meta`'s thread forward to `tip`, a commit fetched from
-/// the agent's host, on behalf of the participant `local`: only when `meta` lists the slot's
-/// participant as a collaborator other than `local`, and when every commit the ref gains is
-/// signed by the key `meta` lists for them. A ref already at or past `tip` stays, and so does
-/// one whose history went apart from it. `tip` must name this thread in its `Mahi-Thread`
-/// trailer, and no commit the ref gains may name another, so a participant's snapshots from
-/// another thread are refused. The history walks go through at most [`MAX_HISTORY_WALK`]
-/// commits.
+/// Moves the `history` ref of `slot` in `meta`'s thread forward to `tip`, a commit fetched
+/// from the agent's host, on behalf of the participant `local`: only when `meta` lists the
+/// slot's participant as a collaborator other than `local`, and when every commit the ref gains
+/// is signed by the key `meta` lists for them. A ref already at or past `tip` stays, and so
+/// does one whose history went apart from it. For snapshots, `tip` must name this thread in its
+/// `Mahi-Thread` trailer, and no commit the ref gains may name another, so a participant's
+/// snapshots from another thread are refused. The history walks go through at most
+/// [`MAX_HISTORY_WALK`] commits.
 ///
 /// `meta` must be the newest the user accepted, read again for each answer, so that a
 /// collaborator made a watcher is refused from then on. The caller takes the answer only from
@@ -270,36 +279,40 @@ fn read_document(
 ///
 /// # Errors
 ///
-/// Returns [`SnapshotsRefusal::Own`] for `local`'s own slot, [`SnapshotsRefusal::NotListed`]
-/// or [`SnapshotsRefusal::Watcher`] if `meta` does not list the participant as a collaborator,
-/// or [`SnapshotsRefusal::Refused`] with [`Refusal::NotSigned`] if a commit the ref would gain
-/// is not theirs, with [`Refusal::OtherThread`] if one names another thread or `tip` names
-/// none, or with [`Refusal::Store`] if the history cannot be read or the ref moved.
-pub fn accept_snapshots(
+/// Returns [`LiveRefusal::Own`] for `local`'s own slot, [`LiveRefusal::NotListed`]
+/// or [`LiveRefusal::Watcher`] if `meta` does not list the participant as a collaborator,
+/// or [`LiveRefusal::Refused`] with [`Refusal::NotSigned`] if a commit the ref would gain
+/// is not theirs, with [`Refusal::OtherThread`] if a snapshot names another thread or `tip`
+/// names none, or with [`Refusal::Store`] if the history cannot be read or the ref moved.
+pub fn accept_live(
     store: &Store,
     meta: &VerifiedMeta,
-    slot: &AgentSlot,
+    (slot, history): (&AgentSlot, LiveHistory),
     tip: ObjectId,
     local: &ParticipantName,
-) -> Result<SnapshotsAccepted, SnapshotsRefusal> {
+) -> Result<LiveAccepted, LiveRefusal> {
     let owner = slot.participant();
     if owner == local {
-        return Err(SnapshotsRefusal::Own);
+        return Err(LiveRefusal::Own);
     }
     let writer = meta
         .participants()
         .find(|listed| listed.name() == owner)
-        .ok_or_else(|| SnapshotsRefusal::NotListed(owner.clone()))?;
+        .ok_or_else(|| LiveRefusal::NotListed(owner.clone()))?;
     match writer.role() {
         Role::Collaborator => {}
-        Role::Watcher => return Err(SnapshotsRefusal::Watcher(owner.clone())),
+        Role::Watcher => return Err(LiveRefusal::Watcher(owner.clone())),
     }
-    let snapshots = ThreadRef::new(meta.thread(), RefKind::Snapshots(slot.clone()));
+    let kind = match history {
+        LiveHistory::Snapshots => RefKind::Snapshots(slot.clone()),
+        LiveHistory::Transcript => RefKind::Transcript(slot.clone()),
+    };
+    let thread_ref = ThreadRef::new(meta.thread(), kind);
     let mut budget = MAX_HISTORY_WALK;
-    match advance(store, &snapshots, tip, writer.key(), &mut budget)? {
-        Advance::Moved => Ok(SnapshotsAccepted::Moved),
-        Advance::Kept => Ok(SnapshotsAccepted::Kept),
-        Advance::Diverged => Ok(SnapshotsAccepted::Diverged),
+    match advance(store, &thread_ref, tip, writer.key(), &mut budget)? {
+        Advance::Moved => Ok(LiveAccepted::Moved),
+        Advance::Kept => Ok(LiveAccepted::Kept),
+        Advance::Diverged => Ok(LiveAccepted::Diverged),
     }
 }
 
@@ -998,7 +1011,15 @@ mod tests {
             ParticipantName::new("bob").unwrap(),
             AgentName::new("claude").unwrap(),
         );
-        let accept = |tip: ObjectId| accept_snapshots(&setup.store, &meta, &bobs, tip, &alice);
+        let accept = |tip: ObjectId| {
+            accept_live(
+                &setup.store,
+                &meta,
+                (&bobs, LiveHistory::Snapshots),
+                tip,
+                &alice,
+            )
+        };
         let by_bob = |parent: Option<ObjectId>, message: &str, content: &[u8]| {
             let scratch = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
             if let Some(parent) = parent {
@@ -1020,20 +1041,69 @@ mod tests {
         let unnamed_tip = by_bob(None, "snapshot", b"old");
         assert!(matches!(
             accept(unnamed_tip),
-            Err(SnapshotsRefusal::Refused(Refusal::OtherThread(commit))) if commit == unnamed_tip
+            Err(LiveRefusal::Refused(Refusal::OtherThread(commit))) if commit == unnamed_tip
         ));
         let other_tip = by_bob(Some(unnamed_tip), &elsewhere, b"other");
         assert!(matches!(
             accept(other_tip),
-            Err(SnapshotsRefusal::Refused(Refusal::OtherThread(commit))) if commit == other_tip
+            Err(LiveRefusal::Refused(Refusal::OtherThread(commit))) if commit == other_tip
         ));
         let other_below = by_bob(Some(other_tip), &here, b"over another thread's");
         assert!(matches!(
             accept(other_below),
-            Err(SnapshotsRefusal::Refused(Refusal::OtherThread(commit))) if commit == other_tip
+            Err(LiveRefusal::Refused(Refusal::OtherThread(commit))) if commit == other_tip
         ));
         let named = by_bob(Some(unnamed_tip), &here, b"new");
-        assert_eq!(accept(named).unwrap(), SnapshotsAccepted::Moved);
+        assert_eq!(accept(named).unwrap(), LiveAccepted::Moved);
+    }
+
+    #[test]
+    fn a_collaborators_fetched_transcript_moves_its_own_ref_only_when_they_signed_it() {
+        let setup = setup();
+        let (key, _) = created(&setup);
+        let bob = listed(&setup, &key, "bob", Role::Collaborator);
+        let meta = load_meta(&setup.store, setup.thread, &setup.owner_key, 0).unwrap();
+        let alice = ParticipantName::new("alice").unwrap();
+        let bobs = AgentSlot::new(
+            ParticipantName::new("bob").unwrap(),
+            AgentName::new("claude").unwrap(),
+        );
+        let head = |kind: RefKind| {
+            setup
+                .store
+                .head(&ThreadRef::new(setup.thread, kind))
+                .unwrap()
+        };
+        let accept = |tip: ObjectId| {
+            accept_live(
+                &setup.store,
+                &meta,
+                (&bobs, LiveHistory::Transcript),
+                tip,
+                &alice,
+            )
+        };
+        let scratch = ThreadRef::new(ThreadId::random().unwrap(), RefKind::Meta);
+        let sealed = setup.store.write_blob(b"sealed turn").unwrap();
+        let tree = setup
+            .store
+            .write_tree(&[("turn", EntryKind::Blob, sealed)])
+            .unwrap();
+        let unnamed = setup
+            .store
+            .append_signed(&scratch, None, tree, "turn 0", &GitSigner(bob.clone()))
+            .unwrap();
+        let second = commit_by(&setup, &bob, Some(unnamed), "turn", b"turn 1");
+
+        assert_eq!(accept(unnamed).unwrap(), LiveAccepted::Moved);
+        assert_eq!(accept(second).unwrap(), LiveAccepted::Moved);
+        let forged = commit_by(&setup, &setup.owner, Some(second), "turn", b"not bob's");
+        assert!(matches!(
+            accept(forged),
+            Err(LiveRefusal::Refused(Refusal::NotSigned(commit))) if commit == forged
+        ));
+        assert_eq!(head(RefKind::Transcript(bobs.clone())), Some(second));
+        assert_eq!(head(RefKind::Snapshots(bobs.clone())), None);
     }
 
     #[test]
@@ -1060,39 +1130,53 @@ mod tests {
                 .unwrap()
         };
         let bobs = slot("bob");
-        let accept = |tip: ObjectId| accept_snapshots(&setup.store, &meta, &bobs, tip, &alice);
+        let accept = |tip: ObjectId| {
+            accept_live(
+                &setup.store,
+                &meta,
+                (&bobs, LiveHistory::Snapshots),
+                tip,
+                &alice,
+            )
+        };
         let first = commit_by(&setup, &bob, None, "f", b"one");
         let second = commit_by(&setup, &bob, Some(first), "f", b"two");
 
-        assert_eq!(accept(first).unwrap(), SnapshotsAccepted::Moved);
-        assert_eq!(accept(second).unwrap(), SnapshotsAccepted::Moved);
-        assert_eq!(accept(first).unwrap(), SnapshotsAccepted::Kept);
+        assert_eq!(accept(first).unwrap(), LiveAccepted::Moved);
+        assert_eq!(accept(second).unwrap(), LiveAccepted::Moved);
+        assert_eq!(accept(first).unwrap(), LiveAccepted::Kept);
         let elsewhere = commit_by(&setup, &bob, Some(first), "f", b"elsewhere");
-        assert_eq!(accept(elsewhere).unwrap(), SnapshotsAccepted::Diverged);
+        assert_eq!(accept(elsewhere).unwrap(), LiveAccepted::Diverged);
         let forged = commit_by(&setup, &setup.owner, Some(second), "f", b"not bob's");
         assert!(matches!(
             accept(forged),
-            Err(SnapshotsRefusal::Refused(Refusal::NotSigned(commit))) if commit == forged
+            Err(LiveRefusal::Refused(Refusal::NotSigned(commit))) if commit == forged
         ));
         assert_eq!(head(&bobs), Some(second));
 
         let carols = slot("carol");
         let by_carol = commit_by(&setup, &carol, None, "f", b"carol's");
         assert!(matches!(
-            accept_snapshots(&setup.store, &meta, &carols, by_carol, &alice),
-            Err(SnapshotsRefusal::Watcher(name)) if name.as_str() == "carol"
+            accept_live(&setup.store, &meta, (&carols, LiveHistory::Snapshots), by_carol, &alice),
+            Err(LiveRefusal::Watcher(name)) if name.as_str() == "carol"
         ));
         assert_eq!(head(&carols), None);
         let daves = slot("dave");
         assert!(matches!(
-            accept_snapshots(&setup.store, &meta, &daves, first, &alice),
-            Err(SnapshotsRefusal::NotListed(name)) if name.as_str() == "dave"
+            accept_live(&setup.store, &meta, (&daves, LiveHistory::Snapshots), first, &alice),
+            Err(LiveRefusal::NotListed(name)) if name.as_str() == "dave"
         ));
         let alices = slot("alice");
         let by_alice = commit(&setup, None, "f", b"alice's own");
         assert!(matches!(
-            accept_snapshots(&setup.store, &meta, &alices, by_alice, &alice),
-            Err(SnapshotsRefusal::Own)
+            accept_live(
+                &setup.store,
+                &meta,
+                (&alices, LiveHistory::Snapshots),
+                by_alice,
+                &alice
+            ),
+            Err(LiveRefusal::Own)
         ));
         assert_eq!(head(&alices), None);
     }

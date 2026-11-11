@@ -92,7 +92,8 @@ pub(crate) fn ends_turn_of(message: &[u8], slot: &str) -> bool {
         .any(|named| named == slot.as_bytes())
 }
 
-/// The latest turn-end snapshot of each agent a host serves, read from its snapshots ref.
+/// The latest turn-end snapshot of each agent a host serves, read from its snapshots ref, with
+/// the newest commit of its transcript ref.
 #[derive(Debug)]
 pub(crate) struct LatestTurnEnds {
     thread: ThreadId,
@@ -103,6 +104,7 @@ pub(crate) struct LatestTurnEnds {
 struct Seen {
     head: ObjectId,
     ended: Option<ObjectId>,
+    transcript: Option<ObjectId>,
 }
 
 impl LatestTurnEnds {
@@ -113,8 +115,11 @@ impl LatestTurnEnds {
         }
     }
 
-    /// Reads the snapshots of `slots` again, forgetting other agents and agents whose
-    /// snapshots ref is gone, and returns the turn ends that are new since the last call.
+    /// Reads the snapshots and transcripts of `slots` again, forgetting other agents and agents
+    /// whose snapshots ref is gone, and returns the turn ends that are new since the last call,
+    /// each with its agent's newest transcript commit. A transcript that moved without a new
+    /// turn end is only kept, for [`LatestTurnEnds::known`]; one that cannot be read keeps the
+    /// commit read before.
     /// Each agent's snapshots are walked back from their newest to the newest seen before or
     /// to a turn end, at most 4,096 of them. When the ref no longer descends from the newest
     /// snapshot seen before, as after it was moved back, the latest turn end of its new
@@ -135,31 +140,31 @@ impl LatestTurnEnds {
                 Err(_) => continue,
             };
             let before = self.seen.get(slot).copied();
-            if before.is_some_and(|before| before.head == head) {
+            let transcript_ref = ThreadRef::new(self.thread, RefKind::Transcript(slot.clone()));
+            let transcript = store
+                .head(&transcript_ref)
+                .unwrap_or_else(|_| before.and_then(|before| before.transcript));
+            if let Some(seen) = self.seen.get_mut(slot)
+                && seen.head == head
+            {
+                seen.transcript = transcript;
                 continue;
             }
             let known = before.and_then(|before| before.ended);
-            let mut budget = MAX_WALK;
-            let moved_on = match before {
-                None => true,
-                Some(before) => match store.descends_within(head, before.head, &mut budget) {
-                    Ok(moved_on) => moved_on,
-                    Err(StoreError::HistoryTooLong(_)) => false,
-                    Err(_) => continue,
-                },
-            };
-            let text = slot.to_string();
-            let stop_at = before.filter(|_| moved_on).map(|before| before.head);
-            let ended = match latest_ended(store, &text, head, stop_at) {
-                Walked::Failed => continue,
-                Walked::Found(found) => Some(found),
-                Walked::Nothing if moved_on => known,
-                Walked::Nothing => None,
+            let Some((ended, moved_on)) = ended_since(store, slot, head, before) else {
+                continue;
             };
             if moved_on && ended != known {
-                new.extend(ended.and_then(|commit| announced(slot, commit)));
+                new.extend(ended.and_then(|commit| announced(slot, commit, transcript)));
             }
-            self.seen.insert(slot.clone(), Seen { head, ended });
+            self.seen.insert(
+                slot.clone(),
+                Seen {
+                    head,
+                    ended,
+                    transcript,
+                },
+            );
         }
         new
     }
@@ -168,9 +173,35 @@ impl LatestTurnEnds {
     pub(crate) fn known(&self) -> Vec<TurnEnd> {
         self.seen
             .iter()
-            .filter_map(|(slot, seen)| announced(slot, seen.ended?))
+            .filter_map(|(slot, seen)| announced(slot, seen.ended?, seen.transcript))
             .collect()
     }
+}
+
+fn ended_since(
+    store: &Store,
+    slot: &AgentSlot,
+    head: ObjectId,
+    before: Option<Seen>,
+) -> Option<(Option<ObjectId>, bool)> {
+    let known = before.and_then(|before| before.ended);
+    let mut budget = MAX_WALK;
+    let moved_on = match before {
+        None => true,
+        Some(before) => match store.descends_within(head, before.head, &mut budget) {
+            Ok(moved_on) => moved_on,
+            Err(StoreError::HistoryTooLong(_)) => false,
+            Err(_) => return None,
+        },
+    };
+    let stop_at = before.filter(|_| moved_on).map(|before| before.head);
+    let ended = match latest_ended(store, &slot.to_string(), head, stop_at) {
+        Walked::Failed => return None,
+        Walked::Found(found) => Some(found),
+        Walked::Nothing if moved_on => known,
+        Walked::Nothing => None,
+    };
+    Some((ended, moved_on))
 }
 
 /// Returns the newest turn-end snapshot of `slot` at or before `head`, walking back at most
@@ -213,12 +244,20 @@ fn latest_ended(store: &Store, slot: &str, head: ObjectId, stop_at: Option<Objec
     Walked::Nothing
 }
 
-fn announced(slot: &AgentSlot, commit: ObjectId) -> Option<TurnEnd> {
-    let commit = <[u8; COMMIT_BYTES]>::try_from(commit.as_bytes()).ok()?;
+fn announced(slot: &AgentSlot, commit: ObjectId, transcript: Option<ObjectId>) -> Option<TurnEnd> {
     Some(TurnEnd {
         slot: slot.clone(),
-        commit,
+        commit: wire(commit)?,
+        transcript: match transcript {
+            Some(transcript) => Some(wire(transcript)?),
+            None => None,
+        },
     })
+}
+
+/// Returns `commit` as the live layer names a commit, or `None` for an id of another length.
+pub(crate) fn wire(commit: ObjectId) -> Option<[u8; COMMIT_BYTES]> {
+    commit.as_bytes().try_into().ok()
 }
 
 #[cfg(test)]
@@ -288,6 +327,7 @@ mod tests {
         let expected = TurnEnd {
             slot: alice.clone(),
             commit: bytes(ended),
+            transcript: None,
         };
         assert_eq!(
             latest.refresh(&store, &slots),
@@ -309,6 +349,42 @@ mod tests {
     }
 
     #[test]
+    fn a_transcript_that_moves_without_a_turn_end_is_named_in_known_turn_ends_only() {
+        let (_dir, store) = repository_on_main();
+        let thread = ThreadId::random().unwrap();
+        let alice = slot("alice.claude");
+        let snapshots = ThreadRef::new(thread, RefKind::Snapshots(alice.clone()));
+        let transcript = ThreadRef::new(thread, RefKind::Transcript(alice.clone()));
+        let tree = store.write_tree(&[]).unwrap();
+        let first = store.append(&transcript, None, tree, "turn 0").unwrap();
+        let ended = store
+            .append(&snapshots, None, tree, &message(&alice))
+            .unwrap();
+        let mut latest = LatestTurnEnds::new(thread);
+        let slots = [alice.clone()];
+        let named = |commit: ObjectId, turn: ObjectId| TurnEnd {
+            slot: alice.clone(),
+            commit: bytes(commit),
+            transcript: Some(bytes(turn)),
+        };
+        assert_eq!(latest.refresh(&store, &slots), [named(ended, first)]);
+
+        let second = store
+            .append(&transcript, Some(first), tree, "turn 1")
+            .unwrap();
+        assert_eq!(latest.refresh(&store, &slots), []);
+        assert_eq!(latest.known(), [named(ended, second)]);
+
+        let third = store
+            .append(&transcript, Some(second), tree, "turn 2")
+            .unwrap();
+        let next = store
+            .append(&snapshots, Some(ended), tree, &message(&alice))
+            .unwrap();
+        assert_eq!(latest.refresh(&store, &slots), [named(next, third)]);
+    }
+
+    #[test]
     fn a_ref_moved_back_announces_only_the_turn_ends_after_it_and_a_removed_one_is_forgotten() {
         let (_dir, store) = repository_on_main();
         let thread = ThreadId::random().unwrap();
@@ -326,6 +402,7 @@ mod tests {
         let newest = TurnEnd {
             slot: alice.clone(),
             commit: bytes(newer),
+            transcript: None,
         };
         assert_eq!(
             latest.refresh(&store, &slots),
@@ -344,6 +421,7 @@ mod tests {
         let rewound = TurnEnd {
             slot: alice.clone(),
             commit: bytes(older),
+            transcript: None,
         };
         assert_eq!(latest.known(), std::slice::from_ref(&rewound));
         let next = store
@@ -354,6 +432,7 @@ mod tests {
             [TurnEnd {
                 slot: alice.clone(),
                 commit: bytes(next),
+                transcript: None,
             }]
         );
 

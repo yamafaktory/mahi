@@ -29,12 +29,13 @@ pub use commits::{
 };
 pub use fetched::{
     Accepted,
+    LiveAccepted,
+    LiveHistory,
+    LiveRefusal,
     Refusal,
-    SnapshotsAccepted,
-    SnapshotsRefusal,
     accept_fetched,
     accept_fetched_meta,
-    accept_snapshots,
+    accept_live,
 };
 pub use key::{
     KeyError,

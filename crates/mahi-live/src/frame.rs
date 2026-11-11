@@ -188,13 +188,16 @@ pub struct StateEntry {
     pub state: TurnState,
 }
 
-/// The latest turn-end snapshot of an agent, as its host names it.
+/// The latest turn-end snapshot of an agent, as its host names it, with the newest commit of
+/// the agent's transcript the host holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnEnd {
     /// The agent.
     pub slot: AgentSlot,
     /// The snapshot's commit.
     pub commit: [u8; COMMIT_BYTES],
+    /// The newest transcript commit, if the agent has one.
+    pub transcript: Option<[u8; COMMIT_BYTES]>,
 }
 
 /// An advisory claim on a path or a task, as a host sends it: the agent that holds it, what
@@ -327,6 +330,7 @@ struct WireState<'a> {
 struct WireTurnEnd<'a> {
     slot: &'a str,
     commit: [u8; COMMIT_BYTES],
+    transcript: Option<[u8; COMMIT_BYTES]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -540,6 +544,7 @@ impl FrameSender {
                 WireBody::TurnEnded(WireTurnEnd {
                     slot: &slot,
                     commit: ended.commit,
+                    transcript: ended.transcript,
                 })
             }
             Body::State(told) => {
@@ -596,6 +601,7 @@ impl FrameSender {
                 .map(|(ended, slot)| WireTurnEnd {
                     slot,
                     commit: ended.commit,
+                    transcript: ended.transcript,
                 })
                 .collect(),
             states: states
@@ -1061,9 +1067,11 @@ fn parse_body(wire: &WireBody<'_>) -> Result<Body, FrameError> {
         WireBody::TurnEnded(WireTurnEnd {
             slot: owner,
             commit,
+            transcript,
         }) => Body::TurnEnded(TurnEnd {
             slot: slot(owner)?,
             commit,
+            transcript,
         }),
         WireBody::State(ref told) => Body::State(parse_state(told)?),
     })
@@ -1095,6 +1103,7 @@ fn parse_claims(
             Ok(TurnEnd {
                 slot: slot(ended.slot)?,
                 commit: ended.commit,
+                transcript: ended.transcript,
             })
         })
         .collect::<Result<Vec<_>, FrameError>>()?;
@@ -1548,6 +1557,7 @@ mod tests {
         TurnEnd {
             slot: slot(participant),
             commit: [byte; COMMIT_BYTES],
+            transcript: Some([byte.wrapping_add(1); COMMIT_BYTES]),
         }
     }
 
@@ -1915,10 +1925,12 @@ mod tests {
                     WireTurnEnd {
                         slot: "alice.claude",
                         commit: [1; COMMIT_BYTES],
+                        transcript: None,
                     },
                     WireTurnEnd {
                         slot: "alice.claude",
                         commit: [2; COMMIT_BYTES],
+                        transcript: None,
                     },
                 ],
             })
@@ -1936,6 +1948,7 @@ mod tests {
                     .map(|name| WireTurnEnd {
                         slot: name,
                         commit: [1; COMMIT_BYTES],
+                        transcript: None,
                     })
                     .collect(),
             })
