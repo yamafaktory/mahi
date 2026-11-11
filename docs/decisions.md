@@ -629,3 +629,12 @@ Chosen by the user (#115). Codex fires its prompt hook for each subagent it spaw
 `agent_id` in the payload. mahi leaves such a prompt out: it is not recorded as the user's ask,
 changes no state and gets no note. The agent's own turn covers the subagent's work. The other choice
 was to record it marked as the subagent's prompt, which would change the transcript format.
+
+## D088 · 2026-11-10 · The note after `y` when the branch came back
+
+Chosen by the user (#111). A fetch can find the last landing's branch back on the remote while
+the landing confirmation asks about it. When the owner then answers `y`, the last landing's paths
+do not land again, and the agent's note reads `alice cancelled your landing: the last landing's
+branch is on up again, so its paths do not land again; call land again.`, with the owner's name
+and the remote. The other choice was to keep the plain line `alice cancelled your landing; nothing
+was pushed.`.

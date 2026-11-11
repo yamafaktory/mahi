@@ -155,6 +155,13 @@ impl std::fmt::Debug for Desk {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Noted {
+    Answered,
+    BranchBack,
+    NoRecord,
+}
+
 impl Desk {
     pub(crate) fn new(
         (git_dir, thread): (PathBuf, ThreadId),
@@ -366,27 +373,39 @@ impl Desk {
         let Some(mut stage) = self.stage() else {
             return;
         };
-        if !matches!(*stage, Stage::Asking { .. }) {
+        let taken = std::mem::replace(&mut *stage, Stage::Idle);
+        let Stage::Asking { remote, .. } = taken else {
+            *stage = taken;
             return;
-        }
-        *stage = Stage::Idle;
+        };
         drop(stage);
-        let line = if self.note_answer(Answer::LandAgain) {
-            format!(
+        let line = match self.note_answer(Answer::LandAgain) {
+            Noted::Answered => format!(
                 "{} cancelled your landing: the last landing's pull request was closed without a merge, so its paths count as changed again; call land again with commits that place them.",
                 self.owner
-            )
-        } else {
-            self.cancelled()
+            ),
+            Noted::BranchBack => format!(
+                "{} cancelled your landing: the last landing's branch is on {remote} again, so its paths do not land again; call land again.",
+                self.owner
+            ),
+            Noted::NoRecord => self.cancelled(),
         };
         let _ = note::record_landing(&self.note, &line);
     }
 
-    fn note_answer(&self, answer: Answer) -> bool {
-        Store::open(&self.git_dir).is_ok_and(|store| {
-            BranchRecord::update(&store, self.thread, |record| record.note_answer(answer))
-                .unwrap_or(false)
-        })
+    fn note_answer(&self, answer: Answer) -> Noted {
+        let mut back = false;
+        let noted = Store::open(&self.git_dir).map(|store| {
+            BranchRecord::update(&store, self.thread, |record| {
+                back = !record.gone;
+                record.note_answer(answer)
+            })
+        });
+        match noted {
+            Ok(Ok(true)) => Noted::Answered,
+            Ok(Ok(false)) if back => Noted::BranchBack,
+            _ => Noted::NoRecord,
+        }
     }
 
     fn cancelled(&self) -> String {
@@ -1183,6 +1202,19 @@ pub(crate) mod tests {
         };
     }
 
+    fn record_of(landing: &Landing, gone: bool) -> BranchRecord {
+        BranchRecord {
+            remote: "up".to_owned(),
+            branch: branch_of(landing.thread),
+            tip: landing.tip,
+            landing: "main".to_owned(),
+            worktree: None,
+            from: Some(landing.store.commit_tree(landing.tip).unwrap()),
+            gone,
+            answer: None,
+        }
+    }
+
     pub(crate) fn ask_about(landing: &Landing) {
         let mut stage = landing.desk.stage().unwrap();
         let Stage::Waiting {
@@ -1233,17 +1265,7 @@ pub(crate) mod tests {
     #[test]
     fn n_is_remembered_so_the_next_landing_does_not_ask_again() {
         let landing = waiting_landing();
-        let tree = landing.store.commit_tree(landing.tip).unwrap();
-        let mut record = BranchRecord {
-            remote: "up".to_owned(),
-            branch: branch_of(landing.thread),
-            tip: landing.tip,
-            landing: "main".to_owned(),
-            worktree: None,
-            from: Some(tree),
-            gone: true,
-            answer: None,
-        };
+        let mut record = record_of(&landing, true);
         record.write(&landing.store, landing.thread).unwrap();
         ask_about(&landing);
         landing.desk.merged();
@@ -1277,17 +1299,7 @@ pub(crate) mod tests {
     #[test]
     fn y_marks_the_record_and_tells_the_agent_to_land_its_paths_again() {
         let landing = waiting_landing();
-        let tree = landing.store.commit_tree(landing.tip).unwrap();
-        let mut record = BranchRecord {
-            remote: "up".to_owned(),
-            branch: branch_of(landing.thread),
-            tip: landing.tip,
-            landing: "main".to_owned(),
-            worktree: None,
-            from: Some(tree),
-            gone: true,
-            answer: None,
-        };
+        let mut record = record_of(&landing, true);
         record.write(&landing.store, landing.thread).unwrap();
         ask_about(&landing);
         landing.desk.land_again();
@@ -1311,6 +1323,42 @@ pub(crate) mod tests {
         assert_eq!(
             landing.desk.view().unwrap().hint,
             "Enter pushes  Esc cancels"
+        );
+    }
+
+    #[test]
+    fn y_after_the_branch_came_back_says_its_paths_do_not_land_again() {
+        let landing = waiting_landing();
+        let record = record_of(&landing, false);
+        record.write(&landing.store, landing.thread).unwrap();
+        ask_about(&landing);
+        landing.desk.land_again();
+        assert!(landing.desk.view().is_none());
+        assert_eq!(
+            BranchRecord::read(&landing.store, landing.thread),
+            Some(record)
+        );
+        let note = crate::note::take(&landing.note).unwrap().unwrap();
+        assert!(
+            note.contains(
+                "alice cancelled your landing: the last landing's branch is on up again, so its \
+                 paths do not land again; call land again."
+            ),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn y_without_a_record_sends_the_plain_cancel_line() {
+        let landing = waiting_landing();
+        ask_about(&landing);
+        landing.desk.land_again();
+        assert!(landing.desk.view().is_none());
+        assert_eq!(BranchRecord::read(&landing.store, landing.thread), None);
+        let note = crate::note::take(&landing.note).unwrap().unwrap();
+        assert!(
+            note.contains("alice cancelled your landing; nothing was pushed."),
+            "{note}"
         );
     }
 
