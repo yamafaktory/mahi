@@ -1,5 +1,6 @@
-//! Runs the real Claude Code through mahi end to end: a thread and its landing, with the user's
-//! own sign-in. `just dogfood` runs it; see the justfile.
+//! Runs the real Claude Code and Codex through mahi end to end, with the user's own sign-in: a
+//! thread, its landing, and a second user who joins Claude's thread with Codex, signed in through
+//! the browser. `just dogfood` runs it; see the justfile.
 
 #![cfg(unix)]
 
@@ -17,6 +18,7 @@ mod tests {
             Read,
             Write,
         },
+        os::unix::fs::DirBuilderExt as _,
         path::{
             Path,
             PathBuf,
@@ -55,10 +57,16 @@ mod tests {
     const LAND_TASK: &str = "Add a subtract(a, b) function to calc.py. Then land the thread with \
                              mahi's land tool, as one commit with a short message, a title and a \
                              description, and say in one sentence what you did.";
+    const CODEX_TASK: &str = "Add a multiply(a, b) function to calc.py, and asserts for it in \
+                              test_calc.py. Run python3 test_calc.py, then say in one sentence \
+                              what you did.";
     const KEY_GAP: Duration = Duration::from_secs(2);
+    const SIGN_IN_WAIT: Duration = Duration::from_mins(5);
 
     struct World {
-        root: tempfile::TempDir,
+        dir: PathBuf,
+        user: &'static str,
+        live: &'static str,
         _agent: KillOnDrop,
     }
 
@@ -73,15 +81,19 @@ mod tests {
 
     impl World {
         fn home(&self) -> PathBuf {
-            self.root.path().join("home")
+            self.dir.join("home")
         }
 
         fn repo(&self) -> PathBuf {
-            self.root.path().join("repo")
+            self.dir.join("repo")
         }
 
         fn socket(&self) -> PathBuf {
-            self.root.path().join("agent.sock")
+            self.dir.join("agent.sock")
+        }
+
+        fn public_key(&self) -> String {
+            fs::read_to_string(self.dir.join("id_dogfood.pub")).unwrap()
         }
 
         fn command(&self, arguments: &[&str]) -> PtyCommand {
@@ -94,9 +106,9 @@ mod tests {
                 .env("HOME", self.home())
                 .env("XDG_CONFIG_HOME", self.home().join(".config"))
                 .env("SSH_AUTH_SOCK", self.socket())
-                .env("USER", "tester")
+                .env("USER", self.user)
                 .env("TERM", "xterm-256color")
-                .env("MAHI_LIVE", "off")
+                .env("MAHI_LIVE", self.live)
         }
 
         fn plain_command(&self, arguments: &[&str]) -> Command {
@@ -107,19 +119,22 @@ mod tests {
                 .env_clear()
                 .env("PATH", required_env("PATH"))
                 .env("HOME", self.home())
-                .env("XDG_CONFIG_HOME", self.home().join(".config"));
+                .env("XDG_CONFIG_HOME", self.home().join(".config"))
+                .env("SSH_AUTH_SOCK", self.socket())
+                .env("USER", self.user)
+                .env("MAHI_LIVE", self.live);
             command
         }
 
         fn worktree(&self, thread: &str, agent: &str) -> PathBuf {
-            let worktrees = self.home().join(".local/share/mahi/worktrees");
-            let repository = fs::read_dir(&worktrees)
-                .unwrap()
-                .next()
+            self.made_worktree(thread, agent)
                 .expect("mahi made a worktree directory for the repository")
-                .unwrap()
-                .path();
-            repository.join(format!("{thread}{agent}"))
+        }
+
+        fn made_worktree(&self, thread: &str, agent: &str) -> Option<PathBuf> {
+            let worktrees = self.home().join(".local/share/mahi/worktrees");
+            let repository = fs::read_dir(&worktrees).ok()?.next()?.ok()?.path();
+            Some(repository.join(format!("{thread}{agent}")))
         }
     }
 
@@ -137,7 +152,25 @@ mod tests {
         assert!(found, "the dogfood test needs {name} on PATH");
     }
 
-    fn world() -> World {
+    fn world(dir: &Path, live: &'static str) -> World {
+        let world = person(dir, "tester", live);
+        let repo = world.repo();
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
+        fs::write(repo.join(".gitignore"), "__pycache__/\n").unwrap();
+        for arguments in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.name", "Dogfood"],
+            &["config", "user.email", "dogfood@mahi.social"],
+            &["add", "."],
+            &["commit", "-q", "-m", "Start a tiny calculator"],
+        ] {
+            git(&repo, arguments);
+        }
+        world
+    }
+
+    fn person(dir: &Path, user: &'static str, live: &'static str) -> World {
         for program in [
             "claude",
             "codex",
@@ -149,10 +182,8 @@ mod tests {
         ] {
             require_program(program);
         }
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("home");
-        fs::create_dir_all(home.join(".config")).unwrap();
-        let socket = root.path().join("agent.sock");
+        fs::create_dir_all(dir.join("home/.config")).unwrap();
+        let socket = dir.join("agent.sock");
         let agent = KillOnDrop(
             Command::new("ssh-agent")
                 .arg("-D")
@@ -167,7 +198,7 @@ mod tests {
             assert!(Instant::now() < deadline, "ssh-agent did not start");
             thread::sleep(Duration::from_millis(50));
         }
-        let key = root.path().join("id_dogfood");
+        let key = dir.join("id_dogfood");
         run(Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "dogfood", "-f"])
             .arg(&key));
@@ -175,21 +206,10 @@ mod tests {
             .env("SSH_AUTH_SOCK", &socket)
             .arg(&key)
             .stderr(Stdio::null()));
-        let repo = root.path().join("repo");
-        fs::create_dir(&repo).unwrap();
-        fs::write(repo.join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
-        fs::write(repo.join(".gitignore"), "__pycache__/\n").unwrap();
-        for arguments in [
-            &["init", "-q", "-b", "main"][..],
-            &["config", "user.name", "Dogfood"],
-            &["config", "user.email", "dogfood@mahi.social"],
-            &["add", "."],
-            &["commit", "-q", "-m", "Start a tiny calculator"],
-        ] {
-            git(&repo, arguments);
-        }
         World {
-            root,
+            dir: dir.to_path_buf(),
+            user,
+            live,
             _agent: agent,
         }
     }
@@ -220,6 +240,7 @@ mod tests {
         changed: Instant,
         sent: Option<Instant>,
         ended: Option<i32>,
+        passphrases: usize,
     }
 
     impl Terminal {
@@ -245,6 +266,7 @@ mod tests {
                 changed: Instant::now(),
                 sent: None,
                 ended: None,
+                passphrases: 0,
             }
         }
 
@@ -289,10 +311,10 @@ mod tests {
             self.sent = Some(Instant::now());
         }
 
-        fn answer_dialogs(&mut self, passphrases: &mut usize) {
+        fn answer_dialogs(&mut self) {
             let asked = self.raw_text().matches(PASSPHRASE_PROMPT).count();
-            if asked > *passphrases && self.send(&format!("{PASSPHRASE}\r")) {
-                *passphrases = asked;
+            if asked > self.passphrases && self.send(&format!("{PASSPHRASE}\r")) {
+                self.passphrases = asked;
             }
             let screen = self.screen();
             let selected = |label: &str| {
@@ -327,7 +349,6 @@ mod tests {
 
         fn drive(&mut self, limit: Duration, mut done: impl FnMut(&mut Self) -> bool) {
             let deadline = Instant::now() + limit;
-            let mut passphrases = 0;
             loop {
                 self.pump();
                 if done(self) || self.ended.is_some() {
@@ -338,7 +359,7 @@ mod tests {
                     "timed out; the screen was:\n{}",
                     self.screen()
                 );
-                self.answer_dialogs(&mut passphrases);
+                self.answer_dialogs();
             }
         }
 
@@ -367,6 +388,17 @@ mod tests {
     }
 
     fn init_with_claude_token(world: &World, token: &[u8]) {
+        init(world);
+        let mut store = world
+            .plain_command(&["credential", "add", "claude"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        store.stdin.take().unwrap().write_all(token).unwrap();
+        assert!(store.wait().unwrap().success());
+    }
+
+    fn init(world: &World) {
         let mut init = Terminal::start(world.command(&["init"]));
         let mut answered = 0;
         init.drive(Duration::from_secs(60), |terminal| {
@@ -382,19 +414,12 @@ mod tests {
             false
         });
         init.quit(&[]);
-        let mut store = world
-            .plain_command(&["credential", "add", "claude"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        store.stdin.take().unwrap().write_all(token).unwrap();
-        assert!(store.wait().unwrap().success());
     }
 
-    fn claude_works_in_a_new_thread(world: &World) -> String {
+    fn claude_works_in_a_new_thread(world: &World) -> (Terminal, String) {
         let mut claude = Terminal::start(world.command(&["run", "claude", CLAUDE_TASK]));
         let mut thread = String::new();
-        claude.drive(Duration::from_secs(600), |terminal| {
+        claude.drive(Duration::from_mins(10), |terminal| {
             if thread.is_empty() && terminal.raw_text().contains("mahi: thread ") {
                 thread = thread_of(&terminal.raw_text());
             }
@@ -405,19 +430,27 @@ mod tests {
                 )
                 && terminal.quiet_for(Duration::from_secs(20))
         });
-        claude.quit(&["/exit", "\r"]);
-        thread
+        assert!(
+            claude.ended.is_none(),
+            "the screen was:\n{}",
+            claude.screen()
+        );
+        (claude, thread)
     }
 
-    fn serve_remote(world: &World, server: &openssh::OpenSsh) -> PathBuf {
-        server.authorize(&fs::read_to_string(world.root.path().join("id_dogfood.pub")).unwrap());
+    fn trust_server(world: &World, server: &openssh::OpenSsh) {
+        server.authorize(&world.public_key());
         fs::create_dir_all(world.home().join(".ssh")).unwrap();
         fs::write(
             world.home().join(".ssh/known_hosts"),
             openssh::known_hosts_line(server.dir.path(), server.port),
         )
         .unwrap();
-        let remote = world.root.path().join("remote.git");
+    }
+
+    fn serve_remote(world: &World, server: &openssh::OpenSsh) -> PathBuf {
+        trust_server(world, server);
+        let remote = world.dir.join("remote.git");
         fs::create_dir(&remote).unwrap();
         git(&remote, &["init", "-q", "--bare", "-b", "main"]);
         git(
@@ -471,15 +504,14 @@ mod tests {
         since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(1)
     }
 
-    fn its_work_passes_its_tests(world: &World, thread: &str) {
-        let worktree = world.worktree(thread, ".claude");
+    fn its_work_passes_its_tests(worktree: &Path, names: &[&str]) {
         let tested = Command::new("python3")
             .arg("test_calc.py")
-            .current_dir(&worktree)
+            .current_dir(worktree)
             .status()
             .unwrap();
-        assert!(tested.success(), "the agent's tests pass");
-        for name in ["add", "subtract"] {
+        assert!(tested.success(), "the tests in {} pass", worktree.display());
+        for name in names {
             assert!(
                 contains(&worktree.join("calc.py"), &format!("def {name}(")),
                 "{name}"
@@ -504,16 +536,138 @@ mod tests {
     #[test]
     fn claude_works_in_a_new_thread_whose_tests_pass() {
         let token = claude_token();
-        let world = world();
+        let root = tempfile::tempdir().unwrap();
+        let world = world(root.path(), "off");
         init_with_claude_token(&world, &token);
-        let thread = claude_works_in_a_new_thread(&world);
-        its_work_passes_its_tests(&world, &thread);
+        let (claude, thread) = claude_works_in_a_new_thread(&world);
+        claude.quit(&["/exit", "\r"]);
+        its_work_passes_its_tests(&world.worktree(&thread, ".claude"), &["add", "subtract"]);
+    }
+
+    fn teammate_with_a_clone(root: &Path, server: &openssh::OpenSsh, remote: &Path) -> World {
+        let bob = person(&root.join("bob"), "bob", "local");
+        trust_server(&bob, server);
+        git(
+            root,
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                bob.repo().to_str().unwrap(),
+            ],
+        );
+        git(
+            &bob.repo(),
+            &["remote", "set-url", "origin", &server.url(remote)],
+        );
+        init(&bob);
+        bob
+    }
+
+    fn ticket_for(owner: &World, thread: &str, teammate: &World) -> String {
+        let card = teammate.plain_command(&["id"]).output().unwrap();
+        assert!(card.status.success(), "{card:?}");
+        let card = String::from_utf8(card.stdout).unwrap();
+        let mut invite =
+            Terminal::start(owner.command(&["invite", "--collaborator", thread, card.trim()]));
+        invite.drive(Duration::from_secs(120), |_| false);
+        assert_eq!(
+            invite.ended,
+            Some(0),
+            "the screen was:\n{}",
+            invite.screen()
+        );
+        invite
+            .raw_text()
+            .split_whitespace()
+            .find(|word| word.starts_with("mahi1"))
+            .expect("mahi invite prints a ticket")
+            .to_owned()
+    }
+
+    fn sign_codex_in(teammate: &World, thread: &str) {
+        let state = teammate
+            .repo()
+            .join(format!(".git/mahi/state/{thread}/{}.codex", teammate.user));
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&state)
+            .unwrap();
+        eprintln!("dogfood: sign Codex in with ChatGPT in the browser");
+        let mut login = KillOnDrop(
+            Command::new("codex")
+                .args(["login", "-c", "cli_auth_credentials_store=\"file\""])
+                .env("CODEX_HOME", &state)
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + SIGN_IN_WAIT;
+        let signed_in = loop {
+            if let Some(status) = login.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Codex was not signed in within {} minutes",
+                SIGN_IN_WAIT.as_secs() / 60
+            );
+            thread::sleep(Duration::from_millis(200));
+        };
+        assert!(signed_in.success(), "codex login failed");
+    }
+
+    #[test]
+    fn codex_joins_claudes_thread_and_their_work_is_kept_in_sync() {
+        let token = claude_token();
+        let root = tempfile::tempdir().unwrap();
+        let owner = world(root.path(), "local");
+        let server = openssh::start("ssh-ed25519", &[]);
+        init_with_claude_token(&owner, &token);
+        let remote = serve_remote(&owner, &server);
+        let (mut claude, thread) = claude_works_in_a_new_thread(&owner);
+
+        let bob = teammate_with_a_clone(root.path(), &server, &remote);
+        let ticket = ticket_for(&owner, &thread, &bob);
+        sign_codex_in(&bob, &thread);
+        let mut codex = Terminal::start(bob.command(&["join", &ticket, "--", "codex"]));
+        let (mut typed, mut entered) = (false, false);
+        codex.drive(Duration::from_mins(10), |terminal| {
+            let worktree = bob.made_worktree(&thread, ".codex");
+            if !typed {
+                let merged = worktree.as_ref().is_some_and(|worktree| {
+                    contains(&worktree.join("calc.py"), "def subtract(")
+                        && contains(&worktree.join("test_calc.py"), "subtract")
+                });
+                typed = merged
+                    && terminal.quiet_for(Duration::from_secs(5))
+                    && terminal.send(CODEX_TASK);
+            } else if !entered {
+                entered = terminal.send("\r");
+            }
+            entered
+                && worktree
+                    .is_some_and(|worktree| contains(&worktree.join("calc.py"), "def multiply("))
+                && terminal.quiet_for(Duration::from_secs(20))
+        });
+        assert!(codex.ended.is_none(), "the screen was:\n{}", codex.screen());
+        let worked = owner.worktree(&thread, ".claude").join("calc.py");
+        claude.drive(Duration::from_mins(5), |_| {
+            contains(&worked, "def multiply(")
+        });
+        let all = ["add", "subtract", "multiply"];
+        its_work_passes_its_tests(&bob.worktree(&thread, ".codex"), &all);
+        its_work_passes_its_tests(&owner.worktree(&thread, ".claude"), &all);
+        codex.quit(&["\x03", "\x03"]);
+        claude.quit(&["/exit", "\r"]);
     }
 
     #[test]
     fn claude_lands_its_thread_through_the_land_tool() {
         let token = claude_token();
-        let world = world();
+        let root = tempfile::tempdir().unwrap();
+        let world = world(root.path(), "off");
         let server = openssh::start("ssh-ed25519", &[]);
         init_with_claude_token(&world, &token);
         let remote = serve_remote(&world, &server);

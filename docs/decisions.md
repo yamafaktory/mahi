@@ -646,3 +646,21 @@ branch back. Only a second mahi process in the same clone that starts another of
 agents fetches then, through `mahi join` or `mahi resume --agent`. mahi leaves `n` as it is in
 that case. The other choices were to cancel the landing with a note, as D088 does for `y`, or to
 refuse such a second process before it fetches.
+
+## D090 · 2026-11-11 · The Codex dogfood signs in through ChatGPT in the browser
+
+Chosen by the user (#15). The dogfood test runs `codex login` with `CODEX_HOME` set to the
+teammate's thread state directory. Codex prints a URL and opens it in the browser, and the user
+signs in with ChatGPT, so each run needs the user. Nothing is read from `~/.codex`, and the sign
+in stays in the test's throwaway directory. The user first chose an OpenAI API key read from a
+file, but an API key needs a paid OpenAI Platform account. A ChatGPT device code then failed:
+OpenAI's device page kept asking to turn device codes on after the user turned them on. The other
+choice was to copy `~/.codex/auth.json` into the thread, which a token refresh could sign out.
+
+## D091 · 2026-11-11 · The Codex dogfood prompts Codex once Claude's work is merged
+
+Chosen by the user (#15). The test starts `mahi join` with Codex and no task. It waits until
+Claude's turn is merged into Codex's worktree, then types the task. Codex then starts from
+Claude's work, without a conflict, and the test checks D070's merge before the first turn. The
+other choice was to pass the task on the command line, as the user prompting first, and to type
+a second prompt so that mahi's note makes Codex resolve the conflict markers.
