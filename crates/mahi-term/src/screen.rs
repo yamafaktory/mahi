@@ -33,6 +33,9 @@ const MODIFIERS: [(Modifier, u8); 9] = [
     (Modifier::HIDDEN, 8),
     (Modifier::CROSSED_OUT, 9),
 ];
+const SYNC_START: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+const SWITCH_SCREENS: &[u8] = b"\x1b[?1049l\x1b[?1049h";
 
 /// A `ratatui` backend that draws with plain escape sequences into any writer, so mahi's
 /// full-screen views share the terminal handling and key reading mahi already has.
@@ -48,6 +51,7 @@ pub struct AnsiBackend<W: Write> {
     size: Size,
     cursor: Position,
     true_color: bool,
+    synchronized: bool,
 }
 
 /// The colours and attributes the terminal was last told to draw with.
@@ -78,6 +82,7 @@ impl<W: Write> AnsiBackend<W> {
             size: Size::new(columns, rows),
             cursor: Position::ORIGIN,
             true_color: true,
+            synchronized: false,
         }
     }
 
@@ -92,6 +97,15 @@ impl<W: Write> AnsiBackend<W> {
     /// Records the terminal's new size, which the next draw fills.
     pub fn resize(&mut self, rows: u16, columns: u16) {
         self.size = Size::new(columns, rows);
+    }
+
+    /// Makes the terminal drop the text the user selected with the mouse, which it keeps when
+    /// the screen is erased: it leaves the alternate screen and enters it again, in one
+    /// synchronized update that the next flush ends, so no other screen shows between.
+    pub fn drop_selection(&mut self) {
+        self.pending.extend_from_slice(SYNC_START);
+        self.pending.extend_from_slice(SWITCH_SCREENS);
+        self.synchronized = true;
     }
 
     /// Returns the writer, which holds everything up to the last flush.
@@ -281,6 +295,10 @@ impl<W: Write> Backend for AnsiBackend<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if self.synchronized {
+            self.pending.extend_from_slice(SYNC_END);
+            self.synchronized = false;
+        }
         self.out.write_all(&self.pending)?;
         self.pending.clear();
         self.out.flush()
@@ -425,6 +443,42 @@ mod tests {
         assert_eq!(screen.cell(0, 2).unwrap().contents(), "仓");
         assert_eq!(screen.cell(0, 4).unwrap().contents(), "c");
         assert_eq!(screen.cell(0, 5).unwrap().contents(), "d");
+    }
+
+    #[test]
+    fn a_dropped_selection_switches_screens_within_the_next_frame() {
+        let mut terminal = Terminal::new(AnsiBackend::new(Vec::new(), 2, 20)).unwrap();
+        terminal.backend_mut().drop_selection();
+        terminal.clear().unwrap();
+        terminal
+            .draw(|frame| Line::from("Confirm").render(frame.area(), frame.buffer_mut()))
+            .unwrap();
+        terminal
+            .draw(|frame| Line::from("Confirm?").render(frame.area(), frame.buffer_mut()))
+            .unwrap();
+        let written = terminal.backend_mut().writer().clone();
+        let first_frame_end = written
+            .windows(SYNC_END.len())
+            .position(|window| window == SYNC_END)
+            .unwrap();
+        let (first, rest) = written.split_at(first_frame_end + SYNC_END.len());
+        assert!(
+            first.starts_with(b"\x1b[?2026h\x1b[?1049l\x1b[?1049h"),
+            "{first:?}"
+        );
+        assert!(
+            first
+                .windows(b"Confirm".len())
+                .any(|window| window == b"Confirm"),
+            "{first:?}"
+        );
+        assert!(!rest.windows(4).any(|window| window == b"1049"), "{rest:?}");
+        assert!(!rest.windows(4).any(|window| window == b"2026"), "{rest:?}");
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[?1049h");
+        parser.process(&written);
+        assert!(parser.screen().alternate_screen());
+        assert_eq!(parser.screen().contents_between(0, 0, 0, 8), "Confirm?");
     }
 
     #[test]

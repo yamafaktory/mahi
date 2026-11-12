@@ -292,6 +292,18 @@ fn write_screen(bytes: &[u8]) -> io::Result<()> {
     out.flush()
 }
 
+/// Takes the notice away and returns a terminal of `size` with its screen cleared, which drops
+/// the text the user selected in that notice.
+fn cleared_terminal(size: WindowSize) -> io::Result<Terminal<AnsiBackend<io::Stdout>>> {
+    let notice_left = ui::clear_notice();
+    let mut terminal = Terminal::new(ui::backend(size.rows, size.cols))?;
+    if notice_left {
+        terminal.backend_mut().drop_selection();
+    }
+    terminal.clear()?;
+    Ok(terminal)
+}
+
 /// Shows the home screen until the user chooses an action, quits, or a signal stops mahi.
 fn choose(
     place: &Place<'_>,
@@ -301,10 +313,8 @@ fn choose(
 ) -> io::Result<Chosen> {
     let signals = TerminationSignals::listen().map_err(io::Error::other)?;
     ui::keys_make_signals(false);
-    ui::clear_notice();
     let mut size = terminal::size();
-    let mut terminal = Terminal::new(ui::backend(size.rows, size.cols))?;
-    terminal.clear()?;
+    let mut terminal = cleared_terminal(size)?;
     let mut keys = ThreadListKeys::default();
     let mut rows = rows(place.store, place.own);
     let mut remote = remote::summary(place.store);

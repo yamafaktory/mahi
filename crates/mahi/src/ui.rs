@@ -89,6 +89,7 @@ static DRAWING: Mutex<()> = Mutex::new(());
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 static LEFT: AtomicBool = AtomicBool::new(false);
 static MOUSE_LEFT: AtomicBool = AtomicBool::new(false);
+static NOTICE_DRAWN: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 const CONTROL_DISABLED: u8 = 0xff;
 #[cfg(target_os = "linux")]
@@ -183,6 +184,7 @@ fn spin(stopped: &mpsc::Receiver<()>) {
             screen = Terminal::new(backend(size.rows, size.cols)).ok();
         }
         if let Some(screen) = screen.as_mut() {
+            NOTICE_DRAWN.store(true, Ordering::SeqCst);
             let _ = draw_over_backdrop(screen, dialog);
         }
     }
@@ -268,8 +270,9 @@ pub(crate) fn show_working() {
 }
 
 /// Takes the notice away, with a working notice still to come, and stops the spinner, before
-/// the full-screen view draws a frame or leaves the screen.
-pub(crate) fn clear_notice() {
+/// the full-screen view draws a frame or leaves the screen; returns whether a notice was on
+/// the screen, so the view makes the terminal drop the text the user selected in it.
+pub(crate) fn clear_notice() -> bool {
     let spinner = NOTICE.lock().ok().and_then(|mut notice| {
         notice.dialog = None;
         notice.busy_since = None;
@@ -278,6 +281,7 @@ pub(crate) fn clear_notice() {
     if let Some(spinner) = spinner {
         spinner.stop();
     }
+    NOTICE_DRAWN.swap(false, Ordering::SeqCst)
 }
 
 fn set_asking(asking: bool) {
@@ -705,8 +709,17 @@ fn show(dialog: &Dialog) -> io::Result<()> {
     leave_mouse()?;
     let size = terminal::size();
     let mut screen = Terminal::new(backend(size.rows, size.cols))?;
+    if replaces_notice(dialog) {
+        screen.backend_mut().drop_selection();
+    }
     screen.clear()?;
     draw_over_backdrop(&mut screen, dialog)
+}
+
+/// Returns whether `dialog` takes the place of a notice, which went without the key press that
+/// makes the terminal drop the text the user selected in it.
+fn replaces_notice(dialog: &Dialog) -> bool {
+    NOTICE_DRAWN.swap(dialog.is_notice(), Ordering::SeqCst)
 }
 
 /// Leaves the mouse to the terminal while a dialog shows, so its text can be selected, and
@@ -859,6 +872,27 @@ fn collect(reader: OwnedFd, lines: &Mutex<Vec<String>>, generation: &AtomicU64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_dialog_in_place_of_a_notice_drops_the_selection() {
+        let confirm = || Dialog::confirm("Confirm", vec!["Add bob?".to_owned()]);
+        let code = Dialog::code("Invite a teammate", "884-neptune-outfielder", &["Tell it."]);
+        assert!(!replaces_notice(&confirm()));
+        assert!(!replaces_notice(&code));
+        assert!(replaces_notice(&confirm()));
+        assert!(!replaces_notice(&confirm()));
+        assert!(!replaces_notice(&Dialog::notice(
+            "mahi",
+            vec!["working…".to_owned()]
+        )));
+        assert!(replaces_notice(&Dialog::notice(
+            "mahi",
+            vec!["done".to_owned()]
+        )));
+        assert!(clear_notice());
+        assert!(!clear_notice());
+        assert!(!replaces_notice(&confirm()));
+    }
 
     fn title(tick: usize) -> String {
         let mut title = String::new();

@@ -237,6 +237,21 @@ impl Dialog {
         self.title.push_str(title);
     }
 
+    /// Returns whether the dialog is a notice, which goes without a key press, as a notice and
+    /// a code do.
+    #[must_use]
+    pub fn is_notice(&self) -> bool {
+        match self.kind {
+            Kind::Notice | Kind::Code { .. } => true,
+            Kind::Message
+            | Kind::Table { .. }
+            | Kind::Confirm { .. }
+            | Kind::Input { .. }
+            | Kind::Choose { .. }
+            | Kind::Menu { .. } => false,
+        }
+    }
+
     /// Makes a yes or no question, `no` selected first.
     #[must_use]
     pub fn confirm(title: &str, lines: Vec<String>) -> Self {
