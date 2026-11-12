@@ -97,6 +97,11 @@ impl SyncView {
         self.landing.as_deref()
     }
 
+    /// Returns the teammates' agents whose turn waits for the user's keypress.
+    pub(crate) fn held(&self) -> impl Iterator<Item = &str> {
+        self.held.iter().map(String::as_str)
+    }
+
     /// Says whether a turn of the teammate's agent `slot` waits for the user's keypress.
     pub(crate) fn waits(&self, slot: &str) -> bool {
         self.held.iter().any(|held| held == slot)

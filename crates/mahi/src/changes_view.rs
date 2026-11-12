@@ -134,6 +134,17 @@ impl ChangesCache {
     }
 }
 
+/// Reads the changes of `own`'s agent in `thread`, whose base is `base`, at once; `None` while
+/// the agent has no snapshot, or when its trees cannot be read or compared.
+pub(crate) fn read_now(
+    store: &Store,
+    thread: ThreadId,
+    own: &AgentSlot,
+    base: ObjectId,
+) -> Option<ChangesView> {
+    trees(store, thread, own, base).and_then(|from| ChangesView::read(store, from))
+}
+
 /// Reads the changes between `from`'s trees in the repository at `git_dir` on a thread of its
 /// own; `None` when the thread cannot start.
 fn start_reading(git_dir: PathBuf, from: Trees) -> Option<Receiver<Option<ChangesView>>> {

@@ -51,6 +51,7 @@ use mahi_agent::{
 use mahi_core::{
     AgentName,
     AgentSlot,
+    LineCounts,
     ParticipantName,
     RefKind,
     ThreadId,
@@ -76,6 +77,7 @@ use serde_json::{
 };
 
 use crate::{
+    changes_view,
     claims::{
         Claim,
         Claims,
@@ -88,6 +90,8 @@ use crate::{
         self,
         NoteBy,
     },
+    palette::HELD_DETAIL,
+    sync_view::SyncView,
     turns::split_event,
 };
 
@@ -128,6 +132,8 @@ fn instructions(me: &AgentSlot, note_by: NoteBy) -> String {
          work. Do not commit or push: `git commit` and `git push` fail in your sandbox, and the \
          thread's work becomes commits on its branch when the thread lands. `list_agents` shows \
          who works in the thread. `read_transcript` and `read_diff` show what an agent did. \
+         `read_status` shows what waits for your user and the files your worktree changed \
+         since the last landing, with the lines each adds and removes. \
          Before you edit, look at `list_claims`, claim what you start with `claim`, and \
          `release` it when you are done.\n\n\
          mahi merges your teammates' work into your worktree between your turns. {note} \
@@ -490,6 +496,20 @@ impl ThreadTools {
         })
     }
 
+    fn read_status(&self) -> Result<String, ToolError> {
+        let store = self.store()?;
+        let view = self.meta(&store)?;
+        let sync = SyncView::read(&store, self.thread, &self.me);
+        let changes = changes_view::read_now(&store, self.thread, &self.me, view.base);
+        Ok(cleaned(&status_text(
+            (self.thread, &self.me),
+            &sync,
+            changes
+                .as_ref()
+                .map(|changes| (changes.files(), changes.more())),
+        )))
+    }
+
     fn list_claims(&self) -> String {
         let mut text = String::new();
         push_claims(&mut text, &self.claims.all(Some(&self.me)));
@@ -709,6 +729,70 @@ fn push_claims(text: &mut String, claims: &[Claim]) {
     }
 }
 
+/// Returns what `read_status` answers to `me` in `thread`: what `sync` holds that waits for
+/// the user, and the worktree's `changes`, its changed files and whether more changed than
+/// are listed, `None` when they cannot be read.
+fn status_text(
+    (thread, me): (ThreadId, &AgentSlot),
+    sync: &SyncView,
+    changes: Option<(&[(String, LineCounts)], bool)>,
+) -> String {
+    let mut text = format!("Thread {thread}. You are {me}.\n\n");
+    if let Some(branch) = sync.landing() {
+        let _ = writeln!(
+            text,
+            "A merge of the landing branch {branch:?} waits for your user's keypress: it \
+             {HELD_DETAIL}."
+        );
+    }
+    for slot in sync.held() {
+        let _ = writeln!(
+            text,
+            "A turn of {slot} waits for your user's keypress: it {HELD_DETAIL}."
+        );
+    }
+    if let Some(conflicts) = sync.conflicts() {
+        let _ = write!(text, "Unresolved conflict markers from {}:", conflicts.from);
+        for path in conflicts.paths {
+            let _ = write!(text, " {path:?}");
+        }
+        if conflicts.more > 0 {
+            let _ = write!(text, " and {} more", conflicts.more);
+        }
+        text.push('\n');
+    }
+    let Some((files, more)) = changes else {
+        text.push_str(
+            "Your worktree's changes cannot be read: your agent has no snapshot yet, or its \
+             trees cannot be compared.\n",
+        );
+        return text;
+    };
+    text.push_str(
+        "Files your worktree changed since the last landing, or the thread's base before it, \
+         as your latest snapshot holds them:\n",
+    );
+    for (path, counts) in files {
+        let _ = write!(text, "{path:?}");
+        match counts {
+            LineCounts::Counted { added, removed } => {
+                let _ = write!(text, " +{added} -{removed}");
+            }
+            LineCounts::Binary => text.push_str(" binary"),
+            LineCounts::TooLarge => text.push_str(" too large to count"),
+            LineCounts::NotAFile => {}
+        }
+        text.push('\n');
+    }
+    if files.is_empty() {
+        text.push_str("none\n");
+    }
+    if more {
+        text.push_str("(more changed than are listed)\n");
+    }
+    text
+}
+
 /// Takes the note kept in `file` of what came into the agent's worktree, and writes it into
 /// `text` ahead of a blank line, when anything came in.
 fn push_note(text: &mut String, file: &Path) {
@@ -771,6 +855,15 @@ impl Toolbox for ThreadTools {
                 description: "Lists the thread's participants and their agents that have \
                               snapshots here, as <participant>.<agent>, marking which one you \
                               are, and the claims.",
+                input_schema: json!({ "type": "object", "properties": {} }),
+            },
+            Tool {
+                name: "read_status",
+                description: "Shows what your user's panel shows: the conflicts, what waits \
+                              for your user's keypress, and the files your worktree changed \
+                              since the last landing, or the thread's base before it, with \
+                              the lines each adds and removes. What your teammates' work \
+                              brought comes in the note.",
                 input_schema: json!({ "type": "object", "properties": {} }),
             },
             Tool {
@@ -846,6 +939,7 @@ impl Toolbox for ThreadTools {
     fn call(&self, name: &str, arguments: &Map<String, Value>) -> Result<String, ToolError> {
         match name {
             "list_agents" => self.list_agents(),
+            "read_status" => self.read_status(),
             "read_diff" => self.read_diff(arguments),
             "read_transcript" => self.read_transcript(arguments),
             "claim" => self.claim(arguments),
@@ -897,7 +991,21 @@ fn push_agents<'a>(
 
 #[cfg(test)]
 mod tests {
+    use gix::objs::tree::EntryKind;
+    use mahi_store::ObjectId;
+
     use super::*;
+    use crate::{
+        conflicts::{
+            self,
+            KeptConflicts,
+        },
+        held::{
+            self,
+            HeldSettings,
+        },
+        source::Source,
+    };
 
     #[test]
     fn a_participant_without_snapshots_here_is_not_said_to_have_no_agent() {
@@ -924,6 +1032,76 @@ mod tests {
         text.clear();
         push_agents(&mut text, [(&alice, true)].into_iter(), &agents, &me);
         assert_eq!(text, "- alice (owner): alice.claude (you)\n");
+    }
+
+    #[test]
+    fn status_text_tells_the_changes_with_their_lines() {
+        let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let me: AgentSlot = "davy.claude".parse().unwrap();
+        let files = [
+            (
+                "README.md".to_owned(),
+                LineCounts::Counted {
+                    added: 1,
+                    removed: 0,
+                },
+            ),
+            ("logo.png".to_owned(), LineCounts::Binary),
+        ];
+        let text = status_text((thread, &me), &SyncView::default(), Some((&files, true)));
+        assert_eq!(
+            text,
+            "Thread 0123456789abcdef0123456789abcdef. You are davy.claude.\n\n\
+             Files your worktree changed since the last landing, or the thread's base before \
+             it, as your latest snapshot holds them:\n\
+             \"README.md\" +1 -0\n\
+             \"logo.png\" binary\n\
+             (more changed than are listed)\n"
+        );
+        let unread = status_text((thread, &me), &SyncView::default(), None);
+        assert!(
+            unread.ends_with(
+                "Your worktree's changes cannot be read: your agent has no snapshot yet, or its \
+                 trees cannot be compared.\n"
+            ),
+            "{unread}"
+        );
+        let clean = status_text((thread, &me), &SyncView::default(), Some((&[], false)));
+        assert!(
+            clean.ends_with("as your latest snapshot holds them:\nnone\n"),
+            "{clean}"
+        );
+    }
+
+    #[test]
+    fn status_text_tells_the_held_turns_and_the_conflicts_the_sync_state_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
+        let me: AgentSlot = "davy.claude".parse().unwrap();
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let commit = ObjectId::from_bytes_or_panic(&[1; 20]);
+        HeldSettings::new(commit, &["CLAUDE.md".to_owned()])
+            .keep(&held::file(&store, thread, (&me, &bob)))
+            .unwrap();
+        let marked = ["src/a.rs".to_owned()];
+        KeptConflicts::of_merge((&Source::Agent(bob.clone()), commit), marked.iter())
+            .unwrap()
+            .save(&conflicts::file(&store, thread, &me))
+            .unwrap();
+        let text = status_text(
+            (thread, &me),
+            &SyncView::read(&store, thread, &me),
+            Some((&[], false)),
+        );
+        assert!(
+            text.contains(
+                "A turn of bob.claude waits for your user's keypress: it changes agent \
+                 settings.\nUnresolved conflict markers from bob.claude: \"src/a.rs\"\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1249,6 +1427,39 @@ mod tests {
             huge.text
                 .ends_with("(the rest of this turn is left out for size)\n")
         );
+    }
+
+    #[test]
+    fn read_status_reads_the_agents_latest_snapshot_since_the_threads_base() {
+        use crate::workspace_live::tests::setup;
+
+        let setup = setup();
+        let me: AgentSlot = "alice.codex".parse().unwrap();
+        let tools = ThreadTools::new(
+            setup.store.common_dir().to_path_buf(),
+            (setup.thread, setup.owner(), None),
+            (me.clone(), Arc::new(Claims::default())),
+        );
+        assert!(tools.tools().iter().any(|tool| tool.name == "read_status"));
+        let before = tools.call("read_status", &Map::new()).unwrap();
+        assert!(before.contains("You are alice.codex."), "{before}");
+        assert!(before.contains("cannot be read"), "{before}");
+        let readme = setup.store.write_blob(b"hello moto\n").unwrap();
+        let tree = setup
+            .store
+            .write_tree(&[("README.md", EntryKind::Blob, readme)])
+            .unwrap();
+        setup
+            .store
+            .append(
+                &ThreadRef::new(setup.thread, RefKind::Snapshots(me)),
+                None,
+                tree,
+                crate::session::SNAPSHOT_MESSAGE,
+            )
+            .unwrap();
+        let after = tools.call("read_status", &Map::new()).unwrap();
+        assert!(after.contains("\"README.md\" +1 -0\n"), "{after}");
     }
 
     #[test]

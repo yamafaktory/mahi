@@ -720,3 +720,19 @@ its state and the files merged from it since the user's last prompt. Below them,
 files of the user's worktree that changed since the thread's base or its last landing, with the
 added and removed line counts: what a landing would hold. The other choices were each agent's
 own changes since the base, read from its latest turn-end snapshot, or the merged files only.
+
+## D098 · 2026-11-12 · Each agent reports the changes it sees, when asked and on its own
+
+Chosen by the user (#133, #134). A new MCP tool, `read_status`, gives the agent what the panel
+shows, so it answers when the user asks what changed. And after a merge that brought a
+teammate's files or left conflicts, mahi types a prompt into the agent, so it reports at once in
+its own pane, at the cost of one turn for each such merge. The other choices were the tool alone,
+or the prompt alone.
+
+## D099 · 2026-11-12 · The prompt after a merge names the teammates whose work merged
+
+Chosen by the user (#134). mahi types `mahi merged bob.claude's work. Tell me what changed.`,
+naming each teammate's agent whose work the merge brought, as `bob.claude's and carol.codex's`
+for two. The note, with the files, reaches the agent with the prompt. The other choices were
+`mahi merged your teammates' work. Tell me what changed.` and `mahi merged your teammates' work.
+Read what changed and tell me whether it affects your work.`
