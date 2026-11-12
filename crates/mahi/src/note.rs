@@ -145,6 +145,17 @@ pub(crate) fn peek(file: &Path) -> Option<String> {
     (!note.is_empty()).then(|| note.render())
 }
 
+/// Returns the teammates' agents the note kept in `file` names, whose merges brought files or
+/// left conflicts; none when it cannot be read.
+pub(crate) fn listed(file: &Path) -> Vec<AgentSlot> {
+    let Ok(_kept) = keeping() else {
+        return Vec::new();
+    };
+    Note::load(file)
+        .map(|note| note.teammates().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// Takes the note kept in `file` when it still reads `shown`, as an agent's hook read it; a
 /// note that grew meanwhile stays, so what came in since is not lost.
 pub(crate) fn take_shown(file: &Path, shown: &str) {
@@ -273,6 +284,12 @@ impl Note {
 
     fn is_empty(&self) -> bool {
         self.came.is_empty() && self.landed.is_none()
+    }
+
+    /// Returns each teammate's agent the note names, whose merges brought files or left
+    /// conflicts.
+    pub(crate) fn teammates(&self) -> impl Iterator<Item = &AgentSlot> {
+        self.came.iter().filter_map(|came| came.from.agent())
     }
 
     /// Returns each teammate's agent the note names, with the first files its merges brought.
@@ -417,6 +434,29 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn the_listed_teammates_are_those_whose_merges_brought_files_or_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        assert!(listed(&file).is_empty());
+        let (bob, carol, dan): (AgentSlot, AgentSlot, AgentSlot) = (
+            "bob.claude".parse().unwrap(),
+            "carol.codex".parse().unwrap(),
+            "dan.claude".parse().unwrap(),
+        );
+        let paths = ["src/lib.rs".to_owned()];
+        let none: [String; 0] = [];
+        let merged = |markers, brought| Merged {
+            markers,
+            kept: &none,
+            brought,
+        };
+        record(&file, &Source::Agent(bob.clone()), merged(&none, &paths)).unwrap();
+        record(&file, &Source::Agent(carol), merged(&none, &none)).unwrap();
+        record(&file, &Source::Agent(dan.clone()), merged(&paths, &none)).unwrap();
+        assert_eq!(listed(&file), [bob, dan]);
+    }
 
     #[test]
     fn a_code_span_is_fenced_past_its_backquotes_on_one_line_and_cut_short() {

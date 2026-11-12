@@ -736,3 +736,10 @@ naming each teammate's agent whose work the merge brought, as `bob.claude's and 
 for two. The note, with the files, reaches the agent with the prompt. The other choices were
 `mahi merged your teammates' work. Tell me what changed.` and `mahi merged your teammates' work.
 Read what changed and tell me whether it affects your work.`
+
+## D100 · 2026-11-12 · A held turn taken in the palette prompts no report
+
+Chosen by the user (#134). A teammate's turn held for the user's keypress, because it changes
+agent settings, and taken in the palette, merges with no report prompt after it: the user just
+chose to take it, and the note still reaches the agent with their next prompt. The other choice
+was to prompt the agent as after an automatic merge.

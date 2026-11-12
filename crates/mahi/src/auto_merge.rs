@@ -1,7 +1,11 @@
 use std::{
     collections::HashSet,
+    fmt::Write as _,
     io::Write,
-    path::PathBuf,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::{
         Arc,
         Mutex,
@@ -59,9 +63,11 @@ use crate::{
         MergeDone,
         MergeError,
         MergeRequest,
+        Noted,
         PathsLeft,
     },
     merged::MergedFrom,
+    note,
     recorder::{
         Merger,
         Wanted,
@@ -235,7 +241,7 @@ impl AutoMerge {
                     agent,
                     writer,
                     (running, pace, Readiness::TurnClosed),
-                    || merger.merge(request, AgentSettings::Take),
+                    |_| merger.merge(request, AgentSettings::Take),
                 );
                 let Some(outcome) = done else {
                     return false;
@@ -271,7 +277,7 @@ impl AutoMerge {
             agent,
             writer,
             (running, pace, Readiness::TurnClosed),
-            || {
+            |_| {
                 let still = Store::open(&self.git_dir)
                     .ok()
                     .and_then(|store| pending_landing(&store, self.thread))
@@ -398,7 +404,8 @@ impl AutoMerge {
     /// it is still due then;
     /// each snapshot is tried once in this run, whatever the merge gives, but for a merge
     /// refused while the agent's conflicts are unresolved, and the thread refs are looked
-    /// through again only once one of them moved.
+    /// through again only once one of them moved. After the merges that became due together,
+    /// it prompts the agent to report what came in, when anything did.
     pub(crate) fn run(
         &self,
         merger: &Merger,
@@ -408,11 +415,18 @@ impl AutoMerge {
         let mut tried = HashSet::new();
         let mut tried_landing = None;
         let mut seen = Vec::new();
+        let mut to_report = Vec::new();
         while running.load(Ordering::SeqCst) {
             thread::sleep(LOOK_EVERY);
             let Ok(store) = Store::open(&self.git_dir) else {
                 continue;
             };
+            report(
+                &mut to_report,
+                &note::file(&store, self.thread, &self.own),
+                (activity, agent, writer),
+                pace,
+            );
             self.waiting.show(self.held_now(&store));
             for (from, record, choice) in self.waiting.take_choices() {
                 seen.clear();
@@ -450,12 +464,13 @@ impl AutoMerge {
             for request in requests {
                 let commit = request.commit;
                 tried.insert(commit);
+                let from = request.from.clone();
                 let done = inject::when_ready(
                     activity,
                     agent,
                     writer,
                     (running, pace, Readiness::AfterTurnEnd),
-                    || {
+                    |_| {
                         self.is_due(&request)
                             .then(|| merger.merge(request, AgentSettings::Hold))
                     },
@@ -463,8 +478,29 @@ impl AutoMerge {
                 let Some(outcome) = done else {
                     return;
                 };
-                if let Some(Err(MergeError::MarkersUnresolved(_))) = outcome {
-                    tried.remove(&commit);
+                match outcome {
+                    Some(Err(MergeError::MarkersUnresolved(_))) => {
+                        tried.remove(&commit);
+                    }
+                    Some(Ok(MergeDone::Merged {
+                        noted: Noted::Something,
+                        ..
+                    })) => {
+                        if !to_report.contains(&from) {
+                            to_report.push(from);
+                        }
+                    }
+                    Some(
+                        Ok(
+                            MergeDone::Already
+                            | MergeDone::Merged {
+                                noted: Noted::Nothing,
+                                ..
+                            },
+                        )
+                        | Err(_),
+                    )
+                    | None => {}
                 }
             }
         }
@@ -488,7 +524,7 @@ impl AutoMerge {
             agent,
             writer,
             (running, pace, Readiness::AfterTurnEnd),
-            || {
+            |_| {
                 let store = Store::open(&self.git_dir).ok()?;
                 (self.landing_due(&store).as_ref() == Some(wanted)).then(|| {
                     (
@@ -533,6 +569,55 @@ pub(crate) fn held_landing(
     let file = held::file_for(store, thread, (own, &from));
     let record = HeldSettings::load(&file).ok()??;
     (record.commit == tip).then_some((from, record))
+}
+
+/// Types the prompt that asks the agent to report what the automatic merges from the
+/// teammates' agents `to_report`, each of which noted files or conflicts, brought into its
+/// worktree, when the agent is idle after a turn its hook reported and the user pressed no
+/// key since, then forgets them; it names those the note kept in `note` still lists, and
+/// forgets the others, since a prompt took the note. It never waits, so merges go on.
+fn report(
+    to_report: &mut Vec<AgentSlot>,
+    note: &Path,
+    (activity, agent, writer): (&Activity, &impl AgentInput, &Mutex<impl Write>),
+    pace: Pace,
+) {
+    if to_report.is_empty() {
+        return;
+    }
+    let listed = note::listed(note);
+    to_report.retain(|slot| listed.contains(slot));
+    if to_report.is_empty() {
+        return;
+    }
+    let typed = inject::if_ready(
+        activity,
+        agent,
+        writer,
+        (pace, Readiness::UntouchedAfterTurnEnd),
+        |input| {
+            activity.typed_prompt();
+            let _ = inject::type_prompt(input, &report_prompt(to_report));
+        },
+    );
+    if typed.is_some() {
+        to_report.clear();
+    }
+}
+
+/// Returns the prompt that asks the agent to report what the merges from the teammates'
+/// agents `named` brought, as `mahi merged bob.claude's work. Tell me what changed.`
+fn report_prompt(named: &[AgentSlot]) -> String {
+    let mut prompt = String::from("mahi merged ");
+    let last = named.len().saturating_sub(1);
+    for (index, slot) in named.iter().enumerate() {
+        if index > 0 {
+            prompt.push_str(if index == last { " and " } else { ", " });
+        }
+        let _ = write!(prompt, "{slot}'s");
+    }
+    prompt.push_str(" work. Tell me what changed.");
+    prompt
 }
 
 #[cfg(test)]
@@ -802,6 +887,165 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn the_report_prompt_names_each_teammate_whose_work_merged() {
+        let slots: Vec<AgentSlot> = ["bob.claude", "carol.codex", "dan.claude"]
+            .iter()
+            .map(|slot| slot.parse().unwrap())
+            .collect();
+        assert_eq!(
+            report_prompt(&slots[..1]),
+            "mahi merged bob.claude's work. Tell me what changed."
+        );
+        assert_eq!(
+            report_prompt(&slots[..2]),
+            "mahi merged bob.claude's and carol.codex's work. Tell me what changed."
+        );
+        assert_eq!(
+            report_prompt(&slots),
+            "mahi merged bob.claude's, carol.codex's and dan.claude's work. Tell me what changed."
+        );
+    }
+
+    #[test]
+    fn a_teammates_turn_that_brings_nothing_prompts_nobody_even_with_an_untaken_note() {
+        let mut team = team();
+        let same = tree_of(&team, &[("README", "hello\n")]);
+        let commit = team.commit_turn_end("bob.claude", &team.bob.0, same);
+        let merging = team.merging();
+        let auto = team.auto_merge();
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        note::record(
+            &note::file(&team.store, team.started.thread, &auto.own),
+            &Source::Agent(bob.clone()),
+            note::Merged {
+                markers: &[],
+                kept: &[],
+                brought: &["an earlier file".to_owned()],
+            },
+        )
+        .unwrap();
+        thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                auto.run(
+                    &merging.merger,
+                    (&merging.activity, &Closed, &merging.writer),
+                    (&merging.running, pace()),
+                );
+            });
+            merging.activity.saw(HookKind::TurnEnd, b"");
+            wait_for("bob's turn was never merged", &merging.running, || {
+                MergedFrom::read(&team.store, &team.started.snapshots)
+                    .unwrap()
+                    .of(&bob)
+                    == Some(commit)
+            });
+            thread::sleep(pace().quiet * 8);
+            merging.running.store(false, Ordering::SeqCst);
+            running.join().unwrap();
+        });
+        merging.recorder.finish().unwrap();
+        assert!(merging.writer.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_report_that_waits_for_a_reported_turn_end_holds_no_merge_back() {
+        let mut team = team();
+        let worktree = team.started.worktree.clone();
+        let first = tree_of(&team, &[("README", "hello\n"), ("notes.txt", "from bob\n")]);
+        team.commit_turn_end("bob.claude", &team.bob.0, first);
+        let mut merging = team.merging();
+        merging.activity = Activity::default();
+        let auto = team.auto_merge();
+        let prompt: &[u8] = b"mahi merged bob.claude's work. Tell me what changed.\r";
+        let typed = || {
+            merging
+                .writer
+                .lock()
+                .unwrap()
+                .windows(prompt.len())
+                .filter(|window| *window == prompt)
+                .count()
+        };
+        thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                auto.run(
+                    &merging.merger,
+                    (&merging.activity, &Closed, &merging.writer),
+                    (&merging.running, pace()),
+                );
+            });
+            wait_for(
+                "bob's first turn was never merged",
+                &merging.running,
+                || worktree.join("notes.txt").exists(),
+            );
+            let later = tree_of(
+                &team,
+                &[
+                    ("README", "hello\n"),
+                    ("notes.txt", "from bob\n"),
+                    ("later.txt", "later\n"),
+                ],
+            );
+            team.commit_turn_end("bob.claude", &team.bob.0, later);
+            wait_for("bob's later turn was held back", &merging.running, || {
+                worktree.join("later.txt").exists()
+            });
+            assert_eq!(typed(), 0);
+            merging.activity.saw(HookKind::TurnEnd, b"");
+            wait_for("the agent was never prompted", &merging.running, || {
+                typed() > 0
+            });
+            thread::sleep(pace().quiet * 4);
+            merging.running.store(false, Ordering::SeqCst);
+            running.join().unwrap();
+        });
+        merging.recorder.finish().unwrap();
+        assert_eq!(typed(), 1);
+    }
+
+    #[test]
+    fn a_teammates_merged_work_prompts_the_agent_once_naming_them() {
+        let mut team = team();
+        let worktree = team.started.worktree.clone();
+        let turn = tree_of(&team, &[("README", "hello\n"), ("notes.txt", "from bob\n")]);
+        team.commit_turn_end("bob.claude", &team.bob.0, turn);
+        let merging = team.merging();
+        let auto = team.auto_merge();
+        let prompt: &[u8] = b"mahi merged bob.claude's work. Tell me what changed.\r";
+        let typed = || {
+            merging
+                .writer
+                .lock()
+                .unwrap()
+                .windows(prompt.len())
+                .filter(|window| *window == prompt)
+                .count()
+        };
+        thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                auto.run(
+                    &merging.merger,
+                    (&merging.activity, &Closed, &merging.writer),
+                    (&merging.running, pace()),
+                );
+            });
+            merging.activity.saw(HookKind::TurnEnd, b"");
+            wait_for("bob's turn was never merged", &merging.running, || {
+                worktree.join("notes.txt").exists()
+            });
+            wait_for("the agent was never prompted", &merging.running, || {
+                typed() > 0
+            });
+            thread::sleep(pace().quiet * 4);
+            merging.running.store(false, Ordering::SeqCst);
+            running.join().unwrap();
+        });
+        merging.recorder.finish().unwrap();
+        assert_eq!(typed(), 1);
     }
 
     #[test]

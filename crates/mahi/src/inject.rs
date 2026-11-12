@@ -1,5 +1,8 @@
 use std::{
-    io::Write,
+    io::{
+        self,
+        Write,
+    },
     sync::{
         Mutex,
         atomic::{
@@ -23,6 +26,7 @@ use mahi_term::Report;
 
 use crate::hub::OutputTap;
 
+const ENTER_AFTER: Duration = Duration::from_millis(250);
 const INTERRUPT: u8 = 0x03;
 const KILL_LINE: u8 = 0x15;
 const ESC: u8 = 0x1b;
@@ -52,6 +56,7 @@ impl Default for Pace {
 pub(crate) struct Activity {
     turn_open: AtomicBool,
     turn_ended: AtomicBool,
+    reported_untouched: AtomicBool,
     asking: AtomicBool,
     line_empty: AtomicBool,
     last: Mutex<Instant>,
@@ -64,6 +69,7 @@ impl Default for Activity {
         Self {
             turn_open: AtomicBool::new(false),
             turn_ended: AtomicBool::new(true),
+            reported_untouched: AtomicBool::new(false),
             asking: AtomicBool::new(false),
             line_empty: AtomicBool::new(true),
             last: Mutex::new(Instant::now()),
@@ -123,6 +129,7 @@ impl Activity {
             return;
         }
         self.touched();
+        self.reported_untouched.store(false, Ordering::SeqCst);
         let effect = line_effect(bytes);
         let Ok(_changing) = self.changing.lock() else {
             return;
@@ -151,6 +158,7 @@ impl Activity {
             HookKind::Prompt => {
                 let was_open = self.turn_open.swap(true, Ordering::SeqCst);
                 self.turn_ended.store(false, Ordering::SeqCst);
+                self.reported_untouched.store(false, Ordering::SeqCst);
                 let was_asking = self.asking.swap(false, Ordering::SeqCst);
                 if !was_open || was_asking {
                     self.tell(TurnState::Working);
@@ -159,6 +167,7 @@ impl Activity {
             HookKind::TurnEnd => {
                 self.turn_open.store(false, Ordering::SeqCst);
                 self.turn_ended.store(true, Ordering::SeqCst);
+                self.reported_untouched.store(true, Ordering::SeqCst);
                 self.asking.store(false, Ordering::SeqCst);
                 self.tell(TurnState::Done);
             }
@@ -186,6 +195,19 @@ impl Activity {
         !self.turn_open.load(Ordering::SeqCst)
             && self.line_empty.load(Ordering::SeqCst)
             && quiet_for >= pace.quiet
+    }
+
+    /// Says whether the agent is idle after a turn its turn-end hook reported in this run, with
+    /// no key of the user's since.
+    fn is_untouched_after_turn_end(&self, pace: &Pace) -> bool {
+        self.reported_untouched.load(Ordering::SeqCst) && self.is_idle(pace)
+    }
+
+    /// Takes in that mahi typed a prompt into the agent, so it types no other until the next
+    /// turn end its hook reports.
+    pub(crate) fn typed_prompt(&self) {
+        self.reported_untouched.store(false, Ordering::SeqCst);
+        self.touched();
     }
 
     /// Says whether the agent is idle after a turn its turn-end hook reported, or since it
@@ -290,6 +312,22 @@ fn kitty_key(params: &[u8], effect: &mut LineEffect) {
     }
 }
 
+/// Types `text` into the agent's `input` as a prompt: the text, then Enter once the agent took
+/// it in; text holding a control character is refused, since it could act as a key.
+pub(crate) fn type_prompt(input: &mut impl Write, text: &str) -> io::Result<()> {
+    if text.chars().any(char::is_control) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a typed prompt holds a control character",
+        ));
+    }
+    input.write_all(text.as_bytes())?;
+    input.flush()?;
+    thread::sleep(ENTER_AFTER);
+    input.write_all(b"\r")?;
+    input.flush()
+}
+
 /// The agent's side of what waits for it: whether mahi's palette is open.
 pub(crate) trait AgentInput {
     /// Returns whether the palette is open, when nothing is given to the agent.
@@ -303,35 +341,61 @@ pub(crate) enum Readiness {
     TurnClosed,
     /// Be idle after a turn its turn-end hook reported, or since it started.
     AfterTurnEnd,
+    /// Be idle after a turn its turn-end hook reported, with no key of the user's since, so no
+    /// prompt, dialog or picker the hooks do not report may be open.
+    UntouchedAfterTurnEnd,
 }
 
 /// Runs `act` once the agent is as `readiness` says and the palette closed, holding the agent's
-/// input while it runs, so no key of the user's comes in between;
+/// input while it runs and handing it to `act`, so no key of the user's comes in between;
 /// returns `None` if `running` is cleared first.
-pub(crate) fn when_ready<T>(
+pub(crate) fn when_ready<W: Write, T>(
     activity: &Activity,
     agent: &impl AgentInput,
-    writer: &Mutex<impl Write>,
+    writer: &Mutex<W>,
     (running, pace, readiness): (&AtomicBool, Pace, Readiness),
-    act: impl FnOnce() -> T,
+    act: impl FnOnce(&mut W) -> T,
 ) -> Option<T> {
     while running.load(Ordering::SeqCst) {
         thread::sleep(pace.look_every);
-        let Ok(input) = writer.lock() else {
+        let Ok(mut input) = writer.lock() else {
             return None;
         };
-        let ready = match readiness {
-            Readiness::TurnClosed => activity.is_idle(&pace),
-            Readiness::AfterTurnEnd => activity.is_idle_after_turn_end(&pace),
-        };
-        if agent.palette_open() || !ready {
-            continue;
+        if is_ready(activity, agent, pace, readiness) {
+            let done = act(&mut input);
+            drop(input);
+            return Some(done);
         }
-        let done = act();
-        drop(input);
-        return Some(done);
     }
     None
+}
+
+/// Runs `act` at once when the agent is as `readiness` says and the palette closed, holding the
+/// agent's input while it runs and handing it to `act`; returns `None`, without waiting, when
+/// it is not.
+pub(crate) fn if_ready<W: Write, T>(
+    activity: &Activity,
+    agent: &impl AgentInput,
+    writer: &Mutex<W>,
+    (pace, readiness): (Pace, Readiness),
+    act: impl FnOnce(&mut W) -> T,
+) -> Option<T> {
+    let mut input = writer.lock().ok()?;
+    is_ready(activity, agent, pace, readiness).then(|| act(&mut input))
+}
+
+fn is_ready(
+    activity: &Activity,
+    agent: &impl AgentInput,
+    pace: Pace,
+    readiness: Readiness,
+) -> bool {
+    let ready = match readiness {
+        Readiness::TurnClosed => activity.is_idle(&pace),
+        Readiness::AfterTurnEnd => activity.is_idle_after_turn_end(&pace),
+        Readiness::UntouchedAfterTurnEnd => activity.is_untouched_after_turn_end(&pace),
+    };
+    ready && !agent.palette_open()
 }
 
 #[cfg(test)]
@@ -367,6 +431,39 @@ mod tests {
         activity.saw(HookKind::Prompt, b"");
         thread::sleep(pace.quiet * 4);
         assert!(!activity.is_idle(&pace));
+    }
+
+    #[test]
+    fn only_a_reported_turn_end_with_no_key_since_lets_a_prompt_in() {
+        let pace = fast();
+        let activity = Activity::default();
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_untouched_after_turn_end(&pace));
+        activity.saw(HookKind::TurnEnd, b"");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_untouched_after_turn_end(&pace));
+        activity.keys(b"/model\r");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_after_turn_end(&pace));
+        assert!(!activity.is_untouched_after_turn_end(&pace));
+        activity.saw(HookKind::TurnEnd, b"");
+        activity.typed_prompt();
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_untouched_after_turn_end(&pace));
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(HookKind::TurnEnd, b"");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_untouched_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn a_typed_prompt_is_its_text_then_enter() {
+        let mut typed = Vec::new();
+        type_prompt(&mut typed, "mahi merged bob.claude's work.").unwrap();
+        assert_eq!(typed, b"mahi merged bob.claude's work.\r");
+        let mut refused = Vec::new();
+        assert!(type_prompt(&mut refused, "line\x1b[2J").is_err());
+        assert!(refused.is_empty());
     }
 
     #[test]
@@ -607,7 +704,7 @@ mod tests {
                     &*agent,
                     &writer,
                     (&running, fast(), Readiness::TurnClosed),
-                    move || held.try_lock().is_err(),
+                    move |_| held.try_lock().is_err(),
                 )
             })
         };
@@ -634,7 +731,7 @@ mod tests {
                     &*agent,
                     &writer,
                     (&running, fast(), Readiness::TurnClosed),
-                    || (),
+                    |_| (),
                 )
             })
         };

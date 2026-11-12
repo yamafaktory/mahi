@@ -104,6 +104,7 @@ pub(crate) enum MergeDone {
         commit: ObjectId,
         tree: ObjectId,
         left: PathsLeft,
+        noted: Noted,
     },
 }
 
@@ -200,6 +201,13 @@ pub(crate) fn merge_landing_now(
     )
 }
 
+/// Whether a merge added anything to the agent's note: files it brought, or conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Noted {
+    Nothing,
+    Something,
+}
+
 /// Whether a merge left some paths of the worktree as they were.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathsLeft {
@@ -262,11 +270,12 @@ fn merge_into(
     } else {
         PathsLeft::Some
     };
-    note_merge(store, into, (from, &merged), (ours, tree));
+    let noted = note_merge(store, into, (from, &merged), (ours, tree));
     Ok(MergeDone::Merged {
         commit: written,
         tree,
         left,
+        noted,
     })
 }
 
@@ -305,13 +314,14 @@ fn write_merge(
 
 /// Adds to `into`'s note what the merge from `from` left in its worktree, whose tree went from
 /// `ours` to `tree`: the paths with markers, those where the agent's side was kept, and the
-/// files it changed. The merge stands whether or not the note could be kept.
+/// files it changed; returns whether there was anything to add. The merge stands whether or
+/// not the note could be kept.
 fn note_merge(
     store: &Store,
     into: Recording<'_>,
     (from, merged): (&Source, &Merged),
     (ours, tree): (ObjectId, ObjectId),
-) {
+) -> Noted {
     let of_kind = |kind: Conflict| -> Vec<String> {
         merged
             .conflicts
@@ -333,15 +343,22 @@ fn note_merge(
         })
         .unwrap_or_default();
     let file = note::file(store, into.snapshots.thread(), into.slot);
+    let (markers, kept) = (of_kind(Conflict::Markers), of_kind(Conflict::KeptOurs));
+    let noted = if markers.is_empty() && kept.is_empty() && brought.is_empty() {
+        Noted::Nothing
+    } else {
+        Noted::Something
+    };
     let _ = note::record(
         &file,
         from,
         note::Merged {
-            markers: &of_kind(Conflict::Markers),
-            kept: &of_kind(Conflict::KeptOurs),
+            markers: &markers,
+            kept: &kept,
             brought: &brought,
         },
     );
+    noted
 }
 
 /// Says whether the snapshot `skipped`, which the user skipped, is the base for merging
