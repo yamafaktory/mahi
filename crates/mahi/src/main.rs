@@ -2,6 +2,7 @@
 
 mod auto_merge;
 mod catch_up;
+mod changes_view;
 mod claims;
 mod cli;
 mod commands;

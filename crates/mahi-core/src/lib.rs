@@ -2,6 +2,7 @@
 
 mod budget;
 mod id;
+mod lines;
 mod name;
 mod refs;
 mod text;
@@ -16,6 +17,7 @@ pub use id::{
     RandomError,
     ThreadId,
 };
+pub use lines::LineCounts;
 pub use name::{
     AgentName,
     AgentSlot,

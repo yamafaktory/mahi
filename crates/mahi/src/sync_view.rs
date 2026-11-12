@@ -7,6 +7,7 @@ use mahi_term::StatusConflicts;
 
 use crate::{
     auto_merge,
+    changes_view::ChangesView,
     conflicts::{
         self,
         KeptConflicts,
@@ -20,16 +21,17 @@ use crate::{
 
 const SHOWN_PATHS: usize = 20;
 
-/// What the sync state of the user's agent holds that the status line shows: the landing
-/// branch whose merge waits for the user's keypress, the teammates' agents whose turn does,
-/// the paths a merge left with conflict markers, and the files each teammate's merges brought
-/// since the user's last prompt.
+/// What the sync state of the user's agent holds that the panel shows: the landing branch
+/// whose merge waits for the user's keypress, the teammates' agents whose turn does, the paths
+/// a merge left with conflict markers, the files each teammate's merges brought since the
+/// user's last prompt, and the worktree's changes since the base or the last landing.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct SyncView {
     landing: Option<String>,
     held: Vec<String>,
     conflicts: Option<Kept>,
     brought: Vec<(String, Vec<String>)>,
+    changes: Option<ChangesView>,
 }
 
 /// The conflicts kept in the user's worktree: the agent they came from, the first paths with
@@ -76,7 +78,19 @@ impl SyncView {
             held,
             conflicts,
             brought,
+            changes: None,
         }
+    }
+
+    /// Returns the view with the worktree's `changes` since the base or the last landing.
+    pub(crate) fn with_changes(mut self, changes: ChangesView) -> Self {
+        self.changes = Some(changes);
+        self
+    }
+
+    /// Returns the worktree's changes since the base or the last landing, once they were read.
+    pub(crate) fn changes(&self) -> Option<&ChangesView> {
+        self.changes.as_ref()
     }
 
     pub(crate) fn landing(&self) -> Option<&str> {

@@ -647,7 +647,7 @@ impl Dialog {
 }
 
 /// Returns the end of `text` that fits in `room` columns, so the cursor after it shows.
-fn tail(text: &str, room: usize) -> &str {
+pub(crate) fn tail(text: &str, room: usize) -> &str {
     let mut width = 0;
     let start = text
         .char_indices()

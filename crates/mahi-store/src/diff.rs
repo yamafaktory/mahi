@@ -9,6 +9,7 @@ use gix_imara_diff::{
     InternedInput,
     UnifiedDiffConfig,
 };
+use mahi_core::LineCounts;
 
 use crate::store::{
     Store,
@@ -68,7 +69,10 @@ impl Store {
         new: ObjectId,
         path: &str,
     ) -> Result<FileDiff, StoreError> {
-        let (before, after) = (self.file_at(old, path)?, self.file_at(new, path)?);
+        let (before, after) = (
+            self.file_at(old, path, MAX_DIFFED_BYTES)?,
+            self.file_at(new, path, MAX_DIFFED_BYTES)?,
+        );
         let (before_text, after_text) = match (as_text(&before), as_text(&after)) {
             (Err(why), _) | (_, Err(why)) => return Ok(why),
             (Ok(before), Ok(after)) => (before, after),
@@ -100,7 +104,42 @@ impl Store {
         Ok(FileDiff::Text(format!("{header}{hunks}")))
     }
 
-    fn file_at(&self, tree: ObjectId, path: &str) -> Result<Found, StoreError> {
+    /// Returns how many lines the file at `path`, `/`-separated, adds and removes from the tree
+    /// `old` to the tree `new`, read as [`Store::file_diff`] reads it but with no file larger
+    /// than `limit` bytes read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::TooLarge`] if a tree on the way is larger than 1 MiB, or
+    /// [`StoreError::Git`] if reading fails.
+    pub fn line_counts(
+        &self,
+        (old, new): (ObjectId, ObjectId),
+        path: &str,
+        limit: u64,
+    ) -> Result<LineCounts, StoreError> {
+        let (before, after) = (
+            self.file_at(old, path, limit)?,
+            self.file_at(new, path, limit)?,
+        );
+        let (before, after) = match (as_text(&before), as_text(&after)) {
+            (Err(why), _) | (_, Err(why)) => {
+                return Ok(match why {
+                    FileDiff::Binary => LineCounts::Binary,
+                    FileDiff::TooLarge => LineCounts::TooLarge,
+                    FileDiff::Same | FileDiff::Text(_) | FileDiff::NotAFile => LineCounts::NotAFile,
+                });
+            }
+            (Ok(before), Ok(after)) => (before.unwrap_or(""), after.unwrap_or("")),
+        };
+        let diff = Diff::compute(Algorithm::Histogram, &InternedInput::new(before, after));
+        Ok(LineCounts::Counted {
+            added: diff.count_additions(),
+            removed: diff.count_removals(),
+        })
+    }
+
+    fn file_at(&self, tree: ObjectId, path: &str, limit: u64) -> Result<Found, StoreError> {
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() > MAX_PATH_DEPTH || parts.iter().any(|part| matches!(*part, "" | "." | ".."))
         {
@@ -112,7 +151,7 @@ impl Store {
         if !mode.is_blob_or_symlink() {
             return Ok(Found::NotAFile);
         }
-        Ok(match self.read_blob(id, MAX_DIFFED_BYTES) {
+        Ok(match self.read_blob(id, limit) {
             Ok(bytes) => Found::File(bytes, mode),
             Err(StoreError::TooLarge { .. }) => Found::TooLarge,
             Err(StoreError::WrongObject { .. }) => Found::NotAFile,
@@ -172,6 +211,59 @@ mod tests {
             panic!("no diff");
         };
         assert!(added.contains("+one\n+2\n"), "{added}");
+    }
+
+    #[test]
+    fn a_changed_file_counts_the_lines_it_adds_and_removes() {
+        let (_dir, store) = store();
+        let old = nested(&store, b"one\ntwo\nthree\n");
+        let new = nested(&store, b"one\n2\nthree\nfour\n");
+        let counted = |old, new, path| {
+            store
+                .line_counts((old, new), path, MAX_DIFFED_BYTES)
+                .unwrap()
+        };
+        assert_eq!(
+            counted(old, new, "src/lib.rs"),
+            LineCounts::Counted {
+                added: 2,
+                removed: 1
+            }
+        );
+        let empty = store.write_tree(&[]).unwrap();
+        assert_eq!(
+            counted(empty, new, "src/lib.rs"),
+            LineCounts::Counted {
+                added: 4,
+                removed: 0
+            }
+        );
+        assert_eq!(
+            counted(old, empty, "src/lib.rs"),
+            LineCounts::Counted {
+                added: 0,
+                removed: 3
+            }
+        );
+        assert_eq!(
+            counted(old, old, "src/lib.rs"),
+            LineCounts::Counted {
+                added: 0,
+                removed: 0
+            }
+        );
+        let binary = nested(&store, b"bin\0ary");
+        assert_eq!(counted(old, binary, "src/lib.rs"), LineCounts::Binary);
+        let large = nested(
+            &store,
+            &vec![b'a'; usize::try_from(MAX_DIFFED_BYTES).unwrap() + 1],
+        );
+        assert_eq!(counted(large, old, "src/lib.rs"), LineCounts::TooLarge);
+        assert_eq!(
+            store.line_counts((old, new), "src/lib.rs", 4).unwrap(),
+            LineCounts::TooLarge
+        );
+        assert_eq!(counted(old, new, "src"), LineCounts::NotAFile);
     }
 
     #[test]

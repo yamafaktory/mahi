@@ -45,9 +45,12 @@ use mahi_term::{
     KeyScanner,
     MouseEvent,
     Notice,
+    OwnAgent,
     PaletteInput,
     PaletteKey,
     PaletteKeys,
+    Panel,
+    PanelChanges,
     Report,
     ReportReader,
     Segment,
@@ -1764,6 +1767,17 @@ impl Workspace {
             .collect();
         let conflicts: Vec<StatusConflicts<'_>> = tab.sync.conflicts().into_iter().collect();
         let shown = tab.agents.get(tab.selected);
+        let own =
+            shown
+                .or_else(|| tab.agents.first())
+                .zip(teammates)
+                .map(|(running, teammates)| {
+                    (
+                        format!("{}.{}", teammates.own(), running.name),
+                        teammates.own_place(),
+                        running.shown_as().state,
+                    )
+                });
         let failed = shown.is_some_and(|running| running.ending == Ending::Failed);
         let screen = tab.screen(teammates);
         let failed_hints = [
@@ -1784,13 +1798,24 @@ impl Workspace {
                 None => &hints,
             },
             waiting: self.waiting(),
-            status: StatusLine {
-                landing: tab.sync.landing().map(|branch| StatusLanding {
-                    branch,
-                    waits: HELD_DETAIL,
+            panel: Panel {
+                own: own.as_ref().map(|(slot, place, state)| OwnAgent {
+                    slot,
+                    place: *place,
+                    state: *state,
                 }),
-                conflicts: &conflicts,
-                agents: &status,
+                status: StatusLine {
+                    landing: tab.sync.landing().map(|branch| StatusLanding {
+                        branch,
+                        waits: HELD_DETAIL,
+                    }),
+                    conflicts: &conflicts,
+                    agents: &status,
+                },
+                changes: tab.sync.changes().map(|changes| PanelChanges {
+                    files: changes.files(),
+                    more: changes.more(),
+                }),
             },
         }
         .render(screen, body, buffer);
@@ -2627,6 +2652,36 @@ mod tests {
     }
 
     #[test]
+    fn the_panel_names_the_users_agent_first_with_the_state_its_pane_shows() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let mut own = running(&mut workspace, "sleep 5");
+        own.ending = Ending::Failed;
+        let tab = tab("a", vec![own]);
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
+        heard(&mut teammates, "bob.claude");
+        let area = Rect::new(0, 0, 120, 12);
+        let mut buffer = Buffer::empty(area);
+        workspace.draw_tab(&tab, Some(&teammates), area, &mut buffer);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (84..area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect()
+            })
+            .collect();
+        assert!(rows[0].starts_with("╭ Thread "), "{rows:#?}");
+        assert!(
+            rows[1].starts_with("│ ● alice.agent  ✗ failed"),
+            "{rows:#?}"
+        );
+        assert!(rows[2].starts_with("│   you"), "{rows:#?}");
+        assert!(rows[3].starts_with("│ ● bob.claude  ◉ live"), "{rows:#?}");
+    }
+
+    #[test]
     fn a_tab_names_its_agent_and_state_over_the_pane_and_its_teammates_under_it() {
         let mut workspace = Workspace::new(
             PaletteKey::default(),
@@ -2637,7 +2692,7 @@ mod tests {
         let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
         heard(&mut teammates, "bob.claude");
         heard(&mut teammates, "carol.codex");
-        let area = Rect::new(0, 0, 100, 12);
+        let area = Rect::new(0, 0, 99, 12);
         let mut buffer = Buffer::empty(area);
         workspace.draw_tab(&tab, Some(&teammates), area, &mut buffer);
         let row = |y: u16| -> String {
@@ -2993,13 +3048,7 @@ mod tests {
             PaletteKey::default(),
             Notice::for_terminal(TerminalHints::default()),
         );
-        workspace.set_screen(
-            WindowSize {
-                rows: 30,
-                cols: 100,
-            },
-            false,
-        );
+        workspace.set_screen(WindowSize { rows: 30, cols: 99 }, false);
         let asking = running(
             &mut workspace,
             "stty raw -echo; printf '\\033[?1002h\\033[?1006hready'; \

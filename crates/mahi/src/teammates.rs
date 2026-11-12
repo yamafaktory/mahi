@@ -146,6 +146,11 @@ impl Teammates {
         changed
     }
 
+    /// Returns the user's place in the thread's `meta`, which picks their colour.
+    pub(crate) fn own_place(&self) -> usize {
+        self.place(&self.own)
+    }
+
     /// Returns the place of `participant` in the thread's `meta`, which picks their colour:
     /// after every participant it lists when it lists none such.
     fn place(&self, participant: &ParticipantName) -> usize {

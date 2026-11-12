@@ -705,3 +705,18 @@ the user, removed lines and added lines, so a teammate's name could read as a st
 replaced by lavender #A98BE0, sky #6CC7E0 and sand #BFB09C, beside plum, teal and blue. Conflicts
 take a brighter orange, #F0883C, which stays apart from every participant colour on a terminal of
 256 colours too. The other choices were to keep the six, or to use only plum, teal and blue.
+
+## D095 · 2026-11-12 · Every participant's status shows in a panel at the right of the agent
+
+Chosen by the user (#130). The status line under a thread's pane is hard to see, and every
+participant should always see the status of everything. A thread's tab shows a panel at the
+right of the agent's pane, and the status line comes back only on a terminal too narrow for the
+panel. The other choices were the same panel hidden by a key, and several rows under the pane.
+
+## D096 · 2026-11-12 · The panel lists the agents, then the changes since the base
+
+Chosen by the user (#130). The panel lists each agent of the thread, the user's own first, with
+its state and the files merged from it since the user's last prompt. Below them, it lists the
+files of the user's worktree that changed since the thread's base or its last landing, with the
+added and removed line counts: what a landing would hold. The other choices were each agent's
+own changes since the base, read from its latest turn-end snapshot, or the merged files only.

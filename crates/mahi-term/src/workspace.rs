@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use mahi_core::LineCounts;
 use ratatui_core::{
     buffer::Buffer,
     layout::{
@@ -20,13 +21,24 @@ use ratatui_core::{
     widgets::Widget,
 };
 use ratatui_widgets::{
-    block::Block,
+    block::{
+        Block,
+        Padding,
+    },
     borders::BorderType,
+    paragraph::{
+        Paragraph,
+        Wrap,
+    },
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     Theme,
-    dialog::shown,
+    dialog::{
+        shown,
+        tail,
+    },
     key_hints,
 };
 
@@ -34,8 +46,11 @@ const TOP_ROWS: u16 = 1;
 const HINT_ROWS: u16 = 1;
 const STATUS_ROWS: u16 = 1;
 const STATUS_GAP: &str = "  ";
-const BORDER: u16 = 2;
 const SMALLEST: u16 = 2;
+const PANEL_COLUMNS: u16 = 36;
+const PANEL_FROM: u16 = 100;
+const PANEL_TITLE: &str = " Thread ";
+const CHANGES_TITLE: &str = "Changes since base";
 
 /// What an agent in a thread's tab is doing, as the workspace shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,16 +326,23 @@ fn agent_item<'a>(agent: &StatusAgent<'a>, brought: Brought) -> Item<'a> {
         Span::raw(agent.state.word()),
     ];
     if let Some(waits) = agent.waits {
-        let warn = Style::new().fg(Theme::WARN);
         spans.push(Span::styled(" · ", Theme::muted()));
-        spans.push(Span::styled("a turn waits for you: ", warn));
-        spans.push(Span::styled(shown(waits), warn));
+        spans.extend(turn_waits(waits));
     }
     if brought == Brought::Shown && !agent.brought.is_empty() {
         spans.push(Span::styled(" · ", Theme::muted()));
         push_paths(&mut spans, agent.brought, Style::new());
     }
     Item::new(spans)
+}
+
+/// Returns the spans that say a turn waits for the user's keypress, and what it changes.
+fn turn_waits(waits: &str) -> [Span<'_>; 2] {
+    let warn = Style::new().fg(Theme::WARN);
+    [
+        Span::styled("a turn waits for you: ", warn),
+        Span::styled(shown(waits), warn),
+    ]
 }
 
 fn landing_item<'a>(landing: &StatusLanding<'a>) -> Item<'a> {
@@ -538,8 +560,181 @@ fn badge() -> Span<'static> {
     Span::styled(" mahi ", Theme::selected())
 }
 
-/// A thread's tab: one of its agents at full size, the status line under it, and the keys
-/// that reach mahi.
+/// The user's own agent, as the panel names it first.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnAgent<'a> {
+    /// Its slot, such as `davy.claude`.
+    pub slot: &'a str,
+    /// The user's place in the thread's `meta`, which picks their colour.
+    pub place: usize,
+    /// What it is doing.
+    pub state: AgentState,
+}
+
+/// The files of the user's worktree that changed since the base or the last landing, and
+/// whether more changed than are listed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PanelChanges<'a> {
+    /// The changed files, `/`-separated, each with the lines it adds and removes.
+    pub files: &'a [(String, LineCounts)],
+    /// Whether more files changed than are listed.
+    pub more: bool,
+}
+
+/// The panel at the right of a thread's pane: what waits for the user, the conflicts, each
+/// agent of the thread, the user's own first, and the worktree's changes since the base or
+/// the last landing. On a terminal too narrow for it, its status line shows under the pane.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Panel<'a> {
+    /// The user's own agent, when one runs in the tab.
+    pub own: Option<OwnAgent<'a>>,
+    /// The held merge of the landing branch, the conflicts and the teammates' agents.
+    pub status: StatusLine<'a>,
+    /// The worktree's changes, once they were read.
+    pub changes: Option<PanelChanges<'a>>,
+}
+
+impl<'a> Panel<'a> {
+    /// Returns the panel's lines for a panel `width` columns wide inside its borders.
+    fn lines(&self, width: u16) -> Vec<Line<'a>> {
+        let width = usize::from(width);
+        let mut lines: Vec<Line<'a>> = Vec::new();
+        lines.extend(
+            self.status
+                .landing
+                .as_ref()
+                .map(|landing| Line::from(landing_item(landing).spans)),
+        );
+        lines.extend(
+            self.status
+                .conflicts
+                .iter()
+                .map(|conflicts| Line::from(conflicts_item(conflicts, usize::MAX).spans)),
+        );
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        if let Some(own) = self.own {
+            lines.push(agent_row(own.slot, own.place, own.state));
+            lines.push(Line::styled("  you", Theme::muted()));
+        }
+        for agent in self.status.agents {
+            lines.push(agent_row(agent.slot, agent.place, agent.state.into()));
+            if let Some(waits) = agent.waits {
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(turn_waits(waits));
+                lines.push(Line::from(spans));
+            }
+            if !agent.brought.is_empty() {
+                let mut spans = vec![Span::raw("  "), Span::styled("merged: ", Theme::muted())];
+                push_paths(&mut spans, agent.brought, Style::new());
+                lines.push(Line::from(spans));
+            }
+        }
+        let Some(changes) = self.changes else {
+            return lines;
+        };
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            CHANGES_TITLE,
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+        if changes.files.is_empty() && !changes.more {
+            lines.push(Line::styled("  none", Theme::muted()));
+        }
+        lines.extend(
+            changes
+                .files
+                .iter()
+                .map(|(path, counts)| file_row(path, *counts, width)),
+        );
+        if changes.more {
+            lines.push(Line::styled(
+                "  more changed than are listed",
+                Theme::muted(),
+            ));
+        }
+        lines
+    }
+
+    fn render(&self, area: Rect, buffer: &mut Buffer) {
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(Theme::BORDER))
+            .style(Theme::surface())
+            .padding(Padding::horizontal(1))
+            .title(Span::styled(PANEL_TITLE, Theme::title()));
+        let inner = block.inner(area);
+        block.render(area, buffer);
+        Paragraph::new(self.lines(inner.width))
+            .wrap(Wrap { trim: false })
+            .render(inner, buffer);
+    }
+}
+
+/// Returns the row that names an agent in its participant's colour, with its state.
+fn agent_row(slot: &str, place: usize, state: AgentState) -> Line<'_> {
+    let colour = Style::new().fg(Theme::participant(place));
+    Line::from(vec![
+        Span::styled("● ", colour),
+        Span::styled(shown(slot), colour.add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(state.as_str(), Theme::muted()),
+    ])
+}
+
+/// Returns the row of a changed file, its path cut from the left to leave room for its line
+/// counts at the right of a row `width` columns wide.
+fn file_row(path: &str, lines: LineCounts, width: usize) -> Line<'_> {
+    let counts = counts_spans(lines);
+    let counts_width: usize = counts.iter().map(Span::width).sum();
+    let room = width.saturating_sub(2 + counts_width + usize::from(counts_width > 0));
+    let path = shown(path);
+    let path = if path.width() > room {
+        Cow::Owned(format!("…{}", tail(&path, room.saturating_sub(1))))
+    } else {
+        path
+    };
+    let gap = width.saturating_sub(2 + path.width() + counts_width);
+    let mut spans = Vec::with_capacity(counts.len() + 3);
+    spans.push(Span::raw("  "));
+    spans.push(Span::raw(path));
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(counts);
+    Line::from(spans)
+}
+
+/// Returns the line counts of a changed file: `+12` in the colour of added lines and `−3` in
+/// that of removed ones, or why they were not counted.
+fn counts_spans(lines: LineCounts) -> Vec<Span<'static>> {
+    match lines {
+        LineCounts::Counted { added, removed } => {
+            let mut spans = Vec::with_capacity(3);
+            if added > 0 {
+                spans.push(Span::styled(
+                    format!("+{added}"),
+                    Style::new().fg(Theme::ADDED),
+                ));
+            }
+            if added > 0 && removed > 0 {
+                spans.push(Span::raw(" "));
+            }
+            if removed > 0 {
+                spans.push(Span::styled(
+                    format!("−{removed}"),
+                    Style::new().fg(Theme::REMOVED),
+                ));
+            }
+            spans
+        }
+        LineCounts::Binary => vec![Span::styled("binary", Theme::muted())],
+        LineCounts::TooLarge => vec![Span::styled("too large", Theme::muted())],
+        LineCounts::NotAFile => Vec::new(),
+    }
+}
+
+/// A thread's tab: one of its agents at full size, the panel at its right, or its status line
+/// under it on a narrow terminal, and the keys that reach mahi.
 #[derive(Debug, Clone, Copy)]
 pub struct ThreadView<'a> {
     /// The agent shown at full size, when there is one.
@@ -549,8 +744,8 @@ pub struct ThreadView<'a> {
     /// The spinner's frame and what the pane waits for, drawn in its middle while it has no
     /// screen.
     pub waiting: Option<(&'a str, &'a str)>,
-    /// What the status line under the pane says.
-    pub status: StatusLine<'a>,
+    /// What the panel shows.
+    pub panel: Panel<'a>,
 }
 
 impl ThreadView<'_> {
@@ -558,11 +753,9 @@ impl ThreadView<'_> {
     /// `rows` and `columns`, at least two of each.
     #[must_use]
     pub fn agent_size(rows: u16, columns: u16) -> (u16, u16) {
-        (
-            rows.saturating_sub(TOP_ROWS + HINT_ROWS + BORDER + STATUS_ROWS)
-                .max(SMALLEST),
-            columns.saturating_sub(BORDER).max(SMALLEST),
-        )
+        let area = Rect::new(0, 0, columns, rows.saturating_sub(TOP_ROWS));
+        let inner = Block::bordered().inner(Self::areas(area).pane);
+        (inner.height.max(SMALLEST), inner.width.max(SMALLEST))
     }
 
     /// Draws the tab into `area`, below the top row, with the shown agent's `screen` in its
@@ -573,7 +766,11 @@ impl ThreadView<'_> {
         area: Rect,
         buffer: &mut Buffer,
     ) -> Option<Position> {
-        let (pane, status, footer) = Self::rows(area);
+        let TabAreas {
+            pane,
+            beside,
+            footer,
+        } = Self::areas(area);
         let title = self
             .shown
             .map_or_else(String::new, |agent| format!(" {} ", agent.label()));
@@ -595,7 +792,10 @@ impl ThreadView<'_> {
                 .centered()
                 .render(middle, buffer);
         }
-        self.status.line(status.width).render(status, buffer);
+        match beside {
+            Beside::Panel(panel) => self.panel.render(panel, buffer),
+            Beside::Status(status) => self.panel.status.line(status.width).render(status, buffer),
+        }
         Line::from(key_hints(self.hints)).render(footer, buffer);
         let screen = screen?;
         let (row, column) = screen.cursor_position();
@@ -608,8 +808,7 @@ impl ThreadView<'_> {
     /// as a drag that leaves it does, and nothing otherwise.
     #[must_use]
     pub fn pane_point(area: Rect, position: Position, clamp: bool) -> Option<(u16, u16)> {
-        let (pane, _, _) = Self::rows(area);
-        let inner = Block::bordered().inner(pane);
+        let inner = Block::bordered().inner(Self::areas(area).pane);
         if inner.is_empty() || (!clamp && !inner.contains(position)) {
             return None;
         }
@@ -618,16 +817,48 @@ impl ThreadView<'_> {
         Some((column, row))
     }
 
-    /// Splits `area` into the pane, the status line's row and the hints' row.
-    fn rows(area: Rect) -> (Rect, Rect, Rect) {
-        let [pane, status, footer] = Layout::vertical([
+    /// Splits `area` into the pane, the panel at its right when `area` is wide enough for it,
+    /// or else the status line's row under it, and the hints' row.
+    fn areas(area: Rect) -> TabAreas {
+        let wide = area.width >= PANEL_FROM;
+        let [body, status, footer] = Layout::vertical([
             Constraint::Fill(1),
-            Constraint::Length(STATUS_ROWS),
+            Constraint::Length(if wide { 0 } else { STATUS_ROWS }),
             Constraint::Length(HINT_ROWS),
         ])
         .areas(area);
-        (pane, status, footer)
+        if !wide {
+            return TabAreas {
+                pane: body,
+                beside: Beside::Status(status),
+                footer,
+            };
+        }
+        let [pane, panel] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Length(PANEL_COLUMNS)])
+                .areas(body);
+        TabAreas {
+            pane,
+            beside: Beside::Panel(panel),
+            footer,
+        }
     }
+}
+
+/// Where a thread's tab draws its parts.
+#[derive(Debug, Clone, Copy)]
+struct TabAreas {
+    pane: Rect,
+    beside: Beside,
+    footer: Rect,
+}
+
+/// What a thread's tab draws beside its pane: the panel at its right, or the status line's
+/// row under it.
+#[derive(Debug, Clone, Copy)]
+enum Beside {
+    Panel(Rect),
+    Status(Rect),
 }
 
 impl WorkspaceAgent<'_> {
@@ -913,6 +1144,173 @@ mod tests {
         assert_eq!(Theme::participant(6), Theme::participant(0));
     }
 
+    fn texts(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_panel_names_each_agent_then_the_changes_since_the_base() {
+        let brought = ["README.md".to_owned()];
+        let agents = [StatusAgent {
+            place: 1,
+            slot: "bob.claude",
+            state: TeammateState::Done,
+            waits: Some("changes agent settings"),
+            brought: &brought,
+        }];
+        let files = [
+            (
+                "README.md".to_owned(),
+                LineCounts::Counted {
+                    added: 1,
+                    removed: 0,
+                },
+            ),
+            (
+                "src/lib.rs".to_owned(),
+                LineCounts::Counted {
+                    added: 12,
+                    removed: 3,
+                },
+            ),
+            ("logo.png".to_owned(), LineCounts::Binary),
+        ];
+        let panel = Panel {
+            own: Some(OwnAgent {
+                slot: "davy.claude",
+                place: 0,
+                state: AgentState::Working,
+            }),
+            status: StatusLine {
+                landing: None,
+                conflicts: &[],
+                agents: &agents,
+            },
+            changes: Some(PanelChanges {
+                files: &files,
+                more: true,
+            }),
+        };
+        let lines = panel.lines(30);
+        assert_eq!(
+            texts(&lines),
+            [
+                "● davy.claude  ● working",
+                "  you",
+                "● bob.claude  ✓ done",
+                "  a turn waits for you: changes agent settings",
+                "  merged: README.md",
+                "",
+                "Changes since base",
+                "  README.md                 +1",
+                "  src/lib.rs            +12 −3",
+                "  logo.png              binary",
+                "  more changed than are listed",
+            ]
+        );
+        assert_eq!(lines[0].spans[1].style.fg, Some(Theme::PARTICIPANTS[0]));
+        assert_eq!(lines[2].spans[1].style.fg, Some(Theme::PARTICIPANTS[1]));
+        let counts = &lines[8].spans;
+        assert_eq!(counts[counts.len() - 3].style.fg, Some(Theme::ADDED));
+        assert_eq!(counts[counts.len() - 1].style.fg, Some(Theme::REMOVED));
+    }
+
+    #[test]
+    fn the_panel_cuts_a_long_path_from_the_left_and_says_when_nothing_changed() {
+        let files = [(
+            "crates/mahi-term/src/workspace.rs".to_owned(),
+            LineCounts::Counted {
+                added: 120,
+                removed: 4,
+            },
+        )];
+        let panel = Panel {
+            changes: Some(PanelChanges {
+                files: &files,
+                more: false,
+            }),
+            ..Panel::default()
+        };
+        let rows = texts(&panel.lines(24));
+        assert_eq!(rows.last().unwrap(), "  …/workspace.rs +120 −4");
+        assert_eq!(rows.last().unwrap().chars().count(), 24);
+        let conflicts = [StatusConflicts {
+            from: "bob.claude",
+            paths: &["a.rs".to_owned(), "b.rs".to_owned()],
+            more: 1,
+        }];
+        let empty = Panel {
+            status: StatusLine {
+                landing: Some(StatusLanding {
+                    branch: "main",
+                    waits: "changes agent settings",
+                }),
+                conflicts: &conflicts,
+                agents: &[],
+            },
+            changes: Some(PanelChanges::default()),
+            ..Panel::default()
+        };
+        assert_eq!(texts(&Panel::default().lines(40)), Vec::<String>::new());
+        assert_eq!(
+            texts(&empty.lines(40)),
+            [
+                "main · a merge waits for you: changes agent settings",
+                "conflicts from bob.claude: a.rs, b.rs and 1 more",
+                "",
+                "",
+                "Changes since base",
+                "  none",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wide_tab_draws_the_panel_at_the_right_and_no_status_line() {
+        let agents = [StatusAgent {
+            place: 1,
+            slot: "bob.codex",
+            state: TeammateState::Offline,
+            waits: None,
+            brought: &[],
+        }];
+        let area = Rect::new(0, 0, 120, 14);
+        let mut buffer = Buffer::empty(area);
+        ThreadView {
+            shown: Some(AGENTS[0]),
+            hints: &[("ctrl-space", "workspace")],
+            waiting: None,
+            panel: Panel {
+                status: StatusLine {
+                    landing: None,
+                    conflicts: &[],
+                    agents: &agents,
+                },
+                ..Panel::default()
+            },
+        }
+        .render(None, area, &mut buffer);
+        let rows = rows(&buffer);
+        let panel: String = rows[0].chars().skip(84).collect();
+        assert!(panel.starts_with("╭ Thread "), "{rows:#?}");
+        assert!(rows[1].contains("│ ● bob.codex  ○ offline"), "{rows:#?}");
+        assert!(rows[12].starts_with('╰'), "{rows:#?}");
+        assert!(rows[13].contains("ctrl-space workspace"), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.starts_with("bob.codex")),
+            "{rows:#?}"
+        );
+        assert_eq!(buffer[(100, 5)].style().bg, Some(Theme::SURFACE));
+    }
+
     #[test]
     fn a_thread_shows_its_agent_with_the_status_line_and_the_hints_under_it() {
         let mut parser = vt100::Parser::new(5, 20, 0);
@@ -924,16 +1322,19 @@ mod tests {
             waits: None,
             brought: &[],
         }];
-        let area = Rect::new(0, 0, 100, 14);
+        let area = Rect::new(0, 0, 99, 14);
         let mut buffer = Buffer::empty(area);
         let cursor = ThreadView {
             shown: Some(AGENTS[0]),
             hints: &[("ctrl-space", "workspace")],
             waiting: None,
-            status: StatusLine {
-                landing: None,
-                conflicts: &[],
-                agents: &agents,
+            panel: Panel {
+                status: StatusLine {
+                    landing: None,
+                    conflicts: &[],
+                    agents: &agents,
+                },
+                ..Panel::default()
             },
         }
         .render(Some(parser.screen()), area, &mut buffer);
@@ -953,7 +1354,7 @@ mod tests {
             shown: None,
             hints: &[],
             waiting: Some(("⠋", "waiting for the thread's host")),
-            status: StatusLine::default(),
+            panel: Panel::default(),
         };
         let mut buffer = Buffer::empty(area);
         view.render(None, area, &mut buffer);
@@ -981,7 +1382,7 @@ mod tests {
             shown: Some(AGENTS[1]),
             hints: &[],
             waiting: None,
-            status: StatusLine::default(),
+            panel: Panel::default(),
         }
         .render(Some(parser.screen()), area, &mut buffer);
         let rows = rows(&buffer);
@@ -1177,7 +1578,7 @@ mod tests {
             shown: Some(AGENTS[0]),
             hints: &[],
             waiting: None,
-            status: StatusLine::default(),
+            panel: Panel::default(),
         }
         .render(Some(parser.screen()), body, &mut buffer);
         let bottom = rows + 1;
@@ -1216,7 +1617,7 @@ mod tests {
 
     #[test]
     fn a_position_in_the_pane_is_a_cell_of_the_agents_screen() {
-        let area = Rect::new(0, 1, 100, 13);
+        let area = Rect::new(0, 1, 99, 13);
         let at = |x, y, clamp| ThreadView::pane_point(area, Position::new(x, y), clamp);
         assert_eq!(at(1, 2, false), Some((0, 0)));
         assert_eq!(at(5, 4, false), Some((4, 2)));
@@ -1235,7 +1636,7 @@ mod tests {
                 shown: Some(AGENTS[2]),
                 hints: &[("q", "quit")],
                 waiting: None,
-                status: StatusLine::default(),
+                panel: Panel::default(),
             }
             .render(Some(parser.screen()), area, &mut buffer);
             TopBar {
@@ -1250,8 +1651,10 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_gets_what_the_tab_bar_the_borders_the_status_line_and_the_hints_leave() {
-        assert_eq!(ThreadView::agent_size(40, 120), (35, 118));
+    fn the_agent_gets_what_the_tab_bar_the_borders_the_panel_or_the_status_line_and_the_hints_leave()
+     {
+        assert_eq!(ThreadView::agent_size(40, 120), (36, 82));
+        assert_eq!(ThreadView::agent_size(40, 99), (35, 97));
         assert_eq!(ThreadView::agent_size(3, 10), (2, 8));
     }
 

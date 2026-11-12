@@ -61,6 +61,7 @@ use mahi_thread::{
 use thiserror::Error;
 
 use crate::{
+    changes_view::ChangesCache,
     claims::Claims,
     environment::{
         Environment,
@@ -147,6 +148,7 @@ struct Hosted {
     key: ThreadKey,
     base: ObjectId,
     owner: ParticipantKey,
+    changes: ChangesCache,
 }
 
 impl WorkspaceLive {
@@ -256,6 +258,7 @@ impl WorkspaceLive {
                         key,
                         base: meta.base(),
                         owner,
+                        changes: ChangesCache::default(),
                     },
                 );
                 Ok(())
@@ -285,15 +288,24 @@ impl WorkspaceLive {
         changed
     }
 
-    /// Reads what the sync state of the user's agent `agent` in `thread` holds for the status
-    /// line, while the workspace hosts the thread; `None` when it does not or the repository
-    /// cannot be opened.
-    pub(crate) fn sync_view(&self, thread: ThreadId, agent: &str) -> Option<SyncView> {
-        let hosted = self.hosted.get(&thread)?;
+    /// Reads what the sync state of the user's agent `agent` in `thread` holds for the panel,
+    /// with the worktree's changes, read again only once they moved, while the workspace hosts
+    /// the thread; `None` when it does not or the repository cannot be opened.
+    pub(crate) fn sync_view(&mut self, thread: ThreadId, agent: &str) -> Option<SyncView> {
+        let hosted = self.hosted.get_mut(&thread)?;
         let agent = AgentName::new(agent).ok()?;
         let own = AgentSlot::new(hosted.teammates.own().clone(), agent);
         let store = Store::open(&self.git_dir).ok()?;
-        Some(SyncView::read(&store, thread, &own))
+        let view = SyncView::read(&store, thread, &own);
+        Some(
+            match hosted
+                .changes
+                .read((&store, &self.git_dir), thread, &own, hosted.base)
+            {
+                Some(changes) => view.with_changes(changes.clone()),
+                None => view,
+            },
+        )
     }
 
     /// Returns the teammates' agents the workspace watches in `thread`, while it hosts it.

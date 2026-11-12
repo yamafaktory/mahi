@@ -76,6 +76,9 @@ pub use view::{
 pub use workspace::{
     AgentState,
     Header,
+    OwnAgent,
+    Panel,
+    PanelChanges,
     StatusAgent,
     StatusConflicts,
     StatusLanding,

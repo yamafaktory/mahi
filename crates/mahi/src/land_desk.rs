@@ -710,6 +710,36 @@ fn branch_of(thread: ThreadId) -> String {
     format!("mahi/{thread}")
 }
 
+/// Returns the record of `thread`'s last landing on its branch at `remote`, if there is one.
+fn landing_record(store: &Store, thread: ThreadId, remote: &str) -> Option<BranchRecord> {
+    let branch = branch_of(thread);
+    BranchRecord::read(store, thread)
+        .filter(|record| record.branch == branch && record.remote == remote)
+}
+
+/// Returns the tree the next landing after `record` measures the worktree's changes from.
+fn measured_tree(store: &Store, record: &BranchRecord) -> Result<ObjectId, StoreError> {
+    match (record.landing_again_from(), record.worktree) {
+        (Some(tree), _) | (None, Some(tree)) => Ok(tree),
+        (None, None) => store.commit_tree(record.tip),
+    }
+}
+
+/// Returns the tree a landing of `thread` to `remote` measures the worktree's changes from:
+/// the last landed one, or the tree of the thread's `base` before the first landing or
+/// without a remote.
+pub(crate) fn landed_tree(
+    store: &Store,
+    thread: ThreadId,
+    remote: Option<&str>,
+    base: ObjectId,
+) -> Result<ObjectId, StoreError> {
+    match remote.and_then(|remote| landing_record(store, thread, remote)) {
+        Some(record) => measured_tree(store, &record),
+        None => store.commit_tree(base),
+    }
+}
+
 pub(crate) type GitIdentity = (Option<String>, Option<String>);
 
 pub(crate) struct Lander {
@@ -967,10 +997,7 @@ impl Lander {
         remote: &SyncSetup,
         base: ObjectId,
     ) -> Result<LastLanding, StoreError> {
-        let branch = branch_of(self.thread);
-        let record = BranchRecord::read(store, self.thread)
-            .filter(|record| record.branch == branch && record.remote == remote.name.as_str());
-        let Some(record) = record else {
+        let Some(record) = landing_record(store, self.thread, remote.name.as_str()) else {
             return Ok(LastLanding {
                 tip: base,
                 measured: store.commit_tree(base)?,
@@ -978,10 +1005,7 @@ impl Lander {
                 ask: false,
             });
         };
-        let measured = match (record.landing_again_from(), record.worktree) {
-            (Some(tree), _) | (None, Some(tree)) => tree,
-            (None, None) => store.commit_tree(record.tip)?,
-        };
+        let measured = measured_tree(store, &record)?;
         let on_remote = if record.gone {
             OnRemote::Gone
         } else {
@@ -1115,6 +1139,40 @@ pub(crate) mod tests {
         pub(crate) note: PathBuf,
         landed: ObjectId,
         tip: ObjectId,
+    }
+
+    #[test]
+    fn the_landed_tree_is_the_last_landings_on_the_remote_or_else_the_bases() {
+        let (_repo, store) = repository_on_main();
+        let thread = ThreadId::random().unwrap();
+        let base = store.head_commit().unwrap();
+        let base_tree = store.commit_tree(base).unwrap();
+        let measured = store.write_tree(&[]).unwrap();
+        assert_eq!(
+            landed_tree(&store, thread, Some("up"), base).unwrap(),
+            base_tree
+        );
+        BranchRecord {
+            remote: "up".to_owned(),
+            branch: branch_of(thread),
+            tip: base,
+            landing: "main".to_owned(),
+            worktree: Some(measured),
+            from: None,
+            gone: false,
+            answer: None,
+        }
+        .write(&store, thread)
+        .unwrap();
+        assert_eq!(
+            landed_tree(&store, thread, Some("up"), base).unwrap(),
+            measured
+        );
+        assert_eq!(
+            landed_tree(&store, thread, Some("other"), base).unwrap(),
+            base_tree
+        );
+        assert_eq!(landed_tree(&store, thread, None, base).unwrap(), base_tree);
     }
 
     fn unreachable_remote(store: &Store, home: &std::path::Path) -> SyncSetup {

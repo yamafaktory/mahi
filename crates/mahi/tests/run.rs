@@ -1440,13 +1440,13 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
             "{rows:#?}"
         );
         assert!(rows[1].starts_with("╭ claude "), "{rows:#?}");
+        assert!(rows[1].contains("╮╭ Thread "), "{rows:#?}");
         assert!(
             rows.iter()
-                .any(|row| row.starts_with("│agent-ready 19 198")),
+                .any(|row| row.starts_with("│agent-ready 20 162")),
             "{rows:#?}"
         );
-        assert!(rows[21].starts_with("╰──"), "{rows:#?}");
-        assert!(rows[22].trim().is_empty(), "{rows:#?}");
+        assert!(rows[22].starts_with("╰──"), "{rows:#?}");
         assert!(rows[23].contains("Ctrl-Space palette"), "{rows:#?}");
         assert_eq!(screen.cursor_position().1, 1);
     }
