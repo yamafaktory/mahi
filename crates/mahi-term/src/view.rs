@@ -169,6 +169,7 @@ impl PaletteView<'_> {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(Theme::ACCENT))
+            .style(Theme::surface())
             .padding(Padding::horizontal(1))
             .title(Line::from(format!(" {title} ")).style(Theme::title()));
         let inner = block.inner(area);

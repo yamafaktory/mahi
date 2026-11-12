@@ -606,6 +606,7 @@ pub(crate) struct Watch {
     lost: Arc<AtomicBool>,
     ask: Arc<AtomicBool>,
     queued: Arc<AtomicUsize>,
+    members: Arc<Mutex<Option<Vec<ParticipantName>>>>,
 }
 
 impl Watch {
@@ -615,18 +616,21 @@ impl Watch {
         let (passed, frames) = mpsc::sync_channel(WATCH_QUEUE);
         let (lost, ask) = (Arc::<AtomicBool>::default(), Arc::<AtomicBool>::default());
         let queued = Arc::<AtomicUsize>::default();
+        let members = Arc::<Mutex<Option<Vec<ParticipantName>>>>::default();
         let watching = Watching {
             frames: passed,
             lost: Arc::clone(&lost),
             ask: Arc::clone(&ask),
             request: Arc::clone(request),
             queued: Arc::clone(&queued),
+            members: Arc::clone(&members),
         };
         let watch = Self {
             frames,
             lost,
             ask,
             queued,
+            members,
         };
         (watch, watching)
     }
@@ -636,6 +640,14 @@ impl Watch {
     /// `teammates` shows changed.
     pub(crate) fn update(&self, teammates: &mut Teammates, now: Instant) -> bool {
         let mut changed = teammates.expire(now);
+        if let Some(members) = self
+            .members
+            .lock()
+            .ok()
+            .and_then(|mut members| members.take())
+        {
+            changed |= teammates.set_members(members);
+        }
         for received in self.frames.try_iter().take(WATCH_QUEUE) {
             self.queued
                 .fetch_sub(drawn_bytes(&received.body), Ordering::SeqCst);
@@ -668,9 +680,18 @@ struct Watching {
     ask: Arc<AtomicBool>,
     request: Arc<Mutex<Vec<Body>>>,
     queued: Arc<AtomicUsize>,
+    members: Arc<Mutex<Option<Vec<ParticipantName>>>>,
 }
 
 impl Watching {
+    /// Passes on the participants in their order in the host's `meta`, which gives each their
+    /// colour.
+    fn pass_members(&self, members: Vec<ParticipantName>) {
+        if let Ok(mut passed) = self.members.lock() {
+            *passed = Some(members);
+        }
+    }
+
     /// Passes on the whole list of `states` a claims frame from `participant`'s node `sender`
     /// told, as one claims frame that holds only them, when the participant is not `owner`.
     fn pass_states(
@@ -1738,6 +1759,9 @@ impl Listener {
         while !self.stop.load(Ordering::SeqCst) {
             if participants_at.elapsed() >= REREAD_EVERY {
                 self.receiver.set_participants(self.peers.participants());
+                if let Some(watching) = &self.watching {
+                    watching.pass_members(self.peers.members());
+                }
                 participants_at = Instant::now();
             }
             if let Some(watching) = &self.watching {
@@ -1829,6 +1853,7 @@ pub(crate) struct HostPeers {
 #[derive(Debug)]
 struct Cache {
     participants: HashMap<NodeId, ParticipantName>,
+    members: Vec<ParticipantName>,
     collaborators: HashSet<NodeId>,
     document: Vec<u8>,
     read_at: Instant,
@@ -1863,6 +1888,14 @@ impl HostPeers {
                     .map(|(node, name)| (*node, name.clone()))
                     .collect()
             })
+            .unwrap_or_default()
+    }
+
+    /// Returns the participants' names in their order in the host's `meta`.
+    pub(crate) fn members(&self) -> Vec<ParticipantName> {
+        self.cache
+            .lock()
+            .map(|cache| cache.members.clone())
             .unwrap_or_default()
     }
 
@@ -1921,6 +1954,10 @@ fn read(git_dir: &Path, thread: ThreadId, owner: &ParticipantKey) -> Result<Cach
         participants: meta
             .participants()
             .map(|participant| (*participant.node(), participant.name().clone()))
+            .collect(),
+        members: meta
+            .participants()
+            .map(|participant| participant.name().clone())
             .collect(),
         collaborators: meta
             .collaborators()
@@ -2626,6 +2663,30 @@ mod tests {
     }
 
     #[test]
+    fn the_order_of_the_participants_the_host_reads_reaches_the_workspace_once() {
+        let (watch, watching) = Watch::open(&Arc::default());
+        let alice = ParticipantName::new("alice").unwrap();
+        let bob = ParticipantName::new("bob").unwrap();
+        let mut teammates = Teammates::new(alice.clone(), alice.clone());
+        let slot = AgentSlot::new(bob.clone(), AgentName::new("claude").unwrap());
+        teammates.add_offline([&slot]);
+        let place = |teammates: &Teammates| {
+            teammates
+                .status(&crate::sync_view::SyncView::default())
+                .map(|agent| agent.place)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(place(&teammates), [0]);
+        watching.pass_members(vec![alice.clone(), bob.clone()]);
+        assert!(watch.update(&mut teammates, Instant::now()));
+        assert_eq!(place(&teammates), [1]);
+        assert!(!watch.update(&mut teammates, Instant::now()));
+        watching.pass_members(vec![bob, alice]);
+        assert!(watch.update(&mut teammates, Instant::now()));
+        assert_eq!(place(&teammates), [0]);
+    }
+
+    #[test]
     fn the_states_a_claims_frame_tells_reach_the_workspace_but_not_the_users_own() {
         let (watch, watching) = Watch::open(&Arc::default());
         let node = NodeId::from_bytes(NodeKey::generate().unwrap().public()).unwrap();
@@ -3237,6 +3298,7 @@ mod tests {
             ask: Arc::default(),
             request: Arc::default(),
             queued: Arc::default(),
+            members: Arc::default(),
         };
         (watching, frames)
     }

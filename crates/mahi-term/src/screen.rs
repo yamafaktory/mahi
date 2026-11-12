@@ -482,6 +482,30 @@ mod tests {
     }
 
     #[test]
+    fn the_themes_colours_stay_apart_on_a_terminal_of_256_colours() {
+        let nearest = |color: Color| match color {
+            Color::Rgb(red, green, blue) => nearest_indexed(red, green, blue),
+            _ => panic!("{color:?} is not given as rgb"),
+        };
+        let apart = |colors: &[Color]| {
+            let mut indexes: Vec<u8> = colors.iter().map(|&color| nearest(color)).collect();
+            indexes.sort_unstable();
+            indexes.dedup();
+            assert_eq!(indexes.len(), colors.len(), "{colors:?}");
+        };
+        let mut named = crate::Theme::PARTICIPANTS.to_vec();
+        named.extend([
+            crate::Theme::ADDED,
+            crate::Theme::REMOVED,
+            crate::Theme::WARN,
+            crate::Theme::CONFLICT,
+        ]);
+        apart(&named);
+        apart(&[crate::Theme::TEXT, crate::Theme::MUTED]);
+        apart(&[crate::Theme::SURFACE, crate::Theme::BORDER]);
+    }
+
+    #[test]
     fn a_resize_is_what_the_next_draw_fills() {
         let mut backend = AnsiBackend::new(Vec::new(), 24, 80);
         assert_eq!(backend.size().unwrap(), Size::new(80, 24));

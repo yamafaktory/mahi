@@ -40,6 +40,7 @@ const TAB_STOP: usize = 8;
 pub(crate) struct Teammates {
     own: ParticipantName,
     owner: ParticipantName,
+    members: Vec<ParticipantName>,
     agents: Vec<Teammate>,
     lost: bool,
     asked_at: Option<Instant>,
@@ -127,6 +128,7 @@ impl Teammates {
     /// thread `owner` owns.
     pub(crate) fn new(own: ParticipantName, owner: ParticipantName) -> Self {
         Self {
+            members: Vec::new(),
             own,
             owner,
             agents: Vec::new(),
@@ -134,6 +136,23 @@ impl Teammates {
             asked_at: None,
             started: None,
         }
+    }
+
+    /// Takes the participants in their order in the thread's `meta`, which gives each their
+    /// colour; returns whether the order changed.
+    pub(crate) fn set_members(&mut self, members: Vec<ParticipantName>) -> bool {
+        let changed = self.members != members;
+        self.members = members;
+        changed
+    }
+
+    /// Returns the place of `participant` in the thread's `meta`, which picks their colour:
+    /// after every participant it lists when it lists none such.
+    fn place(&self, participant: &ParticipantName) -> usize {
+        self.members
+            .iter()
+            .position(|member| member == participant)
+            .unwrap_or(self.members.len())
     }
 
     /// Applies what `participant`, whose node sent it, sent at `now`; returns whether an
@@ -370,10 +389,13 @@ impl Teammates {
         &'a self,
         sync: &'a SyncView,
     ) -> impl Iterator<Item = StatusAgent<'a>> {
-        let watched = self
-            .agents
-            .iter()
-            .map(|teammate| (teammate.slot_text.as_str(), teammate.shown_state()));
+        let watched = self.agents.iter().map(|teammate| {
+            (
+                teammate.slot_text.as_str(),
+                self.place(teammate.slot.participant()),
+                teammate.shown_state(),
+            )
+        });
         let unwatched = sync
             .named()
             .filter(|slot| {
@@ -382,13 +404,21 @@ impl Teammates {
                     .iter()
                     .any(|teammate| teammate.slot_text == *slot)
             })
-            .map(|slot| (slot, TeammateState::Offline));
-        watched.chain(unwatched).map(|(slot, state)| StatusAgent {
-            slot,
-            state,
-            waits: sync.waits(slot).then_some(HELD_DETAIL),
-            brought: sync.brought(slot),
-        })
+            .map(|slot| {
+                let place = slot
+                    .parse::<AgentSlot>()
+                    .map_or(self.members.len(), |slot| self.place(slot.participant()));
+                (slot, place, TeammateState::Offline)
+            });
+        watched
+            .chain(unwatched)
+            .map(|(slot, place, state)| StatusAgent {
+                slot,
+                place,
+                state,
+                waits: sync.waits(slot).then_some(HELD_DETAIL),
+                brought: sync.brought(slot),
+            })
     }
 
     /// Returns the place of the agent a tab without an agent of the user's shows first: the
@@ -554,6 +584,34 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_teammate_takes_the_place_of_their_participant_in_meta() {
+        let name = |name: &str| name.parse::<ParticipantName>().unwrap();
+        let mut teammates = Teammates::new(name("alice"), name("alice"));
+        assert!(teammates.set_members(vec![name("alice"), name("bob"), name("carol")]));
+        assert!(!teammates.set_members(vec![name("alice"), name("bob"), name("carol")]));
+        let carol: AgentSlot = "carol.codex".parse().unwrap();
+        let dave: AgentSlot = "dave.claude".parse().unwrap();
+        teammates.add_offline([&dave, &carol]);
+        let sync = SyncView::default();
+        let places: Vec<(&str, usize)> = teammates
+            .status(&sync)
+            .map(|agent| (agent.slot, agent.place))
+            .collect();
+        assert_eq!(places, [("carol.codex", 2), ("dave.claude", 3)]);
+        assert!(teammates.set_members(vec![
+            name("alice"),
+            name("dave"),
+            name("bob"),
+            name("carol")
+        ]));
+        let places: Vec<(&str, usize)> = teammates
+            .status(&sync)
+            .map(|agent| (agent.slot, agent.place))
+            .collect();
+        assert_eq!(places, [("carol.codex", 3), ("dave.claude", 1)]);
+    }
 
     struct Clock(Instant);
 

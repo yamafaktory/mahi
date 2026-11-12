@@ -139,6 +139,8 @@ impl From<TeammateState> for AgentState {
 pub struct StatusAgent<'a> {
     /// Its slot, such as `bob.claude`.
     pub slot: &'a str,
+    /// Its participant's place in the thread's `meta`, which picks their colour.
+    pub place: usize,
     /// What it is doing.
     pub state: TeammateState,
     /// What a turn of it that waits for the user's keypress changes, such as `changes agent
@@ -299,7 +301,12 @@ fn more(left: usize) -> Option<Item<'static>> {
 
 fn agent_item<'a>(agent: &StatusAgent<'a>, brought: Brought) -> Item<'a> {
     let mut spans = vec![
-        Span::styled(shown(agent.slot), Theme::title()),
+        Span::styled(
+            shown(agent.slot),
+            Style::new()
+                .fg(Theme::participant(agent.place))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::raw(agent.state.word()),
     ];
@@ -328,7 +335,7 @@ fn landing_item<'a>(landing: &StatusLanding<'a>) -> Item<'a> {
 
 /// Returns the item of `conflicts`, listing at most `listed` of its paths, at least one.
 fn conflicts_item<'a>(conflicts: &StatusConflicts<'a>, listed: usize) -> Item<'a> {
-    let warn = Style::new().fg(Theme::WARN);
+    let warn = Style::new().fg(Theme::CONFLICT);
     let mut spans = vec![
         Span::styled("conflicts from ", warn),
         Span::styled(shown(conflicts.from), warn),
@@ -436,6 +443,7 @@ impl TopBar<'_> {
 
     /// Draws the row into `area`.
     pub fn render(&self, area: Rect, buffer: &mut Buffer) {
+        buffer.set_style(area, Theme::surface());
         let left = match &self.tabs {
             Some(tabs) => Line::from(tabs.spans().map(|(span, _)| span).collect::<Vec<_>>()),
             None => Line::from(badge()),
@@ -571,7 +579,7 @@ impl ThreadView<'_> {
             .map_or_else(String::new, |agent| format!(" {} ", agent.label()));
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Theme::ACCENT))
+            .border_style(Style::new().fg(Theme::BORDER))
             .title(Span::styled(title, Theme::title()));
         let inner = block.inner(pane);
         block.render(pane, buffer);
@@ -768,7 +776,7 @@ mod tests {
         for column in [6, 18, 59] {
             assert_eq!(
                 buffer[(column, 0)].style().bg,
-                Some(ratatui_core::style::Color::Reset),
+                Some(Theme::SURFACE),
                 "{column}"
             );
         }
@@ -871,10 +879,46 @@ mod tests {
     }
 
     #[test]
+    fn a_teammate_is_named_in_the_colour_of_their_place() {
+        let agents = [
+            StatusAgent {
+                place: 0,
+                slot: "alice.claude",
+                state: TeammateState::Done,
+                waits: None,
+                brought: &[],
+            },
+            StatusAgent {
+                place: 8,
+                slot: "carol.codex",
+                state: TeammateState::Working,
+                waits: None,
+                brought: &[],
+            },
+        ];
+        let line = StatusLine {
+            landing: None,
+            conflicts: &[],
+            agents: &agents,
+        }
+        .line(80);
+        let colour = |slot: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content == slot)
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(colour("alice.claude"), Some(Theme::PARTICIPANTS[0]));
+        assert_eq!(colour("carol.codex"), Some(Theme::PARTICIPANTS[2]));
+        assert_eq!(Theme::participant(6), Theme::participant(0));
+    }
+
+    #[test]
     fn a_thread_shows_its_agent_with_the_status_line_and_the_hints_under_it() {
         let mut parser = vt100::Parser::new(5, 20, 0);
         parser.process(b"hello from claude");
         let agents = [StatusAgent {
+            place: 1,
             slot: "bob.codex",
             state: TeammateState::Offline,
             waits: None,
@@ -989,18 +1033,21 @@ mod tests {
         }];
         let agents = [
             StatusAgent {
+                place: 1,
                 slot: "bob.claude",
                 state: TeammateState::Done,
                 waits: Some("changes agent settings"),
                 brought: &[],
             },
             StatusAgent {
+                place: 1,
                 slot: "carol.codex",
                 state: TeammateState::Working,
                 waits: None,
                 brought: &owned(&["src/client.rs", "src/lib.rs"]),
             },
             StatusAgent {
+                place: 1,
                 slot: "dan.claude",
                 state: TeammateState::Asks,
                 waits: None,
@@ -1060,6 +1107,7 @@ mod tests {
             more: 0,
         }];
         let agents = [StatusAgent {
+            place: 1,
             slot: "bob.claude",
             state: TeammateState::Done,
             waits: None,
@@ -1099,6 +1147,7 @@ mod tests {
     #[test]
     fn the_status_line_shows_a_teammates_text_without_control_characters() {
         let agents = [StatusAgent {
+            place: 1,
             slot: "bob\x1b[2J.claude",
             state: TeammateState::Live,
             waits: None,

@@ -58,28 +58,57 @@ const MAX_WIDTH: u16 = 76;
 const TABLE_GAP: usize = 2;
 const MASK: char = '•';
 
-/// The colours mahi's full-screen views use.
+/// The colours mahi's full-screen views use: cool greys pulled toward plum, with Royal Plum as
+/// the accent, for a dark terminal.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme;
 
 impl Theme {
-    /// Titles, borders and the keys shown in hints: Royal Plum lightened, to read on a dark
-    /// terminal.
+    /// Titles, the borders of dialogs and the keys shown in hints: Royal Plum lightened, to read
+    /// on a dark terminal.
     pub const ACCENT: Color = Color::Rgb(0xd8, 0x64, 0xaf);
     /// The selected row and mahi's badge: Royal Plum, #832161.
     pub const PLUM: Color = Color::Rgb(0x83, 0x21, 0x61);
+    /// What mahi paints behind its own surfaces: the tab bar, the dialogs and the palette.
+    pub const SURFACE: Color = Color::Rgb(0x1c, 0x1a, 0x22);
+    /// The borders of panes.
+    pub const BORDER: Color = Color::Rgb(0x34, 0x30, 0x3d);
+    /// Text on mahi's own surfaces.
+    pub const TEXT: Color = Color::Rgb(0xe2, 0xde, 0xe6);
     /// Text that matters less.
-    pub const MUTED: Color = Color::DarkGray;
-    /// A question that waits for the user.
-    pub const WARN: Color = Color::Yellow;
+    pub const MUTED: Color = Color::Rgb(0xa3, 0x9d, 0xad);
+    /// Lines a change added.
+    pub const ADDED: Color = Color::Rgb(0x9c, 0xc4, 0x8a);
+    /// Lines a change removed, and something that failed.
+    pub const REMOVED: Color = Color::Rgb(0xe0, 0x70, 0x7a);
+    /// Something that waits for the user.
+    pub const WARN: Color = Color::Rgb(0xe2, 0xbe, 0x7a);
+    /// Conflicts to resolve.
+    pub const CONFLICT: Color = Color::Rgb(0xf0, 0x88, 0x3c);
     /// Something that failed.
-    pub const ERROR: Color = Color::LightRed;
+    pub const ERROR: Color = Self::REMOVED;
+    /// The participants' colours, by their place in the thread's `meta`: plum, teal, blue,
+    /// lavender, sky and sand, then again from the first. None is a colour of the status.
+    pub const PARTICIPANTS: [Color; 6] = [
+        Self::ACCENT,
+        Color::Rgb(0x5f, 0xb8, 0xb0),
+        Color::Rgb(0x7f, 0xa3, 0xe8),
+        Color::Rgb(0xa9, 0x8b, 0xe0),
+        Color::Rgb(0x6c, 0xc7, 0xe0),
+        Color::Rgb(0xbf, 0xb0, 0x9c),
+    ];
+
+    /// Returns the colour of the participant at `place` in the thread's `meta`.
+    #[must_use]
+    pub fn participant(place: usize) -> Color {
+        Self::PARTICIPANTS[place % Self::PARTICIPANTS.len()]
+    }
 
     /// Returns the style of a selected row.
     #[must_use]
     pub fn selected() -> Style {
         Style::new()
-            .fg(Color::White)
+            .fg(Self::TEXT)
             .bg(Self::PLUM)
             .add_modifier(Modifier::BOLD)
     }
@@ -100,6 +129,12 @@ impl Theme {
     #[must_use]
     pub fn muted() -> Style {
         Style::new().fg(Self::MUTED)
+    }
+
+    /// Returns the style of one of mahi's own surfaces: its text on its background.
+    #[must_use]
+    pub fn surface() -> Style {
+        Style::new().fg(Self::TEXT).bg(Self::SURFACE)
     }
 }
 
@@ -458,6 +493,7 @@ impl Dialog {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(Theme::ACCENT))
+            .style(Theme::surface())
             .padding(Padding::horizontal(1))
             .title(Line::from(format!(" {} ", shown(&self.title))).style(Theme::title()));
         let inner = block.inner(boxed);
@@ -801,6 +837,21 @@ mod tests {
                     + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn a_dialog_is_drawn_on_mahis_surface_over_what_lies_around_it() {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buffer = Buffer::empty(area);
+        Dialog::confirm("Confirm", vec!["Add bob?".to_owned()]).render(area, &mut buffer);
+        let corner = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .find(|&at| buffer[at].symbol() == "╭")
+            .unwrap();
+        let inside = buffer[(corner.0 + 40, corner.1 + 3)].style();
+        assert_eq!(inside.bg, Some(Theme::SURFACE));
+        assert_eq!(inside.fg, Some(Theme::TEXT));
+        assert_eq!(buffer[(0, 0)].style().bg, Some(Color::Reset));
     }
 
     #[test]

@@ -241,6 +241,11 @@ impl WorkspaceLive {
         match hub {
             Ok(hub) => {
                 let mut teammates = Teammates::new(participant, meta.owner().clone());
+                teammates.set_members(
+                    meta.participants()
+                        .map(|listed| listed.name().clone())
+                        .collect(),
+                );
                 teammates.add_offline(&known_agents(&store, &meta));
                 self.hosted.insert(
                     thread,

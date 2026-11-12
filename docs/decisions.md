@@ -684,3 +684,24 @@ transcript that moved without a turn end is named in the next claims frame, with
 than in a turn-end frame of its own, so a turn that ends with a snapshot is fetched once. The
 other choice was to add a turn-end snapshot at every turn end, even with no file change, which adds
 an empty commit for each question and still sends nothing while conflicts are unresolved.
+
+## D094 · 2026-11-12 · mahi gets a theme of its own, inspired by delta.dev
+
+Chosen by the user (#129). mahi's views take a palette inspired by https://delta.dev/ but not
+the same: its cool greys pulled toward plum, Royal Plum kept as the accent for titles, the
+selected row and the badge, and green, red, amber and orange for added lines, removed lines, what
+waits for the user and conflicts. mahi paints its own surfaces only (the side panel, the tab bar
+and the dialogs), and the agent's pane keeps the terminal's background, since the agent draws its
+colours against it. Dark terminals only for now. Each participant gets a colour of their own, from
+plum, teal, amber, blue, coral and green, by their place in `meta`, so the colour is the same on
+every teammate's screen. The other choices were delta's palette with its blue accent, which drops
+Royal Plum, and the terminal's own colours with delta's text and diff colours only.
+
+
+## D097 · 2026-11-12 · Participant colours that no status colour uses
+
+Chosen by the user (#129). D094's amber, coral and green look like the colours of what waits for
+the user, removed lines and added lines, so a teammate's name could read as a status. They are
+replaced by lavender #A98BE0, sky #6CC7E0 and sand #BFB09C, beside plum, teal and blue. Conflicts
+take a brighter orange, #F0883C, which stays apart from every participant colour on a terminal of
+256 colours too. The other choices were to keep the six, or to use only plum, teal and blue.

@@ -632,11 +632,11 @@ fn status_lines(text: &str, width: usize) -> Vec<&str> {
 }
 
 fn panel<'a>(title: &str, focused: bool) -> Block<'a> {
-    let border = if focused {
-        Style::new().fg(Theme::ACCENT)
+    let border = Style::new().fg(if focused {
+        Theme::ACCENT
     } else {
-        Theme::muted()
-    };
+        Theme::BORDER
+    });
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(border)
