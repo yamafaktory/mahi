@@ -60,6 +60,9 @@ mod tests {
     const CODEX_TASK: &str = "Add a multiply(a, b) function to calc.py, and asserts for it in \
                               test_calc.py. Run python3 test_calc.py, then say in one sentence \
                               what you did.";
+    const CLAUDE_NEXT_TASK: &str = "Add a divide(a, b) function to calc.py, and asserts for it \
+                                    in test_calc.py. Run python3 test_calc.py, then say in one \
+                                    sentence what you did.";
     const KEY_GAP: Duration = Duration::from_secs(2);
     const SIGN_IN_WAIT: Duration = Duration::from_mins(5);
 
@@ -618,8 +621,54 @@ mod tests {
         assert!(signed_in.success(), "codex login failed");
     }
 
+    #[derive(Default)]
+    struct Typing {
+        typed: bool,
+        entered: bool,
+    }
+
+    impl Typing {
+        fn step(&mut self, terminal: &mut Terminal, task: &str, ready: bool) -> bool {
+            if !self.typed {
+                self.typed = ready && terminal.send(task);
+            } else if !self.entered {
+                self.entered = terminal.send("\r");
+            }
+            self.entered
+        }
+    }
+
+    struct ReportSeen<'paths> {
+        calc: &'paths Path,
+        needle: &'static str,
+        note: &'paths Path,
+        from: String,
+        report: String,
+        merged: bool,
+        noted: bool,
+        reported: bool,
+    }
+
+    impl ReportSeen<'_> {
+        fn update(&mut self, terminal: &Terminal) {
+            self.merged |= contains(self.calc, self.needle);
+            self.noted |= self.merged && contains(self.note, &self.from);
+            self.reported |= self.merged && terminal.screen().contains(&self.report);
+        }
+
+        fn taken(&self) -> bool {
+            self.noted && self.reported && !contains(self.note, &self.from)
+        }
+    }
+
+    fn settle(terminal: &mut Terminal) {
+        terminal.drive(Duration::from_mins(5), |terminal| {
+            terminal.quiet_for(Duration::from_secs(20))
+        });
+    }
+
     #[test]
-    fn codex_joins_claudes_thread_and_their_work_is_kept_in_sync() {
+    fn codex_joins_claudes_thread_their_work_is_kept_in_sync_and_each_reports_the_others() {
         let token = claude_token();
         let root = tempfile::tempdir().unwrap();
         let owner = world(root.path(), "local");
@@ -632,31 +681,80 @@ mod tests {
         let ticket = ticket_for(&owner, &thread, &bob);
         sign_codex_in(&bob, &thread);
         let mut codex = Terminal::start(bob.command(&["join", &ticket, "--", "codex"]));
-        let (mut typed, mut entered) = (false, false);
+        let report = |slot: &str| format!("mahi merged {slot}'s work. Tell me what changed.");
+        let (claude_slot, codex_slot) = (
+            format!("{}.claude", owner.user),
+            format!("{}.codex", bob.user),
+        );
+        let to_claude = report(&codex_slot);
+        let mut claude_reported = false;
+        let mut typing = Typing::default();
         codex.drive(Duration::from_mins(10), |terminal| {
+            claude.pump();
+            claude_reported |= claude.screen().contains(&to_claude);
             let worktree = bob.made_worktree(&thread, ".codex");
-            if !typed {
-                let merged = worktree.as_ref().is_some_and(|worktree| {
-                    contains(&worktree.join("calc.py"), "def subtract(")
-                        && contains(&worktree.join("test_calc.py"), "subtract")
-                });
-                typed = merged
-                    && terminal.quiet_for(Duration::from_secs(5))
-                    && terminal.send(CODEX_TASK);
-            } else if !entered {
-                entered = terminal.send("\r");
-            }
-            entered
+            let merged = worktree.as_ref().is_some_and(|worktree| {
+                contains(&worktree.join("calc.py"), "def subtract(")
+                    && contains(&worktree.join("test_calc.py"), "subtract")
+            });
+            let ready = merged && terminal.quiet_for(Duration::from_secs(5));
+            typing.step(terminal, CODEX_TASK, ready)
                 && worktree
                     .is_some_and(|worktree| contains(&worktree.join("calc.py"), "def multiply("))
                 && terminal.quiet_for(Duration::from_secs(20))
         });
         assert!(codex.ended.is_none(), "the screen was:\n{}", codex.screen());
         let worked = owner.worktree(&thread, ".claude").join("calc.py");
-        claude.drive(Duration::from_mins(5), |_| {
-            contains(&worked, "def multiply(")
+        claude.drive(Duration::from_mins(5), |terminal| {
+            claude_reported |= terminal.screen().contains(&to_claude);
+            contains(&worked, "def multiply(") && claude_reported
         });
-        let all = ["add", "subtract", "multiply"];
+        assert!(
+            claude.ended.is_none(),
+            "the screen was:\n{}",
+            claude.screen()
+        );
+        settle(&mut claude);
+
+        let note = bob
+            .repo()
+            .join(format!(".git/mahi/state/{thread}/sync/{codex_slot}/note"));
+        assert!(
+            note.parent().is_some_and(Path::is_dir),
+            "{}",
+            note.display()
+        );
+        let codex_calc = bob.worktree(&thread, ".codex").join("calc.py");
+        let mut seen = ReportSeen {
+            calc: &codex_calc,
+            needle: "def divide(",
+            note: &note,
+            report: report(&claude_slot),
+            from: claude_slot,
+            merged: false,
+            noted: false,
+            reported: false,
+        };
+        let mut typing = Typing::default();
+        claude.drive(Duration::from_mins(10), |terminal| {
+            codex.pump();
+            seen.update(&codex);
+            typing.step(terminal, CLAUDE_NEXT_TASK, true)
+                && contains(&worked, "def divide(")
+                && terminal.quiet_for(Duration::from_secs(20))
+        });
+        assert!(
+            claude.ended.is_none(),
+            "the screen was:\n{}",
+            claude.screen()
+        );
+        codex.drive(Duration::from_mins(10), |terminal| {
+            seen.update(terminal);
+            seen.taken()
+        });
+        assert!(codex.ended.is_none(), "the screen was:\n{}", codex.screen());
+        settle(&mut codex);
+        let all = ["add", "subtract", "multiply", "divide"];
         its_work_passes_its_tests(&bob.worktree(&thread, ".codex"), &all);
         its_work_passes_its_tests(&owner.worktree(&thread, ".claude"), &all);
         codex.quit(&["\x03", "\x03"]);
