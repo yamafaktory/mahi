@@ -465,7 +465,6 @@ impl TopBar<'_> {
 
     /// Draws the row into `area`.
     pub fn render(&self, area: Rect, buffer: &mut Buffer) {
-        buffer.set_style(area, Theme::surface());
         let left = match &self.tabs {
             Some(tabs) => Line::from(tabs.spans().map(|(span, _)| span).collect::<Vec<_>>()),
             None => Line::from(badge()),
@@ -661,7 +660,6 @@ impl<'a> Panel<'a> {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(Theme::BORDER))
-            .style(Theme::surface())
             .padding(Padding::horizontal(1))
             .title(Span::styled(PANEL_TITLE, Theme::title()));
         let inner = block.inner(area);
@@ -1007,7 +1005,7 @@ mod tests {
         for column in [6, 18, 59] {
             assert_eq!(
                 buffer[(column, 0)].style().bg,
-                Some(Theme::SURFACE),
+                Some(Color::Reset),
                 "{column}"
             );
         }
@@ -1274,6 +1272,52 @@ mod tests {
     }
 
     #[test]
+    fn the_tab_bar_and_the_panel_show_the_terminals_background_and_text_colour() {
+        let (_, top) = top_row(
+            TopBar {
+                tabs: None,
+                header: HEADER,
+            },
+            100,
+        );
+        let area = Rect::new(0, 0, 120, 14);
+        let mut panel = Buffer::empty(area);
+        ThreadView {
+            shown: Some(AGENTS[0]),
+            hints: &[],
+            waiting: None,
+            panel: Panel {
+                changes: Some(PanelChanges {
+                    files: &[],
+                    more: false,
+                }),
+                ..Panel::default()
+            },
+        }
+        .render(None, area, &mut panel);
+        let cells = [
+            &top[(40, 0)],
+            &top[place_of(&top, "davy")],
+            &panel[(100, 5)],
+            &panel[place_of(&panel, CHANGES_TITLE)],
+        ];
+        for cell in cells {
+            assert_eq!(cell.style().bg, Some(Color::Reset), "{:?}", cell.symbol());
+            assert_eq!(cell.style().fg, Some(Color::Reset), "{:?}", cell.symbol());
+        }
+    }
+
+    fn place_of(buffer: &Buffer, text: &str) -> (u16, u16) {
+        let rows = rows(buffer);
+        let (y, x) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(y, row)| Some((y, row[..row.find(text)?].chars().count())))
+            .unwrap();
+        (u16::try_from(x).unwrap(), u16::try_from(y).unwrap())
+    }
+
+    #[test]
     fn a_wide_tab_draws_the_panel_at_the_right_and_no_status_line() {
         let agents = [StatusAgent {
             place: 1,
@@ -1308,7 +1352,7 @@ mod tests {
             !rows.iter().any(|row| row.starts_with("bob.codex")),
             "{rows:#?}"
         );
-        assert_eq!(buffer[(100, 5)].style().bg, Some(Theme::SURFACE));
+        assert_eq!(buffer[(100, 5)].style().bg, Some(Color::Reset));
     }
 
     #[test]

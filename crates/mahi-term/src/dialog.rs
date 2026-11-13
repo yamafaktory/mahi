@@ -59,7 +59,8 @@ const TABLE_GAP: usize = 2;
 const MASK: char = '•';
 
 /// The colours mahi's full-screen views use: cool greys pulled toward plum, with Royal Plum as
-/// the accent, for a dark terminal.
+/// the accent, chosen for a dark terminal; plain text outside a dialog or the palette takes the
+/// terminal's own colour.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme;
 
@@ -69,11 +70,11 @@ impl Theme {
     pub const ACCENT: Color = Color::Rgb(0xd8, 0x64, 0xaf);
     /// The selected row and mahi's badge: Royal Plum, #832161.
     pub const PLUM: Color = Color::Rgb(0x83, 0x21, 0x61);
-    /// What mahi paints behind its own surfaces: the tab bar, the dialogs and the palette.
+    /// What mahi paints behind its dialogs and its palette.
     pub const SURFACE: Color = Color::Rgb(0x1c, 0x1a, 0x22);
     /// The borders of panes.
     pub const BORDER: Color = Color::Rgb(0x34, 0x30, 0x3d);
-    /// Text on mahi's own surfaces.
+    /// Text on mahi's surface and on the selection.
     pub const TEXT: Color = Color::Rgb(0xe2, 0xde, 0xe6);
     /// Text that matters less.
     pub const MUTED: Color = Color::Rgb(0xa3, 0x9d, 0xad);
@@ -131,7 +132,7 @@ impl Theme {
         Style::new().fg(Self::MUTED)
     }
 
-    /// Returns the style of one of mahi's own surfaces: its text on its background.
+    /// Returns the style of a dialog or the palette: mahi's text on its surface.
     #[must_use]
     pub fn surface() -> Style {
         Style::new().fg(Self::TEXT).bg(Self::SURFACE)

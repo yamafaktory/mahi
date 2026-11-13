@@ -503,6 +503,7 @@ mod tests {
         apart(&named);
         apart(&[crate::Theme::TEXT, crate::Theme::MUTED]);
         apart(&[crate::Theme::SURFACE, crate::Theme::BORDER]);
+        apart(&[crate::Theme::SURFACE, crate::Theme::ACCENT]);
     }
 
     #[test]

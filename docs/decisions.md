@@ -763,3 +763,15 @@ mahi's is approved with the hash Codex computes for the hook mahi installs now, 
 folder holds a `.codex` entry. A popup that a later Codex adds is not covered. The other choices
 were text on Codex's screen that shows only at an empty composer, which each release can
 change, or the fix for Claude Code alone, with Codex waiting for its first turn.
+
+## D103 · 2026-11-13 · The workspace shows the terminal's background and text colour
+
+Chosen by the user (#143), in place of part of D094. The agent's pane kept the terminal's
+background while mahi painted its own surface on the tab bar and the side panel, so two
+backgrounds showed side by side. mahi now paints no background on the tab bar and the side
+panel: they and the agent's pane show the terminal's background, and their plain text takes the
+terminal's own colour, so it reads on a light terminal too. Borders and colours keep the parts
+apart. The badge and the selection keep Royal Plum (D094), and dialogs and the palette keep
+mahi's surface, so they stand out. The other choices were mahi's background everywhere, painting
+it on every cell the agent leaves at the default background, and, for the text, keeping mahi's
+light grey #E2DEE6.
