@@ -10,6 +10,7 @@ use serde_json::Value;
 const MAX_KEPT_CHARS: usize = 4000;
 const NO_TEXT: &str = "(a prompt without text)";
 const QUESTIONS: [&str; 2] = ["permission_prompt", "elicitation_dialog"];
+const NEW_SESSIONS: [&str; 2] = ["startup", "resume"];
 const TOOL_DETAILS: [&str; 7] = [
     "file_path",
     "path",
@@ -96,6 +97,18 @@ pub fn asks_user(payload: &[u8]) -> bool {
     })
 }
 
+/// Returns whether a session start's hook payload names a session the agent just started or
+/// resumed, not one it cleared or compacted.
+#[must_use]
+pub fn starts_session(payload: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(payload).is_ok_and(|value| {
+        value
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| NEW_SESSIONS.contains(&source))
+    })
+}
+
 /// Returns whether a hook payload comes from a subagent the agent spawned, which Codex marks
 /// with an `agent_id`.
 #[must_use]
@@ -115,6 +128,21 @@ fn kept(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_started_or_resumed_session_starts_one() {
+        assert!(starts_session(br#"{"session_id":"s","source":"startup"}"#));
+        assert!(starts_session(br#"{"source":"resume"}"#));
+        for other in [
+            &br#"{"source":"clear"}"#[..],
+            br#"{"source":"compact"}"#,
+            br#"{"source":1}"#,
+            br#"{"session_id":"s"}"#,
+            b"startup",
+        ] {
+            assert!(!starts_session(other));
+        }
+    }
 
     #[test]
     fn a_payload_with_an_agent_id_comes_from_a_subagent() {

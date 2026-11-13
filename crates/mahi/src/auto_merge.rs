@@ -573,8 +573,9 @@ pub(crate) fn held_landing(
 
 /// Types the prompt that asks the agent to report what the automatic merges from the
 /// teammates' agents `to_report`, each of which noted files or conflicts, brought into its
-/// worktree, when the agent is idle after a turn its hook reported and the user pressed no
-/// key since, then forgets them; it names those the note kept in `note` still lists, and
+/// worktree, when the agent is idle after a turn end or a session start its hooks reported,
+/// or after its first output at a launch that opens no dialog, and the user pressed no key
+/// since, then forgets them; it names those the note kept in `note` still lists, and
 /// forgets the others, since a prompt took the note. It never waits, so merges go on.
 fn report(
     to_report: &mut Vec<AgentSlot>,

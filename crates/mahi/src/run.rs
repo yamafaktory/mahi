@@ -178,6 +178,7 @@ use crate::{
     inject::{
         Activity,
         AgentInput,
+        AtLaunch,
         Pace,
     },
     land_desk::{
@@ -1285,7 +1286,7 @@ impl Prepared {
         let pusher = self
             .sync
             .map(|setup| start_pusher(setup, &self.git_dir, &started));
-        let activity = Arc::new(Activity::telling(live.as_ref().map(Link::tap), first));
+        let activity = spawned.activity(live.as_ref(), first);
         let key = started.key.take().map(Arc::new);
         let globals = self.globals.clone();
         let (recorder, turns) = start_background(
@@ -1961,13 +1962,9 @@ impl Launch<'_> {
         let (Some(profile), Some(state)) = (self.profile, state) else {
             return false;
         };
-        let resuming = self.arguments.len() == profile.resume_args.len()
-            && self
-                .arguments
-                .iter()
-                .zip(&profile.resume_args)
-                .all(|(given, resume)| given == resume.as_str());
-        resuming && !profile.resume_args.is_empty() && !profile.has_session(state, self.worktree)
+        profile.resumes(self.arguments)
+            && !profile.resume_args.is_empty()
+            && !profile.has_session(state, self.worktree)
     }
 
     /// Adds the agent's arguments: the user's, then those its profile always adds, then those
@@ -2060,9 +2057,9 @@ impl Launch<'_> {
         Ok(())
     }
 
-    fn prepare_state(&self) -> Result<(Option<PathBuf>, Option<HookTrust>), RunError> {
+    fn prepare_state(&self) -> Result<(Option<PathBuf>, Option<HookTrust>, AtLaunch), RunError> {
         let (Some(profile), Some(state)) = (self.profile, &self.state) else {
-            return Ok((None, None));
+            return Ok((None, None, AtLaunch::MayAsk));
         };
         let not_private = || RunError::StateNotPrivate(state.clone());
         let (Some(parent), Some(name)) = (state.parent(), state.file_name()) else {
@@ -2091,14 +2088,20 @@ impl Launch<'_> {
                 crate::describe(&error)
             );
         }
-        let launched = match profile.seed_hook_trust(&directory, &state_path, self.config) {
-            Ok(launched) => Some(launched),
+        let seeded = match profile.seed_hook_trust(&directory, &state_path, self.config) {
+            Ok(seeded) => seeded,
             Err(error) => {
                 crate::report_with("the approval of mahi's hooks was not carried over", &error);
-                None
+                return Ok((Some(state_path), None, AtLaunch::MayAsk));
             }
         };
-        Ok((Some(state_path), launched))
+        let at_launch = profile.at_launch(
+            self.arguments,
+            &directory,
+            &seeded,
+            (self.worktree, self.git_dir.parent()),
+        );
+        Ok((Some(state_path), Some(seeded.trust), at_launch))
     }
 
     /// Shows the agent the repository's configuration cleaned of what it must not read, which
@@ -2160,7 +2163,7 @@ impl Launch<'_> {
         sandbox.allow_connect(self.hook_socket)?;
         sandbox.allow_connect(self.mcp_socket)?;
         let git_common_dir = self.give_git_config(&mut sandbox)?;
-        let (state, launched) = self.prepare_state()?;
+        let (state, launched, at_launch) = self.prepare_state()?;
         if let Some(state) = &state {
             self.restore_session(state);
             self.bind_state(&mut sandbox, state)?;
@@ -2225,25 +2228,35 @@ impl Launch<'_> {
         }
         let pty = pty.sandbox(sandbox);
         let raw = RawMode::enable().map_err(RunError::Terminal)?;
-        Spawned::start(pty.spawn()?, raw, network, state.zip(launched))
+        Spawned::start(pty.spawn()?, raw, network, (state.zip(launched), at_launch))
     }
 }
 
-/// The agent a launch started, with the terminal mode and proxy it runs with, and its state
-/// directory with the approvals of mahi's hooks it recorded at launch.
+/// The agent a launch started, with the terminal mode and proxy it runs with, its state
+/// directory with the approvals of mahi's hooks it recorded at launch, and whether its launch
+/// can open a dialog.
 struct Spawned {
     child: PtyChild,
     raw: Option<RawMode>,
     proxy: Option<Running>,
     hook_trust: Option<(PathBuf, HookTrust)>,
+    at_launch: AtLaunch,
 }
 
 impl Spawned {
+    fn activity(&self, live: Option<&Link>, first: Option<TurnState>) -> Arc<Activity> {
+        Arc::new(Activity::telling(
+            live.map(Link::tap),
+            first,
+            self.at_launch,
+        ))
+    }
+
     fn start(
         mut child: PtyChild,
         raw: Option<RawMode>,
         network: Option<Network>,
-        hook_trust: Option<(PathBuf, HookTrust)>,
+        (hook_trust, at_launch): (Option<(PathBuf, HookTrust)>, AtLaunch),
     ) -> Result<Self, RunError> {
         let proxy = network
             .map(|network| network.start(child.take_loopback_listener()))
@@ -2253,6 +2266,7 @@ impl Spawned {
             raw,
             proxy,
             hook_trust,
+            at_launch,
         })
     }
 }
@@ -2595,7 +2609,7 @@ fn copy_chunk(
     let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
         return Ok(false);
     };
-    activity.touched();
+    activity.wrote();
     screen.output(chunk)?;
     if let Some(tap) = tap {
         tap.output(chunk);

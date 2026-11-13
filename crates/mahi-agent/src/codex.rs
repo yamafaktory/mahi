@@ -7,6 +7,14 @@ use std::{
     str::FromStr,
 };
 
+use serde_json::{
+    Map,
+    Value as Json,
+};
+use sha2::{
+    Digest,
+    Sha256,
+};
 use thiserror::Error;
 use toml::{
     Table,
@@ -18,7 +26,13 @@ pub const SESSION_DIR: &str = "sessions";
 
 /// The events of mahi's hooks, as Codex names them in its approval records, in the order a
 /// [`HookTrust`] keeps them.
-pub const HOOK_EVENTS: [&str; 3] = ["user_prompt_submit", "post_tool_use", "stop"];
+pub const HOOK_EVENTS: [&str; 3] = [HOOKS[0].0, HOOKS[1].0, HOOKS[2].0];
+
+const HOOKS: [(&str, &str); 3] = [
+    ("user_prompt_submit", "UserPromptSubmit"),
+    ("post_tool_use", "PostToolUse"),
+    ("stop", "Stop"),
+];
 
 /// The most bytes of a Codex `config.toml` mahi reads or writes.
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -27,6 +41,8 @@ pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 pub const MAX_SAVED_BYTES: usize = 4096;
 
 const HASH_PREFIX: &str = "sha256:";
+const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
+const TRUSTED: &str = "trusted";
 const HASH_DIGITS: usize = 64;
 const LOG_PREFIX: &str = "rollout-";
 
@@ -143,6 +159,19 @@ impl HookTrust {
         &self.0
     }
 
+    /// Returns the approvals Codex records for mahi's hooks when the user approves the
+    /// `hooks.json` text `hooks_json`: for each of [`HOOK_EVENTS`], the hash of the first hook
+    /// of its first group, as Codex computes it; none for an event the text does not hold.
+    #[must_use]
+    pub fn approving(hooks_json: &str) -> Self {
+        let parsed = serde_json::from_str::<Json>(hooks_json).ok();
+        let hooks = parsed
+            .as_ref()
+            .and_then(|parsed| parsed.get("hooks"))
+            .and_then(Json::as_object);
+        Self(HOOKS.map(|(event, name)| hook_hash(event, hooks?.get(name)?.as_array()?.first()?)))
+    }
+
     /// Returns whether every hook has an approval.
     #[must_use]
     pub fn is_complete(&self) -> bool {
@@ -201,6 +230,46 @@ impl HookTrust {
     }
 }
 
+/// Says whether the `config.toml` text `config` records that the user trusts the folder
+/// `project`, so Codex does not ask whether to trust it.
+#[must_use]
+pub fn trusts_project(config: &str, project: &str) -> bool {
+    parsed(config).is_some_and(|table| {
+        table
+            .get("projects")
+            .and_then(|projects| projects.get(project))
+            .and_then(|settings| settings.get("trust_level"))
+            .and_then(Value::as_str)
+            == Some(TRUSTED)
+    })
+}
+
+fn hook_hash(event: &str, group: &Json) -> Option<HookHash> {
+    let mut handler = group
+        .get("hooks")?
+        .as_array()?
+        .first()?
+        .as_object()?
+        .clone();
+    handler.entry("async").or_insert(Json::Bool(false));
+    handler
+        .entry("timeout")
+        .or_insert(Json::from(DEFAULT_TIMEOUT_SECONDS));
+    let mut identity = Map::new();
+    identity.insert("event_name".to_owned(), Json::from(event));
+    identity.insert("hooks".to_owned(), Json::Array(vec![Json::Object(handler)]));
+    if let Some(matcher) = group.get("matcher").filter(|matcher| matcher.is_string()) {
+        identity.insert("matcher".to_owned(), matcher.clone());
+    }
+    let serialized = serde_json::to_vec(&Json::Object(identity)).ok()?;
+    let mut text = String::with_capacity(HASH_PREFIX.len() + HASH_DIGITS);
+    text.push_str(HASH_PREFIX);
+    for byte in Sha256::digest(&serialized) {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text.parse().ok()
+}
+
 fn key(hooks_json: &str, event: &str) -> String {
     format!("{hooks_json}:{event}:0:0")
 }
@@ -225,6 +294,30 @@ mod tests {
 
     fn trust() -> HookTrust {
         HookTrust([Some(hash('1')), Some(hash('2')), Some(hash('3'))])
+    }
+
+    #[test]
+    fn approving_hooks_hashes_each_event_mahi_keeps_and_none_it_lacks() {
+        let hooks = r#"{"hooks":{
+            "UserPromptSubmit":[{"hooks":[{"type":"command","command":"a","additionalContextLimit":0}]}],
+            "Stop":[{"hooks":[{"type":"command","command":"c"}]}]
+        }}"#;
+        let approving = HookTrust::approving(hooks);
+        let [prompt, tool, stop] = approving.hashes();
+        assert!(prompt.is_some() && stop.is_some() && tool.is_none());
+        assert_ne!(prompt, stop);
+        assert!(!approving.is_complete());
+        assert_eq!(HookTrust::approving("not json"), HookTrust::default());
+    }
+
+    #[test]
+    fn only_a_folder_marked_trusted_is_trusted() {
+        let config = "[projects.\"/w/t\"]\ntrust_level = \"trusted\"\n\
+                      [projects.\"/w/u\"]\ntrust_level = \"untrusted\"\n";
+        assert!(trusts_project(config, "/w/t"));
+        assert!(!trusts_project(config, "/w/u"));
+        assert!(!trusts_project(config, "/w"));
+        assert!(!trusts_project("broken = [", "/w/t"));
     }
 
     #[test]

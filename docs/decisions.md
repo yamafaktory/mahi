@@ -743,3 +743,23 @@ Chosen by the user (#134). A teammate's turn held for the user's keypress, becau
 agent settings, and taken in the palette, merges with no report prompt after it: the user just
 chose to take it, and the note still reaches the agent with their next prompt. The other choice
 was to prompt the agent as after an automatic merge.
+
+## D101 · 2026-11-13 · A new agent's session start lets the report after a merge in
+
+Chosen by the user (#137). After a teammate's work merges, mahi types the report into the agent
+once its `SessionStart` hook ran, with no key of the user's since, as after a reported turn end.
+So a new agent reports a merge before its first turn. Claude Code runs hooks only in a trusted
+folder, so its trust dialog is closed by then. The other choices were an agent quiet and
+untouched since it started, which could type into a startup dialog, or waiting for the agent's
+first turn end.
+
+## D102 · 2026-11-13 · A Codex agent with no dialog at launch takes the report at once
+
+Chosen by the user (#137). Codex 0.168 fires `SessionStart` only with the first prompt, so it
+cannot tell mahi that a new Codex agent is ready. mahi takes the launch as a reported turn end,
+once Codex first writes, when Codex can open no dialog: it starts with no argument or its resume
+arguments, it is signed in, it trusts the worktree or its repository's root, each hook of
+mahi's is approved with the hash Codex computes for the hook mahi installs now, and neither
+folder holds a `.codex` entry. A popup that a later Codex adds is not covered. The other choices
+were text on Codex's screen that shows only at an empty composer, which each release can
+change, or the fix for Claude Code alone, with Codex waiting for its first turn.

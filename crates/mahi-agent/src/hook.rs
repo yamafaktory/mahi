@@ -23,6 +23,8 @@ pub enum HookKind {
     TurnEnd,
     /// The agent waits on a question of its own, such as a permission request.
     Asks,
+    /// The agent's session started, past any dialog its hooks wait for.
+    SessionStart,
 }
 
 /// One event an agent's hook reported, with the payload it read from its standard input.
@@ -43,13 +45,20 @@ impl HookKind {
             Self::Tool => "tool",
             Self::TurnEnd => "turn-end",
             Self::Asks => "asks",
+            Self::SessionStart => "session-start",
         }
     }
 
     /// Returns every event, in the order `mahi hook` lists them.
     #[must_use]
-    pub fn all() -> [Self; 4] {
-        [Self::Prompt, Self::Tool, Self::TurnEnd, Self::Asks]
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Prompt,
+            Self::Tool,
+            Self::TurnEnd,
+            Self::Asks,
+            Self::SessionStart,
+        ]
     }
 
     /// Says what the event means, for `mahi hook --help`.
@@ -60,6 +69,7 @@ impl HookKind {
             Self::Tool => "The agent used a tool, which may have changed the worktree",
             Self::TurnEnd => "The agent finished its turn",
             Self::Asks => "The agent waits on a question of its own, such as a permission request",
+            Self::SessionStart => "The agent's session started",
         }
     }
 

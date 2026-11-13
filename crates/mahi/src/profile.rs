@@ -73,8 +73,10 @@ use crate::{
         EnvNameError,
         PASSED_ON,
     },
+    inject::AtLaunch,
     note::NoteBy,
     settings::AgentApprovals,
+    sync_state,
 };
 
 const CODEX_LOG_DEPTH: usize = 3;
@@ -568,7 +570,8 @@ impl Profile {
     /// When the agent is Codex, adds to its `config.toml` in the state directory `state`, found
     /// at `state_path`, the approvals of mahi's hooks the user gave in an earlier thread and
     /// mahi kept in `config`, so Codex does not ask for them again; a hook already recorded
-    /// there is left as it is. Returns the approvals the state directory then records.
+    /// there is left as it is. Returns the approvals the state directory then records, with
+    /// the text of its `config.toml`.
     ///
     /// # Errors
     ///
@@ -578,17 +581,17 @@ impl Profile {
         state: &OwnedFd,
         state_path: &Path,
         config: &Path,
-    ) -> io::Result<HookTrust> {
+    ) -> io::Result<Seeded> {
         let (Install::Codex, Some(hooks)) = (&self.install, codex_hooks_path(state_path)) else {
-            return Ok(HookTrust::default());
+            return Ok(Seeded::default());
         };
         let current = match read_small(state, CODEX_CONFIG, MAX_CONFIG_BYTES)? {
             Small::Missing => Vec::new(),
             Small::Read(current) => current,
-            Small::Unusable => return Ok(HookTrust::default()),
+            Small::Unusable => return Ok(Seeded::default()),
         };
         let Ok(current) = String::from_utf8(current) else {
-            return Ok(HookTrust::default());
+            return Ok(Seeded::default());
         };
         let saved = match open_owned_dir(config)? {
             Some(config_dir) => match read_small(&config_dir, CODEX_TRUST, MAX_SAVED_BYTES)? {
@@ -601,10 +604,11 @@ impl Profile {
         if let Some(seeded) = &seeded {
             replace(state, CODEX_CONFIG, seeded.as_bytes())?;
         }
-        Ok(HookTrust::recorded(
-            seeded.as_deref().unwrap_or(&current),
-            &hooks,
-        ))
+        let config = seeded.unwrap_or(current);
+        Ok(Seeded {
+            trust: HookTrust::recorded(&config, &hooks),
+            config,
+        })
     }
 
     /// When the agent is Codex, keeps in `config` the approvals of all of mahi's hooks that
@@ -656,6 +660,60 @@ impl Profile {
         replace(&config_dir, CODEX_TRUST, saved.as_bytes())
     }
 
+    /// Says whether the agent's `arguments` are its profile's resume arguments.
+    pub(crate) fn resumes(&self, arguments: &[OsString]) -> bool {
+        arguments.len() == self.resume_args.len()
+            && arguments
+                .iter()
+                .zip(&self.resume_args)
+                .all(|(given, resume)| given == resume.as_str())
+    }
+
+    fn starts_plainly(&self, arguments: &[OsString]) -> bool {
+        arguments.is_empty() || self.resumes(arguments)
+    }
+
+    /// Says whether the agent, started with `arguments` and its state directory open as
+    /// `state`, where `seeded` was read, can open a dialog at launch: Codex can not when it
+    /// starts with no argument or its resume arguments, is signed in, trusts the worktree or
+    /// the repository it belongs to, has each hook of mahi's approved as it is now, and neither
+    /// folder holds a `.codex` of its own, whose hooks would ask for review.
+    pub(crate) fn at_launch(
+        &self,
+        arguments: &[OsString],
+        state: &OwnedFd,
+        seeded: &Seeded,
+        (worktree, repository): (&Path, Option<&Path>),
+    ) -> AtLaunch {
+        let ready = match self.install {
+            Install::Codex => {
+                self.starts_plainly(arguments)
+                    && seeded.trust == HookTrust::approving(CODEX_HOOKS)
+                    && rustix::fs::statat(state, CODEX_SIGN_IN, AtFlags::SYMLINK_NOFOLLOW)
+                        .is_ok_and(|stat| {
+                            FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                        })
+                    && fs::canonicalize(worktree).is_ok_and(|worktree| {
+                        let folders = [Some(worktree.as_path()), repository];
+                        let folders = folders.iter().flatten();
+                        folders.clone().any(|folder| {
+                            folder
+                                .to_str()
+                                .is_some_and(|folder| codex::trusts_project(&seeded.config, folder))
+                        }) && folders
+                            .clone()
+                            .all(|folder| !sync_state::may_exist(&folder.join(CODEX_PROJECT_DIR)))
+                    })
+            }
+            Install::ClaudeCode | Install::Files(_) => false,
+        };
+        if ready {
+            AtLaunch::Ready
+        } else {
+            AtLaunch::MayAsk
+        }
+    }
+
     /// Returns the arguments the profile adds when mahi serves the agent its tools, filled in
     /// with the state directory and `tools`; `None` when a value is not safe to put there.
     pub(crate) fn tool_args(&self, state_path: &Path, tools: (&str, &str)) -> Option<Vec<String>> {
@@ -672,6 +730,8 @@ impl Profile {
 const CODEX_CONFIG: &str = "config.toml";
 const CODEX_HOOKS_FILE: &str = "hooks.json";
 const CODEX_TRUST: &str = "codex-hooks.toml";
+const CODEX_SIGN_IN: &str = "auth.json";
+const CODEX_PROJECT_DIR: &str = ".codex";
 
 fn codex_hooks_path(state_path: &Path) -> Option<String> {
     state_path
@@ -698,6 +758,20 @@ fn open_owned_dir_at(parent: impl AsFd, path: &Path) -> io::Result<Option<OwnedF
     let stat = rustix::fs::fstat(&directory)?;
     let private = stat.st_uid == rustix::process::geteuid().as_raw() && stat.st_mode & 0o022 == 0;
     Ok(private.then_some(directory))
+}
+
+#[derive(Default)]
+pub(crate) struct Seeded {
+    pub(crate) trust: HookTrust,
+    config: String,
+}
+
+impl std::fmt::Debug for Seeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Seeded")
+            .field("trust", &self.trust)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What [`read_small`] found.
@@ -858,6 +932,9 @@ const CLAUDE_CODE_SETTINGS: &str = r#"{
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook turn-end" }] }
+    ],
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "\"$MAHI_BIN\" hook session-start" }] }
     ],
     "Notification": [
       {
@@ -1103,6 +1180,8 @@ mod tests {
         fmt::Write as _,
         os::unix::fs::PermissionsExt,
     };
+
+    use mahi_agent::codex::HookHash;
 
     use super::*;
 
@@ -1457,7 +1536,7 @@ content = "first\n"
     }
 
     #[test]
-    fn claude_code_hooks_report_prompts_tools_turn_ends_and_questions_to_mahi() {
+    fn claude_code_hooks_report_prompts_tools_turn_ends_session_starts_and_questions_to_mahi() {
         let dir = tempfile::tempdir().unwrap();
         claude_code_profile()
             .install(&open_dir(dir.path()), Path::new(""), Path::new(""), None)
@@ -1467,6 +1546,7 @@ content = "first\n"
             ("UserPromptSubmit", "prompt"),
             ("PostToolUse", "tool"),
             ("Stop", "turn-end"),
+            ("SessionStart", "session-start"),
             ("Notification", "asks"),
         ] {
             assert!(settings.contains(event), "{settings}");
@@ -1802,13 +1882,109 @@ content = "first\n"
         );
     }
 
+    #[test]
+    fn only_no_argument_or_the_resume_arguments_start_an_agent_plainly() {
+        let codex = codex_profile();
+        let given = |arguments: &[&str]| -> Vec<OsString> {
+            arguments.iter().map(OsString::from).collect()
+        };
+        assert!(codex.starts_plainly(&[]));
+        assert!(codex.starts_plainly(&given(&["resume", "--last", "--all"])));
+        for other in [
+            &["resume"][..],
+            &["resume", "--last"],
+            &["Fix the tests"],
+            &["resume", "--last", "--all", "now"],
+        ] {
+            assert!(!codex.starts_plainly(&given(other)), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn mahis_codex_hooks_hash_as_codex_records_their_approval() {
+        let hooks: serde_json::Value = serde_json::from_str(CODEX_HOOKS).unwrap();
+        assert_eq!(
+            hooks["hooks"].as_object().unwrap().len(),
+            codex::HOOK_EVENTS.len()
+        );
+        let recorded_by_codex_0_168 = [
+            "sha256:23468c5c4e17bbbf566344edcdcfa20a07b756a9989b560d25e1b69f21b6ad22",
+            "sha256:39674c988de9796bdcca10b57b09029bd9adb5c87a61a9274957b00f1e8d0374",
+            "sha256:427c3420ce7f924f69a73d1b78bea8866a70846ccf9a29197707782b8bd4102b",
+        ];
+        let approving = HookTrust::approving(CODEX_HOOKS);
+        let hashes = approving.hashes().iter().zip(recorded_by_codex_0_168);
+        for (hash, recorded) in hashes {
+            assert_eq!(hash.as_ref().map(HookHash::as_str), Some(recorded));
+        }
+    }
+
+    #[test]
+    fn only_codex_signed_in_trusting_its_folder_with_its_hooks_approved_is_ready_at_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let (state_path, repository, worktree) =
+            (root.join("state"), root.join("repo"), root.join("worktree"));
+        private_dir(&state_path);
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(&worktree).unwrap();
+        let state = open_dir(&state_path);
+        let trusting = |folder: &Path| Seeded {
+            trust: HookTrust::approving(CODEX_HOOKS),
+            config: format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                folder.display()
+            ),
+        };
+        let folders = (worktree.as_path(), Some(repository.as_path()));
+        let codex = codex_profile();
+        let at_launch =
+            |profile: &Profile, seeded: &Seeded| profile.at_launch(&[], &state, seeded, folders);
+        assert_eq!(at_launch(&codex, &trusting(&worktree)), AtLaunch::MayAsk);
+        fs::write(state_path.join(CODEX_SIGN_IN), "{}").unwrap();
+        assert_eq!(at_launch(&codex, &trusting(&worktree)), AtLaunch::Ready);
+        assert_eq!(at_launch(&codex, &trusting(&repository)), AtLaunch::Ready);
+        assert_eq!(
+            codex.at_launch(
+                &[OsString::from("Fix it")],
+                &state,
+                &trusting(&worktree),
+                folders
+            ),
+            AtLaunch::MayAsk
+        );
+        assert_eq!(
+            at_launch(&claude_code_profile(), &trusting(&worktree)),
+            AtLaunch::MayAsk
+        );
+        assert_eq!(at_launch(&codex, &trusting(&root)), AtLaunch::MayAsk);
+        let outdated = Seeded {
+            trust: HookTrust::recorded(
+                &approvals_in(&state_path),
+                state_path.join(CODEX_HOOKS_FILE).to_str().unwrap(),
+            ),
+            ..trusting(&worktree)
+        };
+        assert!(outdated.trust.is_complete());
+        assert_eq!(at_launch(&codex, &outdated), AtLaunch::MayAsk);
+        for folder in [&worktree, &repository] {
+            fs::create_dir(folder.join(".codex")).unwrap();
+            assert_eq!(at_launch(&codex, &trusting(&worktree)), AtLaunch::MayAsk);
+            fs::remove_dir(folder.join(".codex")).unwrap();
+            std::os::unix::fs::symlink("elsewhere", folder.join(".codex")).unwrap();
+            assert_eq!(at_launch(&codex, &trusting(&worktree)), AtLaunch::MayAsk);
+            fs::remove_file(folder.join(".codex")).unwrap();
+        }
+        fs::remove_file(state_path.join(CODEX_SIGN_IN)).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", state_path.join(CODEX_SIGN_IN)).unwrap();
+        assert_eq!(at_launch(&codex, &trusting(&worktree)), AtLaunch::MayAsk);
+    }
+
     fn approvals_in(state: &Path) -> String {
         let hooks = state.join(CODEX_HOOKS_FILE);
         let mut text = String::new();
-        for (event, digit) in ["user_prompt_submit", "post_tool_use", "stop"]
-            .iter()
-            .zip(['1', '2', '3'])
-        {
+        let approvals = codex::HOOK_EVENTS.iter().zip(['1', '2', '3']);
+        for (event, digit) in approvals {
             writeln!(
                 text,
                 "[hooks.state.\"{}:{event}:0:0\"]\ntrusted_hash = \"sha256:{}\"",
@@ -1895,7 +2071,8 @@ content = "first\n"
             .unwrap();
         let launched = codex
             .seed_hook_trust(&open_dir(&old), &old, &config)
-            .unwrap();
+            .unwrap()
+            .trust;
         codex.keep_hook_trust(&old, &config, &launched).unwrap();
         assert_eq!(
             fs::read_to_string(config.join(CODEX_TRUST)).unwrap(),
@@ -1933,7 +2110,8 @@ content = "first\n"
             .unwrap();
         let launched = codex
             .seed_hook_trust(&open_dir(&thread), &thread, &config)
-            .unwrap();
+            .unwrap()
+            .trust;
         assert!(launched.is_complete());
         codex.keep_hook_trust(&thread, &config, &launched).unwrap();
         assert_eq!(
@@ -1955,7 +2133,8 @@ content = "first\n"
             .unwrap();
         let launched = codex
             .seed_hook_trust(&open_dir(&thread), &thread, &config)
-            .unwrap();
+            .unwrap()
+            .trust;
         assert_eq!(launched, HookTrust::default());
         fs::write(thread.join(CODEX_CONFIG), approvals_in(&thread)).unwrap();
         codex.keep_hook_trust(&thread, &config, &launched).unwrap();

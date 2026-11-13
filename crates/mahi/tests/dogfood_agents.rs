@@ -668,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_joins_claudes_thread_their_work_is_kept_in_sync_and_each_reports_the_others() {
+    fn codex_and_claude_keep_in_sync_and_report_each_others_work_even_before_a_turn() {
         let token = claude_token();
         let root = tempfile::tempdir().unwrap();
         let owner = world(root.path(), "local");
@@ -715,6 +715,10 @@ mod tests {
             claude.screen()
         );
         settle(&mut claude);
+        codex.quit(&["\x03", "\x03"]);
+        let mut codex = Terminal::start(bob.command(&["resume", &thread]));
+        settle(&mut codex);
+        assert!(codex.ended.is_none(), "the screen was:\n{}", codex.screen());
 
         let note = bob
             .repo()

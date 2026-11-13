@@ -311,7 +311,7 @@ fn matched(payload: &[u8], needle: &[char], cleaned: &mut String) -> Option<(Kin
     let kind = match HookKind::parse(name)? {
         HookKind::Prompt => Kind::Asked,
         HookKind::Tool => Kind::Used,
-        HookKind::TurnEnd | HookKind::Asks => return None,
+        HookKind::TurnEnd | HookKind::Asks | HookKind::SessionStart => return None,
     };
     let Some(fields) = HookFields::parse(details) else {
         return excerpt_of(&String::from_utf8_lossy(details), needle, cleaned)

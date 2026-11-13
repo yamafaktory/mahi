@@ -668,7 +668,7 @@ impl TurnsRead {
                 Some(HookKind::Tool) => {
                     let _ = writeln!(self.text, "  used: {}", tool_text(payload));
                 }
-                Some(HookKind::TurnEnd | HookKind::Asks) | None => {}
+                Some(HookKind::TurnEnd | HookKind::Asks | HookKind::SessionStart) | None => {}
             }
         }
         if self.text.len() > TURNS_BUDGET {

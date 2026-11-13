@@ -109,7 +109,7 @@ pub(crate) fn record(
                 match kind {
                     HookKind::Tool => events.changed(),
                     HookKind::TurnEnd => events.turn_ended(),
-                    HookKind::Prompt | HookKind::Asks => {}
+                    HookKind::Prompt | HookKind::Asks | HookKind::SessionStart => {}
                 }
             }
         };

@@ -239,7 +239,7 @@ fn serve_connections(
         {
             answer(&mut stream, context);
         }
-        if message.kind == HookKind::Asks {
+        if matches!(message.kind, HookKind::Asks | HookKind::SessionStart) {
             continue;
         }
         match messages.try_send(Delivery::Message(message)) {
@@ -382,6 +382,14 @@ mod tests {
             &br#"{"notification_type":"permission_prompt"}"#[..],
         )
         .unwrap();
+        send(&server.socket, HookKind::TurnEnd, io::empty()).unwrap();
+        assert_eq!(next(&server), message(HookKind::TurnEnd, b""));
+    }
+
+    #[test]
+    fn a_session_start_never_reaches_the_transcript() {
+        let server = server();
+        send(&server.socket, HookKind::SessionStart, io::empty()).unwrap();
         send(&server.socket, HookKind::TurnEnd, io::empty()).unwrap();
         assert_eq!(next(&server), message(HookKind::TurnEnd, b""));
     }

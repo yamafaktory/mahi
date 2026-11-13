@@ -19,7 +19,10 @@ use std::{
 
 use mahi_agent::{
     hook::HookKind,
-    payload::asks_user,
+    payload::{
+        asks_user,
+        starts_session,
+    },
 };
 use mahi_live::TurnState;
 use mahi_term::Report;
@@ -48,6 +51,16 @@ impl Default for Pace {
     }
 }
 
+/// Whether the agent's launch can open a dialog its hooks do not report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtLaunch {
+    /// It can, so mahi types nothing into the agent until its hooks report it idle.
+    MayAsk,
+    /// It cannot, so the agent's first output counts as a reported turn end, unless a key
+    /// came first.
+    Ready,
+}
+
 /// What the agent and the user did last, to tell when the agent is idle: its turn ended, as
 /// its hook reports, or was interrupted, the user's own input line is empty, and nothing was
 /// written or typed for a while. Its changes happen one at a time, so the states it tells
@@ -57,6 +70,8 @@ pub(crate) struct Activity {
     turn_open: AtomicBool,
     turn_ended: AtomicBool,
     reported_untouched: AtomicBool,
+    ready_on_output: AtomicBool,
+    keyed: AtomicBool,
     asking: AtomicBool,
     line_empty: AtomicBool,
     last: Mutex<Instant>,
@@ -70,6 +85,8 @@ impl Default for Activity {
             turn_open: AtomicBool::new(false),
             turn_ended: AtomicBool::new(true),
             reported_untouched: AtomicBool::new(false),
+            ready_on_output: AtomicBool::new(false),
+            keyed: AtomicBool::new(false),
             asking: AtomicBool::new(false),
             line_empty: AtomicBool::new(true),
             last: Mutex::new(Instant::now()),
@@ -82,12 +99,19 @@ impl Default for Activity {
 impl Activity {
     /// Starts in the state `first`, when it is known, telling it at once, as each later
     /// change is told: to the workspace, and to `tap` too, when there is one, for the
-    /// teammates. A run that starts working has its first turn open from the start.
-    pub(crate) fn telling(tap: Option<OutputTap>, first: Option<TurnState>) -> Self {
+    /// teammates. A run that starts working has its first turn open from the start, and the
+    /// first output of a launch that is [`AtLaunch::Ready`] counts as a reported turn end,
+    /// unless a key came first.
+    pub(crate) fn telling(
+        tap: Option<OutputTap>,
+        first: Option<TurnState>,
+        at_launch: AtLaunch,
+    ) -> Self {
         let working = first == Some(TurnState::Working);
         let activity = Self {
             turn_open: AtomicBool::new(working),
             turn_ended: AtomicBool::new(!working),
+            ready_on_output: AtomicBool::new(at_launch == AtLaunch::Ready),
             tap,
             ..Self::default()
         };
@@ -113,6 +137,22 @@ impl Activity {
         self.turn_open.load(Ordering::SeqCst)
     }
 
+    /// Notes output from the agent: once it first writes, a launch that is
+    /// [`AtLaunch::Ready`] counts as a reported turn end, unless the user typed a key.
+    pub(crate) fn wrote(&self) {
+        self.touched();
+        if !self.ready_on_output.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(_changing) = self.changing.lock() else {
+            return;
+        };
+        if self.ready_on_output.swap(false, Ordering::SeqCst) && !self.keyed.load(Ordering::SeqCst)
+        {
+            self.reported_untouched.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Notes output from the agent or keys from the user.
     pub(crate) fn touched(&self) {
         if let Ok(mut last) = self.last.lock() {
@@ -123,15 +163,21 @@ impl Activity {
     /// Notes `bytes` the user typed, or the terminal answered, that went to the agent: text
     /// leaves the line unfinished, Enter, Ctrl-C, Ctrl-U or Escape alone empties it, and Ctrl-C
     /// or Escape interrupts a turn; other sequences, such as arrows or the terminal's answers,
-    /// change neither. Text or Enter answers the agent's question, if it asked one.
+    /// change neither. Text or Enter answers the agent's question, if it asked one. Only the
+    /// terminal's answers, when they are all `bytes` hold, leave the agent untouched.
     pub(crate) fn keys(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         self.touched();
-        self.reported_untouched.store(false, Ordering::SeqCst);
+        if is_terminal_answer(bytes) {
+            return;
+        }
         let effect = line_effect(bytes);
-        let Ok(_changing) = self.changing.lock() else {
+        let changing = self.changing.lock();
+        self.keyed.store(true, Ordering::SeqCst);
+        self.reported_untouched.store(false, Ordering::SeqCst);
+        let Ok(_changing) = changing else {
             return;
         };
         if effect.interrupts {
@@ -176,6 +222,11 @@ impl Activity {
                     self.tell(TurnState::Working);
                 }
             }
+            HookKind::SessionStart => {
+                if starts_session(payload) && !self.keyed.load(Ordering::SeqCst) {
+                    self.reported_untouched.store(true, Ordering::SeqCst);
+                }
+            }
             HookKind::Asks => {
                 if asks_user(payload) && !self.asking.swap(true, Ordering::SeqCst) {
                     self.tell(TurnState::Asks);
@@ -197,14 +248,14 @@ impl Activity {
             && quiet_for >= pace.quiet
     }
 
-    /// Says whether the agent is idle after a turn its turn-end hook reported in this run, with
-    /// no key of the user's since.
+    /// Says whether the agent is idle after a turn end or a session start its hooks reported in
+    /// this run, with no key of the user's since.
     fn is_untouched_after_turn_end(&self, pace: &Pace) -> bool {
         self.reported_untouched.load(Ordering::SeqCst) && self.is_idle(pace)
     }
 
     /// Takes in that mahi typed a prompt into the agent, so it types no other until the next
-    /// turn end its hook reports.
+    /// turn end or session start its hooks report.
     pub(crate) fn typed_prompt(&self) {
         self.reported_untouched.store(false, Ordering::SeqCst);
         self.touched();
@@ -230,6 +281,95 @@ impl LineEffect {
     }
 }
 
+fn is_terminal_answer(bytes: &[u8]) -> bool {
+    let mut at = 0;
+    while at < bytes.len() {
+        let Some(end) = terminal_answer_at(bytes, at) else {
+            return false;
+        };
+        at = end;
+    }
+    true
+}
+
+fn terminal_answer_at(bytes: &[u8], at: usize) -> Option<usize> {
+    if bytes.get(at) != Some(&ESC) {
+        return None;
+    }
+    match bytes.get(at + 1)? {
+        b'[' => {
+            let csi = Csi::at(bytes, at + 2);
+            let answers = match (csi.last?, csi.intermediates) {
+                (b'R', b"") => is_position_report(csi.params),
+                (b'c', b"") => matches!(csi.params.first(), Some(b'?' | b'>')),
+                (b'u', b"") => csi.params.first() == Some(&b'?'),
+                (b'I' | b'O', b"") => csi.params.is_empty(),
+                (b'y', b"$") => two_numbers(csi.params.strip_prefix(b"?").unwrap_or(csi.params)),
+                _ => false,
+            };
+            answers.then_some(csi.end + 1)
+        }
+        b']' | b'P' => string_end(bytes, at + 2),
+        _ => None,
+    }
+}
+
+fn is_position_report(params: &[u8]) -> bool {
+    let modified_f3 = params.starts_with(b"1;") && params != b"1;1";
+    !modified_f3 && two_numbers(params)
+}
+
+fn two_numbers(params: &[u8]) -> bool {
+    let mut fields = params.split(|&byte| byte == b';');
+    let number = |field: Option<&[u8]>| {
+        field.is_some_and(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
+    };
+    number(fields.next()) && number(fields.next()) && fields.next().is_none()
+}
+
+struct Csi<'bytes> {
+    params: &'bytes [u8],
+    intermediates: &'bytes [u8],
+    last: Option<u8>,
+    end: usize,
+}
+
+impl<'bytes> Csi<'bytes> {
+    fn at(bytes: &'bytes [u8], start: usize) -> Self {
+        let in_range = |end: usize, range: std::ops::RangeInclusive<u8>| {
+            bytes.get(end).is_some_and(|byte| range.contains(byte))
+        };
+        let mut end = start;
+        while in_range(end, 0x30..=0x3f) {
+            end += 1;
+        }
+        let middle = end;
+        while in_range(end, 0x20..=0x2f) {
+            end += 1;
+        }
+        Self {
+            params: bytes.get(start..middle).unwrap_or_default(),
+            intermediates: bytes.get(middle..end).unwrap_or_default(),
+            last: bytes
+                .get(end)
+                .copied()
+                .filter(|byte| (0x40..=0x7e).contains(byte)),
+            end,
+        }
+    }
+}
+
+fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut end = start;
+    while let Some(&byte) = bytes.get(end) {
+        end += 1;
+        if byte == 0x07 || (byte == b'\\' && bytes.get(end.wrapping_sub(2)) == Some(&ESC)) {
+            return Some(end);
+        }
+    }
+    None
+}
+
 fn line_effect(bytes: &[u8]) -> LineEffect {
     let mut effect = LineEffect::default();
     if bytes == [ESC] {
@@ -253,29 +393,14 @@ fn line_effect(bytes: &[u8]) -> LineEffect {
 fn escape(bytes: &[u8], at: usize, effect: &mut LineEffect) -> usize {
     match bytes.get(at) {
         Some(b'[') => {
-            let mut end = at + 1;
-            while bytes
-                .get(end)
-                .is_some_and(|byte| (0x20..=0x3f).contains(byte))
-            {
-                end += 1;
+            let csi = Csi::at(bytes, at + 1);
+            if csi.last == Some(b'u') && csi.intermediates.is_empty() {
+                kitty_key(csi.params, effect);
             }
-            if bytes.get(end) == Some(&b'u') {
-                kitty_key(bytes.get(at + 1..end).unwrap_or_default(), effect);
-            }
-            end + 1
+            csi.end + 1
         }
         Some(b'O') => at + 2,
-        Some(b']' | b'P' | b'_' | b'^' | b'X') => {
-            let mut end = at + 1;
-            while let Some(&byte) = bytes.get(end) {
-                end += 1;
-                if byte == 0x07 || (byte == b'\\' && bytes.get(end - 2) == Some(&ESC)) {
-                    break;
-                }
-            }
-            end
-        }
+        Some(b']' | b'P' | b'_' | b'^' | b'X') => string_end(bytes, at + 1).unwrap_or(bytes.len()),
         Some(_) => {
             effect.line_empty = Some(false);
             at + 1
@@ -341,8 +466,8 @@ pub(crate) enum Readiness {
     TurnClosed,
     /// Be idle after a turn its turn-end hook reported, or since it started.
     AfterTurnEnd,
-    /// Be idle after a turn its turn-end hook reported, with no key of the user's since, so no
-    /// prompt, dialog or picker the hooks do not report may be open.
+    /// Be idle after a turn end or a session start its hooks reported, with no key of the
+    /// user's since, so no prompt, dialog or picker the hooks do not report may be open.
     UntouchedAfterTurnEnd,
 }
 
@@ -457,6 +582,117 @@ mod tests {
     }
 
     #[test]
+    fn a_reported_startup_or_resume_with_no_key_since_lets_a_prompt_in_before_any_turn() {
+        let pace = fast();
+        let (startup, resume) = (br#"{"source":"startup"}"#, br#"{"source":"resume"}"#);
+        let activity = Activity::default();
+        activity.saw(HookKind::SessionStart, startup);
+        thread::sleep(pace.quiet);
+        assert!(activity.is_untouched_after_turn_end(&pace));
+        activity.keys(b"/clear\r");
+        for source in [
+            &br#"{"source":"clear"}"#[..],
+            br#"{"source":"compact"}"#,
+            b"",
+        ] {
+            activity.saw(HookKind::SessionStart, source);
+        }
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_untouched_after_turn_end(&pace));
+        let resumed = Activity::default();
+        resumed.saw(HookKind::SessionStart, resume);
+        thread::sleep(pace.quiet);
+        assert!(resumed.is_untouched_after_turn_end(&pace));
+        resumed.typed_prompt();
+        thread::sleep(pace.quiet);
+        assert!(!resumed.is_untouched_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn the_terminals_answers_are_no_key() {
+        let answers = [
+            &b"\x1b[12;1R"[..],
+            b"\x1b[1;1R",
+            b"\x1b]11;rgb:0000/0000/0000\x07",
+            b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\",
+            b"\x1b[?62;22c",
+            b"\x1b[>1;10;0c",
+            b"\x1b[?0u",
+            b"\x1b[I",
+            b"\x1b[O",
+            b"\x1b[?2026;2$y",
+            b"\x1b[4;2$y",
+            b"\x1bP1+r544e=787465726d\x1b\\",
+            b"\x1b[12;1R\x1b[?0u",
+        ];
+        for answer in answers {
+            assert!(is_terminal_answer(answer), "{answer:?}");
+        }
+        for key in [
+            &b"\x1b[A"[..],
+            b"x",
+            b"\x1b[12;1Rx",
+            b"\x1b[1;5D",
+            b"\x1b[1;2R",
+            b"\x1b[1;5R",
+            b"\x1b[R",
+            b"\x1b[2R",
+            b"\x1b[1;2;3R",
+            b"\x1b]11;rgb:0000",
+            b"\x1b[2$y",
+            b"\x1b[?$y",
+            b"\x1b[?;;$y",
+            b"\x1b[?2026;2;1$y",
+            b"\x1b[99u",
+        ] {
+            assert!(!is_terminal_answer(key), "{key:?}");
+        }
+        let pace = fast();
+        let activity = Activity::telling(None, None, AtLaunch::Ready);
+        activity.wrote();
+        for answer in answers {
+            activity.keys(answer);
+        }
+        thread::sleep(pace.quiet);
+        assert!(activity.is_untouched_after_turn_end(&pace));
+        activity.keys(b"\x1b[A");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_untouched_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn a_session_start_after_a_key_lets_no_prompt_in() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.keys(b"/model\r");
+        activity.saw(HookKind::SessionStart, br#"{"source":"startup"}"#);
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_untouched_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn a_launch_with_no_dialog_lets_a_prompt_in_once_the_agent_wrote_until_a_key() {
+        let pace = fast();
+        let activity = Activity::telling(None, None, AtLaunch::Ready);
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_untouched_after_turn_end(&pace));
+        activity.wrote();
+        assert!(!activity.is_untouched_after_turn_end(&pace));
+        thread::sleep(pace.quiet);
+        assert!(activity.is_untouched_after_turn_end(&pace));
+        let keyed_first = Activity::telling(None, None, AtLaunch::Ready);
+        keyed_first.keys(b"h");
+        keyed_first.keys(b"\x15");
+        keyed_first.wrote();
+        thread::sleep(pace.quiet);
+        assert!(!keyed_first.is_untouched_after_turn_end(&pace));
+        activity.keys(b"h");
+        activity.keys(b"\x15");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_untouched_after_turn_end(&pace));
+    }
+
+    #[test]
     fn a_typed_prompt_is_its_text_then_enter() {
         let mut typed = Vec::new();
         type_prompt(&mut typed, "mahi merged bob.claude's work.").unwrap();
@@ -518,13 +754,13 @@ mod tests {
     #[test]
     fn a_run_that_starts_on_a_prompt_is_busy_until_its_turn_ends() {
         let pace = fast();
-        let activity = Activity::telling(None, Some(TurnState::Working));
+        let activity = Activity::telling(None, Some(TurnState::Working), AtLaunch::MayAsk);
         thread::sleep(pace.quiet);
         assert!(!activity.is_idle(&pace));
         activity.saw(HookKind::TurnEnd, b"");
         thread::sleep(pace.quiet);
         assert!(activity.is_idle_after_turn_end(&pace));
-        let waiting = Activity::telling(None, Some(TurnState::Done));
+        let waiting = Activity::telling(None, Some(TurnState::Done), AtLaunch::MayAsk);
         thread::sleep(pace.quiet);
         assert!(waiting.is_idle_after_turn_end(&pace));
     }
@@ -533,7 +769,7 @@ mod tests {
     fn the_first_state_reaches_the_workspace_as_later_ones_do() {
         let (reader, writer) = rustix::pipe::pipe().unwrap();
         crate::report::connect(std::os::fd::IntoRawFd::into_raw_fd(writer));
-        let activity = Activity::telling(None, Some(TurnState::Working));
+        let activity = Activity::telling(None, Some(TurnState::Working), AtLaunch::MayAsk);
         activity.saw(HookKind::Prompt, b"");
         activity.saw(HookKind::TurnEnd, b"");
         let mut read = [0_u8; 64];
