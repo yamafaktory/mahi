@@ -926,24 +926,13 @@ fn gather_credentials(
     profile: Option<&Profile>,
     environment: &Environment,
 ) -> Result<Vec<Handed>, RunError> {
-    let set_by_profile = profile.map(Profile::set_names).unwrap_or_default();
-    let given_otherwise = |variable: &str| {
-        let passed = environment
-            .pass_env
-            .iter()
-            .any(|passed| passed.required && passed.name.as_str() == variable);
-        if passed || set_by_profile.contains(&variable) || PASSED_ON.contains(&variable) {
-            return Err(RunError::GivenTwice(variable.to_owned()));
-        }
-        Ok(())
-    };
     let mut handed: Vec<Handed> = Vec::new();
     for binding in options.credentials() {
         let variable = binding.variable.as_str();
         if handed.iter().any(|earlier| earlier.variable == variable) {
             return Err(RunError::GivenTwice(variable.to_owned()));
         }
-        given_otherwise(variable)?;
+        given_otherwise(variable, profile, environment)?;
         let credential = Credential::load(config, &binding.name)
             .map_err(|error| RunError::Credential(binding.name.clone(), error))?
             .ok_or_else(|| RunError::NoCredential(binding.name.clone()))?;
@@ -958,18 +947,14 @@ fn gather_credentials(
             .iter()
             .any(|earlier| earlier.variable == wanted.variable)
     {
-        let stored = Credential::load(config, &wanted.name)
-            .map_err(|error| RunError::Credential(wanted.name.clone(), error))?;
-        let credential = match stored {
-            Some(stored) => Some(stored),
-            None if passed_from_environment(wanted, profile, environment) => None,
-            None => {
-                given_otherwise(&wanted.variable)?;
-                ask_for_credential(config, wanted, TerminalPrompt::open_interactive)?
-            }
-        };
+        let credential = stored_or_asked(
+            config,
+            wanted,
+            profile,
+            environment,
+            TerminalPrompt::open_interactive,
+        )?;
         if let Some(credential) = credential {
-            given_otherwise(&wanted.variable)?;
             handed.push(Handed {
                 variable: wanted.variable.clone(),
                 credential,
@@ -977,6 +962,64 @@ fn gather_credentials(
         }
     }
     Ok(handed)
+}
+
+/// Asks for the credential of the agent `program`'s profile through `open`, and stores it, when
+/// mahi has none stored, it does not reach the agent from mahi's environment, and the user did
+/// not choose earlier to go without it; so a run that starts the agent next asks nothing.
+pub(crate) fn ask_missing_credential<P: Prompt>(
+    config: &ConfigDir,
+    environment: &Environment,
+    program: &str,
+    open: impl FnOnce() -> io::Result<P>,
+) -> Result<(), RunError> {
+    let Some(profile) = Profile::for_agent(OsStr::new(program)) else {
+        return Ok(());
+    };
+    let Some(wanted) = profile.credential.as_ref() else {
+        return Ok(());
+    };
+    stored_or_asked(config, wanted, profile, environment, open).map(drop)
+}
+
+/// Returns the profile's credential `wanted` as stored, or else none when it reaches the agent
+/// from mahi's environment, or else asks for it through `open`; a stored or asked credential is
+/// refused when its variable is given another way.
+fn stored_or_asked<P: Prompt>(
+    config: &ConfigDir,
+    wanted: &ProfileCredential,
+    profile: &Profile,
+    environment: &Environment,
+    open: impl FnOnce() -> io::Result<P>,
+) -> Result<Option<Credential>, RunError> {
+    let stored = Credential::load(config, &wanted.name)
+        .map_err(|error| RunError::Credential(wanted.name.clone(), error))?;
+    if stored.is_none() && passed_from_environment(wanted, profile, environment) {
+        return Ok(None);
+    }
+    given_otherwise(&wanted.variable, Some(profile), environment)?;
+    match stored {
+        Some(stored) => Ok(Some(stored)),
+        None => ask_for_credential(config, wanted, open),
+    }
+}
+
+/// Refuses a credential for `variable` when the agent gets that variable another way: a
+/// required `--pass-env`, the profile's own variables, or one mahi always passes on.
+fn given_otherwise(
+    variable: &str,
+    profile: Option<&Profile>,
+    environment: &Environment,
+) -> Result<(), RunError> {
+    let passed = environment
+        .pass_env
+        .iter()
+        .any(|passed| passed.required && passed.name.as_str() == variable);
+    let set_by_profile = profile.is_some_and(|profile| profile.sets(variable));
+    if passed || set_by_profile || PASSED_ON.contains(&variable) {
+        return Err(RunError::GivenTwice(variable.to_owned()));
+    }
+    Ok(())
 }
 
 /// Returns whether the profile's credential variable reaches the agent from mahi's own
@@ -1777,11 +1820,10 @@ fn check_profile(
     if environment.mahi_exe.is_none() {
         return Err(RunError::NoMahiBinary(profile.name.as_str()));
     }
-    let set = profile.set_names();
     match environment
         .pass_env
         .iter()
-        .find(|passed| passed.required && set.contains(&passed.name.as_str()))
+        .find(|passed| passed.required && profile.sets(passed.name.as_str()))
     {
         Some(passed) => Err(RunError::SetByProfile {
             name: passed.name.clone(),
@@ -2988,6 +3030,67 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_credential_is_asked_once_unless_declined_passed_or_unknown() {
+        use crate::prompt::tests::Script;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = |name: &str| {
+            let home = dir.path().join(name);
+            fs::create_dir(&home).unwrap();
+            let config = ConfigDir::resolve(Some(&home), None).unwrap();
+            (config, Environment::default())
+        };
+        let asking = |secrets: &[&'static str]| {
+            let script = Script {
+                secrets: secrets.iter().copied().collect(),
+                ..Script::default()
+            };
+            move || Ok(script)
+        };
+        let claude: CredentialName = "claude".parse().unwrap();
+        let stored = |config: &ConfigDir| Credential::load(config, &claude).unwrap().is_some();
+
+        let (config, environment) = home("stored");
+        ask_missing_credential(&config, &environment, "claude", asking(&["sk-ant-oat01-a"]))
+            .unwrap();
+        assert!(stored(&config));
+        ask_missing_credential(&config, &environment, "claude", asking(&[])).unwrap();
+        ask_missing_credential(&config, &environment, "tester.sh", asking(&[])).unwrap();
+
+        let (config, environment) = home("path");
+        ask_missing_credential(
+            &config,
+            &environment,
+            "/usr/bin/claude",
+            asking(&["sk-ant-oat01-b"]),
+        )
+        .unwrap();
+        assert!(stored(&config));
+
+        let (config, environment) = home("declined");
+        ask_missing_credential(&config, &environment, "claude", asking(&[""])).unwrap();
+        assert!(!stored(&config));
+        ask_missing_credential(&config, &environment, "claude", asking(&[])).unwrap();
+
+        let variable = "CLAUDE_CODE_OAUTH_TOKEN";
+        let profile = Profile::for_agent(OsStr::new("claude")).unwrap();
+        assert!(profile.optional_env.iter().any(|name| name == variable));
+        for required in [false, true] {
+            let (config, _) = home(&format!("passed-{required}"));
+            let passing = Environment {
+                pass_env: vec![Passed {
+                    name: variable.parse().unwrap(),
+                    value: Some(Zeroizing::new(b"sk-ant-oat01-from-env".to_vec())),
+                    required,
+                }],
+                ..Environment::default()
+            };
+            ask_missing_credential(&config, &passing, "claude", asking(&[])).unwrap();
+            assert!(!stored(&config));
+        }
+    }
 
     #[test]
     fn a_resume_refuses_a_watcher_and_an_agent_without_turn_ends_beside_a_teammate() {

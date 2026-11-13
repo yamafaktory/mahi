@@ -171,7 +171,6 @@ pub(crate) fn home(environment: &Environment) -> i32 {
         .unwrap_or_default();
     let mut workspace = Workspace::new(palette_key, crate::run::notice(environment));
     workspace.host_with(workspace_live(environment, config.as_ref(), &store));
-    let identity_file = config.as_ref().map(ConfigDir::identity_file);
     let outcome = loop {
         let own = threads::own_key(environment);
         let place = Place {
@@ -193,7 +192,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
                     &mut store,
                     environment,
                     &mut workspace,
-                    identity_file.as_deref(),
+                    config.as_ref(),
                 ) {
                     status = told;
                 }
@@ -728,14 +727,15 @@ fn unlock_key(file: &Path) -> Result<LocalIdentity, String> {
 fn join_in_tab(
     environment: &Environment,
     workspace: &mut Workspace,
-    identity_file: Option<&Path>,
+    config: Option<&ConfigDir>,
 ) -> Result<(), String> {
     const SHOWN: &str = "mahi join";
+    let identity_file = config.map(ConfigDir::identity_file);
     eprintln!("› {SHOWN}");
     let busy = ui::Busy::start();
     let joined = init::set_up_if_needed(environment, TerminalPrompt::open_interactive)
         .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
-        .and_then(|()| match identity_file {
+        .and_then(|()| match identity_file.as_deref() {
             Some(file) => unlock_key(file).map(drop).map_err(Into::into),
             None => Ok(()),
         })
@@ -757,7 +757,7 @@ fn join_in_tab(
     workspace.watch_thread(thread);
     let opened = match role {
         Role::Watcher => Ok(()),
-        Role::Collaborator => start_joined_agent(environment, workspace, &ticket, identity_file),
+        Role::Collaborator => start_joined_agent(environment, workspace, &ticket, config),
     };
     let told = pair::added(
         &owner,
@@ -775,7 +775,7 @@ fn start_joined_agent(
     environment: &Environment,
     workspace: &mut Workspace,
     ticket: &Ticket,
-    identity_file: Option<&Path>,
+    config: Option<&ConfigDir>,
 ) -> Result<(), String> {
     let agent = agent_to_run(
         environment,
@@ -788,8 +788,11 @@ fn start_joined_agent(
         "--".to_owned(),
         agent.clone(),
     ];
+    ask_agent_credential(config, environment, &agent)?;
     let shown = format!("mahi join -- {agent}");
-    let key = identity_file.and_then(unlocked::current);
+    let key = config
+        .map(ConfigDir::identity_file)
+        .and_then(|file| unlocked::current(&file));
     workspace.open(
         environment,
         (&short(&ticket.thread().to_string()), &agent, &shown),
@@ -886,12 +889,12 @@ fn open_agent(
     store: &mut Store,
     environment: &Environment,
     workspace: &mut Workspace,
-    identity_file: Option<&Path>,
+    config: Option<&ConfigDir>,
 ) -> Result<(), String> {
     let started = if action == HomeAction::Join {
-        join_in_tab(environment, workspace, identity_file)
+        join_in_tab(environment, workspace, config)
     } else {
-        start_agent(action, store, environment, workspace, identity_file)
+        start_agent(action, store, environment, workspace, config)
     };
     if started.as_ref().is_err_and(|told| !told.is_empty()) {
         workspace.show_threads();
@@ -899,15 +902,16 @@ fn open_agent(
     started
 }
 
-/// Starts the agent `action` runs in its thread's tab of the workspace, with the user's mahi
-/// key unlocked first when the agent needs it, from the `identity_file`; returns what to tell
-/// the user when it does not start.
+/// Starts the agent `action` runs in its thread's tab of the workspace: sets mahi up if it is
+/// not yet, unlocks the user's mahi key from `config` when the agent needs it, and asks in a
+/// dialog for the agent's credential mahi lacks; returns what to tell the user when it does not
+/// start.
 fn start_agent(
     action: HomeAction,
     store: &mut Store,
     environment: &Environment,
     workspace: &mut Workspace,
-    identity_file: Option<&Path>,
+    config: Option<&ConfigDir>,
 ) -> Result<(), String> {
     let (title, resumed_thread) = match &action {
         HomeAction::Resume(thread) => (short(thread), Some(thread.as_str())),
@@ -921,21 +925,20 @@ fn start_agent(
     let needs_key = !matches!(action, HomeAction::New) || environment.live != LiveMode::Off;
     let words = command_words(action, store, environment)?;
     let name = resumed.unwrap_or_else(|| words.last().cloned().unwrap_or_default());
-    if needs_key {
-        init::set_up_if_needed(environment, TerminalPrompt::open_interactive).map_err(|error| {
-            match error {
-                init::InitError::Prompt(error) if error.kind() == io::ErrorKind::Interrupted => {
-                    String::new()
-                }
-                error => format!("mahi cannot be set up: {error}"),
+    init::set_up_if_needed(environment, TerminalPrompt::open_interactive).map_err(|error| {
+        match error {
+            init::InitError::Prompt(error) if error.kind() == io::ErrorKind::Interrupted => {
+                String::new()
             }
-        })?;
-    }
-    let key = match identity_file {
-        Some(file) if needs_key => Some(unlock_key(file)?),
-        Some(file) => unlocked::current(file),
+            error => format!("mahi cannot be set up: {error}"),
+        }
+    })?;
+    let key = match config.map(ConfigDir::identity_file) {
+        Some(file) if needs_key => Some(unlock_key(&file)?),
+        Some(file) => unlocked::current(&file),
         None => None,
     };
+    ask_agent_credential(config, environment, &name)?;
     let shown = format!("mahi {}", words.join(" "));
     workspace.open(
         environment,
@@ -943,6 +946,34 @@ fn start_agent(
         (&words, title == NEW_TAB),
         key.as_ref(),
     )
+}
+
+/// Asks in a dialog for the credential the agent `program` signs in with, when mahi has none
+/// for it, so the agent's tab starts without asking on its own lines; returns what to tell the
+/// user when it cannot be asked or kept.
+fn ask_agent_credential(
+    config: Option<&ConfigDir>,
+    environment: &Environment,
+    program: &str,
+) -> Result<(), String> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    run::ask_missing_credential(
+        config,
+        environment,
+        program,
+        TerminalPrompt::open_interactive,
+    )
+    .map_err(|error| match error {
+        run::RunError::Terminal(error) if error.kind() == io::ErrorKind::Interrupted => {
+            String::new()
+        }
+        error => {
+            crate::report(&error);
+            format!("{program} was not started")
+        }
+    })
 }
 
 /// Returns the name of the user's agent that resuming `thread` starts, or `agent` when the

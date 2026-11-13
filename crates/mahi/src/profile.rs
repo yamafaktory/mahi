@@ -451,12 +451,16 @@ impl Profile {
     }
 
     /// Returns the variables the profile sets itself.
-    pub(crate) fn set_names(&self) -> Vec<&str> {
+    fn set_names(&self) -> impl Iterator<Item = &str> {
         self.env
             .iter()
             .map(|(name, _)| name.as_str())
             .chain(self.state_env.as_deref())
-            .collect()
+    }
+
+    /// Says whether the profile sets the variable `name` itself.
+    pub(crate) fn sets(&self, name: &str) -> bool {
+        self.set_names().any(|set| set == name)
     }
 
     /// Returns where the agent keeps its sessions, when mahi has a reader for them.
@@ -1365,7 +1369,10 @@ content = "first\n"
             Some(dir.path().join("codex.toml").as_path())
         );
         assert_eq!(codex.state_env.as_deref(), Some("CODEX_HOME"));
-        assert_eq!(codex.set_names(), ["CODEX_QUIET", "CODEX_HOME"]);
+        assert_eq!(
+            codex.set_names().collect::<Vec<_>>(),
+            ["CODEX_QUIET", "CODEX_HOME"]
+        );
         assert!(codex.session_dir().is_none());
         assert_eq!(
             codex
@@ -1746,7 +1753,6 @@ content = "first\n"
         for profile in profiles() {
             for name in profile
                 .set_names()
-                .into_iter()
                 .chain(profile.optional_env.iter().map(String::as_str))
             {
                 assert!(

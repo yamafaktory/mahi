@@ -1929,42 +1929,106 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
     #[test]
     fn a_new_user_sets_mahi_up_and_starts_an_agent_without_leaving_the_home_screen() {
         for live in ["off", "local"] {
-            new_user_sets_mahi_up_and_starts_an_agent(live);
+            new_user_sets_mahi_up_and_starts_an_agent(live, "");
         }
     }
 
-    fn new_user_sets_mahi_up_and_starts_an_agent(live: &str) {
-        let fixture = fixture();
+    #[test]
+    fn a_new_users_token_is_asked_masked_in_a_dialog_and_reaches_the_agent() {
+        new_user_sets_mahi_up_and_starts_an_agent("off", "sk-ant-oat01-typed-in-a-dialog");
+    }
+
+    fn fresh_user(fixture: &Fixture, live: &str) -> (PtyCommand, PathBuf) {
         let fresh = fixture.root.join("fresh-home");
         fs::create_dir(&fresh).unwrap();
-        let agent = "#!/bin/sh\necho agent-ran token=${CLAUDE_CODE_OAUTH_TOKEN:-none}\n";
-        let claude = script(&fixture, "fresh-agents", "claude", agent);
-        script(&fixture, "fresh-agents", "codex", agent);
+        let agent = "#!/bin/sh\necho agent-ran token=${CLAUDE_CODE_OAUTH_TOKEN:+set}\n";
+        let claude = script(fixture, "fresh-agents", "claude", agent);
+        script(fixture, "fresh-agents", "codex", agent);
         let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let command = terminal_command(fixture, &[])
+            .env("PATH", &path)
+            .env("HOME", &fresh)
+            .env("XDG_CONFIG_HOME", fresh.join(".config"))
+            .env("MAHI_LIVE", live);
+        (command, fresh)
+    }
+
+    #[test]
+    fn a_cancelled_token_dialog_opens_no_tab_and_declines_nothing() {
+        let fixture = fixture();
+        let (command, fresh) = fresh_user(&fixture, "off");
+        let mahi = command.spawn().unwrap();
+        let mut terminal = mahi.writer().unwrap();
+        let mut reader = mahi.reader().unwrap();
+        let mut seen = Vec::new();
+        let steps: [(&str, &[u8]); 4] = [
+            ("Threads", b"n"),
+            ("Which agent should start the thread?", b"1"),
+            ("New passphrase", b"correct horse battery\r"),
+            ("Repeat it", b"correct horse battery\r"),
+        ];
+        for (question, answer) in steps {
+            read_until(&mut reader, &mut seen, question);
+            terminal.write_all(answer).unwrap();
+        }
+        let question = "Token for claude";
+        read_until_screen(&mut reader, &mut seen, |screen| screen.contains(question));
+        let escaped = seen.len();
+        terminal.write_all(b"\x1b").unwrap();
+        read_until_screen(&mut reader, &mut seen, |screen| {
+            !screen.contains(question) && !screen.contains("working")
+        });
+        let rest = thread::spawn(move || {
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest);
+            rest
+        });
+        terminal.write_all(b"q").unwrap();
+        let mut mahi = mahi;
+        assert_eq!(exit_within(&mut mahi, Duration::from_secs(20)), 0);
+        seen.extend(rest.join().unwrap());
+        let after = String::from_utf8_lossy(&seen[escaped..]);
+        assert!(!after.contains("⌂ threads"), "{after}");
+        assert!(!after.contains("agent-ran"), "{after}");
+        assert!(!config_dir(&fresh).path().join("declined/claude").exists());
+    }
+
+    fn new_user_sets_mahi_up_and_starts_an_agent(live: &str, token: &str) {
+        let fixture = fixture();
+        let (command, fresh) = fresh_user(&fixture, live);
+        let typed = format!("{token}\r");
         let (code, output) = in_terminal_typing(
-            terminal_command(&fixture, &[])
-                .env("PATH", &path)
-                .env("HOME", &fresh)
-                .env("XDG_CONFIG_HOME", fresh.join(".config"))
-                .env("MAHI_LIVE", live),
+            command,
             &[
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
                 ("New passphrase", b"correct horse battery\r"),
                 ("Repeat it", b"correct horse battery\r"),
-                ("Token for claude", b"\r"),
+                ("Token for claude", typed.as_bytes()),
                 ("mahi run claude: done", b"q"),
             ],
         );
         assert_eq!(code, 0, "{output}");
-        assert!(
-            pane_at(&output, "agent-ran").contains("│agent-ran token=none"),
-            "{output}"
-        );
+        let pane = pane_at(&output, "agent-ran");
+        assert!(pane.contains("│agent-ran token="), "{output}");
+        assert_eq!(pane.contains("token=set"), !token.is_empty(), "{output}");
         assert!(!output.contains("correct horse"), "{output}");
         assert!(!output.contains("Passphrase for your mahi key"), "{output}");
+        if !token.is_empty() {
+            assert!(!output.contains(token), "{output}");
+        }
+        let tab_opened = output.find("⌂ threads").expect("the agent's tab opened");
+        for asked in ["New passphrase", "Token for claude"] {
+            assert!(
+                output.find(asked).is_some_and(|at| at < tab_opened),
+                "{asked} was not asked in a dialog before the tab opened: {output}"
+            );
+        }
         assert!(config_dir(&fresh).recipient_file().is_file());
-        assert!(config_dir(&fresh).path().join("declined/claude").is_file());
+        assert_eq!(
+            config_dir(&fresh).path().join("declined/claude").is_file(),
+            token.is_empty()
+        );
     }
 
     #[test]
