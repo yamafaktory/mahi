@@ -201,7 +201,7 @@ pub(crate) fn merge_landing_now(
     )
 }
 
-/// Whether a merge added anything to the agent's note: files it brought, or conflicts.
+/// Whether a merge changed the agent's note, as it was written: files it brought, or conflicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Noted {
     Nothing,
@@ -314,8 +314,8 @@ fn write_merge(
 
 /// Adds to `into`'s note what the merge from `from` left in its worktree, whose tree went from
 /// `ours` to `tree`: the paths with markers, those where the agent's side was kept, and the
-/// files it changed; returns whether there was anything to add. The merge stands whether or
-/// not the note could be kept.
+/// files it changed; returns whether that changed the note as it is kept. The merge stands
+/// whether or not the note could be kept.
 fn note_merge(
     store: &Store,
     into: Recording<'_>,
@@ -335,21 +335,19 @@ fn note_merge(
         .iter()
         .map(|(path, _)| path.to_string())
         .collect();
-    let brought: Vec<String> = store
+    let brought: Vec<(String, note::Kind)> = store
         .changed_paths(ours, tree, MAX_MERGED_PATHS)
         .map(|changes| {
-            let changed = changes.paths.into_iter().map(|(path, _)| path);
-            changed.filter(|path| !conflicting.contains(path)).collect()
+            let changed = changes.paths.into_iter();
+            changed
+                .filter(|(path, _)| !conflicting.contains(path))
+                .map(|(path, change)| (path, change.into()))
+                .collect()
         })
         .unwrap_or_default();
     let file = note::file(store, into.snapshots.thread(), into.slot);
     let (markers, kept) = (of_kind(Conflict::Markers), of_kind(Conflict::KeptOurs));
-    let noted = if markers.is_empty() && kept.is_empty() && brought.is_empty() {
-        Noted::Nothing
-    } else {
-        Noted::Something
-    };
-    let _ = note::record(
+    let changed = note::record(
         &file,
         from,
         note::Merged {
@@ -358,7 +356,11 @@ fn note_merge(
             brought: &brought,
         },
     );
-    noted
+    if matches!(changed, Ok(true)) {
+        Noted::Something
+    } else {
+        Noted::Nothing
+    }
 }
 
 /// Says whether the snapshot `skipped`, which the user skipped, is the base for merging

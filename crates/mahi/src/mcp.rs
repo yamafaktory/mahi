@@ -1112,7 +1112,7 @@ mod tests {
         push_note(&mut text, &file);
         assert!(text.is_empty());
         let bob: crate::source::Source = "bob.claude".parse().unwrap();
-        let brought = ["src/lib.rs".to_owned()];
+        let brought = [("src/lib.rs".to_owned(), crate::note::Kind::Added)];
         note::record(
             &file,
             &bob,
@@ -1129,7 +1129,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.ends_with("merged bob.claude: ` src/lib.rs `\n\n"),
+            text.ends_with("merged bob.claude: added ` src/lib.rs `\n\n"),
             "{text}"
         );
         let mut again = String::new();

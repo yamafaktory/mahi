@@ -1076,7 +1076,7 @@ mod tests {
         let note = crate::note::file(store, merging.started.thread, &merging.started.slot);
         let told = crate::note::take(&note).unwrap().unwrap();
         assert!(
-            told.contains("merged main on up: ` upstream.txt `"),
+            told.contains("merged main on up: added ` upstream.txt `"),
             "{told}"
         );
 
@@ -1485,6 +1485,61 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_that_leaves_the_note_as_it_was_notes_nothing() {
+        use crate::merge::Noted;
+
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let noted = |done: MergeDone| match done {
+            MergeDone::Merged { noted, .. } => noted,
+            other @ MergeDone::Already => panic!("{other:?}"),
+        };
+        let first = merger
+            .merge(merging.bobs(&[("a.txt", "a\n")]), AgentSettings::Take)
+            .unwrap();
+        assert_eq!(noted(first), Noted::Something);
+        let again = merger
+            .merge(merging.bobs(&[("a.txt", "b\n")]), AgentSettings::Take)
+            .unwrap();
+        assert_eq!(noted(again), Noted::Nothing);
+    }
+
+    #[test]
+    fn a_merge_says_in_the_note_which_files_it_added_changed_and_deleted() {
+        let merging = merging();
+        let merger = merging.recorder.merger();
+        let file = crate::note::file(
+            &merging.store,
+            merging.started.thread,
+            &merging.started.slot,
+        );
+        merger
+            .merge(
+                merging.bobs(&[("gone.txt", "a\n"), ("kept.txt", "a\n")]),
+                AgentSettings::Take,
+            )
+            .unwrap();
+        let text = crate::note::take(&file).unwrap().unwrap();
+        assert!(
+            text.contains("merged bob.codex: added ` gone.txt `, ` kept.txt `"),
+            "{text}"
+        );
+        merger
+            .merge(
+                merging.bobs(&[("kept.txt", "b\n"), ("new.txt", "a\n")]),
+                AgentSettings::Take,
+            )
+            .unwrap();
+        let text = crate::note::take(&file).unwrap().unwrap();
+        assert!(
+            text.contains(
+                "merged bob.codex: added ` new.txt `; changed ` kept.txt `; deleted ` gone.txt `"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn every_merge_leaves_a_note_of_what_it_brought_and_its_conflicts() {
         let merging = merging();
         let merger = merging.recorder.merger();
@@ -1497,7 +1552,10 @@ mod tests {
             .merge(merging.bobs(&[("taken.txt", "a\n")]), AgentSettings::Take)
             .unwrap();
         let text = crate::note::take(&file).unwrap().unwrap();
-        assert!(text.contains("merged bob.codex: ` taken.txt `"), "{text}");
+        assert!(
+            text.contains("merged bob.codex: added ` taken.txt `"),
+            "{text}"
+        );
         let request = merging.readme_conflict();
         merger.merge(request, AgentSettings::Hold).unwrap();
         let text = crate::note::take(&file).unwrap().unwrap();

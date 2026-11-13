@@ -775,3 +775,37 @@ apart. The badge and the selection keep Royal Plum (D094), and dialogs and the p
 mahi's surface, so they stand out. The other choices were mahi's background everywhere, painting
 it on every cell the agent leaves at the default background, and, for the text, keeping mahi's
 light grey #E2DEE6.
+
+## D104 · 2026-11-13 · The note groups a merge's files by what was done to them
+
+Chosen by the user (#142). After a teammate's work merged, the note listed its files with no word
+for what happened, so an agent could not tell that a merge deleted a file. The note now groups
+each teammate's files by kind, in one clause each: `merged davy.claude: added src/new.rs,
+docs/a.md; changed src/lib.rs; deleted README.md`. The other choices were a verb on each file,
+`added src/new.rs, added docs/a.md, …`, and signs like a diff, `+src/new.rs ~src/lib.rs
+-README.md`.
+
+## D105 · 2026-11-13 · read_diff keeps comparing with the thread's base
+
+Chosen by the user (#142). After a teammate reverted their own change, their tree matched the
+thread's base again, so `read_diff` showed no change although the merge deleted the user's copy.
+The note's kinds (D104) now tell the agent what the merge did, and `read_diff` keeps one meaning:
+what a teammate changed since the base. The other choice was to make `read_diff` also show what
+the last merge of a teammate's work changed in the user's own worktree.
+
+## D106 · 2026-11-13 · A file added then deleted before the next prompt leaves the note
+
+Chosen by the user (#142). Several merges from one teammate can land before the agent's next
+prompt, and the note shows what they came to together. A file a teammate added and then deleted
+in that time leaves the note, since the agent never saw it; when it was the teammate's only
+file, the teammate leaves the note and no report is typed for them. The other choice was to show
+it as deleted, the latest kind.
+
+## D107 · 2026-11-13 · A file the agent was shown as added reads deleted when it goes
+
+Chosen by the user (#142), narrowing D106. The prompt hook can show the note, then a merge lands
+before mahi takes it, so the note stays. mahi then marks the added files the shown note named,
+and puts back as deleted any of them that a merge deleted while the hook read it. From then on,
+such a file added and then deleted reads `deleted` in the note, so the agent learns that a file
+it read about is gone; any other file added then deleted still leaves the note. The other
+choice was to keep dropping it.

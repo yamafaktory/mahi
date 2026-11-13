@@ -1584,9 +1584,9 @@ fn start_background(
         let (messages, inputs) = mpsc::sync_channel(HOOK_QUEUE);
         let closing = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&closing);
-        let context = Store::open(git_dir).ok().map(|store| NoteContext {
-            file: note::file(&store, started.thread, &started.slot),
-        });
+        let context = Store::open(git_dir)
+            .ok()
+            .map(|store| NoteContext::new(note::file(&store, started.thread, &started.slot)));
         thread::spawn(move || {
             let context = context
                 .as_ref()

@@ -69,7 +69,7 @@ impl SyncView {
         let brought = Note::load(&note::file(store, thread, own))
             .map(|note| {
                 note.brought()
-                    .map(|(from, paths)| (from.to_string(), paths.to_vec()))
+                    .map(|(from, paths)| (from.to_string(), paths.map(str::to_owned).collect()))
                     .collect()
             })
             .unwrap_or_default();
@@ -187,13 +187,14 @@ mod tests {
             .save(&conflicts::file(&store, thread, &own))
             .unwrap();
         let brought = paths(&["src/client.rs"]);
+        let files = [("src/client.rs".to_owned(), note::Kind::Added)];
         note::record(
             &note::file(&store, thread, &own),
             &Source::Agent(carol.clone()),
             Merged {
                 markers: &[],
                 kept: &[],
-                brought: &brought,
+                brought: &files,
             },
         )
         .unwrap();

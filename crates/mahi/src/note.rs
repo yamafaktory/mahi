@@ -5,9 +5,14 @@ use std::{
         Path,
         PathBuf,
     },
+    process,
     sync::{
         Mutex,
         MutexGuard,
+    },
+    time::{
+        SystemTime,
+        UNIX_EPOCH,
     },
 };
 
@@ -16,7 +21,10 @@ use mahi_core::{
     ThreadId,
     is_invisible,
 };
-use mahi_store::Store;
+use mahi_store::{
+    Change,
+    Store,
+};
 use serde::{
     Deserialize,
     Serialize,
@@ -49,14 +57,83 @@ pub(crate) struct Note {
     came: Vec<Came>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     landed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<NoteId>,
 }
+
+/// What names one note, from the first merge or landing that adds to it until it is taken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct NoteId(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Came {
     from: Source,
     markers: Listed,
     kept: Listed,
-    brought: Listed,
+    brought: Brought,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    seen: Vec<String>,
+}
+
+impl Came {
+    fn is_empty(&self) -> bool {
+        self.markers.is_empty() && self.kept.is_empty() && self.brought.is_empty()
+    }
+}
+
+/// What a merge of a teammate's work did to a file in the agent's worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Added,
+    Changed,
+    Deleted,
+}
+
+impl From<Change> for Kind {
+    fn from(change: Change) -> Self {
+        match change {
+            Change::Added => Self::Added,
+            Change::Modified => Self::Changed,
+            Change::Deleted => Self::Deleted,
+        }
+    }
+}
+
+impl Kind {
+    const ALL: [Self; 3] = [Self::Added, Self::Changed, Self::Deleted];
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Changed => "changed",
+            Self::Deleted => "deleted",
+        }
+    }
+
+    /// Returns what a file came to after this, then `later`, none for one added then deleted
+    /// that the agent never read as added (`seen`).
+    fn then(self, later: Self, seen: bool) -> Option<Self> {
+        match (self, later) {
+            (Self::Added, Self::Deleted) if seen => Some(Self::Deleted),
+            (Self::Added, Self::Deleted) => None,
+            (Self::Added, Self::Added | Self::Changed) => Some(Self::Added),
+            (Self::Changed | Self::Deleted, Self::Added | Self::Changed) => Some(Self::Changed),
+            (Self::Changed | Self::Deleted, Self::Deleted) => Some(Self::Deleted),
+        }
+    }
+}
+
+/// The files merges brought, by what was done to them, each kind listed as [`Listed`] lists
+/// paths. A note an older mahi kept, without these fields, reads as one that brought nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Brought {
+    #[serde(default)]
+    added: Listed,
+    #[serde(default)]
+    changed: Listed,
+    #[serde(default)]
+    deleted: Listed,
 }
 
 /// The first paths of a kind, each cut to 200 bytes, and how many more there were.
@@ -72,7 +149,7 @@ struct Listed {
 pub(crate) struct Merged<'paths> {
     pub(crate) markers: &'paths [String],
     pub(crate) kept: &'paths [String],
-    pub(crate) brought: &'paths [String],
+    pub(crate) brought: &'paths [(String, Kind)],
 }
 
 #[derive(Debug, Error)]
@@ -98,14 +175,21 @@ fn keeping() -> Result<MutexGuard<'static, ()>, NoteError> {
 }
 
 /// Adds what a merge from `from` left to the note kept in `file`, which a note that cannot
-/// be read no longer holds back; past 1 MiB the note keeps what it held.
-pub(crate) fn record(file: &Path, from: &Source, merged: Merged<'_>) -> Result<(), NoteError> {
+/// be read no longer holds back; past 1 MiB the note keeps what it held. Returns whether the
+/// note kept in `file` changed.
+pub(crate) fn record(file: &Path, from: &Source, merged: Merged<'_>) -> Result<bool, NoteError> {
     let _kept = keeping()?;
-    let mut note = match Note::load(file) {
-        Err(NoteError::Malformed(_)) => Note::default(),
-        loaded => loaded?,
+    let (mut note, malformed) = match Note::load(file) {
+        Err(NoteError::Malformed(_)) => (Note::default(), true),
+        loaded => (loaded?, false),
     };
-    note.add(from, merged);
+    if !note.add(from, merged) {
+        if malformed {
+            note.save(file)?;
+        }
+        return Ok(false);
+    }
+    note.name_if_new();
     note.save(file)
 }
 
@@ -134,15 +218,34 @@ pub(crate) fn record_landing(file: &Path, line: &str) -> Result<(), NoteError> {
         .map_or(line.len(), |(index, _)| index);
     push_clean(&mut cleaned, line.get(..end).unwrap_or(line));
     note.landed = Some(cleaned);
-    note.save(file)
+    note.name_if_new();
+    note.save(file).map(drop)
 }
 
-/// Returns the note kept in `file` as the text an agent reads, without taking it, or `None`
-/// when nothing came in or it cannot be read.
-pub(crate) fn peek(file: &Path) -> Option<String> {
+/// Returns the note kept in `file` as the text an agent reads, without taking it, with the
+/// added files it lists by teammate, or `None` when nothing came in or it cannot be read.
+fn peek_offering(file: &Path) -> Option<(String, Offer)> {
     let _kept = keeping().ok()?;
     let note = Note::load(file).ok()?;
-    (!note.is_empty()).then(|| note.render())
+    if note.is_empty() {
+        return None;
+    }
+    let mut added = Vec::new();
+    let text = note.render_into(Some(&mut added));
+    Some((
+        text,
+        Offer {
+            note: note.id,
+            added,
+        },
+    ))
+}
+
+/// The added files a shown text wrote, by teammate, and the note it was read from.
+#[derive(Debug, Default)]
+struct Offer {
+    note: Option<NoteId>,
+    added: Vec<(Source, String)>,
 }
 
 /// Returns the teammates' agents the note kept in `file` names, whose merges brought files or
@@ -157,30 +260,54 @@ pub(crate) fn listed(file: &Path) -> Vec<AgentSlot> {
 }
 
 /// Takes the note kept in `file` when it still reads `shown`, as an agent's hook read it; a
-/// note that grew meanwhile stays, so what came in since is not lost.
-pub(crate) fn take_shown(file: &Path, shown: &str) {
+/// note that grew meanwhile stays, and when it is the note `offer` was read from, the added
+/// files `shown` wrote are marked as read (D107).
+fn take_shown(file: &Path, shown: &str, offer: &Offer) {
     let Ok(_kept) = keeping() else {
         return;
     };
-    let still = Note::load(file).is_ok_and(|note| !note.is_empty() && note.render() == shown);
-    if still {
+    let Ok(mut note) = Note::load(file) else {
+        return;
+    };
+    if !note.is_empty() && note.id == offer.note && note.render() == shown {
         let _ = sync_state::remove(file);
+    } else if note.id.is_some() && note.id == offer.note && note.read(&offer.added) {
+        let _ = note.save(file);
     }
 }
 
-/// The note of an agent's worktree, as its prompt hook adds it to the user's prompt.
+/// The note of an agent's worktree, as its prompt hook adds it to the user's prompt, with
+/// what the text it last handed out wrote.
 #[derive(Debug)]
 pub(crate) struct NoteContext {
-    pub(crate) file: PathBuf,
+    file: PathBuf,
+    offered: Mutex<Offer>,
+}
+
+impl NoteContext {
+    /// Starts handing out the note kept in `file`.
+    pub(crate) fn new(file: PathBuf) -> Self {
+        Self {
+            file,
+            offered: Mutex::default(),
+        }
+    }
 }
 
 impl hook::Context for NoteContext {
     fn peek(&self) -> Option<String> {
-        peek(&self.file)
+        let (text, offered) = peek_offering(&self.file)?;
+        if let Ok(mut last) = self.offered.lock() {
+            *last = offered;
+        }
+        Some(text)
     }
 
     fn taken(&self, shown: &str) {
-        take_shown(&self.file, shown);
+        let Ok(offered) = self.offered.lock() else {
+            return;
+        };
+        take_shown(&self.file, shown, &offered);
     }
 }
 
@@ -193,22 +320,30 @@ pub(crate) enum NoteBy {
 }
 
 impl Listed {
+    fn insert(&mut self, path: String) {
+        if self.paths.len() < MAX_LISTED {
+            self.paths.push(path);
+        } else {
+            self.more = self.more.saturating_add(1);
+        }
+    }
+
     fn add(&mut self, paths: &[String]) {
         for path in paths {
             let (path, was_cut) = cut(path);
             if path.is_empty() || (!was_cut && self.paths.contains(&path)) {
                 continue;
             }
-            if self.paths.len() < MAX_LISTED && !self.paths.contains(&path) {
-                self.paths.push(path);
-            } else {
+            if self.paths.contains(&path) {
                 self.more = self.more.saturating_add(1);
+            } else {
+                self.insert(path);
             }
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+        self.paths.is_empty() && self.more == 0
     }
 
     fn holds(&self) -> bool {
@@ -220,13 +355,27 @@ impl Listed {
     }
 
     fn push(&self, out: &mut String, (between, budget): (&str, &mut usize)) {
+        let (_, more) = self.push_within(out, (between, budget), "", |_| {});
+        if more > 0 {
+            let _ = write!(out, " and {more} more");
+        }
+        out.push('\n');
+    }
+
+    /// Writes the paths that fit `budget`, `first` before the first of them and `between` the
+    /// others; returns how many it wrote and how many it left out, those past the list too.
+    fn push_within(
+        &self,
+        out: &mut String,
+        (between, budget): (&str, &mut usize),
+        first: &str,
+        mut wrote: impl FnMut(&str),
+    ) -> (usize, usize) {
         let mut more = self.more;
         let mut shown = 0;
         for path in &self.paths {
             let start = out.len();
-            if shown > 0 {
-                out.push_str(between);
-            }
+            out.push_str(if shown > 0 { between } else { first });
             push_code(out, path, LONGEST_PATH + 1);
             let used = out.len() - start;
             if used > *budget {
@@ -236,9 +385,113 @@ impl Listed {
             }
             *budget -= used;
             shown += 1;
+            wrote(path);
         }
-        if more > 0 {
-            let _ = write!(out, " and {more} more");
+        (shown, more)
+    }
+}
+
+impl Brought {
+    fn of(&self, kind: Kind) -> &Listed {
+        match kind {
+            Kind::Added => &self.added,
+            Kind::Changed => &self.changed,
+            Kind::Deleted => &self.deleted,
+        }
+    }
+
+    fn of_mut(&mut self, kind: Kind) -> &mut Listed {
+        match kind {
+            Kind::Added => &mut self.added,
+            Kind::Changed => &mut self.changed,
+            Kind::Deleted => &mut self.deleted,
+        }
+    }
+
+    fn add(&mut self, files: &[(String, Kind)], seen: &[String]) {
+        for (path, kind) in files {
+            let (path, was_cut) = cut(path);
+            if path.is_empty() {
+                continue;
+            }
+            let earlier = Kind::ALL
+                .into_iter()
+                .find(|earlier| self.of(*earlier).paths.contains(&path));
+            let now = match earlier {
+                Some(_) if was_cut || path.ends_with(CUT) => {
+                    let listed = self.of_mut(*kind);
+                    listed.more = listed.more.saturating_add(1);
+                    continue;
+                }
+                Some(earlier) => {
+                    let now = earlier.then(*kind, seen.contains(&path));
+                    if now == Some(earlier) {
+                        continue;
+                    }
+                    self.of_mut(earlier).paths.retain(|listed| *listed != path);
+                    now
+                }
+                None => Some(*kind),
+            };
+            if let Some(now) = now {
+                self.of_mut(now).insert(path);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        Kind::ALL.into_iter().all(|kind| self.of(kind).is_empty())
+    }
+
+    fn holds(&self) -> bool {
+        Kind::ALL.into_iter().all(|kind| self.of(kind).holds())
+    }
+
+    fn paths(&self) -> impl Iterator<Item = &str> {
+        Kind::ALL
+            .into_iter()
+            .flat_map(|kind| self.of(kind).paths.iter().map(String::as_str))
+    }
+
+    /// Writes the files grouped by what was done to them, as `added a, b and 3 more; deleted c`.
+    fn push(
+        &self,
+        out: &mut String,
+        budget: &mut usize,
+        mut written: Option<(&Source, &mut Vec<(Source, String)>)>,
+    ) {
+        let mut groups: usize = 0;
+        let mut first = String::new();
+        for kind in Kind::ALL {
+            first.clear();
+            if groups > 0 {
+                first.push_str("; ");
+            }
+            first.push_str(kind.word());
+            first.push(' ');
+            let listed = self.of(kind);
+            let (shown, more) = match (kind, written.as_mut()) {
+                (Kind::Added, Some((from, list))) => {
+                    listed.push_within(out, (", ", budget), &first, |path| {
+                        list.push(((*from).clone(), path.to_owned()));
+                    })
+                }
+                (Kind::Added | Kind::Changed | Kind::Deleted, _) => {
+                    listed.push_within(out, (", ", budget), &first, |_| {})
+                }
+            };
+            match (shown, more) {
+                (_, 0) => {}
+                (0, more) => {
+                    let _ = write!(out, "{first}{more} more");
+                }
+                (_, more) => {
+                    let _ = write!(out, " and {more} more");
+                }
+            }
+            if shown > 0 || more > 0 {
+                groups += 1;
+            }
         }
         out.push('\n');
     }
@@ -268,16 +521,18 @@ impl Note {
             Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(malformed()),
             Err(error) => return Err(NoteError::Io(file.to_path_buf(), error)),
         };
-        let note: Self = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
+        let mut note: Self = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
+        note.came.retain(|came| !came.is_empty());
         let holds = note.came.len() <= MAX_TEAMMATES
             && note
                 .landed
                 .as_ref()
                 .is_none_or(|landed| landed.len() <= MAX_TEXT_BYTES)
             && note.came.iter().all(|came| {
-                [&came.markers, &came.kept, &came.brought]
-                    .iter()
-                    .all(|listed| listed.holds())
+                came.markers.holds()
+                    && came.kept.holds()
+                    && came.brought.holds()
+                    && came.seen.len() <= MAX_LISTED
             });
         holds.then_some(note).ok_or_else(malformed)
     }
@@ -293,57 +548,109 @@ impl Note {
     }
 
     /// Returns each teammate's agent the note names, with the first files its merges brought.
-    pub(crate) fn brought(&self) -> impl Iterator<Item = (&AgentSlot, &[String])> {
-        self.came.iter().filter_map(|came| {
-            came.from
-                .agent()
-                .map(|slot| (slot, came.brought.paths.as_slice()))
-        })
+    pub(crate) fn brought(&self) -> impl Iterator<Item = (&AgentSlot, impl Iterator<Item = &str>)> {
+        self.came
+            .iter()
+            .filter_map(|came| came.from.agent().map(|slot| (slot, came.brought.paths())))
     }
 
-    fn save(&self, file: &Path) -> Result<(), NoteError> {
+    /// Writes the note to `file`, unless it is past 1 MiB; returns whether it wrote it.
+    fn save(&self, file: &Path) -> Result<bool, NoteError> {
         let bytes =
             serde_json::to_vec(self).map_err(|_| NoteError::Malformed(file.to_path_buf()))?;
         if bytes.len() > MAX_NOTE_BYTES {
-            return Ok(());
+            return Ok(false);
         }
-        sync_state::write(file, &bytes).map_err(|error| NoteError::Io(file.to_path_buf(), error))
+        sync_state::write(file, &bytes)
+            .map(|()| true)
+            .map_err(|error| NoteError::Io(file.to_path_buf(), error))
     }
 
     /// Adds what a merge from `from` left, to what that teammate's earlier merges left; a
     /// teammate past the 64th is left out.
-    pub(crate) fn add(&mut self, from: &Source, merged: Merged<'_>) {
-        if merged.markers.is_empty() && merged.kept.is_empty() && merged.brought.is_empty() {
-            return;
-        }
-        let index = match self.came.iter().position(|came| came.from == *from) {
-            Some(index) => index,
-            None if self.came.len() < MAX_TEAMMATES => {
-                self.came.push(Came {
-                    from: from.clone(),
-                    markers: Listed::default(),
-                    kept: Listed::default(),
-                    brought: Listed::default(),
-                });
-                self.came.len() - 1
-            }
-            None => return,
+    pub(crate) fn add(&mut self, from: &Source, merged: Merged<'_>) -> bool {
+        let Some((index, existed)) = self.entry(from) else {
+            return false;
         };
+        let before = existed.then(|| self.came.get(index).cloned()).flatten();
         let Some(came) = self.came.get_mut(index) else {
-            return;
+            return false;
         };
         came.markers.add(merged.markers);
         came.kept.add(merged.kept);
-        came.brought.add(merged.brought);
+        came.brought.add(merged.brought, &came.seen);
+        if came.is_empty() {
+            self.came.remove(index);
+            return before.is_some();
+        }
+        before.as_ref() != Some(&*came)
+    }
+
+    fn name_if_new(&mut self) {
+        if self.id.is_none() {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos());
+            self.id = Some(NoteId(format!("{nanos}-{}", process::id())));
+        }
+    }
+
+    /// Returns the index of `from`'s entry, added within 64 teammates, and whether it existed.
+    fn entry(&mut self, from: &Source) -> Option<(usize, bool)> {
+        if let Some(index) = self.came.iter().position(|came| came.from == *from) {
+            return Some((index, true));
+        }
+        if self.came.len() >= MAX_TEAMMATES {
+            return None;
+        }
+        self.came.push(Came {
+            from: from.clone(),
+            markers: Listed::default(),
+            kept: Listed::default(),
+            brought: Brought::default(),
+            seen: Vec::new(),
+        });
+        Some((self.came.len() - 1, false))
+    }
+
+    /// Takes in that the agent read the added files `offered` (D107); returns whether it changed
+    /// the note.
+    fn read(&mut self, offered: &[(Source, String)]) -> bool {
+        let mut changed = false;
+        for (from, path) in offered {
+            let Some((index, _)) = self.entry(from) else {
+                continue;
+            };
+            let Some(came) = self.came.get_mut(index) else {
+                continue;
+            };
+            let added = &came.brought.added.paths;
+            came.seen.retain(|seen| added.contains(seen));
+            if added.contains(path) {
+                if !came.seen.contains(path) {
+                    came.seen.push(path.clone());
+                    changed = true;
+                }
+            } else if !came.brought.paths().any(|listed| listed == path) {
+                came.brought.deleted.insert(path.clone());
+                changed = true;
+            }
+        }
+        self.came.retain(|came| !came.is_empty());
+        changed
     }
 
     /// Returns the note as the agent reads it: the conflicts first, with the agent asked to
     /// resolve them before anything else, then the files each teammate's merges brought, each
     /// path in a code span.
     pub(crate) fn render(&self) -> String {
+        self.render_into(None)
+    }
+
+    fn render_into(&self, written: Option<&mut Vec<(Source, String)>>) -> String {
         let mut out = String::new();
         if !self.came.is_empty() {
-            self.render_came(&mut out);
+            self.render_came(&mut out, written);
         }
         if let Some(landed) = &self.landed {
             if !out.is_empty() {
@@ -354,7 +661,7 @@ impl Note {
         out
     }
 
-    fn render_came(&self, out: &mut String) {
+    fn render_came(&self, out: &mut String, mut written: Option<&mut Vec<(Source, String)>>) {
         out.push_str(OPENING);
         let mut budget = MAX_TEXT_BYTES;
         out.push('\n');
@@ -391,7 +698,8 @@ impl Note {
         for came in &self.came {
             if !came.brought.is_empty() {
                 let _ = write!(out, "merged {}: ", came.from.named());
-                came.brought.push(out, (", ", &mut budget));
+                let written = written.as_deref_mut().map(|list| (&came.from, list));
+                came.brought.push(out, &mut budget, written);
             }
         }
         out.truncate(out.trim_end().len());
@@ -434,6 +742,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::hook::Context as _;
 
     #[test]
     fn the_listed_teammates_are_those_whose_merges_brought_files_or_conflicts() {
@@ -446,15 +755,16 @@ mod tests {
             "dan.claude".parse().unwrap(),
         );
         let paths = ["src/lib.rs".to_owned()];
+        let files = added(&["src/lib.rs"]);
         let none: [String; 0] = [];
         let merged = |markers, brought| Merged {
             markers,
             kept: &none,
             brought,
         };
-        record(&file, &Source::Agent(bob.clone()), merged(&none, &paths)).unwrap();
-        record(&file, &Source::Agent(carol), merged(&none, &none)).unwrap();
-        record(&file, &Source::Agent(dan.clone()), merged(&paths, &none)).unwrap();
+        record(&file, &Source::Agent(bob.clone()), merged(&none, &files)).unwrap();
+        record(&file, &Source::Agent(carol), merged(&none, &[])).unwrap();
+        record(&file, &Source::Agent(dan.clone()), merged(&paths, &[])).unwrap();
         assert_eq!(listed(&file), [bob, dan]);
     }
 
@@ -482,12 +792,29 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    fn only_brought(files: &[(String, Kind)]) -> Merged<'_> {
+        Merged {
+            markers: &[],
+            kept: &[],
+            brought: files,
+        }
+    }
+
+    fn added(names: &[&str]) -> Vec<(String, Kind)> {
+        names
+            .iter()
+            .map(|name| ((*name).to_owned(), Kind::Added))
+            .collect()
+    }
+
     #[test]
     fn the_note_lists_conflicts_first_then_what_each_teammate_brought() {
         let mut note = Note::default();
         let bob: Source = "bob.claude".parse().unwrap();
         let carol: Source = "carol.codex".parse().unwrap();
-        let brought: Vec<String> = (0..23).map(|index| format!("src/{index}.rs")).collect();
+        let brought: Vec<(String, Kind)> = (0..23)
+            .map(|index| (format!("src/{index}.rs"), Kind::Added))
+            .collect();
         note.add(
             &bob,
             Merged {
@@ -501,7 +828,7 @@ mod tests {
             Merged {
                 markers: &[],
                 kept: &[],
-                brought: &paths(&["tests/parse.rs"]),
+                brought: &added(&["tests/parse.rs"]),
             },
         );
         note.add(
@@ -509,7 +836,7 @@ mod tests {
             Merged {
                 markers: &paths(&["src/lib.rs"]),
                 kept: &[],
-                brought: &paths(&["src/0.rs"]),
+                brought: &added(&["src/0.rs"]),
             },
         );
         let text = note.render();
@@ -525,10 +852,321 @@ mod tests {
             "Your version was kept, but bob.claude changed these too; check them with read_diff: \
              ` logo.png `"
         );
-        assert!(lines[4].starts_with("merged bob.claude: ` src/0.rs `, ` src/1.rs `"));
+        assert!(lines[4].starts_with("merged bob.claude: added ` src/0.rs `, ` src/1.rs `"));
         assert!(lines[4].ends_with(" and 3 more"), "{}", lines[4]);
-        assert_eq!(lines[5], "merged carol.codex: ` tests/parse.rs `");
+        assert_eq!(lines[5], "merged carol.codex: added ` tests/parse.rs `");
         assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn the_note_says_what_each_teammates_merges_did_to_each_file_since_the_last_prompt() {
+        let mut note = Note::default();
+        let davy: Source = "davy.claude".parse().unwrap();
+        let merge = |note: &mut Note, files: &[(&str, Kind)]| {
+            let files: Vec<(String, Kind)> = files
+                .iter()
+                .map(|(path, kind)| ((*path).to_owned(), *kind))
+                .collect();
+            note.add(
+                &davy,
+                Merged {
+                    markers: &[],
+                    kept: &[],
+                    brought: &files,
+                },
+            );
+        };
+        merge(
+            &mut note,
+            &[
+                ("README.md", Kind::Deleted),
+                ("src/lib.rs", Kind::Changed),
+                ("src/new.rs", Kind::Added),
+                ("old.rs", Kind::Changed),
+                ("back.rs", Kind::Deleted),
+            ],
+        );
+        merge(
+            &mut note,
+            &[
+                ("src/new.rs", Kind::Changed),
+                ("old.rs", Kind::Deleted),
+                ("back.rs", Kind::Added),
+                ("docs/a.md", Kind::Added),
+            ],
+        );
+        let text = note.render();
+        assert_eq!(
+            text.lines().last().unwrap(),
+            "merged davy.claude: added ` src/new.rs `, ` docs/a.md `; changed ` src/lib.rs `, \
+             ` back.rs `; deleted ` README.md `, ` old.rs `"
+        );
+    }
+
+    #[test]
+    fn what_a_file_came_to_after_two_merges_is_what_the_agent_sees_now() {
+        use Kind::{
+            Added,
+            Changed,
+            Deleted,
+        };
+        for (earlier, later, now) in [
+            (Added, Added, Some(Added)),
+            (Added, Changed, Some(Added)),
+            (Added, Deleted, None),
+            (Changed, Added, Some(Changed)),
+            (Changed, Changed, Some(Changed)),
+            (Changed, Deleted, Some(Deleted)),
+            (Deleted, Added, Some(Changed)),
+            (Deleted, Changed, Some(Changed)),
+            (Deleted, Deleted, Some(Deleted)),
+        ] {
+            assert_eq!(
+                earlier.then(later, false),
+                now,
+                "{earlier:?} then {later:?}"
+            );
+            let once_shown = match (earlier, later) {
+                (Added, Deleted) => Some(Deleted),
+                _ => now,
+            };
+            assert_eq!(
+                earlier.then(later, true),
+                once_shown,
+                "shown, {earlier:?} then {later:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_the_agent_was_shown_as_added_is_said_deleted_when_it_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        let (bob, carol): (Source, Source) = (
+            "bob.claude".parse().unwrap(),
+            "carol.codex".parse().unwrap(),
+        );
+        let one = |path: &str, kind| [(path.to_owned(), kind)];
+        let hook = NoteContext::new(file.clone());
+        record(&file, &bob, only_brought(&one("x.rs", Kind::Added))).unwrap();
+        let shown = hook.peek().unwrap();
+        assert!(shown.contains("added ` x.rs `"));
+        record(&file, &carol, only_brought(&one("tmp.rs", Kind::Added))).unwrap();
+        hook.taken(&shown);
+        record(&file, &bob, only_brought(&one("x.rs", Kind::Deleted))).unwrap();
+        record(&file, &carol, only_brought(&one("tmp.rs", Kind::Deleted))).unwrap();
+        let text = take(&file).unwrap().unwrap();
+        assert!(
+            text.contains("merged bob.claude: deleted ` x.rs `"),
+            "{text}"
+        );
+        assert!(!text.contains("carol.codex"), "{text}");
+    }
+
+    #[test]
+    fn a_file_deleted_while_the_hook_reads_it_as_added_is_said_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        let bob: Source = "bob.claude".parse().unwrap();
+        let one = |kind| [("x.rs".to_owned(), kind)];
+        let hook = NoteContext::new(file.clone());
+        record(&file, &bob, only_brought(&one(Kind::Added))).unwrap();
+        let shown = hook.peek().unwrap();
+        record(&file, &bob, only_brought(&one(Kind::Deleted))).unwrap();
+        hook.taken(&shown);
+        let text = take(&file).unwrap().unwrap();
+        assert!(
+            text.contains("merged bob.claude: deleted ` x.rs `"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_note_taken_another_way_while_the_hook_reads_it_brings_nothing_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        let bob: Source = "bob.claude".parse().unwrap();
+        let one = |path: &str| [(path.to_owned(), Kind::Added)];
+        let hook = NoteContext::new(file.clone());
+        record(&file, &bob, only_brought(&one("x.rs"))).unwrap();
+        let shown = hook.peek().unwrap();
+        assert!(take(&file).unwrap().is_some());
+        hook.taken(&shown);
+        assert_eq!(take(&file).unwrap(), None);
+        record(&file, &bob, only_brought(&one("x.rs"))).unwrap();
+        let shown = hook.peek().unwrap();
+        assert!(take(&file).unwrap().is_some());
+        record(&file, &bob, only_brought(&one("y.rs"))).unwrap();
+        hook.taken(&shown);
+        let text = take(&file).unwrap().unwrap();
+        assert!(
+            text.ends_with("merged bob.claude: added ` y.rs `"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_new_note_that_reads_as_the_one_the_hook_read_is_not_taken_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        let line = "alice cancelled your landing; nothing was pushed.";
+        let hook = NoteContext::new(file.clone());
+        record_landing(&file, line).unwrap();
+        let shown = hook.peek().unwrap();
+        assert!(take(&file).unwrap().is_some());
+        record_landing(&file, line).unwrap();
+        hook.taken(&shown);
+        assert_eq!(take(&file).unwrap().as_deref(), Some(line));
+    }
+
+    #[test]
+    fn a_file_the_text_left_out_for_room_is_not_one_the_agent_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        let long =
+            |teammate: usize, index: usize| format!("{teammate}/{index}/{}", "p".repeat(190));
+        let teammates: Vec<Source> = (0..10)
+            .map(|teammate| format!("p{teammate}.claude").parse().unwrap())
+            .collect();
+        for (teammate, from) in teammates.iter().enumerate() {
+            let files: Vec<(String, Kind)> = (0..20)
+                .map(|index| (long(teammate, index), Kind::Added))
+                .collect();
+            record(&file, from, only_brought(&files)).unwrap();
+        }
+        let hook = NoteContext::new(file.clone());
+        let shown = hook.peek().unwrap();
+        let unshown = long(9, 19);
+        assert!(!shown.contains(&unshown));
+        record(
+            &file,
+            &teammates[9],
+            only_brought(&[(unshown.clone(), Kind::Deleted)]),
+        )
+        .unwrap();
+        hook.taken(&shown);
+        let text = take(&file).unwrap().unwrap();
+        assert!(!text.contains(&unshown), "{text}");
+    }
+
+    #[test]
+    fn a_note_the_hook_read_but_never_took_still_drops_a_file_added_then_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        let bob: Source = "bob.claude".parse().unwrap();
+        let one = |kind| [("x.rs".to_owned(), kind)];
+        record(&file, &bob, only_brought(&one(Kind::Added))).unwrap();
+        assert!(NoteContext::new(file.clone()).peek().is_some());
+        record(&file, &bob, only_brought(&one(Kind::Deleted))).unwrap();
+        assert_eq!(take(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn a_merge_that_leaves_the_note_as_it_was_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        let bob: Source = "bob.claude".parse().unwrap();
+        let files = added(&["a.rs", "b.rs"]);
+        assert!(record(&file, &bob, only_brought(&files)).unwrap());
+        assert!(!record(&file, &bob, only_brought(&added(&["a.rs"]))).unwrap());
+        assert!(!record(&file, &bob, only_brought(&[])).unwrap());
+        let gone = [("a.rs".to_owned(), Kind::Deleted)];
+        assert!(record(&file, &bob, only_brought(&gone)).unwrap());
+        let both_gone = [("b.rs".to_owned(), Kind::Deleted)];
+        assert!(record(&file, &bob, only_brought(&both_gone)).unwrap());
+        assert_eq!(listed(&file), Vec::<AgentSlot>::new());
+    }
+
+    #[test]
+    fn a_listed_path_that_ends_like_a_cut_one_never_composes() {
+        let mut note = Note::default();
+        let bob: Source = "bob.claude".parse().unwrap();
+        let path = format!("{}{CUT}", "p".repeat(LONGEST_PATH - CUT.len_utf8()));
+        note.add(&bob, only_brought(&[(path.clone(), Kind::Added)]));
+        note.add(&bob, only_brought(&[(path, Kind::Deleted)]));
+        let brought = &note.came[0].brought;
+        assert_eq!(brought.added.paths.len(), 1);
+        assert_eq!(brought.deleted.more, 1);
+    }
+
+    #[test]
+    fn each_kind_lists_its_own_twenty_and_a_file_added_then_deleted_leaves_the_note() {
+        let mut note = Note::default();
+        let davy: Source = "davy.claude".parse().unwrap();
+        let mut files: Vec<(String, Kind)> = (0..21)
+            .map(|index| (format!("src/{index}.rs"), Kind::Added))
+            .collect();
+        files.push(("README.md".to_owned(), Kind::Deleted));
+        note.add(&davy, only_brought(&files));
+        let last = note.render();
+        let last = last.lines().last().unwrap();
+        assert!(
+            last.contains(" and 1 more; deleted ` README.md `"),
+            "{last}"
+        );
+
+        let mut fresh = Note::default();
+        fresh.add(&davy, only_brought(&[("tmp.rs".to_owned(), Kind::Added)]));
+        fresh.add(&davy, only_brought(&[("tmp.rs".to_owned(), Kind::Deleted)]));
+        assert!(fresh.is_empty(), "{fresh:?}");
+        assert_eq!(fresh.teammates().count(), 0);
+    }
+
+    #[test]
+    fn a_file_that_moves_between_kinds_keeps_each_kind_to_twenty_and_the_note_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        let bob: Source = "bob.claude".parse().unwrap();
+        let named = |prefix: &str, kind: Kind| -> Vec<(String, Kind)> {
+            (0..20)
+                .map(|index| (format!("{prefix}{index}"), kind))
+                .collect()
+        };
+        let mut first = named("a", Kind::Added);
+        first.extend(named("c", Kind::Changed));
+        first.extend(named("d", Kind::Deleted));
+        record(&file, &bob, only_brought(&first)).unwrap();
+        let second = [
+            ("d0".to_owned(), Kind::Added),
+            ("e0".to_owned(), Kind::Deleted),
+        ];
+        record(&file, &bob, only_brought(&second)).unwrap();
+        let note = Note::load(&file).unwrap();
+        let brought = &note.came[0].brought;
+        assert_eq!((brought.changed.paths.len(), brought.changed.more), (20, 1));
+        assert_eq!(brought.deleted.paths.len(), 20);
+        assert!(brought.deleted.paths.contains(&"e0".to_owned()));
+    }
+
+    #[test]
+    fn an_older_note_that_only_brought_files_names_no_teammate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        fs::write(
+            &file,
+            r#"{"came":[{"from":"bob.claude","markers":{"paths":[],"more":0},
+            "kept":{"paths":[],"more":0},"brought":{"paths":["README.md"],"more":0}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(listed(&file), Vec::<AgentSlot>::new());
+        assert_eq!(take(&file).unwrap(), None);
+    }
+
+    #[test]
+    fn a_note_an_older_mahi_kept_keeps_its_conflicts_and_landing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note");
+        fs::write(
+            &file,
+            r#"{"came":[{"from":"bob.claude","markers":{"paths":["src/lib.rs"],"more":0},
+            "kept":{"paths":[],"more":0},"brought":{"paths":["README.md"],"more":2}}],
+            "landed":"alice pushed your landing."}"#,
+        )
+        .unwrap();
+        let text = take(&file).unwrap().unwrap();
+        assert!(text.contains("` src/lib.rs `"), "{text}");
+        assert!(text.contains("alice pushed your landing."), "{text}");
+        assert!(!text.contains("README.md"), "{text}");
     }
 
     #[test]
@@ -540,7 +1178,7 @@ mod tests {
             Merged {
                 markers: &paths(&["m.txt"]),
                 kept: &paths(&["logo.png"]),
-                brought: &paths(&["upstream.txt", "m.txt"]),
+                brought: &added(&["upstream.txt", "m.txt"]),
             },
         );
         assert_eq!(
@@ -549,7 +1187,7 @@ mod tests {
                 "{OPENING}\n{RESOLVE_FIRST}\n\
                  Resolve the conflict markers in (from main on up): ` m.txt `\n\
                  Your version was kept, but main on up changed these too: ` logo.png `\n\
-                 merged main on up: ` upstream.txt `, ` m.txt `"
+                 merged main on up: added ` upstream.txt `, ` m.txt `"
             )
         );
         assert_eq!(note.brought().count(), 0);
@@ -565,7 +1203,7 @@ mod tests {
             Merged {
                 markers: &[],
                 kept: &[],
-                brought: &paths(&["a``b.rs", "x\u{202e}\x1b[2J.rs", &long]),
+                brought: &added(&["a``b.rs", "x\u{202e}\x1b[2J.rs", &long]),
             },
         );
         let text = note.render();
@@ -577,8 +1215,7 @@ mod tests {
         assert!(
             !note.came[0]
                 .brought
-                .paths
-                .iter()
+                .paths()
                 .any(|path| path.len() > LONGEST_PATH + CUT.len_utf8())
         );
     }
@@ -592,12 +1229,15 @@ mod tests {
         let merged = Merged {
             markers: &[],
             kept: &[],
-            brought: &paths(&["a.rs"]),
+            brought: &added(&["a.rs"]),
         };
         record(&file, &bob, merged).unwrap();
         record(&file, &bob, merged).unwrap();
         let text = take(&file).unwrap().unwrap();
-        assert!(text.ends_with("merged bob.claude: ` a.rs `"), "{text}");
+        assert!(
+            text.ends_with("merged bob.claude: added ` a.rs `"),
+            "{text}"
+        );
         assert!(!text.contains(RESOLVE_FIRST));
         assert_eq!(take(&file).unwrap(), None);
     }
@@ -617,7 +1257,7 @@ mod tests {
             Some("alice pushed your landing: 2 commits on mahi/x to origin.")
         );
         let bob: Source = "bob.claude".parse().unwrap();
-        let brought = paths(&["a.rs"]);
+        let brought = added(&["a.rs"]);
         let merged = Merged {
             markers: &[],
             kept: &[],
@@ -640,18 +1280,25 @@ mod tests {
         let crafted: Vec<String> = (0..25)
             .map(|index| format!("{index}{}", "\u{1}".repeat(199)))
             .collect();
+        let crafted_files: Vec<(String, Kind)> = crafted
+            .iter()
+            .map(|path| (path.clone(), Kind::Added))
+            .collect();
+        let mut unwritten = 0;
         for teammate in 0..64 {
             let from: AgentSlot = format!("p{teammate}.claude").parse().unwrap();
             let merged = Merged {
                 markers: &crafted,
                 kept: &crafted,
-                brought: &crafted,
+                brought: &crafted_files,
             };
-            assert!(
-                record(&file, &Source::Agent(from.clone()), merged).is_ok()
-                    || Note::load(&file).is_ok()
-            );
+            match record(&file, &Source::Agent(from.clone()), merged) {
+                Ok(true) => {}
+                Ok(false) => unwritten += 1,
+                Err(_) => assert!(Note::load(&file).is_ok()),
+            }
         }
+        assert!(unwritten > 0);
         let text = take(&file).unwrap().unwrap();
         assert!(text.len() <= MAX_TEXT_BYTES + 1024, "{}", text.len());
         assert!(text.contains(" more"), "{text}");
@@ -667,13 +1314,13 @@ mod tests {
             Merged {
                 markers: &[],
                 kept: &[],
-                brought: &[long("a.rs"), long("b.rs")],
+                brought: &[(long("a.rs"), Kind::Added), (long("b.rs"), Kind::Added)],
             },
         );
-        let brought = &note.came[0].brought;
-        assert_eq!(brought.paths.len(), 1);
-        assert!(brought.paths[0].ends_with('…'));
-        assert_eq!(brought.more, 1);
+        let added = &note.came[0].brought.added;
+        assert_eq!(added.paths.len(), 1);
+        assert!(added.paths[0].ends_with('…'));
+        assert_eq!(added.more, 1);
         note.add(
             &"carol.codex".parse().unwrap(),
             Merged {
@@ -699,7 +1346,7 @@ mod tests {
             Merged {
                 markers: &[],
                 kept: &[],
-                brought: &paths(&["a.rs"]),
+                brought: &added(&["a.rs"]),
             },
         )
         .unwrap();
@@ -711,8 +1358,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("note");
         let bob: Source = "bob.claude".parse().unwrap();
-        let brought = |name: &str| vec![name.to_owned()];
-        let merged = |paths: &[String]| {
+        let brought = |name: &str| vec![(name.to_owned(), Kind::Added)];
+        let merged = |paths: &[(String, Kind)]| {
             record(
                 &file,
                 &bob,
@@ -724,15 +1371,16 @@ mod tests {
             )
             .unwrap();
         };
-        assert_eq!(peek(&file), None);
+        let hook = NoteContext::new(file.clone());
+        assert_eq!(hook.peek(), None);
         merged(&brought("a.rs"));
-        let shown = peek(&file).unwrap();
+        let shown = hook.peek().unwrap();
         merged(&brought("b.rs"));
-        take_shown(&file, &shown);
-        let kept = peek(&file).unwrap();
+        hook.taken(&shown);
+        let kept = hook.peek().unwrap();
         assert!(kept.contains("` b.rs `"), "{kept}");
-        take_shown(&file, &kept);
-        assert_eq!(peek(&file), None);
+        hook.taken(&kept);
+        assert_eq!(hook.peek(), None);
     }
 
     #[test]
