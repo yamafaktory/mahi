@@ -819,3 +819,36 @@ input line unfinished, in one read or across two. Merges wait until Enter, Ctrl-
 Escape empties the line again, and never land in a running turn. The other choices were to read it as the Escape key, which ends
 the turn for mahi while such an agent still works, or as an Alt prefix that changes nothing,
 which lets a merge run while Escape pressed twice holds a picker open.
+
+## D109 · 2026-11-14 · The side panel lists a teammate's merged files in a row per kind
+
+Chosen by the user (#147). The panel listed each teammate's merged files as `merged: <files>`,
+with no word for what the merge did. It now shows one row per kind, deleted first, as the note
+groups them (D104): `deleted: <files>`, `changed: <files>`, then `added: <files>`. The rows read
+without colour, and the deleted files show first when the panel cuts the list short. The other
+choices were a sign before each file, a sign with colour, and colour alone.
+
+## D110 · 2026-11-14 · mahi gets a palette for light terminals
+
+Chosen by the user (#144), in place of D094's dark terminals only. Since D103 the tab bar and the
+side panel show the terminal's background, and on a white one some of mahi's colours read
+poorly. mahi asks the terminal for its background with OSC 11 at start and picks a dark or a
+light palette from it. Dark stays the default when the terminal does not answer. The light
+palette's colours are still to be chosen. The other choice was to keep the theme for dark
+terminals only.
+
+## D111 · 2026-11-14 · An agent can trace a line of code back to its thread, after a plan
+
+Chosen by the user (#148). A tool lets an agent go from a line of code to the thread, the agent
+and the turns that wrote it. A plan in the issue comes first: the tool's shape, how it finds the
+turn, what a user outside the thread gets, and what happens after a squash or a rebase. The user
+approves the plan before any code. The other choices were to keep the idea for later, or to
+close it.
+
+## D112 · 2026-11-14 · A second Escape soon after the first leaves the line unfinished
+
+Chosen by the user (#153), widening D108. Escape pressed twice opens Claude Code's rewind picker
+and Codex's backtrack picker, and each press arrives as a read of its own. A second Escape soon
+after the first now leaves the agent's input line unfinished, so no merge runs while a picker is
+open. Merges wait until Enter, Ctrl-C, Ctrl-U or a later single Escape. The window follows the
+agents' own double-press window. The other choice was to leave each Escape as the Escape key.
