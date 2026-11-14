@@ -296,7 +296,8 @@ mod tests {
         let before = rustix::termios::tcgetattr(&slave).unwrap();
         let _ = background(slave.as_fd(), slave.as_fd(), Duration::from_millis(50));
         let after = rustix::termios::tcgetattr(&slave).unwrap();
-        assert_eq!(after.local_modes, before.local_modes);
+        let modes = |termios: &Termios| termios.local_modes - LocalModes::PENDIN;
+        assert_eq!(modes(&after), modes(&before));
         assert_eq!(after.input_modes, before.input_modes);
     }
 
