@@ -367,7 +367,7 @@ fn agent_item<'a>(agent: &StatusAgent<'a>, brought: Brought) -> Item<'a> {
 
 /// Returns the spans that say a turn waits for the user's keypress, and what it changes.
 fn turn_waits(waits: &str) -> [Span<'_>; 2] {
-    let warn = Style::new().fg(Theme::WARN);
+    let warn = Style::new().fg(Theme::palette().warn);
     [
         Span::styled("a turn waits for you: ", warn),
         Span::styled(shown(waits), warn),
@@ -375,7 +375,7 @@ fn turn_waits(waits: &str) -> [Span<'_>; 2] {
 }
 
 fn landing_item<'a>(landing: &StatusLanding<'a>) -> Item<'a> {
-    let warn = Style::new().fg(Theme::WARN);
+    let warn = Style::new().fg(Theme::palette().warn);
     Item::new(vec![
         Span::styled(shown(landing.branch), Theme::title()),
         Span::styled(" · ", Theme::muted()),
@@ -386,7 +386,7 @@ fn landing_item<'a>(landing: &StatusLanding<'a>) -> Item<'a> {
 
 /// Returns the item of `conflicts`, listing at most `listed` of its paths, at least one.
 fn conflicts_item<'a>(conflicts: &StatusConflicts<'a>, listed: usize) -> Item<'a> {
-    let warn = Style::new().fg(Theme::CONFLICT);
+    let warn = Style::new().fg(Theme::palette().conflict);
     let mut spans = vec![
         Span::styled("conflicts from ", warn),
         Span::styled(shown(conflicts.from), warn),
@@ -465,7 +465,7 @@ impl<'a> Header<'a> {
         } else {
             spans.push(Span::styled(
                 shown(self.remote),
-                Style::new().fg(Theme::WARN),
+                Style::new().fg(Theme::palette().warn),
             ));
             if self.remote_key {
                 spans.push(Span::styled(" (m)", Theme::muted()));
@@ -695,7 +695,7 @@ impl<'a> Panel<'a> {
     fn render(&self, area: Rect, buffer: &mut Buffer) {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Theme::BORDER))
+            .border_style(Style::new().fg(Theme::palette().border))
             .padding(Padding::horizontal(1))
             .title(Span::styled(PANEL_TITLE, Theme::title()));
         let inner = block.inner(area);
@@ -747,7 +747,7 @@ fn counts_spans(lines: LineCounts) -> Vec<Span<'static>> {
             if added > 0 {
                 spans.push(Span::styled(
                     format!("+{added}"),
-                    Style::new().fg(Theme::ADDED),
+                    Style::new().fg(Theme::palette().added),
                 ));
             }
             if added > 0 && removed > 0 {
@@ -756,7 +756,7 @@ fn counts_spans(lines: LineCounts) -> Vec<Span<'static>> {
             if removed > 0 {
                 spans.push(Span::styled(
                     format!("−{removed}"),
-                    Style::new().fg(Theme::REMOVED),
+                    Style::new().fg(Theme::palette().removed),
                 ));
             }
             spans
@@ -810,7 +810,7 @@ impl ThreadView<'_> {
             .map_or_else(String::new, |agent| format!(" {} ", agent.label()));
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Theme::BORDER))
+            .border_style(Style::new().fg(Theme::palette().border))
             .title(Span::styled(title, Theme::title()));
         let inner = block.inner(pane);
         block.render(pane, buffer);
@@ -1078,7 +1078,7 @@ mod tests {
         );
         let remote = row.find("none chosen").unwrap();
         let column = u16::try_from(row[..remote].chars().count()).unwrap();
-        assert_eq!(buffer[(column, 0)].style().fg, Some(Theme::WARN));
+        assert_eq!(buffer[(column, 0)].style().fg, Some(Theme::palette().warn));
         let chosen = Header {
             remote: "origin (private)",
             remote_chosen: true,
@@ -1173,8 +1173,14 @@ mod tests {
                 .find(|span| span.content == slot)
                 .and_then(|span| span.style.fg)
         };
-        assert_eq!(colour("alice.claude"), Some(Theme::PARTICIPANTS[0]));
-        assert_eq!(colour("carol.codex"), Some(Theme::PARTICIPANTS[2]));
+        assert_eq!(
+            colour("alice.claude"),
+            Some(Theme::palette().participants[0])
+        );
+        assert_eq!(
+            colour("carol.codex"),
+            Some(Theme::palette().participants[2])
+        );
         assert_eq!(Theme::participant(6), Theme::participant(0));
     }
 
@@ -1258,11 +1264,23 @@ mod tests {
                 "  more changed than are listed",
             ]
         );
-        assert_eq!(lines[0].spans[1].style.fg, Some(Theme::PARTICIPANTS[0]));
-        assert_eq!(lines[2].spans[1].style.fg, Some(Theme::PARTICIPANTS[1]));
+        assert_eq!(
+            lines[0].spans[1].style.fg,
+            Some(Theme::palette().participants[0])
+        );
+        assert_eq!(
+            lines[2].spans[1].style.fg,
+            Some(Theme::palette().participants[1])
+        );
         let counts = &lines[10].spans;
-        assert_eq!(counts[counts.len() - 3].style.fg, Some(Theme::ADDED));
-        assert_eq!(counts[counts.len() - 1].style.fg, Some(Theme::REMOVED));
+        assert_eq!(
+            counts[counts.len() - 3].style.fg,
+            Some(Theme::palette().added)
+        );
+        assert_eq!(
+            counts[counts.len() - 1].style.fg,
+            Some(Theme::palette().removed)
+        );
     }
 
     #[test]

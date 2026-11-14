@@ -536,7 +536,7 @@ impl Home {
         let [printed, last] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(told)]).areas(inner);
         for (line, row) in lines.into_iter().zip(last.rows()) {
-            Line::styled(line, Style::new().fg(Theme::WARN)).render(row, buffer);
+            Line::styled(line, Style::new().fg(Theme::palette().warn)).render(row, buffer);
         }
         let shown_lines = usize::from(printed.height);
         let start = activity.len().saturating_sub(shown_lines);
@@ -546,7 +546,7 @@ impl Home {
             .iter()
             .map(|line| {
                 let style = if line.contains("failed") || line.contains("cannot") {
-                    Style::new().fg(Theme::ERROR)
+                    Style::new().fg(Theme::palette().removed)
                 } else {
                     Theme::muted()
                 };
@@ -633,9 +633,9 @@ fn status_lines(text: &str, width: usize) -> Vec<&str> {
 
 fn panel<'a>(title: &str, focused: bool) -> Block<'a> {
     let border = Style::new().fg(if focused {
-        Theme::ACCENT
+        Theme::palette().accent
     } else {
-        Theme::BORDER
+        Theme::palette().border
     });
     Block::bordered()
         .border_type(BorderType::Rounded)

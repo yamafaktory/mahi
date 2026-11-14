@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     cell,
     fmt,
+    sync::OnceLock,
 };
 
 use mahi_core::is_invisible;
@@ -50,7 +51,10 @@ use ratatui_widgets::{
 };
 use zeroize::Zeroizing;
 
-use crate::PaletteInput;
+use crate::{
+    Background,
+    PaletteInput,
+};
 
 const CODE_MARK: &str = "🔑  ";
 const MAX_INPUT_CHARS: usize = 1024;
@@ -58,58 +62,133 @@ const MAX_WIDTH: u16 = 76;
 const TABLE_GAP: usize = 2;
 const MASK: char = '•';
 
-/// The colours mahi's full-screen views use: cool greys pulled toward plum, with Royal Plum as
-/// the accent, chosen for a dark terminal; plain text outside a dialog or the palette takes the
-/// terminal's own colour.
+/// The colours of one of mahi's palettes: cool greys pulled toward plum, with Royal Plum as the
+/// accent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    /// Titles, the borders of dialogs and the keys shown in hints.
+    pub accent: Color,
+    /// What mahi paints behind its dialogs and its palette.
+    pub surface: Color,
+    /// The borders of panes.
+    pub border: Color,
+    /// Text on mahi's surface.
+    pub text: Color,
+    /// Text that matters less.
+    pub muted: Color,
+    /// Lines a change added.
+    pub added: Color,
+    /// Lines a change removed, and something that failed.
+    pub removed: Color,
+    /// Something that waits for the user.
+    pub warn: Color,
+    /// Conflicts to resolve.
+    pub conflict: Color,
+    /// The participants' colours, by their place in the thread's `meta`: plum, teal, blue,
+    /// lavender, sky and sand, then again from the first. None is a colour of the status.
+    pub participants: [Color; 6],
+}
+
+impl Palette {
+    /// The palette for a dark terminal.
+    pub const DARK: Self = Self {
+        accent: DARK_ACCENT,
+        surface: Color::Rgb(0x1c, 0x1a, 0x22),
+        border: Color::Rgb(0x34, 0x30, 0x3d),
+        text: Color::Rgb(0xe2, 0xde, 0xe6),
+        muted: Color::Rgb(0xa3, 0x9d, 0xad),
+        added: Color::Rgb(0x9c, 0xc4, 0x8a),
+        removed: Color::Rgb(0xe0, 0x70, 0x7a),
+        warn: Color::Rgb(0xe2, 0xbe, 0x7a),
+        conflict: Color::Rgb(0xf0, 0x88, 0x3c),
+        participants: [
+            DARK_ACCENT,
+            Color::Rgb(0x5f, 0xb8, 0xb0),
+            Color::Rgb(0x7f, 0xa3, 0xe8),
+            Color::Rgb(0xa9, 0x8b, 0xe0),
+            Color::Rgb(0x6c, 0xc7, 0xe0),
+            Color::Rgb(0xbf, 0xb0, 0x9c),
+        ],
+    };
+
+    /// The palette for a light terminal: the dark palette's hues, darkened to read on a light
+    /// background.
+    pub const LIGHT: Self = Self {
+        accent: LIGHT_ACCENT,
+        surface: Color::Rgb(0xf6, 0xf3, 0xf8),
+        border: Color::Rgb(0xd3, 0xcd, 0xd9),
+        text: Color::Rgb(0x2a, 0x26, 0x30),
+        muted: Color::Rgb(0x73, 0x6b, 0x80),
+        added: Color::Rgb(0x4f, 0x78, 0x3d),
+        removed: Color::Rgb(0xcf, 0x2d, 0x3b),
+        warn: Color::Rgb(0x8d, 0x67, 0x1f),
+        conflict: Color::Rgb(0xb1, 0x52, 0x0e),
+        participants: [
+            LIGHT_ACCENT,
+            Color::Rgb(0x36, 0x79, 0x74),
+            Color::Rgb(0x2d, 0x68, 0xd9),
+            Color::Rgb(0x7f, 0x53, 0xd1),
+            Color::Rgb(0x1e, 0x77, 0x90),
+            Color::Rgb(0x7e, 0x6b, 0x51),
+        ],
+    };
+
+    /// Returns the palette for a terminal with a `background` of that kind.
+    #[must_use]
+    pub fn of(background: Background) -> &'static Self {
+        match background {
+            Background::Dark => &Self::DARK,
+            Background::Light => &Self::LIGHT,
+        }
+    }
+}
+
+const DARK_ACCENT: Color = Color::Rgb(0xd8, 0x64, 0xaf);
+const LIGHT_ACCENT: Color = Color::Rgb(0xc1, 0x31, 0x8e);
+
+static BACKGROUND: OnceLock<Background> = OnceLock::new();
+
+/// The styles mahi's full-screen views use, from the palette of the terminal's background; plain
+/// text outside a dialog or the palette takes the terminal's own colour.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme;
 
 impl Theme {
-    /// Titles, the borders of dialogs and the keys shown in hints: Royal Plum lightened, to read
-    /// on a dark terminal.
-    pub const ACCENT: Color = Color::Rgb(0xd8, 0x64, 0xaf);
-    /// The selected row and mahi's badge: Royal Plum, #832161.
+    /// The selected row and mahi's badge in both palettes: Royal Plum, #832161.
     pub const PLUM: Color = Color::Rgb(0x83, 0x21, 0x61);
-    /// What mahi paints behind its dialogs and its palette.
-    pub const SURFACE: Color = Color::Rgb(0x1c, 0x1a, 0x22);
-    /// The borders of panes.
-    pub const BORDER: Color = Color::Rgb(0x34, 0x30, 0x3d);
-    /// Text on mahi's surface and on the selection.
-    pub const TEXT: Color = Color::Rgb(0xe2, 0xde, 0xe6);
-    /// Text that matters less.
-    pub const MUTED: Color = Color::Rgb(0xa3, 0x9d, 0xad);
-    /// Lines a change added.
-    pub const ADDED: Color = Color::Rgb(0x9c, 0xc4, 0x8a);
-    /// Lines a change removed, and something that failed.
-    pub const REMOVED: Color = Color::Rgb(0xe0, 0x70, 0x7a);
-    /// Something that waits for the user.
-    pub const WARN: Color = Color::Rgb(0xe2, 0xbe, 0x7a);
-    /// Conflicts to resolve.
-    pub const CONFLICT: Color = Color::Rgb(0xf0, 0x88, 0x3c);
-    /// Something that failed.
-    pub const ERROR: Color = Self::REMOVED;
-    /// The participants' colours, by their place in the thread's `meta`: plum, teal, blue,
-    /// lavender, sky and sand, then again from the first. None is a colour of the status.
-    pub const PARTICIPANTS: [Color; 6] = [
-        Self::ACCENT,
-        Color::Rgb(0x5f, 0xb8, 0xb0),
-        Color::Rgb(0x7f, 0xa3, 0xe8),
-        Color::Rgb(0xa9, 0x8b, 0xe0),
-        Color::Rgb(0x6c, 0xc7, 0xe0),
-        Color::Rgb(0xbf, 0xb0, 0x9c),
-    ];
+    /// Text on Royal Plum.
+    pub const ON_PLUM: Color = Color::Rgb(0xe2, 0xde, 0xe6);
+
+    /// Picks the palette for the terminal's `background`, once at start; a later call
+    /// changes nothing.
+    pub fn set_background(background: Background) {
+        let _ = BACKGROUND.set(background);
+    }
+
+    /// Returns the terminal's background, as set at start.
+    #[must_use]
+    pub fn background() -> Background {
+        BACKGROUND.get().copied().unwrap_or_default()
+    }
+
+    /// Returns the palette picked for the terminal's background.
+    #[must_use]
+    pub fn palette() -> &'static Palette {
+        Palette::of(Self::background())
+    }
 
     /// Returns the colour of the participant at `place` in the thread's `meta`.
     #[must_use]
     pub fn participant(place: usize) -> Color {
-        Self::PARTICIPANTS[place % Self::PARTICIPANTS.len()]
+        let participants = &Self::palette().participants;
+        participants[place % participants.len()]
     }
 
     /// Returns the style of a selected row.
     #[must_use]
     pub fn selected() -> Style {
         Style::new()
-            .fg(Self::TEXT)
+            .fg(Self::ON_PLUM)
             .bg(Self::PLUM)
             .add_modifier(Modifier::BOLD)
     }
@@ -117,25 +196,31 @@ impl Theme {
     /// Returns the style of a title.
     #[must_use]
     pub fn title() -> Style {
-        Style::new().fg(Self::ACCENT).add_modifier(Modifier::BOLD)
+        Style::new()
+            .fg(Self::palette().accent)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Returns the style of a command or a name the user types, written between backticks.
     #[must_use]
     pub fn code() -> Style {
-        Style::new().fg(Self::WARN).add_modifier(Modifier::BOLD)
+        Style::new()
+            .fg(Self::palette().warn)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Returns the style of quieter text.
     #[must_use]
     pub fn muted() -> Style {
-        Style::new().fg(Self::MUTED)
+        Style::new().fg(Self::palette().muted)
     }
 
     /// Returns the style of a dialog or the palette: mahi's text on its surface.
     #[must_use]
     pub fn surface() -> Style {
-        Style::new().fg(Self::TEXT).bg(Self::SURFACE)
+        Style::new()
+            .fg(Self::palette().text)
+            .bg(Self::palette().surface)
     }
 }
 
@@ -493,7 +578,7 @@ impl Dialog {
         Clear.render(boxed, buffer);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Theme::ACCENT))
+            .border_style(Style::new().fg(Theme::palette().accent))
             .style(Theme::surface())
             .padding(Padding::horizontal(1))
             .title(Line::from(format!(" {} ", shown(&self.title))).style(Theme::title()));
@@ -596,7 +681,7 @@ impl Dialog {
                 Line::from(vec![
                     Span::styled("› ", Theme::title()),
                     Span::raw(tail(&typed, room)),
-                    Span::styled("▏", Style::new().fg(Theme::ACCENT)),
+                    Span::styled("▏", Style::new().fg(Theme::palette().accent)),
                 ])
                 .render(rest, buffer);
             }
@@ -840,6 +925,61 @@ mod tests {
             .collect()
     }
 
+    fn contrast(foreground: Color, background: Color) -> f64 {
+        let luminance = |color: Color| {
+            let Color::Rgb(red, green, blue) = color else {
+                panic!("{color:?} is not given as rgb");
+            };
+            let channel = |value: u8| f64::from(value) / 255.0;
+            crate::background::relative_luminance([channel(red), channel(green), channel(blue)])
+        };
+        let (one, other) = (luminance(foreground), luminance(background));
+        (one.max(other) + 0.05) / (one.min(other) + 0.05)
+    }
+
+    #[test]
+    fn each_palettes_text_colours_read_on_its_surface_and_the_light_ones_on_white() {
+        let white = Color::Rgb(0xff, 0xff, 0xff);
+        for (palette, grounds) in [
+            (Palette::DARK, vec![Palette::DARK.surface]),
+            (
+                Palette::LIGHT,
+                vec![Palette::LIGHT.surface, white, Color::Rgb(0xfd, 0xf6, 0xe3)],
+            ),
+        ] {
+            let mut texts = vec![
+                palette.accent,
+                palette.text,
+                palette.muted,
+                palette.added,
+                palette.removed,
+                palette.warn,
+                palette.conflict,
+            ];
+            texts.extend(palette.participants);
+            for ground in grounds {
+                for &text in &texts {
+                    assert!(contrast(text, ground) >= 4.5, "{text:?} on {ground:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_selections_text_reads_on_royal_plum() {
+        assert!(contrast(Theme::ON_PLUM, Theme::PLUM) >= 4.5);
+    }
+
+    #[test]
+    fn a_light_background_picks_the_light_palette() {
+        assert_eq!(Theme::palette(), &Palette::DARK);
+        Theme::set_background(Background::Light);
+        assert_eq!(Theme::background(), Background::Light);
+        assert_eq!(Theme::palette(), &Palette::LIGHT);
+        assert_eq!(Theme::participant(7), Palette::LIGHT.participants[1]);
+        assert_eq!(Theme::surface().bg, Some(Palette::LIGHT.surface));
+    }
+
     #[test]
     fn a_dialog_is_drawn_on_mahis_surface_over_what_lies_around_it() {
         let area = Rect::new(0, 0, 80, 20);
@@ -850,8 +990,8 @@ mod tests {
             .find(|&at| buffer[at].symbol() == "╭")
             .unwrap();
         let inside = buffer[(corner.0 + 40, corner.1 + 3)].style();
-        assert_eq!(inside.bg, Some(Theme::SURFACE));
-        assert_eq!(inside.fg, Some(Theme::TEXT));
+        assert_eq!(inside.bg, Some(Theme::palette().surface));
+        assert_eq!(inside.fg, Some(Theme::palette().text));
         assert_eq!(buffer[(0, 0)].style().bg, Some(Color::Reset));
     }
 

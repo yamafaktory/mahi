@@ -9,6 +9,7 @@ use std::{
 };
 
 use mahi_store::GlobalPatterns;
+use mahi_term::Background;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -31,6 +32,10 @@ pub(crate) const HOOK_SOCKET: &str = "MAHI_HOOK_SOCKET";
 
 /// The variable that tells `mahi mcp` where the mahi that started the agent serves its tools.
 pub(crate) const MCP_SOCKET: &str = "MAHI_MCP_SOCKET";
+
+/// The variable that tells a mahi the workspace starts whether the terminal's background is
+/// light or dark, so it does not ask the terminal again.
+pub(crate) const THEME: &str = "MAHI_THEME";
 
 /// The variable that tells the agent's hooks where the mahi binary is.
 pub(crate) const MAHI_BIN: &str = "MAHI_BIN";
@@ -93,6 +98,7 @@ pub(crate) struct Environment {
     pub(crate) term_program: Option<String>,
     pub(crate) tmux: bool,
     pub(crate) colorterm: Option<String>,
+    pub(crate) theme: Option<Background>,
     pub(crate) kitty: bool,
     pub(crate) vte: bool,
     pub(crate) whole: Vec<(OsString, Zeroizing<Vec<u8>>)>,
@@ -230,6 +236,7 @@ impl Environment {
             term_program: text("TERM_PROGRAM"),
             tmux: value("TMUX").is_some(),
             colorterm: text("COLORTERM"),
+            theme: text(THEME).as_deref().and_then(Background::from_name),
             kitty: value("KITTY_WINDOW_ID").is_some(),
             vte: value("VTE_VERSION").is_some(),
             key_fd: text(KEY_FD)

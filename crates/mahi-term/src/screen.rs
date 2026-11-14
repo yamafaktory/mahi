@@ -493,17 +493,19 @@ mod tests {
             indexes.dedup();
             assert_eq!(indexes.len(), colors.len(), "{colors:?}");
         };
-        let mut named = crate::Theme::PARTICIPANTS.to_vec();
-        named.extend([
-            crate::Theme::ADDED,
-            crate::Theme::REMOVED,
-            crate::Theme::WARN,
-            crate::Theme::CONFLICT,
-        ]);
-        apart(&named);
-        apart(&[crate::Theme::TEXT, crate::Theme::MUTED]);
-        apart(&[crate::Theme::SURFACE, crate::Theme::BORDER]);
-        apart(&[crate::Theme::SURFACE, crate::Theme::ACCENT]);
+        for palette in [crate::Palette::DARK, crate::Palette::LIGHT] {
+            let mut named = palette.participants.to_vec();
+            named.extend([
+                palette.added,
+                palette.removed,
+                palette.warn,
+                palette.conflict,
+            ]);
+            apart(&named);
+            apart(&[palette.text, palette.muted]);
+            apart(&[palette.surface, palette.border]);
+            apart(&[palette.surface, palette.accent]);
+        }
     }
 
     #[test]

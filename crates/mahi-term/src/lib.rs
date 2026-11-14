@@ -3,6 +3,7 @@
 //! agent's escape sequences, and drawing the palette.
 
 mod agent_screen;
+mod background;
 mod dialog;
 mod home;
 mod input;
@@ -21,9 +22,15 @@ pub use agent_screen::{
     new_screen,
     resize_screen,
 };
+pub use background::{
+    BACKGROUND_QUERY,
+    Background,
+    BackgroundReply,
+};
 pub use dialog::{
     Answer,
     Dialog,
+    Palette,
     Theme,
     key_hints,
 };

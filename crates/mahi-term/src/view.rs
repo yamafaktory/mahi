@@ -168,7 +168,7 @@ impl PaletteView<'_> {
         let title = fitted(self.title, usize::from(area.width).saturating_sub(4), true);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(Theme::ACCENT))
+            .border_style(Style::new().fg(Theme::palette().accent))
             .style(Theme::surface())
             .padding(Padding::horizontal(1))
             .title(Line::from(format!(" {title} ")).style(Theme::title()));
@@ -233,7 +233,12 @@ fn item_line(item: &PaletteItem<'_>, room: usize, selected: bool) -> Line<'stati
     let mut spans = vec![Span::raw(label)];
     if used + 2 < room {
         let detail = fitted(item.detail, room - used - 2, true);
-        spans.push(Span::styled(format!("  {detail}"), Theme::muted()));
+        let style = if selected {
+            Style::new()
+        } else {
+            Theme::muted()
+        };
+        spans.push(Span::styled(format!("  {detail}"), style));
     }
     let line = Line::from(spans);
     if selected {
@@ -384,6 +389,19 @@ mod tests {
         parser
             .screen()
             .contents_between(row, 0, row, parser.screen().size().1)
+    }
+
+    #[test]
+    fn a_selected_items_detail_takes_the_selections_text_colour() {
+        let item = PaletteItem {
+            label: "bob.claude",
+            detail: "add a login page",
+        };
+        let selected = item_line(&item, 60, true);
+        assert_eq!(selected.style.fg, Some(Theme::ON_PLUM));
+        assert!(selected.spans.iter().all(|span| span.style.fg.is_none()));
+        let other = item_line(&item, 60, false);
+        assert_eq!(other.spans[1].style.fg, Some(Theme::palette().muted));
     }
 
     #[test]

@@ -61,6 +61,7 @@ use mahi_term::{
     TabBar,
     TabHit,
     TeammateState,
+    Theme,
     ThreadChoice,
     ThreadView,
     TopBar,
@@ -85,6 +86,7 @@ use crate::{
         Environment,
         KEY_FD,
         REPORT_FD,
+        THEME,
     },
     join::WAITING_FOR_HOST,
     palette::HELD_DETAIL,
@@ -194,7 +196,8 @@ impl Child {
             let ours = [KEY_FD, REPORT_FD, COMMAND_FD]
                 .iter()
                 .any(|own| name == own);
-            if name != "TERM" && !ours && !TERMINAL_OWN.iter().any(|own| name == own) {
+            let set_here = name == "TERM" || name == THEME;
+            if !set_here && !ours && !TERMINAL_OWN.iter().any(|own| name == own) {
                 command = command.env(name, OsStr::from_bytes(value));
             }
         }
@@ -214,7 +217,9 @@ impl Child {
             .env(COMMAND_FD, command_end.as_raw_fd().to_string())
             .pass_fd(command_end);
         Ok(Some((
-            command.env("TERM", CHILD_TERM),
+            command
+                .env("TERM", CHILD_TERM)
+                .env(THEME, Theme::background().as_str()),
             reports,
             File::from(commands),
         )))
@@ -3402,12 +3407,14 @@ mod tests {
                 variable("MAHI_SEEN", b"carried"),
                 variable("TMUX", b"/tmp/tmux"),
                 variable("TERM", b"xterm-kitty"),
+                variable("MAHI_THEME", b"dark"),
             ],
             ..Environment::default()
         };
+        Theme::set_background(mahi_term::Background::Light);
         let words = [
             OsStr::new("-c"),
-            OsStr::new("echo \"$MAHI_SEEN $0 tmux=$TMUX term=$TERM\""),
+            OsStr::new("echo \"$MAHI_SEEN $0 tmux=$TMUX term=$TERM theme=$MAHI_THEME\""),
             OsStr::new("word"),
         ];
         let command = Child::mahi(&environment, &words, (Path::new("/"), SIZE), None)
@@ -3419,7 +3426,7 @@ mod tests {
             child
                 .screen()
                 .contents()
-                .contains("carried word tmux= term=xterm-256color")
+                .contains("carried word tmux= term=xterm-256color theme=light")
         });
         assert!(
             Child::mahi(

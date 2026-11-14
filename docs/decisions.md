@@ -852,3 +852,14 @@ and Codex's backtrack picker, and each press arrives as a read of its own. A sec
 after the first now leaves the agent's input line unfinished, so no merge runs while a picker is
 open. Merges wait until Enter, Ctrl-C, Ctrl-U or a later single Escape. The window follows the
 agents' own double-press window. The other choice was to leave each Escape as the Escape key.
+
+## D113 · 2026-11-14 · The light palette keeps the dark palette's hues, darkened
+
+Chosen by the user (#144), completing D110. Each light colour keeps the hue of its dark colour
+and is darkened until it reaches 4.5:1 contrast on white, on #FDF6E3 and on the light surface:
+ACCENT #C1318E, MUTED #736B80, ADDED #4F783D, REMOVED #CF2D3B, WARN #8D671F, CONFLICT #B1520E,
+teal #367974, blue #2D68D9, lavender #7F53D1, sky #1E7790, sand #7E6B51, the surface #F6F3F8
+with text #2A2630, and pane borders #D3CDD9. Royal Plum stays behind the selection and the badge,
+with its text in #E2DEE6. Dialogs and the palette take the light surface on a light terminal.
+Teal is #367974 rather than the proposed #367973, so it stays apart from ADDED on a terminal of
+256 colours. The other choices were to keep dialogs dark in both palettes, or to adjust colours.

@@ -757,7 +757,7 @@ fn draw_over_backdrop(
             Some(kept) => frame.buffer_mut().content.clone_from(&kept.content),
             None => Line::from(vec![
                 Span::styled(" mahi ", Theme::selected()),
-                Span::styled("  working", Style::new().fg(Theme::MUTED)),
+                Span::styled("  working", Style::new().fg(Theme::palette().muted)),
             ])
             .render(area, frame.buffer_mut()),
         }

@@ -67,11 +67,16 @@ use std::{
         self,
         Write as _,
     },
+    os::fd::AsFd,
     process,
 };
 
 use clap::Parser;
 use mahi_identity::ConfigDir;
+use mahi_term::{
+    Background,
+    Theme,
+};
 
 use crate::{
     cli::{
@@ -137,6 +142,18 @@ fn main() {
         commands::connect(fd);
     }
     ui::set_true_color(ui::draws_true_color(environment.colorterm.as_deref()));
+    let may_ask = terminal::is_interactive() && terminal::is_foreground(io::stdin().as_fd());
+    if let Some(background) =
+        chosen_background(cli.command.as_ref(), environment.theme, may_ask, || {
+            terminal::background(
+                io::stdin().as_fd(),
+                io::stdout().as_fd(),
+                terminal::BACKGROUND_WAIT,
+            )
+        })
+    {
+        Theme::set_background(background);
+    }
     make_config_private(&environment);
     if required.is_some() {
         let loaded = ConfigDir::resolve(
@@ -160,6 +177,22 @@ fn main() {
         process::exit(home::home(&environment));
     };
     process::exit(run_command(command, &environment));
+}
+
+/// Returns the background whose palette `command` draws with, when it draws with mahi's theme
+/// (the home screen, and an agent's or a watched thread's palette): the one `theme` names, or
+/// else the one `ask` reads from the terminal when mahi `may_ask` it, or else dark.
+fn chosen_background(
+    command: Option<&Command>,
+    theme: Option<Background>,
+    may_ask: bool,
+    ask: impl FnOnce() -> Background,
+) -> Option<Background> {
+    let draws = matches!(
+        command,
+        None | Some(Command::Run(_) | Command::Resume(_) | Command::Join(_))
+    );
+    draws.then(|| theme.unwrap_or_else(|| if may_ask { ask() } else { Background::Dark }))
 }
 
 /// Sets mahi up when the command needs it, then runs the command, and returns its exit code.
@@ -441,5 +474,41 @@ fn causes(message: &mut String, error: &dyn Error) {
     while let Some(cause) = source {
         let _ = write!(message, ": {cause}");
         source = cause.source();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(words: &[&str]) -> Option<Command> {
+        let mut all = vec!["mahi"];
+        all.extend_from_slice(words);
+        Cli::parse_from(all).command
+    }
+
+    #[test]
+    fn only_a_command_that_draws_asks_and_the_theme_variable_or_a_terminal_it_cannot_ask_wins() {
+        let asked = |command: Option<&Command>, theme, may_ask| {
+            let mut asks = 0;
+            let background = chosen_background(command, theme, may_ask, || {
+                asks += 1;
+                Background::Light
+            });
+            (background, asks)
+        };
+        let run = command(&["run", "claude"]);
+        let threads = command(&["threads"]);
+        assert_eq!(asked(None, None, true), (Some(Background::Light), 1));
+        assert_eq!(
+            asked(run.as_ref(), None, true),
+            (Some(Background::Light), 1)
+        );
+        assert_eq!(asked(None, None, false), (Some(Background::Dark), 0));
+        assert_eq!(
+            asked(None, Some(Background::Dark), true),
+            (Some(Background::Dark), 0)
+        );
+        assert_eq!(asked(threads.as_ref(), None, true), (None, 0));
     }
 }

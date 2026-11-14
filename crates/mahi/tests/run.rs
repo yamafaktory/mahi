@@ -5289,6 +5289,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         .env("SSH_AUTH_SOCK", &fixture.socket)
         .env("USER", "tester")
         .env("MAHI_LIVE", "off")
+        .env("MAHI_THEME", "dark")
         .spawn()
         .unwrap();
         let terminal = mahi.writer().unwrap();
@@ -5309,6 +5310,46 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         });
         assert_eq!(exit_code(status.unwrap()), 128 + 15);
         assert!(canonical(&terminal));
+    }
+
+    #[test]
+    fn ctrl_c_while_mahi_asks_the_terminal_for_its_background_ends_it_and_restores_the_terminal() {
+        let fixture = fixture();
+        let mut mahi = PtyCommand::new(
+            mahi_binary().as_path(),
+            &fixture.repo,
+            WindowSize { rows: 24, cols: 80 },
+        )
+        .arg("run")
+        .arg("sleep")
+        .arg("60")
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &fixture.home)
+        .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+        .env("SSH_AUTH_SOCK", &fixture.socket)
+        .env("USER", "tester")
+        .env("MAHI_LIVE", "off")
+        .spawn()
+        .unwrap();
+        let mut terminal = mahi.writer().unwrap();
+        let mut reader = mahi.reader().unwrap();
+        let mut seen = Vec::new();
+        let mut chunk = [0; 256];
+        while !seen.windows(5).any(|window| window == b"\x1b]11;") {
+            let read = reader.read(&mut chunk).unwrap();
+            assert!(read > 0, "mahi ended before it asked: {seen:?}");
+            seen.extend_from_slice(&chunk[..read]);
+        }
+        drain(reader);
+        terminal.write_all(b"\x03").unwrap();
+        let mut status = None;
+        wait_until("mahi to exit", || {
+            status = mahi.try_wait().unwrap();
+            status.is_some()
+        });
+        assert_eq!(exit_code(status.unwrap()), 128 + 2);
+        let modes = rustix::termios::tcgetattr(&terminal).unwrap().local_modes;
+        assert!(modes.contains(LocalModes::ICANON));
     }
 
     #[test]
