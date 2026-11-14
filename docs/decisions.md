@@ -809,3 +809,13 @@ and puts back as deleted any of them that a merge deleted while the hook read it
 such a file added and then deleted reads `deleted` in the note, so the agent learns that a file
 it read about is gone; any other file added then deleted still leaves the note. The other
 choice was to keep dropping it.
+
+## D108 · 2026-11-14 · An escape byte before another one leaves the line unfinished
+
+Chosen by the user (#150). Terminals that send Alt as an escape prefix send Alt+Up as
+`ESC ESC [A`. Codex reads those bytes as Escape, and an agent that reads them as Alt+Up keeps
+working. mahi counts an escape byte right before another one as a key that leaves the agent's
+input line unfinished, in one read or across two. Merges wait until Enter, Ctrl-C, Ctrl-U or
+Escape empties the line again, and never land in a running turn. The other choices were to read it as the Escape key, which ends
+the turn for mahi while such an agent still works, or as an Alt prefix that changes nothing,
+which lets a merge run while Escape pressed twice holds a picker open.

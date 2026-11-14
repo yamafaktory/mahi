@@ -179,8 +179,7 @@ impl Activity {
             self.took(&line_effect(bytes));
             return;
         };
-        let escaped = unfinished.as_slice() == [ESC] && bytes.first() == Some(&ESC);
-        if escaped || bytes == [ESC] {
+        if bytes == [ESC] {
             unfinished.clear();
         }
         let joined = !unfinished.is_empty();
@@ -189,7 +188,7 @@ impl Activity {
         }
         let read = if joined { unfinished.as_slice() } else { bytes };
         let head = read.get(..unfinished_answer_at(read)).unwrap_or_default();
-        let effect = (!is_terminal_answer(head)).then(|| line_effect(head));
+        let effect = (!is_terminal_answer(head)).then(|| line_effect(read));
         let finished = head.len();
         if joined {
             unfinished.drain(..finished);
@@ -200,9 +199,6 @@ impl Activity {
             unfinished.clear();
         }
         drop(unfinished);
-        if escaped {
-            self.took(&line_effect(&[ESC]));
-        }
         if let Some(effect) = effect {
             self.took(&effect);
         }
@@ -803,19 +799,6 @@ mod tests {
     }
 
     #[test]
-    fn an_escape_held_after_an_answer_is_the_escape_key_when_a_sequence_follows() {
-        let pace = fast();
-        let activity = Activity::default();
-        activity.keys(b"a");
-        activity.saw(HookKind::Prompt, b"");
-        activity.keys(b"\x1b[I\x1b");
-        activity.keys(b"\x1b[O");
-        assert!(!activity.is_turn_open());
-        thread::sleep(pace.quiet);
-        assert!(activity.is_idle(&pace));
-    }
-
-    #[test]
     fn a_control_key_after_a_held_answer_prefix_still_counts() {
         let pace = fast();
         for prefix in [&b"\x1b[1"[..], b"\x1b]1", b"\x1b]11;rgb", b"\x1bP1"] {
@@ -1045,6 +1028,38 @@ mod tests {
         assert!(activity.is_idle(&pace));
         activity.keys(b"");
         assert!(activity.is_idle(&pace));
+    }
+
+    #[test]
+    fn an_escape_before_another_escape_leaves_the_line_unfinished_in_one_read_or_two() {
+        let unfinished = LineEffect {
+            line_empty: Some(false),
+            interrupts: false,
+        };
+        for bytes in [
+            &b"\x1b\x1b"[..],
+            b"\x1b\x1b[A",
+            b"\x1b\x1b[12;40R",
+            b"\x1b[I\x1b\x1b[O",
+        ] {
+            assert_eq!(line_effect(bytes), unfinished, "{bytes:?}");
+        }
+        let pace = fast();
+        for reads in [
+            &[&b"\x1b[I\x1b\x1b[O"[..]][..],
+            &[b"\x1b[I\x1b", b"\x1b[O"],
+            &[b"\x1b[I\x1b", b"\x1b[12;", b"40R"],
+        ] {
+            let activity = Activity::default();
+            activity.saw(HookKind::Prompt, b"");
+            for read in reads {
+                activity.keys(read);
+            }
+            assert!(activity.is_turn_open(), "{reads:?}");
+            activity.saw(HookKind::TurnEnd, b"");
+            thread::sleep(pace.quiet);
+            assert!(!activity.is_idle(&pace), "{reads:?}");
+        }
     }
 
     #[test]
