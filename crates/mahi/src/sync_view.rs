@@ -3,7 +3,10 @@ use mahi_core::{
     ThreadId,
 };
 use mahi_store::Store;
-use mahi_term::StatusConflicts;
+use mahi_term::{
+    MergedFiles,
+    StatusConflicts,
+};
 
 use crate::{
     auto_merge,
@@ -15,6 +18,7 @@ use crate::{
     held,
     note::{
         self,
+        Brought,
         Note,
     },
 };
@@ -30,7 +34,7 @@ pub(crate) struct SyncView {
     landing: Option<String>,
     held: Vec<String>,
     conflicts: Option<Kept>,
-    brought: Vec<(String, Vec<String>)>,
+    brought: Vec<(String, Brought)>,
     changes: Option<ChangesView>,
 }
 
@@ -69,7 +73,7 @@ impl SyncView {
         let brought = Note::load(&note::file(store, thread, own))
             .map(|note| {
                 note.brought()
-                    .map(|(from, paths)| (from.to_string(), paths.map(str::to_owned).collect()))
+                    .map(|(from, brought)| (from.to_string(), brought.clone()))
                     .collect()
             })
             .unwrap_or_default();
@@ -107,12 +111,12 @@ impl SyncView {
         self.held.iter().any(|held| held == slot)
     }
 
-    /// Returns the files the merges of the teammate's agent `slot` brought.
-    pub(crate) fn brought(&self, slot: &str) -> &[String] {
+    /// Returns the files the merges of the teammate's agent `slot` brought, by kind.
+    pub(crate) fn brought(&self, slot: &str) -> MergedFiles<'_> {
         self.brought
             .iter()
             .find(|(from, _)| from == slot)
-            .map_or(&[], |(_, paths)| paths.as_slice())
+            .map_or_else(MergedFiles::default, |(_, brought)| brought.files())
     }
 
     /// Returns the conflicts left in the user's worktree, when there are any.
@@ -187,7 +191,11 @@ mod tests {
             .save(&conflicts::file(&store, thread, &own))
             .unwrap();
         let brought = paths(&["src/client.rs"]);
-        let files = [("src/client.rs".to_owned(), note::Kind::Added)];
+        let gone = paths(&["old.rs"]);
+        let files = [
+            ("src/client.rs".to_owned(), note::Kind::Added),
+            ("old.rs".to_owned(), note::Kind::Deleted),
+        ];
         note::record(
             &note::file(&store, thread, &own),
             &Source::Agent(carol.clone()),
@@ -200,8 +208,13 @@ mod tests {
         .unwrap();
         let view = SyncView::read(&store, thread, &own);
         assert!(view.waits("bob.claude") && !view.waits("carol.codex"));
-        assert_eq!(view.brought("carol.codex"), brought);
-        assert!(view.brought("bob.claude").is_empty());
+        let carols = MergedFiles {
+            deleted: &gone,
+            changed: &[],
+            added: &brought,
+        };
+        assert_eq!(view.brought("carol.codex"), carols);
+        assert_eq!(view.brought("bob.claude"), MergedFiles::default());
         let conflicts = view.conflicts().unwrap();
         assert_eq!(
             (conflicts.from, conflicts.paths, conflicts.more),
@@ -222,7 +235,7 @@ mod tests {
         }
         let status: Vec<_> = teammates
             .status(&view)
-            .map(|agent| (agent.slot, agent.state, agent.waits, agent.brought.to_vec()))
+            .map(|agent| (agent.slot, agent.state, agent.waits, agent.brought))
             .collect();
         assert_eq!(
             status,
@@ -231,14 +244,14 @@ mod tests {
                     "bob.claude",
                     TeammateState::Live,
                     Some(HELD_DETAIL),
-                    Vec::new()
+                    MergedFiles::default()
                 ),
-                ("carol.codex", TeammateState::Live, None, brought.clone()),
+                ("carol.codex", TeammateState::Live, None, carols),
                 (
                     "dan.claude",
                     TeammateState::Offline,
                     Some(HELD_DETAIL),
-                    Vec::new()
+                    MergedFiles::default()
                 ),
             ]
         );

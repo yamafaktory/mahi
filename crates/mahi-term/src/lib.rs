@@ -76,6 +76,7 @@ pub use view::{
 pub use workspace::{
     AgentState,
     Header,
+    MergedFiles,
     OwnAgent,
     Panel,
     PanelChanges,

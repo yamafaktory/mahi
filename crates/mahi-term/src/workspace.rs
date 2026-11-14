@@ -161,8 +161,37 @@ pub struct StatusAgent<'a> {
     /// What a turn of it that waits for the user's keypress changes, such as `changes agent
     /// settings`.
     pub waits: Option<&'a str>,
-    /// The files the last merge of its work into the user's worktree brought.
-    pub brought: &'a [String],
+    /// The files the merges of its work into the user's worktree brought.
+    pub brought: MergedFiles<'a>,
+}
+
+/// The files the merges of a teammate's agent brought, by what they did to each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MergedFiles<'a> {
+    /// The files its merges deleted.
+    pub deleted: &'a [String],
+    /// The files its merges changed.
+    pub changed: &'a [String],
+    /// The files its merges added.
+    pub added: &'a [String],
+}
+
+impl<'a> MergedFiles<'a> {
+    fn rows(&self) -> [(&'static str, &'a [String]); 3] {
+        [
+            ("deleted: ", self.deleted),
+            ("changed: ", self.changed),
+            ("added: ", self.added),
+        ]
+    }
+
+    fn paths(&self) -> impl Iterator<Item = &'a String> {
+        self.rows().into_iter().flat_map(|(_, paths)| paths)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.paths().next().is_none()
+    }
 }
 
 /// The paths a merge of a teammate's agent's work left with conflict markers.
@@ -331,7 +360,7 @@ fn agent_item<'a>(agent: &StatusAgent<'a>, brought: Brought) -> Item<'a> {
     }
     if brought == Brought::Shown && !agent.brought.is_empty() {
         spans.push(Span::styled(" · ", Theme::muted()));
-        push_paths(&mut spans, agent.brought, Style::new());
+        push_paths(&mut spans, agent.brought.paths(), Style::new());
     }
     Item::new(spans)
 }
@@ -376,8 +405,13 @@ fn conflicts_item<'a>(conflicts: &StatusConflicts<'a>, listed: usize) -> Item<'a
     Item::new(spans)
 }
 
-fn push_paths<'a>(spans: &mut Vec<Span<'a>>, paths: &'a [String], style: Style) {
-    for (index, path) in paths.iter().enumerate() {
+fn push_paths<'a>(
+    spans: &mut Vec<Span<'a>>,
+    paths: impl IntoIterator<Item = &'a String>,
+    style: Style,
+) {
+    let paths = paths.into_iter().enumerate();
+    for (index, path) in paths {
         if index > 0 {
             spans.push(Span::styled(", ", style));
         }
@@ -624,9 +658,11 @@ impl<'a> Panel<'a> {
                 spans.extend(turn_waits(waits));
                 lines.push(Line::from(spans));
             }
-            if !agent.brought.is_empty() {
-                let mut spans = vec![Span::raw("  "), Span::styled("merged: ", Theme::muted())];
-                push_paths(&mut spans, agent.brought, Style::new());
+            let rows = agent.brought.rows();
+            let rows = rows.into_iter().filter(|(_, paths)| !paths.is_empty());
+            for (kind, paths) in rows {
+                let mut spans = vec![Span::raw("  "), Span::styled(kind, Theme::muted())];
+                push_paths(&mut spans, paths, Style::new());
                 lines.push(Line::from(spans));
             }
         }
@@ -1115,14 +1151,14 @@ mod tests {
                 slot: "alice.claude",
                 state: TeammateState::Done,
                 waits: None,
-                brought: &[],
+                brought: MergedFiles::default(),
             },
             StatusAgent {
                 place: 8,
                 slot: "carol.codex",
                 state: TeammateState::Working,
                 waits: None,
-                brought: &[],
+                brought: MergedFiles::default(),
             },
         ];
         let line = StatusLine {
@@ -1156,13 +1192,19 @@ mod tests {
 
     #[test]
     fn the_panel_names_each_agent_then_the_changes_since_the_base() {
-        let brought = ["README.md".to_owned()];
+        let deleted = owned(&["old.rs"]);
+        let changed = owned(&["README.md"]);
+        let added = owned(&["src/client.rs", "src/net.rs"]);
         let agents = [StatusAgent {
             place: 1,
             slot: "bob.claude",
             state: TeammateState::Done,
             waits: Some("changes agent settings"),
-            brought: &brought,
+            brought: MergedFiles {
+                deleted: &deleted,
+                changed: &changed,
+                added: &added,
+            },
         }];
         let files = [
             (
@@ -1205,7 +1247,9 @@ mod tests {
                 "  you",
                 "● bob.claude  ✓ done",
                 "  a turn waits for you: changes agent settings",
-                "  merged: README.md",
+                "  deleted: old.rs",
+                "  changed: README.md",
+                "  added: src/client.rs, src/net.rs",
                 "",
                 "Changes since base",
                 "  README.md                 +1",
@@ -1216,7 +1260,7 @@ mod tests {
         );
         assert_eq!(lines[0].spans[1].style.fg, Some(Theme::PARTICIPANTS[0]));
         assert_eq!(lines[2].spans[1].style.fg, Some(Theme::PARTICIPANTS[1]));
-        let counts = &lines[8].spans;
+        let counts = &lines[10].spans;
         assert_eq!(counts[counts.len() - 3].style.fg, Some(Theme::ADDED));
         assert_eq!(counts[counts.len() - 1].style.fg, Some(Theme::REMOVED));
     }
@@ -1324,7 +1368,7 @@ mod tests {
             slot: "bob.codex",
             state: TeammateState::Offline,
             waits: None,
-            brought: &[],
+            brought: MergedFiles::default(),
         }];
         let area = Rect::new(0, 0, 120, 14);
         let mut buffer = Buffer::empty(area);
@@ -1364,7 +1408,7 @@ mod tests {
             slot: "bob.codex",
             state: TeammateState::Offline,
             waits: None,
-            brought: &[],
+            brought: MergedFiles::default(),
         }];
         let area = Rect::new(0, 0, 99, 14);
         let mut buffer = Buffer::empty(area);
@@ -1482,21 +1526,25 @@ mod tests {
                 slot: "bob.claude",
                 state: TeammateState::Done,
                 waits: Some("changes agent settings"),
-                brought: &[],
+                brought: MergedFiles::default(),
             },
             StatusAgent {
                 place: 1,
                 slot: "carol.codex",
                 state: TeammateState::Working,
                 waits: None,
-                brought: &owned(&["src/client.rs", "src/lib.rs"]),
+                brought: MergedFiles {
+                    deleted: &owned(&["src/lib.rs"]),
+                    changed: &owned(&["src/main.rs"]),
+                    added: &owned(&["src/client.rs"]),
+                },
             },
             StatusAgent {
                 place: 1,
                 slot: "dan.claude",
                 state: TeammateState::Asks,
                 waits: None,
-                brought: &[],
+                brought: MergedFiles::default(),
             },
         ];
         let status = StatusLine {
@@ -1505,8 +1553,8 @@ mod tests {
             agents: &agents,
         };
         let whole = "conflicts from bob.claude: src/a.rs, src/b.rs  bob.claude done · a turn \
-                     waits for you: changes agent settings  carol.codex working · src/client.rs, \
-                     src/lib.rs  dan.claude asks";
+                     waits for you: changes agent settings  carol.codex working · src/lib.rs, \
+                     src/main.rs, src/client.rs  dan.claude asks";
         assert_eq!(status_text(&status, 200), whole);
         let narrower = u16::try_from(whole.chars().count() - 1).unwrap();
         assert_eq!(
@@ -1556,7 +1604,7 @@ mod tests {
             slot: "bob.claude",
             state: TeammateState::Done,
             waits: None,
-            brought: &[],
+            brought: MergedFiles::default(),
         }];
         let status = StatusLine {
             landing: Some(StatusLanding {
@@ -1596,7 +1644,10 @@ mod tests {
             slot: "bob\x1b[2J.claude",
             state: TeammateState::Live,
             waits: None,
-            brought: &owned(&["src/\u{202e}evil.rs"]),
+            brought: MergedFiles {
+                changed: &owned(&["src/\u{202e}evil.rs"]),
+                ..MergedFiles::default()
+            },
         }];
         let status = StatusLine {
             landing: None,

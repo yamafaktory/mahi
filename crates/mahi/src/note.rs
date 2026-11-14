@@ -25,6 +25,7 @@ use mahi_store::{
     Change,
     Store,
 };
+use mahi_term::MergedFiles;
 use serde::{
     Deserialize,
     Serialize,
@@ -127,7 +128,7 @@ impl Kind {
 /// The files merges brought, by what was done to them, each kind listed as [`Listed`] lists
 /// paths. A note an older mahi kept, without these fields, reads as one that brought nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct Brought {
+pub(crate) struct Brought {
     #[serde(default)]
     added: Listed,
     #[serde(default)]
@@ -392,6 +393,15 @@ impl Listed {
 }
 
 impl Brought {
+    /// Returns the first paths of the files merges brought, by kind.
+    pub(crate) fn files(&self) -> MergedFiles<'_> {
+        MergedFiles {
+            deleted: &self.deleted.paths,
+            changed: &self.changed.paths,
+            added: &self.added.paths,
+        }
+    }
+
     fn of(&self, kind: Kind) -> &Listed {
         match kind {
             Kind::Added => &self.added,
@@ -547,11 +557,11 @@ impl Note {
         self.came.iter().filter_map(|came| came.from.agent())
     }
 
-    /// Returns each teammate's agent the note names, with the first files its merges brought.
-    pub(crate) fn brought(&self) -> impl Iterator<Item = (&AgentSlot, impl Iterator<Item = &str>)> {
+    /// Returns each teammate's agent the note names, with the files its merges brought.
+    pub(crate) fn brought(&self) -> impl Iterator<Item = (&AgentSlot, &Brought)> {
         self.came
             .iter()
-            .filter_map(|came| came.from.agent().map(|slot| (slot, came.brought.paths())))
+            .filter_map(|came| came.from.agent().map(|slot| (slot, &came.brought)))
     }
 
     /// Writes the note to `file`, unless it is past 1 MiB; returns whether it wrote it.
