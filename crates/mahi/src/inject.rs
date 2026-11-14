@@ -33,6 +33,7 @@ const ENTER_AFTER: Duration = Duration::from_millis(250);
 const INTERRUPT: u8 = 0x03;
 const KILL_LINE: u8 = 0x15;
 const ESC: u8 = 0x1b;
+const HELD_AT_MOST: usize = 4096;
 
 /// How work that waits for the agent paces itself: how long the agent and the user must be
 /// quiet, and how often it looks.
@@ -74,6 +75,7 @@ pub(crate) struct Activity {
     keyed: AtomicBool,
     asking: AtomicBool,
     line_empty: AtomicBool,
+    unfinished: Mutex<Vec<u8>>,
     last: Mutex<Instant>,
     tap: Option<OutputTap>,
     changing: Mutex<()>,
@@ -89,6 +91,7 @@ impl Default for Activity {
             keyed: AtomicBool::new(false),
             asking: AtomicBool::new(false),
             line_empty: AtomicBool::new(true),
+            unfinished: Mutex::new(Vec::new()),
             last: Mutex::new(Instant::now()),
             tap: None,
             changing: Mutex::new(()),
@@ -164,16 +167,48 @@ impl Activity {
     /// leaves the line unfinished, Enter, Ctrl-C, Ctrl-U or Escape alone empties it, and Ctrl-C
     /// or Escape interrupts a turn; other sequences, such as arrows or the terminal's answers,
     /// change neither. Text or Enter answers the agent's question, if it asked one. Only the
-    /// terminal's answers, when they are all `bytes` hold, leave the agent untouched.
+    /// terminal's answers, when they are all `bytes` hold, leave the agent untouched. An
+    /// answer that `bytes` leave unfinished waits for the next `bytes`, unless they are Escape
+    /// alone.
     pub(crate) fn keys(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         self.touched();
-        if is_terminal_answer(bytes) {
+        let Ok(mut unfinished) = self.unfinished.lock() else {
+            self.took(&line_effect(bytes));
             return;
+        };
+        let escaped = unfinished.as_slice() == [ESC] && bytes.first() == Some(&ESC);
+        if escaped || bytes == [ESC] {
+            unfinished.clear();
         }
-        let effect = line_effect(bytes);
+        let joined = !unfinished.is_empty();
+        if joined {
+            unfinished.extend_from_slice(bytes);
+        }
+        let read = if joined { unfinished.as_slice() } else { bytes };
+        let head = read.get(..unfinished_answer_at(read)).unwrap_or_default();
+        let effect = (!is_terminal_answer(head)).then(|| line_effect(head));
+        let finished = head.len();
+        if joined {
+            unfinished.drain(..finished);
+        } else {
+            unfinished.extend_from_slice(bytes.get(finished..).unwrap_or_default());
+        }
+        if unfinished.len() > HELD_AT_MOST {
+            unfinished.clear();
+        }
+        drop(unfinished);
+        if escaped {
+            self.took(&line_effect(&[ESC]));
+        }
+        if let Some(effect) = effect {
+            self.took(&effect);
+        }
+    }
+
+    fn took(&self, effect: &LineEffect) {
         let changing = self.changing.lock();
         self.keyed.store(true, Ordering::SeqCst);
         self.reported_untouched.store(false, Ordering::SeqCst);
@@ -281,6 +316,46 @@ impl LineEffect {
     }
 }
 
+fn unfinished_answer_at(bytes: &[u8]) -> usize {
+    let mut at = 0;
+    while let Some(start) = bytes
+        .get(at..)
+        .and_then(|rest| rest.iter().position(|&byte| byte == ESC))
+    {
+        let start = at + start;
+        if let Some(end) = terminal_answer_at(bytes, start) {
+            at = end;
+            continue;
+        }
+        let (before, tail) = bytes.split_at(start);
+        if starts_answer(tail)
+            || (tail == [ESC] && !before.is_empty() && is_terminal_answer(before))
+        {
+            return start;
+        }
+        at = start + 1;
+    }
+    bytes.len()
+}
+
+fn starts_answer(tail: &[u8]) -> bool {
+    match tail {
+        [ESC, b'[', _, ..] => {
+            let csi = Csi::at(tail, 2);
+            csi.last.is_none() && csi.end == tail.len()
+        }
+        [ESC, b']', rest @ ..] => {
+            let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+            let after = rest.get(digits..).unwrap_or_default();
+            digits > 0
+                && (after.is_empty() || after.first() == Some(&b';'))
+                && string_end(tail, 2).is_none()
+        }
+        [ESC, b'P', b'0'..=b'9' | b'>' | b'!', ..] => string_end(tail, 2).is_none(),
+        _ => false,
+    }
+}
+
 fn is_terminal_answer(bytes: &[u8]) -> bool {
     let mut at = 0;
     while at < bytes.len() {
@@ -362,6 +437,9 @@ impl<'bytes> Csi<'bytes> {
 fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut end = start;
     while let Some(&byte) = bytes.get(end) {
+        if byte < 0x20 && byte != 0x07 && byte != ESC {
+            return Some(end);
+        }
         end += 1;
         if byte == 0x07 || (byte == b'\\' && bytes.get(end.wrapping_sub(2)) == Some(&ESC)) {
             return Some(end);
@@ -397,7 +475,7 @@ fn escape(bytes: &[u8], at: usize, effect: &mut LineEffect) -> usize {
             if csi.last == Some(b'u') && csi.intermediates.is_empty() {
                 kitty_key(csi.params, effect);
             }
-            csi.end + 1
+            csi.end + usize::from(csi.last.is_some())
         }
         Some(b'O') => at + 2,
         Some(b']' | b'P' | b'_' | b'^' | b'X') => string_end(bytes, at + 1).unwrap_or(bytes.len()),
@@ -661,6 +739,112 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_split_across_reads_is_no_key_and_leaves_the_line_empty() {
+        let pace = fast();
+        for (first, rest) in [
+            (&b"\x1b[12;"[..], &b"1R"[..]),
+            (b"\x1b]11;rgb:00", b"00/0000/0000\x07"),
+            (b"\x1b]10;rgb:ffff/ffff/ffff\x1b", b"\\"),
+            (b"\x1b[I\x1b", b"[O"),
+            (b"\x1b[?62;22c\x1b", b"[12;1R"),
+        ] {
+            let activity = Activity::telling(None, None, AtLaunch::Ready);
+            activity.wrote();
+            activity.keys(first);
+            activity.keys(rest);
+            thread::sleep(pace.quiet);
+            assert!(
+                activity.is_untouched_after_turn_end(&pace),
+                "{first:?} {rest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_sequence_that_turns_out_a_key_still_counts() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.keys(b"\x1b[9");
+        activity.keys(b"9u");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+        activity.keys(b"\r");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+        activity.saw(HookKind::Prompt, b"");
+        activity.keys(b"\x1b[12;");
+        activity.keys(b"\x1b");
+        assert!(!activity.is_turn_open());
+    }
+
+    #[test]
+    fn an_alt_chord_that_starts_like_an_answer_leaves_later_keys_counting() {
+        let pace = fast();
+        for chord in [
+            &b"\x1b]"[..],
+            b"\x1bP",
+            b"\x1b_",
+            b"\x1b^",
+            b"\x1bX",
+            b"\x1b[",
+            b"\x1bO",
+        ] {
+            let activity = Activity::default();
+            activity.keys(chord);
+            activity.keys(b"\r");
+            activity.keys(b"a");
+            thread::sleep(pace.quiet);
+            assert!(!activity.is_idle(&pace), "{chord:?}");
+            activity.saw(HookKind::Prompt, b"");
+            activity.keys(chord);
+            activity.keys(b"\x03");
+            assert!(!activity.is_turn_open(), "{chord:?}");
+        }
+    }
+
+    #[test]
+    fn an_escape_held_after_an_answer_is_the_escape_key_when_a_sequence_follows() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.keys(b"a");
+        activity.saw(HookKind::Prompt, b"");
+        activity.keys(b"\x1b[I\x1b");
+        activity.keys(b"\x1b[O");
+        assert!(!activity.is_turn_open());
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+    }
+
+    #[test]
+    fn a_control_key_after_a_held_answer_prefix_still_counts() {
+        let pace = fast();
+        for prefix in [&b"\x1b[1"[..], b"\x1b]1", b"\x1b]11;rgb", b"\x1bP1"] {
+            let activity = Activity::default();
+            activity.saw(HookKind::Prompt, b"");
+            activity.keys(prefix);
+            activity.keys(b"\x03");
+            assert!(!activity.is_turn_open(), "{prefix:?}");
+            activity.keys(b"a");
+            activity.keys(prefix);
+            activity.keys(b"\r");
+            thread::sleep(pace.quiet);
+            assert!(activity.is_idle(&pace), "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn an_unfinished_sequence_past_its_bound_is_dropped() {
+        let pace = fast();
+        let activity = Activity::default();
+        let mut long = b"\x1b]11;rgb:".to_vec();
+        long.resize(HELD_AT_MOST + 1, b'0');
+        activity.keys(&long);
+        activity.keys(b"x");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+    }
+
+    #[test]
     fn a_session_start_after_a_key_lets_no_prompt_in() {
         let pace = fast();
         let activity = Activity::default();
@@ -905,6 +1089,40 @@ mod tests {
             assert_eq!(effect(neutral), LineEffect::default(), "{neutral:?}");
         }
         assert_eq!(effect(b"\r\x1b[12;40R"), emptied);
+    }
+
+    #[test]
+    fn only_a_tail_that_can_still_become_an_answer_is_held() {
+        for (bytes, held) in [
+            (&b"abc"[..], &b""[..]),
+            (b"\x1b", b""),
+            (b"\x1b[", b""),
+            (b"\x1b]", b""),
+            (b"\x1bP", b""),
+            (b"\x1bO", b""),
+            (b"\x1b_a", b""),
+            (b"\x1b[A", b""),
+            (b"a\x1b[12;", b"\x1b[12;"),
+            (b"\x1b[?", b"\x1b[?"),
+            (b"\x1b[?2026;2$", b"\x1b[?2026;2$"),
+            (b"x\x1b]11;rgb:00", b"\x1b]11;rgb:00"),
+            (b"\x1b]11;rgb:00\x1b", b"\x1b]11;rgb:00\x1b"),
+            (b"\x1bP1+r\x1b", b"\x1bP1+r\x1b"),
+            (b"\x1b]11;a\rb", b""),
+            (b"\x1b]a", b""),
+            (b"\x1b]1a", b""),
+            (b"\x1bPh", b""),
+            (b"\x1bP>", b"\x1bP>"),
+            (b"\x1b[ 1", b""),
+            (b"\x1b[1\x03", b""),
+            (b"\r\x1b[12;40R\x1b[12", b"\x1b[12"),
+            (b"\x1b[I\x1b", b"\x1b"),
+            (b"\x1b[?62;22c\x1b", b"\x1b"),
+            (b"x\x1b", b""),
+            (b"\x1b[A\x1b", b""),
+        ] {
+            assert_eq!(&bytes[unfinished_answer_at(bytes)..], held, "{bytes:?}");
+        }
     }
 
     struct FakeAgent {
