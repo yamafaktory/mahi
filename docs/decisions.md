@@ -863,3 +863,13 @@ with text #2A2630, and pane borders #D3CDD9. Royal Plum stays behind the selecti
 with its text in #E2DEE6. Dialogs and the palette take the light surface on a light terminal.
 Teal is #367974 rather than the proposed #367973, so it stays apart from ADDED on a terminal of
 256 colours. The other choices were to keep dialogs dark in both palettes, or to adjust colours.
+
+## D114 · 2026-11-14 · A second Escape follows each agent's own picker
+
+Chosen by the user (#153), completing D112. Claude Code opens its picker on a second Escape
+within 800 ms of the first, and Codex opens its backtrack preview on any Escape after an Escape
+with no other key between. mahi follows each: for Claude Code a second Escape within 800 ms
+leaves the line unfinished and a third counts as Escape again, and for Codex every Escape after
+an Escape, with no other key between, leaves it unfinished. The other choices were 800 ms for
+every agent, or no window for every agent. During the work, not by the user, an agent mahi does
+not know is taken as Codex, so no merge runs while a picker may be open.

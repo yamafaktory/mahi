@@ -24,6 +24,7 @@ use std::{
         PathBuf,
     },
     sync::OnceLock,
+    time::Duration,
 };
 
 use mahi_agent::{
@@ -73,12 +74,16 @@ use crate::{
         EnvNameError,
         PASSED_ON,
     },
-    inject::AtLaunch,
+    inject::{
+        AtLaunch,
+        EscapeTwice,
+    },
     note::NoteBy,
     settings::AgentApprovals,
     sync_state,
 };
 
+const CLAUDE_CODE_ESCAPE_TWICE: Duration = Duration::from_millis(800);
 const CODEX_LOG_DEPTH: usize = 3;
 const MOST_SESSION_ENTRIES: usize = 10_000;
 const CLAUDE_CODE_SESSIONS: &str = "sessions";
@@ -677,6 +682,16 @@ impl Profile {
         arguments.is_empty() || self.resumes(arguments)
     }
 
+    /// Returns when a second Escape opens the agent's picker: Claude Code's within 800 ms of the
+    /// first, Codex's at any time; another agent's is taken as Codex's, so no merge runs while
+    /// a picker may be open.
+    pub(crate) fn escape_twice(&self) -> EscapeTwice {
+        match self.install {
+            Install::ClaudeCode => EscapeTwice::Within(CLAUDE_CODE_ESCAPE_TWICE),
+            Install::Codex | Install::Files(_) => EscapeTwice::Any,
+        }
+    }
+
     /// Says whether the agent, started with `arguments` and its state directory open as
     /// `state`, where `seeded` was read, can open a dialog at launch: Codex can not when it
     /// starts with no argument or its resume arguments, is signed in, trusts the worktree or
@@ -1205,6 +1220,18 @@ mod tests {
     ) -> Vec<&'static str> {
         let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
         profile.approval_args(approvals, &arguments).to_vec()
+    }
+
+    #[test]
+    fn claude_codes_picker_opens_within_800_ms_and_codexs_and_any_others_at_any_time() {
+        assert_eq!(
+            claude_code_profile().escape_twice(),
+            EscapeTwice::Within(Duration::from_millis(800))
+        );
+        assert_eq!(codex_profile().escape_twice(), EscapeTwice::Any);
+        let dir = profiles_dir(&[("other.toml", CODEX)]);
+        let other = read_profiles(dir.path()).unwrap().remove(0);
+        assert_eq!(other.escape_twice(), EscapeTwice::Any);
     }
 
     #[test]

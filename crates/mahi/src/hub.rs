@@ -735,6 +735,7 @@ mod tests {
     use crate::inject::{
         Activity,
         AtLaunch,
+        EscapeTwice,
     };
 
     fn slot(participant: &str, agent: &str) -> AgentSlot {
@@ -832,7 +833,7 @@ mod tests {
         let guest = handle.serve(codex.clone(), size).unwrap();
         let tap = OutputTap::new(size);
         tap.attach(guest.tap.clone());
-        let activity = Activity::telling(Some(tap), None, AtLaunch::MayAsk);
+        let activity = Activity::telling(Some(tap), None, AtLaunch::MayAsk, EscapeTwice::Any);
         assert_eq!(handle.state_of(&codex), None);
         activity.saw(HookKind::Prompt, b"");
         assert_eq!(handle.state_of(&codex), Some(TurnState::Working));
@@ -853,7 +854,12 @@ mod tests {
         let guest = handle.serve(codex.clone(), size).unwrap();
         let tap = OutputTap::new(size);
         tap.attach(guest.tap.clone());
-        let _activity = Activity::telling(Some(tap), Some(TurnState::Done), AtLaunch::MayAsk);
+        let _activity = Activity::telling(
+            Some(tap),
+            Some(TurnState::Done),
+            AtLaunch::MayAsk,
+            EscapeTwice::Any,
+        );
         assert_eq!(handle.state_of(&codex), Some(TurnState::Done));
     }
 

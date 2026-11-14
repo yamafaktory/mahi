@@ -179,6 +179,7 @@ use crate::{
         Activity,
         AgentInput,
         AtLaunch,
+        EscapeTwice,
         Pace,
     },
     land_desk::{
@@ -2270,7 +2271,13 @@ impl Launch<'_> {
         }
         let pty = pty.sandbox(sandbox);
         let raw = RawMode::enable().map_err(RunError::Terminal)?;
-        Spawned::start(pty.spawn()?, raw, network, (state.zip(launched), at_launch))
+        let escape_twice = self.profile.map_or(EscapeTwice::Any, Profile::escape_twice);
+        Spawned::start(
+            pty.spawn()?,
+            raw,
+            network,
+            (state.zip(launched), at_launch, escape_twice),
+        )
     }
 }
 
@@ -2283,6 +2290,7 @@ struct Spawned {
     proxy: Option<Running>,
     hook_trust: Option<(PathBuf, HookTrust)>,
     at_launch: AtLaunch,
+    escape_twice: EscapeTwice,
 }
 
 impl Spawned {
@@ -2291,6 +2299,7 @@ impl Spawned {
             live.map(Link::tap),
             first,
             self.at_launch,
+            self.escape_twice,
         ))
     }
 
@@ -2298,7 +2307,11 @@ impl Spawned {
         mut child: PtyChild,
         raw: Option<RawMode>,
         network: Option<Network>,
-        (hook_trust, at_launch): (Option<(PathBuf, HookTrust)>, AtLaunch),
+        (hook_trust, at_launch, escape_twice): (
+            Option<(PathBuf, HookTrust)>,
+            AtLaunch,
+            EscapeTwice,
+        ),
     ) -> Result<Self, RunError> {
         let proxy = network
             .map(|network| network.start(child.take_loopback_listener()))
@@ -2309,6 +2322,7 @@ impl Spawned {
             proxy,
             hook_trust,
             at_launch,
+            escape_twice,
         })
     }
 }

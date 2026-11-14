@@ -52,6 +52,81 @@ impl Default for Pace {
     }
 }
 
+/// When a second Escape opens the agent's picker, so the agent's input line counts as
+/// unfinished: Claude Code's opens within its window, Codex's at any time after an Escape with
+/// no other key between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EscapeTwice {
+    /// The second Escape opens the picker when it comes within this long of the first, and a
+    /// third one closes it.
+    Within(Duration),
+    /// Every Escape after an Escape, with no other key between, opens or keeps the picker.
+    Any,
+}
+
+/// The key a read holds, as the Escapes in a row see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Press {
+    Escape,
+    Escapes,
+    Other,
+}
+
+/// The Escapes the user pressed in a row, to tell when one opens the agent's picker.
+#[derive(Debug)]
+struct Escapes {
+    rule: EscapeTwice,
+    last: Option<Instant>,
+}
+
+impl Escapes {
+    fn new(rule: EscapeTwice) -> Self {
+        Self { rule, last: None }
+    }
+
+    /// Takes in a `press` at `now`; returns whether it opens or keeps the agent's picker, as
+    /// two Escapes in one read do.
+    fn press(&mut self, press: Press, now: Instant) -> bool {
+        let opens = match press {
+            Press::Other => {
+                self.forget();
+                return false;
+            }
+            Press::Escapes => true,
+            Press::Escape => self.last.is_some_and(|last| match self.rule {
+                EscapeTwice::Within(window) => now.saturating_duration_since(last) <= window,
+                EscapeTwice::Any => true,
+            }),
+        };
+        self.last = match self.rule {
+            EscapeTwice::Within(_) if opens => None,
+            EscapeTwice::Within(_) | EscapeTwice::Any => Some(now),
+        };
+        opens
+    }
+
+    fn forget(&mut self) {
+        self.last = None;
+    }
+}
+
+/// What reading the user's keys keeps from one read to the next: the end of a read that can
+/// still become a terminal answer, and the Escapes in a row.
+#[derive(Debug)]
+struct Reading {
+    unfinished: Vec<u8>,
+    escapes: Escapes,
+}
+
+impl Reading {
+    fn new(rule: EscapeTwice) -> Self {
+        Self {
+            unfinished: Vec::new(),
+            escapes: Escapes::new(rule),
+        }
+    }
+}
+
 /// Whether the agent's launch can open a dialog its hooks do not report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtLaunch {
@@ -75,7 +150,7 @@ pub(crate) struct Activity {
     keyed: AtomicBool,
     asking: AtomicBool,
     line_empty: AtomicBool,
-    unfinished: Mutex<Vec<u8>>,
+    reading: Mutex<Reading>,
     last: Mutex<Instant>,
     tap: Option<OutputTap>,
     changing: Mutex<()>,
@@ -91,7 +166,7 @@ impl Default for Activity {
             keyed: AtomicBool::new(false),
             asking: AtomicBool::new(false),
             line_empty: AtomicBool::new(true),
-            unfinished: Mutex::new(Vec::new()),
+            reading: Mutex::new(Reading::new(EscapeTwice::Any)),
             last: Mutex::new(Instant::now()),
             tap: None,
             changing: Mutex::new(()),
@@ -109,12 +184,14 @@ impl Activity {
         tap: Option<OutputTap>,
         first: Option<TurnState>,
         at_launch: AtLaunch,
+        escape_twice: EscapeTwice,
     ) -> Self {
         let working = first == Some(TurnState::Working);
         let activity = Self {
             turn_open: AtomicBool::new(working),
             turn_ended: AtomicBool::new(!working),
             ready_on_output: AtomicBool::new(at_launch == AtLaunch::Ready),
+            reading: Mutex::new(Reading::new(escape_twice)),
             tap,
             ..Self::default()
         };
@@ -169,17 +246,25 @@ impl Activity {
     /// change neither. Text or Enter answers the agent's question, if it asked one. Only the
     /// terminal's answers, when they are all `bytes` hold, leave the agent untouched. An
     /// answer that `bytes` leave unfinished waits for the next `bytes`, unless they are Escape
-    /// alone.
+    /// alone. A second Escape that opens the agent's picker, as [`EscapeTwice`] tells, leaves
+    /// the line unfinished.
     pub(crate) fn keys(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         self.touched();
-        let Ok(mut unfinished) = self.unfinished.lock() else {
+        let Ok(mut reading) = self.reading.lock() else {
             self.took(&line_effect(bytes));
             return;
         };
+        let Reading {
+            unfinished,
+            escapes,
+        } = &mut *reading;
         if bytes == [ESC] {
+            if unfinished.as_slice() == [ESC] {
+                escapes.press(Press::Escape, Instant::now());
+            }
             unfinished.clear();
         }
         let joined = !unfinished.is_empty();
@@ -188,7 +273,17 @@ impl Activity {
         }
         let read = if joined { unfinished.as_slice() } else { bytes };
         let head = read.get(..unfinished_answer_at(read)).unwrap_or_default();
-        let effect = (!is_terminal_answer(head)).then(|| line_effect(read));
+        let effect = (!is_terminal_answer(head)).then(|| {
+            let opens = press_of(head).is_some_and(|press| escapes.press(press, Instant::now()));
+            if opens {
+                LineEffect {
+                    line_empty: Some(false),
+                    interrupts: false,
+                }
+            } else {
+                line_effect(read)
+            }
+        });
         let finished = head.len();
         if joined {
             unfinished.drain(..finished);
@@ -198,9 +293,15 @@ impl Activity {
         if unfinished.len() > HELD_AT_MOST {
             unfinished.clear();
         }
-        drop(unfinished);
+        drop(reading);
         if let Some(effect) = effect {
             self.took(&effect);
+        }
+    }
+
+    fn forget_escapes(&self) {
+        if let Ok(mut reading) = self.reading.lock() {
+            reading.escapes.forget();
         }
     }
 
@@ -233,6 +334,7 @@ impl Activity {
         };
         match kind {
             HookKind::Prompt => {
+                self.forget_escapes();
                 let was_open = self.turn_open.swap(true, Ordering::SeqCst);
                 self.turn_ended.store(false, Ordering::SeqCst);
                 self.reported_untouched.store(false, Ordering::SeqCst);
@@ -288,6 +390,7 @@ impl Activity {
     /// Takes in that mahi typed a prompt into the agent, so it types no other until the next
     /// turn end or session start its hooks report.
     pub(crate) fn typed_prompt(&self) {
+        self.forget_escapes();
         self.reported_untouched.store(false, Ordering::SeqCst);
         self.touched();
     }
@@ -483,21 +586,91 @@ fn escape(bytes: &[u8], at: usize, effect: &mut LineEffect) -> usize {
     }
 }
 
+/// A key the kitty keyboard protocol reported: its code, its modifiers but the lock keys, and
+/// whether it was released.
+struct KittyKey {
+    code: Option<u32>,
+    modifiers: u32,
+    released: bool,
+}
+
+impl KittyKey {
+    fn of(params: &[u8]) -> Self {
+        let mut fields = params.split(|&byte| byte == b';');
+        let code = fields
+            .next()
+            .and_then(|field| field.split(|&byte| byte == b':').next())
+            .and_then(|digits| std::str::from_utf8(digits).ok()?.parse::<u32>().ok());
+        let mut modifier = fields
+            .next()
+            .unwrap_or_default()
+            .split(|&byte| byte == b':');
+        let modifiers = modifier
+            .next()
+            .and_then(|digits| std::str::from_utf8(digits).ok()?.parse::<u32>().ok())
+            .map_or(0, |value| value.saturating_sub(1) & !(64 | 128));
+        let released = modifier.next() == Some(b"3");
+        Self {
+            code,
+            modifiers,
+            released,
+        }
+    }
+}
+
+/// Returns the key `read` holds for the Escapes in a row: Escape, given alone or in the kitty
+/// keyboard protocol, two or more of them, another key, or none, when it holds only key
+/// releases or mouse reports.
+fn press_of(read: &[u8]) -> Option<Press> {
+    let mut escapes: usize = 0;
+    let mut at = 0;
+    while let Some(&byte) = read.get(at) {
+        if byte != ESC {
+            return Some(Press::Other);
+        }
+        if let Some(end) = terminal_answer_at(read, at) {
+            at = end;
+            continue;
+        }
+        match read.get(at + 1) {
+            None | Some(&ESC) => {
+                escapes += 1;
+                at += 1;
+            }
+            Some(b'[') => {
+                let csi = Csi::at(read, at + 2);
+                let mouse = csi.params.first() == Some(&b'<');
+                match (csi.last, csi.intermediates) {
+                    (Some(b'u'), b"") => match KittyKey::of(csi.params) {
+                        KittyKey { released: true, .. } => {}
+                        KittyKey {
+                            code: Some(27),
+                            modifiers: 0,
+                            ..
+                        } => escapes += 1,
+                        KittyKey { .. } => return Some(Press::Other),
+                    },
+                    (Some(b'M' | b'm'), b"") if mouse => {}
+                    _ => return Some(Press::Other),
+                }
+                at = csi.end + 1;
+            }
+            Some(_) => return Some(Press::Other),
+        }
+    }
+    match escapes {
+        0 => None,
+        1 => Some(Press::Escape),
+        _ => Some(Press::Escapes),
+    }
+}
+
 fn kitty_key(params: &[u8], effect: &mut LineEffect) {
-    let mut fields = params.split(|&byte| byte == b';');
-    let code = fields
-        .next()
-        .and_then(|field| field.split(|&byte| byte == b':').next())
-        .and_then(|digits| std::str::from_utf8(digits).ok()?.parse::<u32>().ok());
-    let mut modifier = fields
-        .next()
-        .unwrap_or_default()
-        .split(|&byte| byte == b':');
-    let modifiers = modifier
-        .next()
-        .and_then(|digits| std::str::from_utf8(digits).ok()?.parse::<u32>().ok())
-        .map_or(0, |value| value.saturating_sub(1) & !(64 | 128));
-    let released = modifier.next() == Some(b"3");
+    let KittyKey {
+        code,
+        modifiers,
+        released,
+    } = KittyKey::of(params);
     if released {
         return;
     }
@@ -608,6 +781,107 @@ mod tests {
             quiet: Duration::from_millis(100),
             look_every: Duration::from_millis(10),
         }
+    }
+
+    #[test]
+    fn a_second_escape_opens_the_picker_within_claude_codes_window_or_at_any_time_for_codex() {
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+        let mut claude = Escapes::new(EscapeTwice::Within(Duration::from_millis(800)));
+        assert!(!claude.press(Press::Escape, at(0)));
+        assert!(claude.press(Press::Escape, at(800)));
+        assert!(!claude.press(Press::Escape, at(900)));
+        assert!(!claude.press(Press::Escape, at(1800)));
+        assert!(claude.press(Press::Escape, at(2000)));
+        assert!(!claude.press(Press::Other, at(2100)));
+        assert!(!claude.press(Press::Escape, at(2200)));
+        let mut codex = Escapes::new(EscapeTwice::Any);
+        assert!(!codex.press(Press::Escape, at(0)));
+        assert!(codex.press(Press::Escape, at(60_000)));
+        assert!(codex.press(Press::Escape, at(60_100)));
+        assert!(!codex.press(Press::Other, at(60_200)));
+        assert!(!codex.press(Press::Escape, at(60_300)));
+    }
+
+    #[test]
+    fn a_second_escape_leaves_the_line_unfinished_and_the_turn_open() {
+        let pace = fast();
+        let activity = Activity::telling(None, None, AtLaunch::MayAsk, EscapeTwice::Any);
+        activity.keys(b"\x1b");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+        activity.keys(b"\x1b");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+        activity.keys(b"\x15");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+        activity.keys(b"\x1b");
+        activity.saw(HookKind::Prompt, b"");
+        activity.keys(b"\x1b");
+        assert!(!activity.is_turn_open());
+        activity.saw(HookKind::Prompt, b"");
+        activity.keys(b"\x1b\x1b");
+        assert!(activity.is_turn_open());
+    }
+
+    #[test]
+    fn claude_codes_window_holds_through_activity_and_a_third_escape_empties_the_line() {
+        let pace = fast();
+        let within = EscapeTwice::Within(Duration::from_secs(60));
+        let activity = Activity::telling(None, None, AtLaunch::MayAsk, within);
+        activity.keys(b"\x1b");
+        activity.keys(b"\x1b");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+        activity.keys(b"\x1b");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+        let short = EscapeTwice::Within(Duration::from_millis(1));
+        let activity = Activity::telling(None, None, AtLaunch::MayAsk, short);
+        activity.keys(b"\x1b");
+        thread::sleep(pace.quiet);
+        activity.keys(b"\x1b");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+    }
+
+    #[test]
+    fn kitty_escapes_count_and_releases_and_mouse_reports_leave_the_escapes_in_a_row() {
+        let pace = fast();
+        for reads in [
+            &[&b"\x1b[27u"[..], b"\x1b[27;1:3u", b"\x1b[27u"][..],
+            &[b"\x1b", b"\x1b[<65;10;5M", b"\x1b"],
+            &[b"\x1b\x1b", b"\x1b"],
+            &[b"\x1b[I\x1b", b"\x1b"],
+            &[b"\x1b", b"\x1b\x1b[O", b"\x1b"],
+        ] {
+            let activity = Activity::telling(None, None, AtLaunch::MayAsk, EscapeTwice::Any);
+            for read in reads {
+                activity.keys(read);
+            }
+            thread::sleep(pace.quiet);
+            assert!(!activity.is_idle(&pace), "{reads:?}");
+        }
+        assert_eq!(press_of(b"\x1b"), Some(Press::Escape));
+        assert_eq!(press_of(b"\x1b[27u\x1b[27;1:3u"), Some(Press::Escape));
+        assert_eq!(press_of(b"\x1b\x1b"), Some(Press::Escapes));
+        assert_eq!(press_of(b"\x1b\x1b[O"), Some(Press::Escape));
+        assert_eq!(press_of(b"\x1b[27;1:3u"), None);
+        assert_eq!(press_of(b"\x1b[<0;3;4m"), None);
+        for other in [&b"x"[..], b"\x1b[A", b"\x1bx", b"\x1b[27;5u", b"\x1b[97u"] {
+            assert_eq!(press_of(other), Some(Press::Other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_mahi_typed_forgets_the_escapes_in_a_row() {
+        let activity = Activity::telling(None, None, AtLaunch::MayAsk, EscapeTwice::Any);
+        activity.keys(b"\x1b");
+        activity.typed_prompt();
+        activity.saw(HookKind::Prompt, b"");
+        activity.keys(b"\x1b");
+        assert!(!activity.is_turn_open());
     }
 
     #[test]
@@ -722,7 +996,7 @@ mod tests {
             assert!(!is_terminal_answer(key), "{key:?}");
         }
         let pace = fast();
-        let activity = Activity::telling(None, None, AtLaunch::Ready);
+        let activity = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
         activity.wrote();
         for answer in answers {
             activity.keys(answer);
@@ -744,7 +1018,7 @@ mod tests {
             (b"\x1b[I\x1b", b"[O"),
             (b"\x1b[?62;22c\x1b", b"[12;1R"),
         ] {
-            let activity = Activity::telling(None, None, AtLaunch::Ready);
+            let activity = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
             activity.wrote();
             activity.keys(first);
             activity.keys(rest);
@@ -840,14 +1114,14 @@ mod tests {
     #[test]
     fn a_launch_with_no_dialog_lets_a_prompt_in_once_the_agent_wrote_until_a_key() {
         let pace = fast();
-        let activity = Activity::telling(None, None, AtLaunch::Ready);
+        let activity = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
         thread::sleep(pace.quiet);
         assert!(!activity.is_untouched_after_turn_end(&pace));
         activity.wrote();
         assert!(!activity.is_untouched_after_turn_end(&pace));
         thread::sleep(pace.quiet);
         assert!(activity.is_untouched_after_turn_end(&pace));
-        let keyed_first = Activity::telling(None, None, AtLaunch::Ready);
+        let keyed_first = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
         keyed_first.keys(b"h");
         keyed_first.keys(b"\x15");
         keyed_first.wrote();
@@ -921,13 +1195,23 @@ mod tests {
     #[test]
     fn a_run_that_starts_on_a_prompt_is_busy_until_its_turn_ends() {
         let pace = fast();
-        let activity = Activity::telling(None, Some(TurnState::Working), AtLaunch::MayAsk);
+        let activity = Activity::telling(
+            None,
+            Some(TurnState::Working),
+            AtLaunch::MayAsk,
+            EscapeTwice::Any,
+        );
         thread::sleep(pace.quiet);
         assert!(!activity.is_idle(&pace));
         activity.saw(HookKind::TurnEnd, b"");
         thread::sleep(pace.quiet);
         assert!(activity.is_idle_after_turn_end(&pace));
-        let waiting = Activity::telling(None, Some(TurnState::Done), AtLaunch::MayAsk);
+        let waiting = Activity::telling(
+            None,
+            Some(TurnState::Done),
+            AtLaunch::MayAsk,
+            EscapeTwice::Any,
+        );
         thread::sleep(pace.quiet);
         assert!(waiting.is_idle_after_turn_end(&pace));
     }
@@ -936,7 +1220,12 @@ mod tests {
     fn the_first_state_reaches_the_workspace_as_later_ones_do() {
         let (reader, writer) = rustix::pipe::pipe().unwrap();
         crate::report::connect(std::os::fd::IntoRawFd::into_raw_fd(writer));
-        let activity = Activity::telling(None, Some(TurnState::Working), AtLaunch::MayAsk);
+        let activity = Activity::telling(
+            None,
+            Some(TurnState::Working),
+            AtLaunch::MayAsk,
+            EscapeTwice::Any,
+        );
         activity.saw(HookKind::Prompt, b"");
         activity.saw(HookKind::TurnEnd, b"");
         let mut read = [0_u8; 64];
