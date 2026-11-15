@@ -96,7 +96,7 @@ The owner lands the thread by asking their own agent, which calls mahi's `land` 
 To work with a teammate, the thread's owner runs `mahi invite --collaborator <thread>`, or
 presses `i` on the home screen; `--watcher` invites a teammate who only watches. mahi shows a
 short pairing code such as `412-merit-intention`; the teammate runs
-`mahi join` (or presses `c`) in a clone of the project and types it, and once the owner says
+`mahi join` (or presses `J`) in a clone of the project and types it, and once the owner says
 yes, the teammate watches the thread live. Pairing meets through the remote `mahi remote`
 chose. Cards and tickets still work without it: `mahi id` prints the card a thread's owner
 needs, `mahi invite --collaborator <thread> <card>` turns it into a ticket, and `mahi join <ticket>` uses it.

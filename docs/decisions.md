@@ -873,3 +873,11 @@ leaves the line unfinished and a third counts as Escape again, and for Codex eve
 an Escape, with no other key between, leaves it unfinished. The other choices were 800 ms for
 every agent, or no window for every agent. During the work, not by the user, an agent mahi does
 not know is taken as Codex, so no merge runs while a picker may be open.
+
+## D115 · 2026-11-15 · The home screen joins with J
+
+Chosen by the user (#160), with the key left to the agent. `c` for join was confusing, and `j`
+stays the vim motion down. The agent chose `J` (Shift-J): it keeps the letter of join, and
+every other letter it could take had no link to join. The other choices were `o`, `a` and `w`.
+With Caps Lock on, `j` on most terminals sends `J` and opens the join dialog. The user keeps
+`J` anyway, since Escape closes the dialog and nothing joins without a code.

@@ -58,7 +58,7 @@ const THREAD_KEYS: &str = "rilep";
 const MENU: [(&str, &str); 8] = [
     ("Threads", "t"),
     ("New thread", "n"),
-    ("Join with a code", "c"),
+    ("Join with a code", "J"),
     ("Remote", "m"),
     ("Credentials", "s"),
     ("Your card", "u"),
@@ -275,7 +275,7 @@ impl Home {
             }
             PaletteInput::Text('t') => self.focus = Focus::Threads,
             PaletteInput::Text('n') => return Some(HomeAction::New),
-            PaletteInput::Text('c') => return Some(HomeAction::Join),
+            PaletteInput::Text('J') => return Some(HomeAction::Join),
             PaletteInput::Text('m') => return Some(HomeAction::Remote),
             PaletteInput::Text('u') => return Some(HomeAction::Card),
             PaletteInput::Text('s') => return Some(HomeAction::Credentials),
@@ -392,7 +392,7 @@ impl Home {
                 "invite",
                 "show a code so a teammate can watch and prompt it",
             ],
-            ["c", "join", "type a teammate's code to join their thread"],
+            ["J", "join", "type a teammate's code to join their thread"],
             [
                 "m",
                 "remote",
@@ -486,7 +486,7 @@ impl Home {
                     Span::raw("  No threads yet. Press "),
                     Span::styled("n", Theme::title()),
                     Span::raw(" to start one with an agent, or "),
-                    Span::styled("c", Theme::title()),
+                    Span::styled("J", Theme::title()),
                     Span::raw(" to join a teammate's."),
                 ]),
             ])
@@ -578,7 +578,7 @@ impl Home {
                 ("p", "purge"),
                 ("i", "invite"),
                 ("n", "new"),
-                ("c", "join"),
+                ("J", "join"),
                 ("tab", "menu"),
             ],
         };
@@ -744,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn vim_keys_move_the_selection_and_c_joins() {
+    fn vim_keys_move_the_selection_and_shift_j_joins() {
         let rows = rows();
         let mut home = Home::default();
         assert_eq!(home.key(PaletteInput::Text('j'), &rows), None);
@@ -758,8 +758,9 @@ mod tests {
         home.key(PaletteInput::Text('j'), &rows);
         home.key(PaletteInput::Text('k'), &rows);
         assert_eq!(home.key(PaletteInput::Enter, &rows), Some(HomeAction::New));
+        assert_eq!(home.key(PaletteInput::Text('c'), &rows), None);
         assert_eq!(
-            home.key(PaletteInput::Text('c'), &rows),
+            home.key(PaletteInput::Text('J'), &rows),
             Some(HomeAction::Join)
         );
         assert!(screen(&home, &rows, "").contains("↑↓ jk move"));
@@ -770,7 +771,7 @@ mod tests {
         let rows = rows();
         let mut home = Home::default();
         assert_eq!(
-            keys(&mut home, &rows, "nricmsuq"),
+            keys(&mut home, &rows, "nriJmsuq"),
             [
                 HomeAction::New,
                 HomeAction::Resume("t1".to_owned()),

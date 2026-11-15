@@ -1483,7 +1483,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]).env("MAHI_LIVE", "local"),
             &[
-                ("Threads", b"c"),
+                ("Threads", b"J"),
                 ("Passphrase for your mahi key", passphrase.as_bytes()),
                 ("Pairing code", b"412-merit-intention"),
                 ("412-merit-intention", b"\x1b"),
@@ -5647,7 +5647,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             } else {
                 let mut home = Driven::start(mahi_in_terminal(&bob.repo, &[], &bob_env));
                 home.wait_for("Threads");
-                home.terminal.write_all(b"c").unwrap();
+                home.terminal.write_all(b"J").unwrap();
                 home.wait_for("Passphrase for your mahi key");
                 home.type_line(PASSPHRASE);
                 home.wait_for("Pairing code");
