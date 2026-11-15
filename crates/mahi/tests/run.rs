@@ -5568,6 +5568,13 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             _running: Option<Driven>,
         }
 
+        impl Pairing {
+            fn answer_owner(&mut self, answer: &str) {
+                thread::sleep(Duration::from_secs(1));
+                self.owner.type_line(answer);
+            }
+        }
+
         /// Where bob types the pairing code: on the home screen, or in a `mahi` command.
         enum JoinFrom<'args> {
             Home,
@@ -5598,7 +5605,70 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
 
         /// Pairs bob as `role` with the thread's owner, bob's mahi running with `path` as its
         /// `PATH`, until the owner is asked whether to add bob.
-        fn pair_as(fixture: &Fixture, from: &JoinFrom<'_>, (role, path): (&str, &str)) -> Pairing {
+        fn pair_as(fixture: &Fixture, from: &JoinFrom<'_>, role: (&str, &str)) -> Pairing {
+            pair(fixture, &OwnerAt::Command, from, role)
+        }
+
+        enum OwnerAt {
+            Command,
+            Home,
+        }
+
+        fn start_owner(
+            fixture: &Fixture,
+            at: &OwnerAt,
+            (role, thread): (&str, &str),
+            owner_env: &[(&str, &OsStr)],
+        ) -> (Driven, String) {
+            match at {
+                OwnerAt::Command => {
+                    let owner = Driven::start(mahi_in_terminal(
+                        &fixture.repo,
+                        &["invite", role, thread],
+                        owner_env,
+                    ));
+                    let shown = owner.wait_for("Tell this code to your teammate");
+                    let code = shown
+                        .split("Pairing code: ")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .unwrap()
+                        .to_owned();
+                    (owner, code)
+                }
+                OwnerAt::Home => {
+                    let mut home = Driven::start(mahi_in_terminal(&fixture.repo, &[], owner_env));
+                    home.wait_for(thread);
+                    home.terminal.write_all(b"i").unwrap();
+                    home.wait_for("What may they do with your agents?");
+                    let choice: &[u8] = if role == "--collaborator" { b"1" } else { b"2" };
+                    home.terminal.write_all(choice).unwrap();
+                    home.wait_for("Tell this code to your teammate");
+                    let mut parser = vt100::Parser::new(24, 200, 0);
+                    parser.process(home.text().as_bytes());
+                    let code = parser
+                        .screen()
+                        .contents()
+                        .lines()
+                        .find_map(|line| {
+                            line.split('🔑')
+                                .nth(1)?
+                                .split_whitespace()
+                                .next()
+                                .map(str::to_owned)
+                        })
+                        .unwrap();
+                    (home, code)
+                }
+            }
+        }
+
+        fn pair(
+            fixture: &Fixture,
+            at: &OwnerAt,
+            from: &JoinFrom<'_>,
+            (role, path): (&str, &str),
+        ) -> Pairing {
             let (thread, _claude) = worked_thread(fixture);
             let (server, remote) = serve_remote(fixture);
             let bob = teammate(fixture, "bob");
@@ -5618,18 +5688,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             let owner_env = owner_env(fixture, &owner_config);
             let running =
                 matches!(from, JoinFrom::Home).then(|| run_thread(fixture, &thread, &owner_env));
-            let owner = Driven::start(mahi_in_terminal(
-                &fixture.repo,
-                &["invite", role, &thread],
-                &owner_env,
-            ));
-            let shown = owner.wait_for("Tell this code to your teammate");
-            let code = shown
-                .split("Pairing code: ")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .unwrap()
-                .to_owned();
+            let (mut owner, code) = start_owner(fixture, at, (role, &thread), &owner_env);
             assert!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]).contains("refs/mahi/pair/"));
             let bob_config = bob.home.join(".config");
             let bob_env: [(&str, &OsStr); 6] = [
@@ -5653,12 +5712,14 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
                 home.wait_for("Pairing code");
                 home
             };
+            owner.type_line("");
             joiner.type_line(&code);
             joiner.wait_for("The code matched");
-            let asked = owner.wait_for("[y/N]");
-            assert!(asked.contains("Add bob (SHA256:"), "{asked}");
-            let named = format!("to thread {thread} as a {}? [y/N]", &role[2..]);
-            assert!(asked.contains(&named), "{asked}");
+            let asked = owner.wait_for("Add bob (SHA256:");
+            if let OwnerAt::Command = *at {
+                let named = format!("to thread {thread} as a {}? [Y/n]", &role[2..]);
+                assert!(asked.contains(&named), "{asked}");
+            }
             if let JoinFrom::Command(_) = from {
                 assert!(!joiner.text().contains(&code), "{}", joiner.text());
             }
@@ -5673,6 +5734,52 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         }
 
         #[test]
+        fn the_owner_on_the_home_screen_adds_a_teammate_with_enter_once_the_question_takes_keys() {
+            let fixture = fixture();
+            let mut pairing = pair(
+                &fixture,
+                &OwnerAt::Home,
+                &JoinFrom::Command(&["join"]),
+                ("--watcher", "/usr/bin:/bin:/usr"),
+            );
+            pairing.owner.terminal.write_all(b"\r").unwrap();
+            thread::sleep(Duration::from_secs(1));
+            assert!(
+                !pairing.owner.text().contains("Passphrase"),
+                "{}",
+                pairing.owner.text()
+            );
+            pairing.owner.terminal.write_all(b"\r").unwrap();
+            pairing.owner.wait_for("Passphrase");
+            pairing
+                .owner
+                .terminal
+                .write_all(format!("{PASSPHRASE}\r").as_bytes())
+                .unwrap();
+            pairing.joiner.wait_for("waiting for the thread's host");
+            assert!(bob_listed(&fixture, &pairing.thread));
+            let _ = pairing.joiner.child.kill();
+            let _ = pairing.joiner.child.wait();
+        }
+
+        #[test]
+        fn the_owner_adds_a_teammate_who_paired_with_enter_alone() {
+            let fixture = fixture();
+            let mut pairing = pair_until_asked(&fixture);
+            thread::sleep(Duration::from_secs(1));
+            assert!(
+                !pairing.owner.text().contains("Passphrase"),
+                "{}",
+                pairing.owner.text()
+            );
+            pairing.answer_owner("");
+            pairing.owner.wait_for("Passphrase");
+            pairing.owner.type_line(PASSPHRASE);
+            assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
+            assert!(bob_listed(&fixture, &pairing.thread));
+        }
+
+        #[test]
         fn a_teammate_who_joins_from_the_home_screen_lands_in_a_tab_on_the_thread() {
             let fixture = fixture();
             let mut pairing = pair_as(
@@ -5680,7 +5787,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
                 &JoinFrom::Home,
                 ("--watcher", "/usr/bin:/bin:/usr"),
             );
-            pairing.owner.type_line("y");
+            pairing.answer_owner("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
             assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
@@ -5717,7 +5824,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             );
             let tools = codex.parent().unwrap().to_str().unwrap().to_owned();
             let mut pairing = pair_as(&fixture, &JoinFrom::Home, ("--collaborator", &tools));
-            pairing.owner.type_line("y");
+            pairing.answer_owner("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
             assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
@@ -5763,7 +5870,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             );
             let tools = codex.parent().unwrap().to_str().unwrap().to_owned();
             let mut pairing = pair_as(&fixture, &JoinFrom::Home, ("--collaborator", &tools));
-            pairing.owner.type_line("y");
+            pairing.answer_owner("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
             assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
@@ -6169,7 +6276,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
         fn a_teammate_who_types_the_pairing_code_is_added_and_nothing_is_left_on_the_remote() {
             let fixture = fixture();
             let mut pairing = pair_until_asked(&fixture);
-            pairing.owner.type_line("y");
+            pairing.answer_owner("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
             let code = pairing.owner.exit_code();
@@ -6204,7 +6311,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
                 &pairing.thread,
                 &owner_env(&fixture, &owner_config),
             );
-            pairing.owner.type_line("y");
+            pairing.answer_owner("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
             assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
@@ -6238,7 +6345,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
                 &pairing.thread,
                 &owner_env(&fixture, &owner_config),
             );
-            pairing.owner.type_line("y");
+            pairing.answer_owner("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
             assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
@@ -6265,7 +6372,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
                 &pairing.thread,
                 &owner_env(&fixture, &owner_config),
             );
-            pairing.owner.type_line("y");
+            pairing.answer_owner("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
             assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
@@ -6302,7 +6409,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
                 &pairing.thread,
                 &owner_env(&fixture, &owner_config),
             );
-            pairing.owner.type_line("y");
+            pairing.answer_owner("y");
             pairing.owner.wait_for("Passphrase");
             pairing.owner.type_line(PASSPHRASE);
             assert_eq!(pairing.owner.exit_code(), 0, "{}", pairing.owner.text());
@@ -6328,7 +6435,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
         fn a_teammate_the_owner_does_not_add_is_told_and_nothing_is_left_on_the_remote() {
             let fixture = fixture();
             let mut pairing = pair_until_asked(&fixture);
-            pairing.owner.type_line("n");
+            pairing.answer_owner("n");
             assert_eq!(pairing.owner.exit_code(), 1, "{}", pairing.owner.text());
             assert!(pairing.owner.text().contains("you did not add bob"));
             assert_eq!(pairing.joiner.exit_code(), 1, "{}", pairing.joiner.text());

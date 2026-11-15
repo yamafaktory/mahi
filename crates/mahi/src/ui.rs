@@ -37,6 +37,7 @@ use mahi_term::{
     Dialog,
     PaletteInput,
     PaletteKeys,
+    Preselected,
     Theme,
 };
 use ratatui_core::{
@@ -60,6 +61,7 @@ use rustix::termios::{
 use crate::terminal;
 
 const MAX_ACTIVITY_LINES: usize = 200;
+pub(crate) const KEY_GUARD: Duration = Duration::from_millis(500);
 const MAX_ACTIVITY_LINE_CHARS: usize = 400;
 const MAX_READ: usize = 1024;
 const SEQUENCE_WAIT: Duration = Duration::from_millis(30);
@@ -500,17 +502,19 @@ impl DialogPrompt {
         }
     }
 
+    pub(crate) fn confirm(&mut self, question: &str, preselected: Preselected) -> io::Result<bool> {
+        let mut lines = self.take_said();
+        lines.push(question.to_owned());
+        let dialog = Dialog::confirm("Confirm", lines, preselected);
+        match self.ask_guarded(dialog, key_guard(preselected))? {
+            Answer::Confirmed(confirmed) => Ok(confirmed),
+            _ => Err(cancelled()),
+        }
+    }
+
     pub(crate) fn answer(&mut self, question: &str) -> io::Result<String> {
         let trimmed = question.trim_end();
         let mut lines = self.take_said();
-        if let Some(asked) = trimmed.strip_suffix("[y/N]") {
-            lines.push(asked.trim_end().to_owned());
-            return match self.ask(Dialog::confirm("Confirm", lines))? {
-                Answer::Confirmed(true) => Ok("y".to_owned()),
-                Answer::Confirmed(false) => Ok("n".to_owned()),
-                _ => Err(cancelled()),
-            };
-        }
         lines.push(trimmed.to_owned());
         match self.ask(Dialog::input("mahi asks", lines, false))? {
             Answer::Text(text) => Ok(text.trim().to_owned()),
@@ -540,27 +544,35 @@ impl DialogPrompt {
     /// Shows `dialog` until it is answered, then a notice that mahi is working. Keys typed
     /// before it showed are thrown away, so none answers it unseen; Ctrl-C is a key while it
     /// waits, and a stop signal puts the terminal back and ends mahi.
-    pub(crate) fn ask(&mut self, mut dialog: Dialog) -> io::Result<Answer> {
+    pub(crate) fn ask(&mut self, dialog: Dialog) -> io::Result<Answer> {
+        self.ask_guarded(dialog, Duration::ZERO)
+    }
+
+    fn ask_guarded(&mut self, mut dialog: Dialog, guard: Duration) -> io::Result<Answer> {
         let signalling = keys_make_signals_now();
         keys_make_signals(false);
         let _ = rustix::termios::tcflush(io::stdin(), QueueSelector::IFlush);
         set_asking(true);
-        let answer = self.read_answer(&mut dialog);
+        let answer = self.read_answer(&mut dialog, guard);
         set_asking(false);
         show_working();
         keys_make_signals(signalling);
         answer
     }
 
-    fn read_answer(&mut self, dialog: &mut Dialog) -> io::Result<Answer> {
+    fn read_answer(&mut self, dialog: &mut Dialog, guard: Duration) -> io::Result<Answer> {
         let signals = TerminationSignals::listen().ok();
         keys_make_signals(false);
+        let takes_keys_at = Instant::now() + guard;
         let mut buffer = zeroize::Zeroizing::new([0_u8; MAX_READ]);
         loop {
             show(dialog)?;
             let Some(read) = read_keys(signals.as_ref(), &mut buffer)? else {
                 return Ok(Answer::Cancelled);
             };
+            if Instant::now() < takes_keys_at {
+                continue;
+            }
             let mut chunk = buffer.get(..read).unwrap_or_default();
             if !self.keys.is_pasting()
                 && let Some(after) = after_paste_tail(chunk)
@@ -869,13 +881,20 @@ fn collect(reader: OwnedFd, lines: &Mutex<Vec<String>>, generation: &AtomicU64) 
     }
 }
 
+pub(crate) fn key_guard(preselected: Preselected) -> Duration {
+    match preselected {
+        Preselected::Yes => KEY_GUARD,
+        Preselected::No => Duration::ZERO,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn only_a_dialog_in_place_of_a_notice_drops_the_selection() {
-        let confirm = || Dialog::confirm("Confirm", vec!["Add bob?".to_owned()]);
+        let confirm = || Dialog::confirm("Confirm", vec!["Add bob?".to_owned()], Preselected::No);
         let code = Dialog::code("Invite a teammate", "884-neptune-outfielder", &["Tell it."]);
         assert!(!replaces_notice(&confirm()));
         assert!(!replaces_notice(&code));

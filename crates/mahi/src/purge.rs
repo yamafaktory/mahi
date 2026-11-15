@@ -37,6 +37,7 @@ use mahi_store::{
     Store,
     StoreError,
 };
+use mahi_term::Preselected;
 use mahi_thread::{
     KeyError,
     MAX_META_BYTES,
@@ -386,13 +387,15 @@ fn confirmed(
         Some(setup) => format!("here and on {}", setup.name),
         None => "here only, since no remote is chosen".to_owned(),
     };
-    let answer = prompt
-        .answer(&format!(
-            "Purge thread {thread} {where_}? Its history, worktrees and agents' state are \
-             deleted for good. [y/N] "
-        ))
-        .map_err(PurgeError::Prompt)?;
-    Ok(matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes"))
+    prompt
+        .confirm(
+            &format!(
+                "Purge thread {thread} {where_}? Its history, worktrees and agents' state are \
+                 deleted for good."
+            ),
+            Preselected::No,
+        )
+        .map_err(PurgeError::Prompt)
 }
 
 fn read_meta(store: &Store, thread: ThreadId) -> Option<Vec<u8>> {

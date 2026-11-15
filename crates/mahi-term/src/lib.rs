@@ -31,6 +31,7 @@ pub use dialog::{
     Answer,
     Dialog,
     Palette,
+    Preselected,
     Theme,
     key_hints,
 };

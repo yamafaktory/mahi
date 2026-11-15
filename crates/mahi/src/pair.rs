@@ -55,6 +55,7 @@ use mahi_store::{
     Store,
     StoreError,
 };
+use mahi_term::Preselected;
 use mahi_thread::{
     CardError,
     ParticipantCard,
@@ -367,15 +368,15 @@ fn owner_pairs(
     }
     let name = card.participant().name().to_string();
     let question = format!(
-        "Add {name} ({}) to thread {thread} as a {}? [y/N] ",
+        "Add {name} ({}) to thread {thread} as a {}?",
         card.participant().key().fingerprint(),
         role_name(role)
     );
     drop(stop);
-    let answer = TerminalPrompt::open()
-        .and_then(|mut prompt| prompt.answer(&question))
+    let adds = TerminalPrompt::open()
+        .and_then(|mut prompt| prompt.confirm(&question, Preselected::Yes))
         .map_err(PairingError::Prompt)?;
-    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+    if !adds {
         if let Ok(sealed) = channel.seal(REFUSED)
             && link.send(&sealed).is_ok()
         {

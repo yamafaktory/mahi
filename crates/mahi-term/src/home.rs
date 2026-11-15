@@ -48,6 +48,7 @@ use crate::{
     Dialog,
     Header,
     PaletteInput,
+    Preselected,
     Theme,
     dialog::shown,
     key_hints,
@@ -362,7 +363,7 @@ impl Home {
             return Some(action);
         };
         self.dialog = Some((
-            Dialog::confirm("Confirm", vec![question]),
+            Dialog::confirm("Confirm", vec![question], Preselected::No),
             Pending::Confirm(action),
         ));
         None

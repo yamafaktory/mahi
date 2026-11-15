@@ -22,11 +22,13 @@ use mahi_sandbox::{
     Termination,
     TerminationSignals,
 };
+use mahi_term::Preselected;
 use rustix::{
     fs::OFlags,
     termios::{
         LocalModes,
         OptionalActions,
+        QueueSelector,
         Termios,
     },
 };
@@ -46,6 +48,11 @@ pub(crate) trait Prompt {
     fn say(&mut self, line: &str) -> io::Result<()>;
     fn secret(&mut self, question: &str) -> io::Result<SecretString>;
     fn answer(&mut self, question: &str) -> io::Result<String>;
+
+    /// Asks a yes or no question: on lines, an empty answer takes `preselected`.
+    fn confirm(&mut self, question: &str, preselected: Preselected) -> io::Result<bool> {
+        confirm_by_answer(|asked| self.answer(asked), question, preselected)
+    }
 
     /// Asks the user to pick one of `options`, each the answer it stands for and its label,
     /// and returns the answer: on lines, the options are listed and the answer typed.
@@ -72,6 +79,12 @@ pub(crate) struct TerminalPrompt {
 enum On {
     Lines { terminal: File, input: File },
     Dialogs(DialogPrompt),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Typing {
+    Hidden,
+    Shown { after: Duration },
 }
 
 struct EchoOff<'a> {
@@ -115,10 +128,15 @@ impl TerminalPrompt {
         })
     }
 
+    fn line_answer(files: (&File, &File), question: &str, guard: Duration) -> io::Result<String> {
+        let line = Self::read_answer(files, question, Typing::Shown { after: guard })?;
+        Ok(String::from_utf8_lossy(&line).trim().to_owned())
+    }
+
     fn read_answer(
         (terminal, input): (&File, &File),
         question: &str,
-        echo: bool,
+        typing: Typing,
     ) -> io::Result<Zeroizing<Vec<u8>>> {
         let signals = TerminationSignals::listen().map_err(io::Error::other)?;
         let mut answer = Answer {
@@ -126,13 +144,22 @@ impl TerminalPrompt {
             signals: &signals,
             stopped: None,
         };
+        rustix::termios::tcflush(terminal, QueueSelector::IFlush)?;
         let line = {
-            let _echo_off = if echo {
-                None
-            } else {
-                Some(EchoOff::new(terminal)?)
+            let quiet = match typing {
+                Typing::Shown { after } if after.is_zero() => None,
+                Typing::Hidden | Typing::Shown { .. } => Some(EchoOff::new(terminal)?),
             };
             write!(&*terminal, "{question}")?;
+            let _quiet = match typing {
+                Typing::Shown { after } if !after.is_zero() => {
+                    thread::sleep(after);
+                    rustix::termios::tcflush(terminal, QueueSelector::IFlush)?;
+                    drop(quiet);
+                    None
+                }
+                Typing::Hidden | Typing::Shown { .. } => quiet,
+            };
             read_line(&mut answer)
         };
         if let Some(signal) = answer.stopped {
@@ -156,6 +183,10 @@ impl<P: Prompt + ?Sized> Prompt for &mut P {
 
     fn answer(&mut self, question: &str) -> io::Result<String> {
         (**self).answer(question)
+    }
+
+    fn confirm(&mut self, question: &str, preselected: Preselected) -> io::Result<bool> {
+        (**self).confirm(question, preselected)
     }
 
     fn pick(&mut self, question: &str, options: &[(&str, &str)]) -> io::Result<String> {
@@ -188,7 +219,7 @@ impl Prompt for TerminalPrompt {
     fn secret(&mut self, question: &str) -> io::Result<SecretString> {
         match &mut self.on {
             On::Lines { terminal, input } => {
-                let line = Self::read_answer((terminal, input), question, false)?;
+                let line = Self::read_answer((terminal, input), question, Typing::Hidden)?;
                 writeln!(terminal)?;
                 let text = std::str::from_utf8(&line).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "the answer is not UTF-8")
@@ -202,10 +233,20 @@ impl Prompt for TerminalPrompt {
     fn answer(&mut self, question: &str) -> io::Result<String> {
         match &mut self.on {
             On::Lines { terminal, input } => {
-                let line = Self::read_answer((terminal, input), question, true)?;
-                Ok(String::from_utf8_lossy(&line).trim().to_owned())
+                Self::line_answer((terminal, input), question, Duration::ZERO)
             }
             On::Dialogs(dialogs) => dialogs.answer(question),
+        }
+    }
+
+    fn confirm(&mut self, question: &str, preselected: Preselected) -> io::Result<bool> {
+        match &mut self.on {
+            On::Lines { terminal, input } => confirm_by_answer(
+                |asked| Self::line_answer((terminal, input), asked, ui::key_guard(preselected)),
+                question,
+                preselected,
+            ),
+            On::Dialogs(dialogs) => dialogs.confirm(question, preselected),
         }
     }
 
@@ -273,6 +314,24 @@ fn read_line(mut terminal: impl Read) -> io::Result<Zeroizing<Vec<u8>>> {
     Ok(line)
 }
 
+fn confirm_by_answer(
+    answer: impl FnOnce(&str) -> io::Result<String>,
+    question: &str,
+    preselected: Preselected,
+) -> io::Result<bool> {
+    let hint = match preselected {
+        Preselected::Yes => "[Y/n]",
+        Preselected::No => "[y/N]",
+    };
+    let answered = answer(&format!("{question} {hint} "))?;
+    let answered = answered.trim();
+    Ok(if answered.is_empty() {
+        preselected == Preselected::Yes
+    } else {
+        answered.eq_ignore_ascii_case("y") || answered.eq_ignore_ascii_case("yes")
+    })
+}
+
 impl<'a> EchoOff<'a> {
     fn new(terminal: &'a File) -> io::Result<Self> {
         let saved = rustix::termios::tcgetattr(terminal)?;
@@ -291,7 +350,10 @@ impl Drop for EchoOff<'_> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::collections::VecDeque;
+    use std::{
+        collections::VecDeque,
+        os::fd::OwnedFd,
+    };
 
     use super::*;
 
@@ -322,6 +384,108 @@ pub(crate) mod tests {
                 .pop_front()
                 .expect("an unexpected question")
                 .to_owned())
+        }
+    }
+
+    fn lines() -> (OwnedFd, File, File) {
+        let (master, slave) = crate::terminal::tests::pty_pair(24, 80);
+        let terminal = File::from(slave.try_clone().unwrap());
+        rustix::fs::fcntl_setfl(&slave, OFlags::NONBLOCK).unwrap();
+        (master, terminal, File::from(slave))
+    }
+
+    fn type_once_shown(
+        master: OwnedFd,
+        question: &'static str,
+        typed: Vec<(Duration, &'static [u8])>,
+    ) -> thread::JoinHandle<(String, OwnedFd)> {
+        thread::spawn(move || {
+            let mut shown = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !String::from_utf8_lossy(&shown).contains(question) {
+                let read = rustix::io::read(&master, &mut chunk).unwrap();
+                shown.extend_from_slice(&chunk[..read]);
+            }
+            for (wait, bytes) in typed {
+                thread::sleep(wait);
+                rustix::io::write(&master, bytes).unwrap();
+            }
+            rustix::fs::fcntl_setfl(&master, OFlags::NONBLOCK).unwrap();
+            while let Ok(read) = rustix::io::read(&master, &mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                shown.extend_from_slice(&chunk[..read]);
+            }
+            (String::from_utf8_lossy(&shown).into_owned(), master)
+        })
+    }
+
+    #[test]
+    fn keys_typed_before_a_question_on_lines_answer_nothing() {
+        let (master, terminal, input) = lines();
+        rustix::io::write(&master, b"y\n").unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let typist = type_once_shown(master, "Purge? ", vec![(Duration::ZERO, b"n\n")]);
+        let answer =
+            TerminalPrompt::line_answer((&terminal, &input), "Purge? ", Duration::ZERO).unwrap();
+        assert_eq!(answer, "n");
+        typist.join().unwrap();
+    }
+
+    #[test]
+    fn a_guarded_question_on_lines_drops_and_hides_the_keys_typed_while_it_guards() {
+        let (master, terminal, input) = lines();
+        let typist = type_once_shown(
+            master,
+            "Add? ",
+            vec![
+                (Duration::ZERO, b"x\n"),
+                (ui::KEY_GUARD + Duration::from_millis(300), b"\n"),
+            ],
+        );
+        let answer =
+            TerminalPrompt::line_answer((&terminal, &input), "Add? ", ui::KEY_GUARD).unwrap();
+        assert_eq!(answer, "");
+        let (shown, _master) = typist.join().unwrap();
+        assert!(shown.starts_with("Add? "), "{shown:?}");
+        assert!(!shown.contains('x'), "{shown:?}");
+    }
+
+    #[test]
+    fn only_a_question_that_selects_yes_first_is_guarded() {
+        assert_eq!(ui::key_guard(Preselected::Yes), ui::KEY_GUARD);
+        assert_eq!(ui::key_guard(Preselected::No), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_confirmation_on_lines_shows_its_preselected_answer_and_takes_it_when_empty() {
+        let confirm = |typed: &'static str, preselected| {
+            let mut asked = String::new();
+            let confirmed = confirm_by_answer(
+                |question| {
+                    question.clone_into(&mut asked);
+                    Ok(typed.to_owned())
+                },
+                "Add bob?",
+                preselected,
+            )
+            .unwrap();
+            (confirmed, asked)
+        };
+        assert_eq!(
+            confirm("", Preselected::Yes),
+            (true, "Add bob? [Y/n] ".to_owned())
+        );
+        assert_eq!(
+            confirm("", Preselected::No),
+            (false, "Add bob? [y/N] ".to_owned())
+        );
+        for typed in ["y", "Y", "yes", "Yes", " YES "] {
+            assert!(confirm(typed, Preselected::No).0, "{typed:?}");
+        }
+        for typed in ["n", "No", "maybe"] {
+            assert!(!confirm(typed, Preselected::Yes).0, "{typed:?}");
         }
     }
 

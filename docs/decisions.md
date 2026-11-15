@@ -889,3 +889,16 @@ teammate with no key. The agent proposed `i` for invite, the home screen's key, 
 chose `e` for end as well, also the home screen's key. Each key acts only while the palette
 lists its action, once the shown tab knows its thread. The other choice was to leave End this
 thread without a key.
+
+## D117 · 2026-11-15 · Adding a teammate who paired selects Yes first
+
+Chosen by the user (#162). When a teammate pairs, the owner's question `Add <name>
+(<fingerprint>) to thread <thread-id> as a <role>?` selected No first. The owner gave the code
+to that teammate, so the question now ends in `[Y/n]`: its dialog selects Yes first, and on
+lines an empty answer adds the teammate. Every other confirmation keeps No first. The No default
+came from the generic confirmation, not from an earlier choice. During the work, not by the
+user: a question asked on lines now drops the keys typed before it, so an Enter pressed while
+the owner waits for the teammate cannot add them. Then, chosen by the user: a question that
+selects Yes first takes no key for its first 500 ms, as the land question does, so an Enter
+pressed just as it shows cannot add the teammate either. A question that selects No first takes
+keys at once, since Enter there declines.

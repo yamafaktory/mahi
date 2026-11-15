@@ -47,6 +47,7 @@ use mahi_term::{
     HomeRow,
     HomeView,
     PaletteKeys,
+    Preselected,
     ThreadView,
     TopBar,
 };
@@ -674,8 +675,10 @@ fn chosen_in_palette(moved: Moved) -> Option<Chosen> {
 /// Asks the question `action` is confirmed with, if any; returns whether it runs.
 fn confirmed(action: &HomeAction) -> bool {
     action.question().is_none_or(|question| {
-        let answer = DialogPrompt::default().ask(Dialog::confirm("Confirm", vec![question]));
-        matches!(answer, Ok(Answer::Confirmed(true)))
+        matches!(
+            DialogPrompt::default().confirm(&question, Preselected::No),
+            Ok(true)
+        )
     })
 }
 
@@ -699,6 +702,7 @@ fn stop_to_quit(workspace: &Workspace) -> bool {
             "{running} running: stop {them} and quit? Each ends as a stop signal ends it, with \
              its last snapshot unless it was already taking it."
         )],
+        Preselected::No,
     ));
     matches!(confirmed, Ok(Answer::Confirmed(true)))
 }
@@ -823,14 +827,14 @@ fn stop_thread_first(action: &HomeAction, workspace: &mut Workspace) -> Result<(
     } else {
         (format!("{count} agents are"), "them")
     };
-    let confirmed = DialogPrompt::default().ask(Dialog::confirm(
-        "Confirm",
-        vec![format!(
+    let confirmed = DialogPrompt::default().confirm(
+        &format!(
             "{running} running in this thread: stop {them} and {verb}? Each ends as a stop \
              signal ends it, with its last snapshot unless it was already taking it."
-        )],
-    ));
-    if !matches!(confirmed, Ok(Answer::Confirmed(true))) {
+        ),
+        Preselected::No,
+    );
+    if !matches!(confirmed, Ok(true)) {
         return Err("the agents keep running".to_owned());
     }
     let busy = ui::Busy::start();
@@ -1117,6 +1121,7 @@ fn credential_words(environment: &Environment) -> Result<Vec<String>, String> {
         vec![format!(
             "Remove the credential {name}? What signs in with it has to be given a token again."
         )],
+        Preselected::No,
     ));
     match confirmed {
         Ok(Answer::Confirmed(true)) => Ok(vec![

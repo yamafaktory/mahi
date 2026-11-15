@@ -44,6 +44,7 @@ use crate::{
         LandingView,
     },
     source::Source,
+    ui::KEY_GUARD,
 };
 
 const MAX_HELD_BYTES: usize = 1024 * 1024;
@@ -60,7 +61,6 @@ const HELD_INTRO: &str = "Its turn changes what agents read as their settings or
 const HELD_UNTOLD: &str = "(mahi could not tell which paths)";
 const HELD_BEHIND: &str = "Its later turns wait behind it.";
 const NOT_TAKEN: &str = "Not taken: ";
-const OPEN_GUARD: Duration = Duration::from_millis(500);
 const CLEAR: &[u8] = b"\x1b[2J";
 const REPAINT_PAUSE: Duration = Duration::from_millis(100);
 
@@ -505,7 +505,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
 
     fn draw(&self, state: &mut State<W>) -> io::Result<()> {
         if state.guard == Guard::UntilShown {
-            state.guard = Guard::Until(Instant::now() + OPEN_GUARD);
+            state.guard = Guard::Until(Instant::now() + KEY_GUARD);
         }
         let size = self.terminal.size();
         if let Some(landing) = self.landing() {
@@ -516,7 +516,7 @@ impl<W: Write, T: AgentTerminal> Screen<W, T> {
             }
             if state.landing_drawn != Some(landing.generation) {
                 state.landing_drawn = Some(landing.generation);
-                state.guard = Guard::Until(Instant::now() + OPEN_GUARD);
+                state.guard = Guard::Until(Instant::now() + KEY_GUARD);
             }
             let view = PaletteView {
                 title: &landing.title,
@@ -1114,7 +1114,7 @@ mod tests {
         assert_eq!(screen.typed(b"\r").unwrap(), 1);
         assert!(screen.is_open());
         assert!(waiting.take_choices().is_empty());
-        thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"\r").unwrap();
         assert!(!screen.is_open());
         assert_eq!(waiting.take_choices().len(), 1);
@@ -1127,14 +1127,14 @@ mod tests {
         screen.output(b"\x1b[").unwrap();
         screen.open_guarded().unwrap();
         assert!(screen.is_opening());
-        thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        thread::sleep(KEY_GUARD + Duration::from_millis(50));
         assert_eq!(screen.typed(b"\x18").unwrap(), 1);
         assert!(waiting.take_choices().is_empty());
         screen.output(b"m").unwrap();
         assert!(!screen.is_opening());
         screen.typed(b"\x18").unwrap();
         assert!(waiting.take_choices().is_empty());
-        thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"\x18").unwrap();
         assert_eq!(waiting.take_choices().len(), 1);
     }
@@ -1191,7 +1191,7 @@ mod tests {
             desk.view().is_some(),
             "a key in the first 500 ms is dropped"
         );
-        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        std::thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"x\x7f").unwrap();
         assert!(desk.view().is_some());
         screen.typed(b"\x1b").unwrap();
@@ -1213,7 +1213,7 @@ mod tests {
             text.contains("y lands them again  n they were merged  Esc cancels"),
             "{text}"
         );
-        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        std::thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"x\r").unwrap();
         assert_eq!(
             desk.view().unwrap().hint,
@@ -1221,12 +1221,12 @@ mod tests {
         );
         screen.typed(b"n").unwrap();
         assert_eq!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
-        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        std::thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"\x1b").unwrap();
         assert!(crate::land_desk::tests::offer_again(&landing));
         crate::land_desk::tests::ask_about(&landing);
         screen.open().unwrap();
-        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        std::thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"y").unwrap();
         assert!(desk.view().is_none());
         assert!(!screen.is_open());
@@ -1240,7 +1240,7 @@ mod tests {
         let screen = screen(&terminal).with_desk(Arc::clone(&desk));
         screen.open().unwrap();
         crate::land_desk::tests::push_now(&landing);
-        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        std::thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"\x1b").unwrap();
         assert!(desk.view().is_some());
         assert!(!screen.is_open());
@@ -1254,7 +1254,7 @@ mod tests {
         let desk = Arc::clone(&landing.desk);
         let screen = screen(&terminal).with_desk(Arc::clone(&desk));
         screen.open().unwrap();
-        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        std::thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"n").unwrap();
         screen.typed(b"\r").unwrap();
         assert_eq!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
@@ -1267,7 +1267,7 @@ mod tests {
         let desk = Arc::clone(&landing.desk);
         let screen = screen(&terminal).with_desk(Arc::clone(&desk));
         screen.open().unwrap();
-        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        std::thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"\x1b").unwrap();
         assert!(desk.view().is_none());
         screen.open().unwrap();
@@ -1277,7 +1277,7 @@ mod tests {
         screen.tick().unwrap();
         screen.typed(b"\r").unwrap();
         assert_eq!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
-        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        std::thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"\r").unwrap();
         assert_ne!(desk.view().unwrap().hint, "Enter pushes  Esc cancels");
     }
@@ -1308,7 +1308,7 @@ mod tests {
         let screen = screen(&terminal).with_desk(Arc::clone(&desk));
         screen.open().unwrap();
         written(&screen);
-        std::thread::sleep(OPEN_GUARD + Duration::from_millis(50));
+        std::thread::sleep(KEY_GUARD + Duration::from_millis(50));
         screen.typed(b"\r").unwrap();
         crate::land_desk::tests::until_done(&desk);
         screen.tick().unwrap();

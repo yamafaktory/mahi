@@ -297,6 +297,15 @@ impl fmt::Debug for Answer {
     }
 }
 
+/// Which answer a yes or no question selects first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preselected {
+    /// Yes is selected first.
+    Yes,
+    /// No is selected first.
+    No,
+}
+
 impl Dialog {
     /// Makes a dialog that shows `lines` until the user presses Enter or Escape.
     #[must_use]
@@ -373,10 +382,16 @@ impl Dialog {
         }
     }
 
-    /// Makes a yes or no question, `no` selected first.
+    /// Makes a yes or no question with `preselected` selected first.
     #[must_use]
-    pub fn confirm(title: &str, lines: Vec<String>) -> Self {
-        Self::with(title, lines, Kind::Confirm { yes: false })
+    pub fn confirm(title: &str, lines: Vec<String>, preselected: Preselected) -> Self {
+        Self::with(
+            title,
+            lines,
+            Kind::Confirm {
+                yes: preselected == Preselected::Yes,
+            },
+        )
     }
 
     /// Makes a line to type, shown as dots when `masked`.
@@ -984,7 +999,8 @@ mod tests {
     fn a_dialog_is_drawn_on_mahis_surface_over_what_lies_around_it() {
         let area = Rect::new(0, 0, 80, 20);
         let mut buffer = Buffer::empty(area);
-        Dialog::confirm("Confirm", vec!["Add bob?".to_owned()]).render(area, &mut buffer);
+        Dialog::confirm("Confirm", vec!["Add bob?".to_owned()], Preselected::No)
+            .render(area, &mut buffer);
         let corner = (0..area.height)
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
             .find(|&at| buffer[at].symbol() == "╭")
@@ -1231,7 +1247,8 @@ mod tests {
 
     #[test]
     fn a_confirmation_answers_y_n_or_the_selected_button() {
-        let mut dialog = Dialog::confirm("Land", vec!["Land thread t1?".to_owned()]);
+        let mut dialog =
+            Dialog::confirm("Land", vec!["Land thread t1?".to_owned()], Preselected::No);
         assert_eq!(
             dialog.key(PaletteInput::Enter),
             Some(Answer::Confirmed(false))
@@ -1248,6 +1265,20 @@ mod tests {
         assert_eq!(dialog.key(PaletteInput::Pasted('y')), None);
         assert_eq!(dialog.key(PaletteInput::Escape), Some(Answer::Cancelled));
         assert!(drawn(&dialog).contains("Land thread t1?"));
+    }
+
+    #[test]
+    fn a_confirmation_with_yes_first_answers_yes_on_enter() {
+        let mut dialog = Dialog::confirm("Confirm", vec!["Add bob?".to_owned()], Preselected::Yes);
+        assert_eq!(
+            dialog.key(PaletteInput::Enter),
+            Some(Answer::Confirmed(true))
+        );
+        assert_eq!(dialog.key(PaletteInput::Tab), None);
+        assert_eq!(
+            dialog.key(PaletteInput::Enter),
+            Some(Answer::Confirmed(false))
+        );
     }
 
     #[test]
@@ -1299,7 +1330,7 @@ mod tests {
         assert_eq!(dialog.key(PaletteInput::Pasted('j')), None);
         assert_eq!(dialog.key(PaletteInput::Enter), Some(Answer::Choice(0)));
         assert!(drawn(&dialog).contains("↑↓ jk move"));
-        let mut confirm = Dialog::confirm("Land", vec![]);
+        let mut confirm = Dialog::confirm("Land", vec![], Preselected::No);
         assert_eq!(confirm.key(PaletteInput::Text('j')), None);
         assert_eq!(
             confirm.key(PaletteInput::Enter),

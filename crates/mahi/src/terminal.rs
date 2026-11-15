@@ -172,7 +172,7 @@ fn read_background(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::os::fd::OwnedFd;
 
     use rustix::{
@@ -186,7 +186,7 @@ mod tests {
 
     use super::*;
 
-    fn pty_pair(rows: u16, cols: u16) -> (OwnedFd, OwnedFd) {
+    pub(crate) fn pty_pair(rows: u16, cols: u16) -> (OwnedFd, OwnedFd) {
         let master = rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
         rustix::pty::grantpt(&master).unwrap();
         rustix::pty::unlockpt(&master).unwrap();
