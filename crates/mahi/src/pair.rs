@@ -101,7 +101,7 @@ const MAX_RECORD_BYTES: u64 = 128;
 const TICKET_PREFIX: &str = "ticket ";
 const REFUSED: &[u8] = b"refused";
 const TELL_CODE: &str = "Tell this code to your teammate. In a clone of this project, they press \
-                         c on mahi's home screen, or run mahi join, and type it.";
+                         J on mahi's home screen, or run mahi join, and type it.";
 const WAITING_FOR_CODE: &str = "Waiting up to 10 minutes.";
 
 #[derive(Debug, Error)]
@@ -619,6 +619,19 @@ mod tests {
         gix::init(dir.path()).unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn the_owner_is_told_the_key_that_joins_on_the_home_screen() {
+        let key = TELL_CODE
+            .split("they press ")
+            .nth(1)
+            .and_then(|rest| rest.chars().next())
+            .unwrap();
+        assert_eq!(
+            mahi_term::Home::default().key(mahi_term::PaletteInput::Text(key), &[]),
+            Some(mahi_term::HomeAction::Join)
+        );
     }
 
     #[test]
