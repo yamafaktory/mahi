@@ -881,3 +881,11 @@ stays the vim motion down. The agent chose `J` (Shift-J): it keeps the letter of
 every other letter it could take had no link to join. The other choices were `o`, `a` and `w`.
 With Caps Lock on, `j` on most terminals sends `J` and opens the join dialog. The user keeps
 `J` anyway, since Escape closes the dialog and nothing joins without a code.
+
+## D116 · 2026-11-15 · The palette ends with e and invites with i
+
+Asked for by the user (#161). The workspace's palette listed End this thread and Invite a
+teammate with no key. The agent proposed `i` for invite, the home screen's key, and the user
+chose `e` for end as well, also the home screen's key. Each key acts only while the palette
+lists its action, once the shown tab knows its thread. The other choice was to leave End this
+thread without a key.

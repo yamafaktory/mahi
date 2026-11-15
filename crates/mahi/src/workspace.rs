@@ -660,10 +660,18 @@ enum Entry {
     Quit,
 }
 
-const THREAD_ACTIONS: [(ThreadChoice, &str); 2] = [
-    (ThreadChoice::End, "End this thread"),
-    (ThreadChoice::Invite, "Invite a teammate"),
+const THREAD_ACTIONS: [(ThreadChoice, &str, Option<char>); 2] = [
+    (ThreadChoice::End, "End this thread", Some('e')),
+    (ThreadChoice::Invite, "Invite a teammate", Some('i')),
 ];
+
+fn listed_action(entries: &[Entry], typed: char) -> Option<Entry> {
+    let (choice, _, _) = THREAD_ACTIONS
+        .into_iter()
+        .find(|(_, _, key)| *key == Some(typed))?;
+    let action = Entry::Act(choice);
+    entries.contains(&action).then_some(action)
+}
 
 impl Workspace {
     /// Starts a workspace with no thread open, whose keys follow `palette_key`, and which
@@ -1534,8 +1542,12 @@ impl Workspace {
             );
         }
         if shown.is_some_and(|tab| tab.thread.is_some()) {
-            for (choice, label) in THREAD_ACTIONS {
-                add(label.to_owned(), String::new(), Entry::Act(choice));
+            for (choice, label, key) in THREAD_ACTIONS {
+                add(
+                    label.to_owned(),
+                    key.map(String::from).unwrap_or_default(),
+                    Entry::Act(choice),
+                );
             }
         }
         if shown.is_some_and(|tab| tab.watch_only && tab.agents.is_empty()) {
@@ -1568,6 +1580,11 @@ impl Workspace {
                 PaletteInput::Text(' ') => Some(Entry::Step(Step::Waiting)),
                 PaletteInput::Text('q') => Some(Entry::Quit),
                 PaletteInput::Text('p') => Some(Entry::AgentPalette),
+                PaletteInput::Text(typed)
+                    if let Some(action) = listed_action(&palette.entries, typed) =>
+                {
+                    Some(action)
+                }
                 PaletteInput::Left => Some(Entry::Step(Step::Previous)),
                 PaletteInput::Right => Some(Entry::Step(Step::Next)),
                 other => match palette.menu.key(other) {
@@ -2559,6 +2576,8 @@ mod tests {
         workspace.type_keys(b"\x00", &mut threads);
         let entries = &workspace.palette.as_ref().unwrap().entries;
         assert!(!entries.iter().any(|entry| matches!(entry, Entry::Act(_))));
+        assert_eq!(workspace.type_keys(b"i", &mut threads), Moved::Nothing);
+        assert!(workspace.palette_open());
         workspace.type_keys(b"\x1b", &mut threads);
         let thread: ThreadId = "0123456789abcdef0123456789abcdef".parse().unwrap();
         workspace.tabs[0].thread = Some(thread);
@@ -2571,7 +2590,7 @@ mod tests {
         assert_eq!(
             actions,
             THREAD_ACTIONS
-                .map(|(choice, _)| Entry::Act(choice))
+                .map(|(choice, _, _)| Entry::Act(choice))
                 .iter()
                 .collect::<Vec<_>>()
         );
@@ -2590,8 +2609,9 @@ mod tests {
                 .find(|row| row.contains(item))
                 .unwrap_or_else(|| panic!("{item} missing: {rows:#?}"))
         };
-        for item in ["End this thread", "Invite a teammate"] {
-            row_of(item);
+        for (item, key) in [("End this thread", " e"), ("Invite a teammate", " i")] {
+            let row = row_of(item).trim_end_matches(['│', '╯', ' ']);
+            assert!(row.ends_with(key), "{rows:#?}");
         }
         assert!(
             !rows.iter().any(|row| {
@@ -2617,6 +2637,28 @@ mod tests {
         );
         assert!(!workspace.palette_open());
         assert_eq!(workspace.type_keys(b"x", &mut threads), Moved::Nothing);
+        for (typed, choice) in [(b"i", ThreadChoice::Invite), (b"e", ThreadChoice::End)] {
+            workspace.type_keys(b"\x00", &mut threads);
+            assert_eq!(
+                workspace.type_keys(typed, &mut threads),
+                Moved::Act(choice, thread)
+            );
+            assert!(!workspace.palette_open());
+        }
+    }
+
+    #[test]
+    fn thread_action_keys_take_no_key_the_palette_or_its_menu_reads() {
+        let keys: Vec<char> = THREAD_ACTIONS
+            .iter()
+            .filter_map(|(_, _, key)| *key)
+            .collect();
+        let taken = |key: char| key.is_ascii_digit() || " qpjk".contains(key);
+        assert!(!keys.iter().copied().any(taken), "{keys:?}");
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "{keys:?}");
     }
 
     #[test]
