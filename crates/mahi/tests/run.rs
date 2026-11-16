@@ -4322,6 +4322,7 @@ echo stray > "$CODEX_HOME/history.jsonl"
         );
     }
 
+    #[derive(Clone)]
     struct Teammate {
         home: PathBuf,
         repo: PathBuf,
@@ -4942,12 +4943,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
             &format!("#!/bin/sh\n{CLAIMER}\n"),
         );
         let bob_thread = {
-            let bob = Teammate {
-                home: bob.home.clone(),
-                repo: bob.repo.clone(),
-                socket: bob.socket.clone(),
-                key: bob.key.clone(),
-            };
+            let bob = bob.clone();
             thread::spawn(move || {
                 teammate_in_terminal(
                     &bob,
@@ -4958,16 +4954,74 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
         };
         let output = owner.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let bob_worktree = fs::read_dir(bob.home.join(".local/share/mahi/worktrees"))
+        fs::write(teammate_worktree(&bob, thread).join("done"), "").unwrap();
+        let (code, text) = bob_thread.join().unwrap();
+        assert_eq!(code, 0, "{text}");
+        assert!(stdout.contains("saw bob's claim"), "{stdout}");
+    }
+
+    fn teammate_worktree(teammate: &Teammate, thread: ThreadId) -> PathBuf {
+        fs::read_dir(teammate.home.join(".local/share/mahi/worktrees"))
             .unwrap()
             .flat_map(|repository| fs::read_dir(repository.unwrap().path()).unwrap())
             .map(|entry| entry.unwrap().path())
             .find(|path| path.ends_with(format!("{thread}.claude")))
+            .unwrap()
+    }
+
+    const README_WRITER: &str = r#"#!/bin/sh
+echo "from bob" > README.md
+"$MAHI_BIN" hook turn-end < /dev/null
+start=$(date +%s)
+until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done"#;
+
+    #[test]
+    fn a_collaborators_turn_reaches_the_owner_who_typed_and_erased_a_line() {
+        let fixture = fixture();
+        save_identity(&fixture);
+        let ready = script(
+            &fixture,
+            "owner-tools",
+            "claude",
+            "#!/bin/sh\necho owner-agent-ready\nsleep 60\n",
+        );
+        let mut owner = terminal_command(&fixture, &["run", ready.to_str().unwrap()])
+            .env("MAHI_LIVE", "local")
+            .spawn()
             .unwrap();
-        fs::write(bob_worktree.join("done"), "").unwrap();
+        let (output, _output_end) = collect(&owner);
+        wait_until("the owner's agent", || {
+            String::from_utf8_lossy(&output.lock().unwrap()).contains("owner-agent-ready")
+        });
+        let (thread, _key) = running_thread(&fixture);
+        let mut keys = owner.writer().unwrap();
+        for key in [&b"h"[..], b"i", b"\x7f", b"\x7f"] {
+            keys.write_all(key).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        }
+        let bob = teammate(&fixture, "bob");
+        let ticket = invite_teammate(&fixture, (thread, "--collaborator"), &bob);
+        let writer = script(&fixture, "bob-tools", "claude", README_WRITER);
+        let bob_thread = {
+            let bob = bob.clone();
+            thread::spawn(move || {
+                teammate_in_terminal(
+                    &bob,
+                    "bob",
+                    &["join", &ticket, "--", writer.to_str().unwrap()],
+                )
+            })
+        };
+        let owner_worktree = fixture.thread_worktrees().pop().unwrap();
+        let reached = waited(Duration::from_secs(60), || {
+            fs::read_to_string(owner_worktree.join("README.md"))
+                .is_ok_and(|text| text == "from bob\n")
+        });
+        let _ = owner.kill();
+        fs::write(teammate_worktree(&bob, thread).join("done"), "").unwrap();
         let (code, text) = bob_thread.join().unwrap();
         assert_eq!(code, 0, "{text}");
-        assert!(stdout.contains("saw bob's claim"), "{stdout}");
+        assert!(reached, "{}", owner_worktree.display());
     }
 
     #[test]

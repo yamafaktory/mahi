@@ -595,7 +595,7 @@ fn report(
         activity,
         agent,
         writer,
-        (pace, Readiness::UntouchedAfterTurnEnd),
+        (pace, Readiness::ClearAfterTurnEnd),
         |input| {
             activity.typed_prompt();
             let _ = inject::type_prompt(input, &report_prompt(to_report));
@@ -1034,6 +1034,7 @@ mod tests {
                     (&merging.running, pace()),
                 );
             });
+            merging.activity.saw(HookKind::Prompt, b"");
             merging.activity.saw(HookKind::TurnEnd, b"");
             wait_for("bob's turn was never merged", &merging.running, || {
                 worktree.join("notes.txt").exists()

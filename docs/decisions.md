@@ -902,3 +902,21 @@ the owner waits for the teammate cannot add them. Then, chosen by the user: a qu
 selects Yes first takes no key for its first 500 ms, as the land question does, so an Enter
 pressed just as it shows cannot add the teammate either. A question that selects No first takes
 keys at once, since Enter there declines.
+
+## D118 · 2026-11-16 · An erased line counts as empty again
+
+Chosen by the user (#166). In a run with two terminals, the owner typed in their agent's line
+and erased it with Backspace. mahi counted the line as unfinished until Enter, Ctrl-C, Ctrl-U
+or Escape, so the collaborator's merge waited almost four minutes, and the report prompt never
+came. mahi now counts the ASCII characters typed and the Backspaces, and a count back to zero
+empties the line. Any other cursor or edit key, a character outside ASCII or an Alt chord makes
+the count unsure, so the line stays unfinished. Every mistake leaves the line unfinished, never
+empty. The other choices were to keep the rule and say on the status line that a merge waits
+for the line, or both. Also chosen by the user: the report prompt comes once the line is
+counted back to empty, not only when no key came since the turn end. The user first included
+Enter, Escape, Ctrl-C and Ctrl-U. The review then found that Enter can send a built-in command
+such as `/model`, which opens a picker no hook reports, that Escape can keep a draft or step
+back only one level of a nested dialog, and that Ctrl-U clears one line of a multi-line draft.
+So the user chose Backspace back to zero only. Those keys still empty the line for merges, and
+a prompt hook clears it for the report. An arrow or Tab on an empty line also leaves it not
+clear for the report.

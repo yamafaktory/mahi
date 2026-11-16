@@ -32,8 +32,14 @@ use crate::hub::OutputTap;
 const ENTER_AFTER: Duration = Duration::from_millis(250);
 const INTERRUPT: u8 = 0x03;
 const KILL_LINE: u8 = 0x15;
+const BACKSPACE: u8 = 0x7f;
+const CTRL_H: u8 = 0x08;
 const ESC: u8 = 0x1b;
 const HELD_AT_MOST: usize = 4096;
+const KITTY_LOCK_KEYS: std::ops::RangeInclusive<u32> = 57358..=57360;
+const KITTY_KEYPAD_TEXT: std::ops::RangeInclusive<u32> = 57399..=57416;
+const KITTY_MODIFIER_KEYS: std::ops::RangeInclusive<u32> = 57441..=57454;
+const KITTY_PRIVATE_USE: std::ops::RangeInclusive<u32> = 57344..=63743;
 
 /// How work that waits for the agent paces itself: how long the agent and the user must be
 /// quiet, and how often it looks.
@@ -110,12 +116,60 @@ impl Escapes {
     }
 }
 
+/// What mahi knows of the user's input line in the agent, from the keys alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Line {
+    /// Empty, with no key since it emptied that could open a picker or bring text back.
+    Clear,
+    /// Empty, but a key since may have opened a picker, brought back a past prompt or left a
+    /// draft: an arrow, Enter, which can send a command that opens a dialog, Escape, Ctrl-C or
+    /// Ctrl-U.
+    Moved,
+    /// Holds this many characters the user typed, each of which a Backspace takes back.
+    Typed(usize),
+    /// Holds text mahi cannot count.
+    Unsure,
+}
+
+impl Line {
+    fn is_empty(self) -> bool {
+        match self {
+            Self::Clear | Self::Moved => true,
+            Self::Typed(_) | Self::Unsure => false,
+        }
+    }
+
+    fn typed(self) -> Self {
+        match self {
+            Self::Clear => Self::Typed(1),
+            Self::Typed(count) => Self::Typed(count.saturating_add(1)),
+            Self::Moved | Self::Unsure => Self::Unsure,
+        }
+    }
+
+    fn backspace(self) -> Self {
+        match self {
+            Self::Typed(1) => Self::Clear,
+            Self::Typed(count) => Self::Typed(count - 1),
+            Self::Clear | Self::Moved | Self::Unsure => self,
+        }
+    }
+
+    fn moved(self) -> Self {
+        match self {
+            Self::Clear | Self::Moved => Self::Moved,
+            Self::Typed(_) | Self::Unsure => Self::Unsure,
+        }
+    }
+}
+
 /// What reading the user's keys keeps from one read to the next: the end of a read that can
-/// still become a terminal answer, and the Escapes in a row.
+/// still become a terminal answer, the Escapes in a row, and the input line.
 #[derive(Debug)]
 struct Reading {
     unfinished: Vec<u8>,
     escapes: Escapes,
+    line: Line,
 }
 
 impl Reading {
@@ -123,6 +177,7 @@ impl Reading {
         Self {
             unfinished: Vec::new(),
             escapes: Escapes::new(rule),
+            line: Line::Clear,
         }
     }
 }
@@ -145,11 +200,10 @@ pub(crate) enum AtLaunch {
 pub(crate) struct Activity {
     turn_open: AtomicBool,
     turn_ended: AtomicBool,
-    reported_untouched: AtomicBool,
+    reported: AtomicBool,
     ready_on_output: AtomicBool,
     keyed: AtomicBool,
     asking: AtomicBool,
-    line_empty: AtomicBool,
     reading: Mutex<Reading>,
     last: Mutex<Instant>,
     tap: Option<OutputTap>,
@@ -161,11 +215,10 @@ impl Default for Activity {
         Self {
             turn_open: AtomicBool::new(false),
             turn_ended: AtomicBool::new(true),
-            reported_untouched: AtomicBool::new(false),
+            reported: AtomicBool::new(false),
             ready_on_output: AtomicBool::new(false),
             keyed: AtomicBool::new(false),
             asking: AtomicBool::new(false),
-            line_empty: AtomicBool::new(true),
             reading: Mutex::new(Reading::new(EscapeTwice::Any)),
             last: Mutex::new(Instant::now()),
             tap: None,
@@ -229,7 +282,7 @@ impl Activity {
         };
         if self.ready_on_output.swap(false, Ordering::SeqCst) && !self.keyed.load(Ordering::SeqCst)
         {
-            self.reported_untouched.store(true, Ordering::SeqCst);
+            self.reported.store(true, Ordering::SeqCst);
         }
     }
 
@@ -241,25 +294,27 @@ impl Activity {
     }
 
     /// Notes `bytes` the user typed, or the terminal answered, that went to the agent: text
-    /// leaves the line unfinished, Enter, Ctrl-C, Ctrl-U or Escape alone empties it, and Ctrl-C
-    /// or Escape interrupts a turn; other sequences, such as arrows or the terminal's answers,
-    /// change neither. Text or Enter answers the agent's question, if it asked one. Only the
-    /// terminal's answers, when they are all `bytes` hold, leave the agent untouched. An
-    /// answer that `bytes` leave unfinished waits for the next `bytes`, unless they are Escape
-    /// alone. A second Escape that opens the agent's picker, as [`EscapeTwice`] tells, leaves
-    /// the line unfinished.
+    /// leaves the line unfinished, Backspace takes back a character typed, Enter, Ctrl-C,
+    /// Ctrl-U or Escape alone empties it, and Ctrl-C or Escape interrupts a turn; another key,
+    /// such as an arrow, may open a picker or bring text back, so it leaves an empty line
+    /// [`Line::Moved`] and makes typed text [`Line::Unsure`]; the terminal's answers change
+    /// nothing. Text or Enter answers the agent's question, if it asked one. An answer that
+    /// `bytes` leave unfinished waits for the next `bytes`, unless they are Escape alone. A
+    /// second Escape that opens the agent's picker, as [`EscapeTwice`] tells, leaves the line
+    /// unfinished.
     pub(crate) fn keys(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         self.touched();
         let Ok(mut reading) = self.reading.lock() else {
-            self.took(&line_effect(bytes));
+            self.took(&line_effect(Line::Unsure, bytes));
             return;
         };
         let Reading {
             unfinished,
             escapes,
+            line,
         } = &mut *reading;
         if bytes == [ESC] {
             if unfinished.as_slice() == [ESC] {
@@ -275,14 +330,17 @@ impl Activity {
         let head = read.get(..unfinished_answer_at(read)).unwrap_or_default();
         let effect = (!is_terminal_answer(head)).then(|| {
             let opens = press_of(head).is_some_and(|press| escapes.press(press, Instant::now()));
-            if opens {
-                LineEffect {
-                    line_empty: Some(false),
-                    interrupts: false,
-                }
+            let effect = if opens {
+                let mut effect = LineEffect::on(*line);
+                effect.unsure();
+                effect
             } else {
-                line_effect(read)
+                line_effect(*line, read)
+            };
+            if !self.asking.load(Ordering::SeqCst) {
+                *line = effect.line;
             }
+            effect
         });
         let finished = head.len();
         if joined {
@@ -299,6 +357,15 @@ impl Activity {
         }
     }
 
+    fn sent_prompt(&self) {
+        if let Ok(mut reading) = self.reading.lock() {
+            reading.escapes.forget();
+            if reading.line == Line::Moved {
+                reading.line = Line::Clear;
+            }
+        }
+    }
+
     fn forget_escapes(&self) {
         if let Ok(mut reading) = self.reading.lock() {
             reading.escapes.forget();
@@ -308,7 +375,6 @@ impl Activity {
     fn took(&self, effect: &LineEffect) {
         let changing = self.changing.lock();
         self.keyed.store(true, Ordering::SeqCst);
-        self.reported_untouched.store(false, Ordering::SeqCst);
         let Ok(_changing) = changing else {
             return;
         };
@@ -319,11 +385,8 @@ impl Activity {
                 self.tell(TurnState::Done);
             }
         }
-        if let Some(empty) = effect.line_empty {
-            self.line_empty.store(empty, Ordering::SeqCst);
-            if !effect.interrupts && self.asking.swap(false, Ordering::SeqCst) {
-                self.tell(TurnState::Working);
-            }
+        if effect.edits && !effect.interrupts && self.asking.swap(false, Ordering::SeqCst) {
+            self.tell(TurnState::Working);
         }
     }
 
@@ -334,10 +397,10 @@ impl Activity {
         };
         match kind {
             HookKind::Prompt => {
-                self.forget_escapes();
+                self.sent_prompt();
                 let was_open = self.turn_open.swap(true, Ordering::SeqCst);
                 self.turn_ended.store(false, Ordering::SeqCst);
-                self.reported_untouched.store(false, Ordering::SeqCst);
+                self.reported.store(false, Ordering::SeqCst);
                 let was_asking = self.asking.swap(false, Ordering::SeqCst);
                 if !was_open || was_asking {
                     self.tell(TurnState::Working);
@@ -346,7 +409,7 @@ impl Activity {
             HookKind::TurnEnd => {
                 self.turn_open.store(false, Ordering::SeqCst);
                 self.turn_ended.store(true, Ordering::SeqCst);
-                self.reported_untouched.store(true, Ordering::SeqCst);
+                self.reported.store(true, Ordering::SeqCst);
                 self.asking.store(false, Ordering::SeqCst);
                 self.tell(TurnState::Done);
             }
@@ -357,7 +420,7 @@ impl Activity {
             }
             HookKind::SessionStart => {
                 if starts_session(payload) && !self.keyed.load(Ordering::SeqCst) {
-                    self.reported_untouched.store(true, Ordering::SeqCst);
+                    self.reported.store(true, Ordering::SeqCst);
                 }
             }
             HookKind::Asks => {
@@ -369,29 +432,39 @@ impl Activity {
         self.touched();
     }
 
+    fn line(&self) -> Option<Line> {
+        self.reading.lock().ok().map(|reading| reading.line)
+    }
+
     fn is_idle(&self, pace: &Pace) -> bool {
+        self.line()
+            .is_some_and(|line| self.is_idle_with(line, pace))
+    }
+
+    fn is_idle_with(&self, line: Line, pace: &Pace) -> bool {
         let Ok(quiet_for) = self.last.lock().map(|last| last.elapsed()) else {
             return false;
         };
         if self.asking.load(Ordering::SeqCst) {
             return false;
         }
-        !self.turn_open.load(Ordering::SeqCst)
-            && self.line_empty.load(Ordering::SeqCst)
-            && quiet_for >= pace.quiet
+        !self.turn_open.load(Ordering::SeqCst) && line.is_empty() && quiet_for >= pace.quiet
     }
 
     /// Says whether the agent is idle after a turn end or a session start its hooks reported in
-    /// this run, with no key of the user's since.
-    fn is_untouched_after_turn_end(&self, pace: &Pace) -> bool {
-        self.reported_untouched.load(Ordering::SeqCst) && self.is_idle(pace)
+    /// this run, with its input line [`Line::Clear`].
+    fn is_clear_after_turn_end(&self, pace: &Pace) -> bool {
+        self.reported.load(Ordering::SeqCst)
+            && self
+                .line()
+                .is_some_and(|line| line == Line::Clear && self.is_idle_with(line, pace))
     }
 
     /// Takes in that mahi typed a prompt into the agent, so it types no other until the next
     /// turn end or session start its hooks report.
     pub(crate) fn typed_prompt(&self) {
         self.forget_escapes();
-        self.reported_untouched.store(false, Ordering::SeqCst);
+        self.reported.store(false, Ordering::SeqCst);
         self.touched();
     }
 
@@ -402,16 +475,38 @@ impl Activity {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+/// What keys did to the input line: the line they left, whether they edited it, as text,
+/// Enter or an interrupt does, and whether they interrupt a turn.
+#[derive(Debug, PartialEq, Eq)]
 struct LineEffect {
-    line_empty: Option<bool>,
+    line: Line,
+    edits: bool,
     interrupts: bool,
 }
 
 impl LineEffect {
+    fn on(line: Line) -> Self {
+        Self {
+            line,
+            edits: false,
+            interrupts: false,
+        }
+    }
+
     fn empties(&mut self, interrupts: bool) {
-        self.line_empty = Some(true);
+        self.line = Line::Moved;
+        self.edits = true;
         self.interrupts |= interrupts;
+    }
+
+    fn types(&mut self) {
+        self.line = self.line.typed();
+        self.edits = true;
+    }
+
+    fn unsure(&mut self) {
+        self.line = Line::Unsure;
+        self.edits = true;
     }
 }
 
@@ -509,6 +604,12 @@ struct Csi<'bytes> {
 }
 
 impl<'bytes> Csi<'bytes> {
+    fn is_mouse(&self) -> bool {
+        self.params.first() == Some(&b'<')
+            && self.intermediates.is_empty()
+            && matches!(self.last, Some(b'M' | b'm'))
+    }
+
     fn at(bytes: &'bytes [u8], start: usize) -> Self {
         let in_range = |end: usize, range: std::ops::RangeInclusive<u8>| {
             bytes.get(end).is_some_and(|byte| range.contains(byte))
@@ -547,8 +648,8 @@ fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-fn line_effect(bytes: &[u8]) -> LineEffect {
-    let mut effect = LineEffect::default();
+fn line_effect(line: Line, bytes: &[u8]) -> LineEffect {
+    let mut effect = LineEffect::on(line);
     if bytes == [ESC] {
         effect.empties(true);
         return effect;
@@ -560,26 +661,40 @@ fn line_effect(bytes: &[u8]) -> LineEffect {
             b'\r' | b'\n' | KILL_LINE => effect.empties(false),
             INTERRUPT => effect.empties(true),
             ESC => at = escape(bytes, at, &mut effect),
-            0x00..=0x1f | 0x7f => {}
-            _ => effect.line_empty = Some(false),
+            BACKSPACE | CTRL_H => effect.line = effect.line.backspace(),
+            0x00..=0x1f => effect.line = effect.line.moved(),
+            0x20..=0x7e => effect.types(),
+            0x80..=0xff => effect.unsure(),
         }
     }
     effect
 }
 
 fn escape(bytes: &[u8], at: usize, effect: &mut LineEffect) -> usize {
+    if let Some(end) = terminal_answer_at(bytes, at - 1) {
+        return end;
+    }
     match bytes.get(at) {
         Some(b'[') => {
             let csi = Csi::at(bytes, at + 1);
-            if csi.last == Some(b'u') && csi.intermediates.is_empty() {
+            if csi.last.is_none() {
+                if !starts_answer(bytes.get(at - 1..).unwrap_or_default()) {
+                    effect.unsure();
+                }
+            } else if csi.last == Some(b'u') && csi.intermediates.is_empty() {
                 kitty_key(csi.params, effect);
+            } else if !csi.is_mouse() {
+                effect.line = effect.line.moved();
             }
             csi.end + usize::from(csi.last.is_some())
         }
-        Some(b'O') => at + 2,
+        Some(b'O') => {
+            effect.line = effect.line.moved();
+            at + 2
+        }
         Some(b']' | b'P' | b'_' | b'^' | b'X') => string_end(bytes, at + 1).unwrap_or(bytes.len()),
         Some(_) => {
-            effect.line_empty = Some(false);
+            effect.unsure();
             at + 1
         }
         None => at,
@@ -639,7 +754,6 @@ fn press_of(read: &[u8]) -> Option<Press> {
             }
             Some(b'[') => {
                 let csi = Csi::at(read, at + 2);
-                let mouse = csi.params.first() == Some(&b'<');
                 match (csi.last, csi.intermediates) {
                     (Some(b'u'), b"") => match KittyKey::of(csi.params) {
                         KittyKey { released: true, .. } => {}
@@ -650,7 +764,7 @@ fn press_of(read: &[u8]) -> Option<Press> {
                         } => escapes += 1,
                         KittyKey { .. } => return Some(Press::Other),
                     },
-                    (Some(b'M' | b'm'), b"") if mouse => {}
+                    _ if csi.is_mouse() => {}
                     _ => return Some(Press::Other),
                 }
                 at = csi.end + 1;
@@ -677,10 +791,13 @@ fn kitty_key(params: &[u8], effect: &mut LineEffect) {
     match (code, modifiers) {
         (Some(27), 0) | (Some(99), 4) => effect.empties(true),
         (Some(13), 0) | (Some(117), 4) => effect.empties(false),
-        (Some(code), 0 | 1) if code >= 32 && code != 127 && !(57344..=63743).contains(&code) => {
-            effect.line_empty = Some(false);
-        }
-        _ => {}
+        (Some(127), 0) => effect.line = effect.line.backspace(),
+        (Some(32..=126), 0 | 1) => effect.types(),
+        (Some(code), 0 | 1) if code > 127 && !KITTY_PRIVATE_USE.contains(&code) => effect.unsure(),
+        (Some(code), _) if code == 13 || KITTY_KEYPAD_TEXT.contains(&code) => effect.unsure(),
+        (Some(code), _)
+            if KITTY_MODIFIER_KEYS.contains(&code) || KITTY_LOCK_KEYS.contains(&code) => {}
+        _ => effect.line = effect.line.moved(),
     }
 }
 
@@ -713,9 +830,9 @@ pub(crate) enum Readiness {
     TurnClosed,
     /// Be idle after a turn its turn-end hook reported, or since it started.
     AfterTurnEnd,
-    /// Be idle after a turn end or a session start its hooks reported, with no key of the
-    /// user's since, so no prompt, dialog or picker the hooks do not report may be open.
-    UntouchedAfterTurnEnd,
+    /// Be idle after a turn end or a session start its hooks reported, with its input line
+    /// clear, so no prompt, dialog or picker the hooks do not report may be open.
+    ClearAfterTurnEnd,
 }
 
 /// Runs `act` once the agent is as `readiness` says and the palette closed, holding the agent's
@@ -765,7 +882,7 @@ fn is_ready(
     let ready = match readiness {
         Readiness::TurnClosed => activity.is_idle(&pace),
         Readiness::AfterTurnEnd => activity.is_idle_after_turn_end(&pace),
-        Readiness::UntouchedAfterTurnEnd => activity.is_untouched_after_turn_end(&pace),
+        Readiness::ClearAfterTurnEnd => activity.is_clear_after_turn_end(&pace),
     };
     ready && !agent.palette_open()
 }
@@ -907,36 +1024,36 @@ mod tests {
     }
 
     #[test]
-    fn only_a_reported_turn_end_with_no_key_since_lets_a_prompt_in() {
+    fn only_a_reported_turn_end_with_a_clear_line_lets_a_prompt_in() {
         let pace = fast();
         let activity = Activity::default();
         thread::sleep(pace.quiet);
-        assert!(!activity.is_untouched_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
         activity.saw(HookKind::TurnEnd, b"");
         thread::sleep(pace.quiet);
-        assert!(activity.is_untouched_after_turn_end(&pace));
+        assert!(activity.is_clear_after_turn_end(&pace));
         activity.keys(b"/model\r");
         thread::sleep(pace.quiet);
         assert!(activity.is_idle_after_turn_end(&pace));
-        assert!(!activity.is_untouched_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
         activity.saw(HookKind::TurnEnd, b"");
         activity.typed_prompt();
         thread::sleep(pace.quiet);
-        assert!(!activity.is_untouched_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
         activity.saw(HookKind::Prompt, b"");
         activity.saw(HookKind::TurnEnd, b"");
         thread::sleep(pace.quiet);
-        assert!(activity.is_untouched_after_turn_end(&pace));
+        assert!(activity.is_clear_after_turn_end(&pace));
     }
 
     #[test]
-    fn a_reported_startup_or_resume_with_no_key_since_lets_a_prompt_in_before_any_turn() {
+    fn a_reported_startup_or_resume_with_a_clear_line_lets_a_prompt_in_before_any_turn() {
         let pace = fast();
         let (startup, resume) = (br#"{"source":"startup"}"#, br#"{"source":"resume"}"#);
         let activity = Activity::default();
         activity.saw(HookKind::SessionStart, startup);
         thread::sleep(pace.quiet);
-        assert!(activity.is_untouched_after_turn_end(&pace));
+        assert!(activity.is_clear_after_turn_end(&pace));
         activity.keys(b"/clear\r");
         for source in [
             &br#"{"source":"clear"}"#[..],
@@ -946,14 +1063,14 @@ mod tests {
             activity.saw(HookKind::SessionStart, source);
         }
         thread::sleep(pace.quiet);
-        assert!(!activity.is_untouched_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
         let resumed = Activity::default();
         resumed.saw(HookKind::SessionStart, resume);
         thread::sleep(pace.quiet);
-        assert!(resumed.is_untouched_after_turn_end(&pace));
+        assert!(resumed.is_clear_after_turn_end(&pace));
         resumed.typed_prompt();
         thread::sleep(pace.quiet);
-        assert!(!resumed.is_untouched_after_turn_end(&pace));
+        assert!(!resumed.is_clear_after_turn_end(&pace));
     }
 
     #[test]
@@ -1002,10 +1119,10 @@ mod tests {
             activity.keys(answer);
         }
         thread::sleep(pace.quiet);
-        assert!(activity.is_untouched_after_turn_end(&pace));
+        assert!(activity.is_clear_after_turn_end(&pace));
         activity.keys(b"\x1b[A");
         thread::sleep(pace.quiet);
-        assert!(!activity.is_untouched_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
     }
 
     #[test]
@@ -1024,7 +1141,7 @@ mod tests {
             activity.keys(rest);
             thread::sleep(pace.quiet);
             assert!(
-                activity.is_untouched_after_turn_end(&pace),
+                activity.is_clear_after_turn_end(&pace),
                 "{first:?} {rest:?}"
             );
         }
@@ -1108,29 +1225,34 @@ mod tests {
         activity.keys(b"/model\r");
         activity.saw(HookKind::SessionStart, br#"{"source":"startup"}"#);
         thread::sleep(pace.quiet);
-        assert!(!activity.is_untouched_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
     }
 
     #[test]
-    fn a_launch_with_no_dialog_lets_a_prompt_in_once_the_agent_wrote_until_a_key() {
+    fn a_launch_with_no_dialog_lets_a_prompt_in_once_the_agent_wrote_while_its_line_is_clear() {
         let pace = fast();
         let activity = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
         thread::sleep(pace.quiet);
-        assert!(!activity.is_untouched_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
         activity.wrote();
-        assert!(!activity.is_untouched_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
         thread::sleep(pace.quiet);
-        assert!(activity.is_untouched_after_turn_end(&pace));
+        assert!(activity.is_clear_after_turn_end(&pace));
         let keyed_first = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
         keyed_first.keys(b"h");
         keyed_first.keys(b"\x15");
         keyed_first.wrote();
         thread::sleep(pace.quiet);
-        assert!(!keyed_first.is_untouched_after_turn_end(&pace));
+        assert!(!keyed_first.is_clear_after_turn_end(&pace));
         activity.keys(b"h");
-        activity.keys(b"\x15");
         thread::sleep(pace.quiet);
-        assert!(!activity.is_untouched_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
+        activity.keys(b"\x7f");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_clear_after_turn_end(&pace));
+        activity.keys(b"\r");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_clear_after_turn_end(&pace));
     }
 
     #[test]
@@ -1322,7 +1444,8 @@ mod tests {
     #[test]
     fn an_escape_before_another_escape_leaves_the_line_unfinished_in_one_read_or_two() {
         let unfinished = LineEffect {
-            line_empty: Some(false),
+            line: Line::Unsure,
+            edits: true,
             interrupts: false,
         };
         for bytes in [
@@ -1331,7 +1454,7 @@ mod tests {
             b"\x1b\x1b[12;40R",
             b"\x1b[I\x1b\x1b[O",
         ] {
-            assert_eq!(line_effect(bytes), unfinished, "{bytes:?}");
+            assert_eq!(line_effect(Line::Clear, bytes), unfinished, "{bytes:?}");
         }
         let pace = fast();
         for reads in [
@@ -1353,46 +1476,145 @@ mod tests {
 
     #[test]
     fn the_line_state_comes_from_keys_not_from_sequences() {
-        let effect = |bytes: &[u8]| line_effect(bytes);
-        let text = LineEffect {
-            line_empty: Some(false),
-            interrupts: false,
+        let effect = |bytes: &[u8]| line_effect(Line::Clear, bytes);
+        let left = |line: Line, edits: bool, interrupts: bool| LineEffect {
+            line,
+            edits,
+            interrupts,
         };
-        let emptied = LineEffect {
-            line_empty: Some(true),
-            interrupts: false,
-        };
-        let interrupted = LineEffect {
-            line_empty: Some(true),
-            interrupts: true,
-        };
-        assert_eq!(effect(b"abc"), text);
-        assert_eq!(effect(b"abc\r"), emptied);
-        assert_eq!(effect(b"abc\x03"), interrupted);
-        assert_eq!(effect(b"\x1b"), interrupted);
-        assert_eq!(effect(b"\x1b[27u"), interrupted);
-        assert_eq!(effect(b"\x1b[99;5u"), interrupted);
-        assert_eq!(effect(b"x\x1b[117;5u"), emptied);
-        assert_eq!(effect(b"\x1b[13u"), emptied);
-        assert_eq!(effect(b"\x1b[97u"), text);
-        assert_eq!(effect(b"\x1bx"), text);
-        for neutral in [
+        assert_eq!(effect(b"abc"), left(Line::Typed(3), true, false));
+        assert_eq!(effect(b"abc\r"), left(Line::Moved, true, false));
+        assert_eq!(effect(b"abc\x03"), left(Line::Moved, true, true));
+        assert_eq!(effect(b"\x1b"), left(Line::Moved, true, true));
+        assert_eq!(effect(b"\x1b[27u"), left(Line::Moved, true, true));
+        assert_eq!(effect(b"\x1b[99;5u"), left(Line::Moved, true, true));
+        assert_eq!(effect(b"x\x1b[117;5u"), left(Line::Moved, true, false));
+        assert_eq!(effect(b"\x1b[13u"), left(Line::Moved, true, false));
+        assert_eq!(effect(b"\x1b[97u"), left(Line::Typed(1), true, false));
+        assert_eq!(effect(b"\x1bx"), left(Line::Unsure, true, false));
+        for answer in [
             &b"\x1b[12;40R"[..],
             b"\x1b[?62;22c",
             b"\x1b[?1u",
             b"\x1b[I",
             b"\x1b[O",
-            b"\x1b[A\x1bOB",
-            b"\x1b[5~",
             b"\x1b]11;rgb:0000/0000/0000\x07",
             b"\x1bP1+r544e\x1b\\",
             b"\x1b[27;1:3u",
             b"\x1b[57441u",
+            b"\x1b[<0;10;5M",
             b"\x7f",
         ] {
-            assert_eq!(effect(neutral), LineEffect::default(), "{neutral:?}");
+            assert_eq!(
+                effect(answer),
+                left(Line::Clear, false, false),
+                "{answer:?}"
+            );
         }
-        assert_eq!(effect(b"\r\x1b[12;40R"), emptied);
+        for moving in [&b"\x1b[A\x1bOB"[..], b"\x1b[5~", b"\t", b"\x1b[9u", b"\x01"] {
+            assert_eq!(
+                effect(moving),
+                left(Line::Moved, false, false),
+                "{moving:?}"
+            );
+        }
+        assert_eq!(effect(b"\r\x1b[12;40R"), left(Line::Moved, true, false));
+    }
+
+    #[test]
+    fn backspace_takes_back_each_character_typed_and_any_other_edit_leaves_the_line_unsure() {
+        let after = |line: Line, bytes: &[u8]| line_effect(line, bytes).line;
+        assert_eq!(after(Line::Clear, b"ab\x7f"), Line::Typed(1));
+        assert_eq!(after(Line::Clear, b"ab\x7f\x08"), Line::Clear);
+        assert_eq!(after(Line::Typed(2), b"\x1b[127u\x1b[127u"), Line::Clear);
+        assert_eq!(after(Line::Clear, b"\x7f\x7fa"), Line::Typed(1));
+        assert_eq!(after(Line::Moved, b"a\x7f"), Line::Unsure);
+        assert_eq!(after(Line::Moved, b"\x7f"), Line::Moved);
+        for unsure in [
+            &b"ab\x1b[D\x7f\x7f"[..],
+            b"ab\x17\x7f\x7f",
+            b"ab\x01\x7f\x7f",
+            b"\xc3\xa9\x7f",
+            b"\x1b[233u\x7f",
+            b"\x1bb\x7f",
+        ] {
+            assert_eq!(after(Line::Clear, unsure), Line::Unsure, "{unsure:?}");
+        }
+        for emptying in [&b"\x15"[..], b"\x03", b"\x1b[117;5u", b"\r", b"\x1b"] {
+            assert_eq!(after(Line::Unsure, emptying), Line::Moved, "{emptying:?}");
+        }
+    }
+
+    #[test]
+    fn a_kitty_chord_or_a_split_sequence_never_counts_a_line_back_to_empty() {
+        let after = |line: Line, bytes: &[u8]| line_effect(line, bytes).line;
+        for unsure in [
+            &b"ab\x1b[97;5u\x7f\x7f"[..],
+            b"ab\x1b[98;3u\x7f\x7f",
+            b"ab\x1b[13;2u\x7f\x7f",
+            b"\x1b[57399u\x7f",
+            b"a\x1b[121;5u\x7f",
+            b"\x1b[",
+        ] {
+            assert_eq!(after(Line::Clear, unsure), Line::Unsure, "{unsure:?}");
+        }
+        assert_eq!(after(Line::Clear, b"\x1b[98;3u"), Line::Moved);
+        assert_eq!(after(Line::Clear, b"\x1b[57441u\x1b[57358u"), Line::Clear);
+        assert_eq!(after(Line::Clear, b"a\x1b[12;"), Line::Typed(1));
+    }
+
+    #[test]
+    fn keys_that_answer_a_reported_question_leave_the_line_as_it_was() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(
+            HookKind::Asks,
+            br#"{"notification_type":"permission_prompt"}"#,
+        );
+        activity.keys(b"\x1b[B");
+        activity.keys(b"\r");
+        activity.saw(HookKind::TurnEnd, b"");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_clear_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn a_line_typed_then_erased_lets_merges_and_the_report_in_but_a_moved_one_only_merges() {
+        let pace = fast();
+        let activity = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
+        activity.wrote();
+        activity.keys(b"hel");
+        activity.keys(b"lo");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+        for _ in 0..4 {
+            activity.keys(b"\x7f");
+        }
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+        activity.keys(b"\x7f");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_after_turn_end(&pace));
+        assert!(activity.is_clear_after_turn_end(&pace));
+        activity.keys(b"\x1b[A");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
+        activity.keys(b"\x7f");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_clear_after_turn_end(&pace));
+        activity.keys(b"x\x7f");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+        activity.keys(b"\x15");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle_after_turn_end(&pace));
+        assert!(!activity.is_clear_after_turn_end(&pace));
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(HookKind::TurnEnd, b"");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_clear_after_turn_end(&pace));
     }
 
     #[test]
