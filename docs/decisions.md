@@ -943,3 +943,14 @@ whose clock runs ahead, shows its day and time; without a time zone mahi shows U
 `mahi threads search` carries `time` in RFC 3339, in UTC; the workspace's record of an offline
 teammate always shows days and times, since it stays on screen as it was made; and an empty `TZ`
 counts as unset.
+
+## D121 · 2026-11-16 · Last activity behind a flag, and on the home screen once unlocked
+
+Chosen by the user (#178). A thread's last activity comes from its turns' times, which are
+sealed, so reading them needs the passphrase, and plain `mahi threads` asks none. So
+`mahi threads --activity` asks once and adds each thread's last activity, and the home screen
+shows it while the mahi key is unlocked, leaving it blank otherwise. The other choices were the
+home screen alone, or no last activity. During the work, not by the user: the text reads
+`last active 3m ago`, the JSON field is `last_active` and appears only with `--activity`, and
+each agent's turns are read back at most 64 turns for a time; on the home screen, the column
+goes when the agents would get fewer than 16 cells, before the whole thread id does.

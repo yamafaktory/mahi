@@ -11,6 +11,10 @@ use jiff::{
     Timestamp,
     tz::TimeZone,
 };
+use serde::{
+    Serialize,
+    Serializer,
+};
 
 use crate::palette::push_age;
 
@@ -59,6 +63,16 @@ impl Clock {
         if self.zone.is_none() {
             out.push_str(" UTC");
         }
+    }
+}
+
+/// A recorded time, written in RFC 3339 in UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimeText(pub(crate) Timestamp);
+
+impl Serialize for TimeText {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
     }
 }
 

@@ -50,6 +50,7 @@ mod sync_state;
 mod sync_view;
 mod teammates;
 mod terminal;
+mod thread_keys;
 mod thread_lock;
 mod threads;
 mod turn_end;
@@ -92,6 +93,7 @@ use crate::{
     profile::Profile,
     prompt::TerminalPrompt,
     run::Outcome,
+    threads::Activity,
 };
 
 /// Makes mahi's configuration directory private when its group or others may write to it, as
@@ -122,7 +124,9 @@ fn shows_times(command: Option<&Command>) -> bool {
     match command {
         None | Some(Command::Run(_) | Command::Resume(_)) => true,
         Some(Command::Join(join)) => join.agent().is_some(),
-        Some(Command::Threads(threads)) => threads.search.is_some(),
+        Some(Command::Threads(threads)) => {
+            threads.search.is_some() || threads.activity() == Activity::Read
+        }
         Some(
             Command::Init
             | Command::End(_)
@@ -337,8 +341,11 @@ fn listed_threads(command: &ThreadsCommand, environment: &Environment) -> i32 {
         );
     }
     exit_code(
-        threads::threads(environment, command.format())
-            .map(|listing| print_out(&listing, "Threads", "", false)),
+        threads::threads(environment, command.format(), command.activity()).map(|listed| {
+            let code = print_out(&listed.listing, "Threads", "", false);
+            eprint!("{}", listed.unread);
+            code
+        }),
     )
 }
 

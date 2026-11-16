@@ -31,7 +31,10 @@ use crate::{
     },
     profile::Profile,
     remote::RemoteName,
-    threads::Format,
+    threads::{
+        Activity,
+        Format,
+    },
 };
 
 const EXIT_CODES: &str = "\
@@ -326,15 +329,28 @@ pub(crate) struct ThreadsCommand {
     #[command(subcommand)]
     pub(crate) search: Option<ThreadsSearch>,
     /// Prints the threads as one JSON array, each thread an object with its id, agents,
-    /// worktree, purged and `gone_branch`.
+    /// worktree, purged and `gone_branch`, and `last_active` with --activity.
     #[arg(long)]
     json: bool,
+    /// Also says when each thread was last active, from its agents' turns. Asks once for your
+    /// passphrase.
+    #[arg(long)]
+    activity: bool,
 }
 
 impl ThreadsCommand {
     /// Returns how the threads are printed.
     pub(crate) fn format(&self) -> Format {
         Format::chosen(self.json)
+    }
+
+    /// Returns whether the threads' last activity is read.
+    pub(crate) fn activity(&self) -> Activity {
+        if self.activity {
+            Activity::Read
+        } else {
+            Activity::Left
+        }
     }
 }
 

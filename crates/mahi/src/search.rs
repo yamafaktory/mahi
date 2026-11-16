@@ -7,8 +7,6 @@ use std::{
     ops::ControlFlow,
 };
 
-use age::secrecy::SecretString;
-use jiff::Timestamp;
 use mahi_agent::{
     hook::HookKind,
     payload::HookFields,
@@ -21,7 +19,6 @@ use mahi_core::{
 use mahi_identity::{
     ConfigDir,
     ConfigError,
-    IdentityError,
 };
 use mahi_store::{
     Store,
@@ -29,7 +26,6 @@ use mahi_store::{
 };
 use mahi_thread::{
     ParticipantKey,
-    load_meta,
     walk_turns_while,
 };
 use serde::{
@@ -41,21 +37,21 @@ use thiserror::Error;
 
 use crate::{
     environment::Environment,
-    prompt::{
-        Prompt as _,
-        TerminalPrompt,
+    thread_keys::{
+        MahiKey,
+        ThreadKeys,
+        UnlockError,
     },
-    session,
     threads::{
         self,
         AsText,
         Format,
     },
     turns::split_event,
-    unlocked,
     when::{
         self,
         Clock,
+        TimeText,
     },
 };
 
@@ -77,10 +73,8 @@ pub(crate) enum SearchError {
     NotSetUp,
     #[error("cannot find mahi's configuration")]
     Config(#[from] ConfigError),
-    #[error("cannot ask for the passphrase")]
-    Terminal(#[source] io::Error),
-    #[error("cannot unlock your mahi key")]
-    Unlock(#[source] IdentityError),
+    #[error(transparent)]
+    Unlock(#[from] UnlockError),
     #[error("cannot write the matches as JSON")]
     Json(#[source] serde_json::Error),
 }
@@ -126,16 +120,6 @@ struct Match<'searched> {
     time: Option<TimeText>,
     kind: Kind,
     text: String,
-}
-
-/// A recorded time, written in RFC 3339 in UTC.
-#[derive(Debug, Clone, Copy)]
-struct TimeText(Timestamp);
-
-impl Serialize for TimeText {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(&self.0)
-    }
 }
 
 /// Searches the prompts and tool calls of every thread of the repository around the current
@@ -197,47 +181,13 @@ fn find_all<'searched>(
     needle: &[char],
     (matches, unread): (&mut Vec<Match<'searched>>, &mut String),
 ) -> Result<ControlFlow<()>, SearchError> {
-    let mut identity = None;
+    let mut keys = ThreadKeys::new(store, own, MahiKey::Locked(config));
     let mut cleaned = String::new();
     for (thread, agents) in searched {
-        let meta = session::thread_owner(store, *thread, own.clone())
-            .map_err(|error| crate::describe(&error))
-            .and_then(|owner| {
-                load_meta(store, *thread, &owner, 0).map_err(|error| crate::describe(&error))
-            });
-        let listed = meta.and_then(|meta| {
-            let me = meta
-                .participants()
-                .find(|participant| participant.key() == own)
-                .map(|participant| participant.name().clone())
-                .ok_or_else(|| "it does not list you".to_owned())?;
-            Ok((meta, me))
-        });
-        let (meta, me) = match listed {
-            Ok(listed) => listed,
-            Err(error) => {
-                let _ = writeln!(unread, "mahi: cannot read thread {thread}: {error}");
-                continue;
-            }
-        };
-        if identity.is_none() {
-            identity = Some(unlocked::identity(
-                &config.identity_file(),
-                ask_passphrase,
-                SearchError::Unlock,
-            )?);
-        }
-        let Some(identity) = identity.as_ref() else {
-            continue;
-        };
-        let key = match meta.thread_key(&me, identity.as_age()) {
+        let key = match keys.open(*thread)? {
             Ok(key) => key,
             Err(error) => {
-                let _ = writeln!(
-                    unread,
-                    "mahi: cannot read thread {thread}: {}",
-                    crate::describe(&error)
-                );
+                let _ = writeln!(unread, "mahi: cannot read thread {thread}: {error}");
                 continue;
             }
         };
@@ -294,12 +244,6 @@ fn find_all<'searched>(
         }
     }
     Ok(ControlFlow::Continue(()))
-}
-
-fn ask_passphrase() -> Result<SecretString, SearchError> {
-    TerminalPrompt::open()
-        .and_then(|mut prompt| prompt.secret("Passphrase for your mahi key: "))
-        .map_err(SearchError::Terminal)
 }
 
 fn found_text(matches: &[Match<'_>], clock: &Clock) -> String {
@@ -464,6 +408,8 @@ fn excerpt(text: &str, at: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use jiff::Timestamp;
+
     use super::*;
 
     fn found(payload: &[u8], text: &str) -> Option<(Kind, String)> {

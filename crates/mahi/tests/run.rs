@@ -848,6 +848,29 @@ content = '{{"bin": "{mahi_bin}"}}'
     }
 
     #[test]
+    fn threads_activity_needs_no_setup_while_there_is_no_thread_to_read() {
+        let fixture = fixture();
+        let fresh = fixture.root.join("fresh-home");
+        fs::create_dir(&fresh).unwrap();
+        let output = fixture
+            .command(&["threads", "--activity"])
+            .env("HOME", &fresh)
+            .env("XDG_CONFIG_HOME", fresh.join(".config"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "no threads in this repository\n"
+        );
+    }
+
+    #[test]
     fn threads_json_prints_each_thread_as_an_object_in_one_array() {
         let fixture = fixture();
         let empty = fixture.mahi(&["threads", "--json"]);
@@ -927,6 +950,25 @@ content = '{{"bin": "{mahi_bin}"}}'
             .and_then(|at| output[at..].lines().next())
             .unwrap_or_else(|| panic!("{output}"));
         assert!(json.trim_end().ends_with(tail), "{output}");
+
+        let (code, output) = in_terminal(&fixture, &["threads", "--activity"], Some(PASSPHRASE));
+        assert_eq!(code, 0, "{output}");
+        assert_eq!(output.matches("Passphrase").count(), 1, "{output}");
+        let listed = output
+            .lines()
+            .find(|line| line.starts_with(&format!("{thread}  tester.sh  ")))
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(
+            listed.contains("  last active ") && listed.trim_end().ends_with(" ago"),
+            "{output}"
+        );
+        let (code, output) = in_terminal(
+            &fixture,
+            &["threads", "--json", "--activity"],
+            Some(PASSPHRASE),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("\"last_active\":\""), "{output}");
 
         let (code, output) = in_terminal(
             &fixture,

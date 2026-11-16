@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     fs,
     io::{
@@ -21,7 +22,14 @@ use clap::{
     CommandFactory,
     Parser,
 };
-use mahi_core::ThreadId;
+use jiff::{
+    Timestamp,
+    tz::TimeZone,
+};
+use mahi_core::{
+    ThreadId,
+    ThreadRef,
+};
 use mahi_identity::{
     ConfigDir,
     CredentialName,
@@ -36,7 +44,10 @@ use mahi_sandbox::{
     TerminationSignals,
     WindowSize,
 };
-use mahi_store::Store;
+use mahi_store::{
+    ObjectId,
+    Store,
+};
 use mahi_term::{
     AnsiBackend,
     Answer,
@@ -88,6 +99,10 @@ use crate::{
         self,
         RawMode,
     },
+    thread_keys::{
+        MahiKey,
+        ThreadKeys,
+    },
     threads,
     ui::{
         self,
@@ -97,6 +112,10 @@ use crate::{
         Showing,
     },
     unlocked,
+    when::{
+        self,
+        Clock,
+    },
     workspace::{
         Moved,
         NEW_TAB,
@@ -172,16 +191,23 @@ pub(crate) fn home(environment: &Environment) -> i32 {
         .unwrap_or_default();
     let mut workspace = Workspace::new(palette_key, crate::run::notice(environment));
     workspace.host_with(workspace_live(environment, config.as_ref(), &store));
+    let mut last_active = ActivityCache::default();
     let outcome = loop {
         let own = threads::own_key(environment);
         let place = Place {
             store: &store,
             own: own.as_ref(),
+            config: config.as_ref(),
+            time_zone: environment.time_zone.as_ref(),
             repository: &repository,
             identity: &identity,
             captured: captured.as_ref(),
         };
-        match choose(&place, &mut home, &mut status, &mut workspace) {
+        match choose(
+            &place,
+            (&mut home, &mut status),
+            (&mut workspace, &mut last_active),
+        ) {
             Ok(Chosen::Quit) if workspace.is_running() && !stop_to_quit(&workspace) => {
                 "the agents keep running".clone_into(&mut status);
             }
@@ -232,6 +258,8 @@ pub(crate) fn home(environment: &Environment) -> i32 {
 struct Place<'a> {
     store: &'a Store,
     own: Option<&'a ParticipantKey>,
+    config: Option<&'a ConfigDir>,
+    time_zone: Option<&'a TimeZone>,
     repository: &'a str,
     identity: &'a str,
     captured: Option<&'a Captured>,
@@ -307,16 +335,15 @@ fn cleared_terminal(size: WindowSize) -> io::Result<Terminal<AnsiBackend<io::Std
 /// Shows the home screen until the user chooses an action, quits, or a signal stops mahi.
 fn choose(
     place: &Place<'_>,
-    home: &mut Home,
-    status: &mut String,
-    workspace: &mut Workspace,
+    (home, status): (&mut Home, &mut String),
+    (workspace, last_active): (&mut Workspace, &mut ActivityCache),
 ) -> io::Result<Chosen> {
     let signals = TerminationSignals::listen().map_err(io::Error::other)?;
     ui::keys_make_signals(false);
     let mut size = terminal::size();
     let mut terminal = cleared_terminal(size)?;
     let mut keys = ThreadListKeys::default();
-    let mut rows = rows(place.store, place.own);
+    let mut rows = rows(place, last_active);
     let mut remote = remote::summary(place.store);
     home.fit(&rows);
     let mut activity = activity(place.captured);
@@ -330,7 +357,7 @@ fn choose(
         give_mouse(workspace, home, size);
         dirty |= follow_children(workspace, status, &mut passed)?;
         if read_at.elapsed() >= REREAD {
-            let fresh = self::rows(place.store, place.own);
+            let fresh = self::rows(place, last_active);
             if fresh != rows {
                 rows = fresh;
                 home.fit(&rows);
@@ -622,8 +649,82 @@ fn read_input(buffer: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn rows(store: &Store, own: Option<&ParticipantKey>) -> Vec<HomeRow> {
-    threads::home_rows(store, own).unwrap_or_default()
+fn rows(place: &Place<'_>, cache: &mut ActivityCache) -> Vec<HomeRow> {
+    let Ok(summaries) = threads::summarise(place.store, place.own) else {
+        return Vec::new();
+    };
+    let identity = place
+        .config
+        .and_then(|config| unlocked::peek(&config.identity_file()));
+    let last = cache.read((place.store, place.own), identity, &summaries);
+    let clock = Clock::new(when::now(), place.time_zone.cloned());
+    threads::home_rows(
+        place.store,
+        &summaries,
+        last.as_ref().map(|last| (last, &clock)),
+    )
+}
+
+/// When each thread was last active, read while the home screen keeps the user's mahi key
+/// unlocked: each thread is read again only once its refs moved, and all are forgotten when the
+/// key locks.
+#[derive(Debug, Default)]
+struct ActivityCache {
+    threads: BTreeMap<ThreadId, ThreadRead>,
+}
+
+/// A thread's refs when it was last read, and when it was last active then.
+#[derive(Debug)]
+struct ThreadRead {
+    heads: Vec<(ThreadRef, ObjectId)>,
+    last: Option<Timestamp>,
+}
+
+impl ActivityCache {
+    /// Returns when each of the `summaries`' threads in `store` was last active for the user
+    /// whose key is `own`, with their unlocked mahi key `identity`, reading again only a thread
+    /// whose refs moved; `None` while the key is locked, so no last activity shows.
+    fn read(
+        &mut self,
+        (store, own): (&Store, Option<&ParticipantKey>),
+        identity: Option<LocalIdentity>,
+        summaries: &threads::Summaries,
+    ) -> Option<BTreeMap<ThreadId, Timestamp>> {
+        let (Some(own), Some(identity)) = (own, identity) else {
+            self.threads.clear();
+            return None;
+        };
+        let refs = store.thread_refs().ok()?;
+        let mut keys = ThreadKeys::new(store, own, MahiKey::Unlocked(identity));
+        let mut read = BTreeMap::new();
+        let threads = threads::readable(summaries);
+        for (thread, agents) in threads {
+            let heads: Vec<(ThreadRef, ObjectId)> = refs
+                .iter()
+                .filter(|(thread_ref, _)| thread_ref.thread() == thread)
+                .cloned()
+                .collect();
+            let last = match self.threads.remove(&thread) {
+                Some(seen) if seen.heads == heads => seen.last,
+                Some(_) | None => threads::thread_last_active(
+                    store,
+                    &mut keys,
+                    (thread, agents),
+                    &mut String::new(),
+                )
+                .ok()
+                .flatten(),
+            };
+            read.insert(thread, ThreadRead { heads, last });
+        }
+        self.threads = read;
+        Some(
+            self.threads
+                .iter()
+                .filter_map(|(&thread, read)| Some((thread, read.last?)))
+                .collect(),
+        )
+    }
 }
 
 /// Runs the chosen action as `act` does, then shows the thread's tab when it invited a
@@ -1379,7 +1480,50 @@ fn add_remote(store: &mut Store) -> Result<Added, remote::RemoteError> {
 
 #[cfg(test)]
 mod tests {
+    use mahi_thread::{
+        Event,
+        TurnRecord,
+    };
+
     use super::*;
+    use crate::workspace_live::tests::{
+        append_alices_turn,
+        setup,
+    };
+
+    #[test]
+    fn last_activity_is_read_again_only_for_a_thread_whose_refs_moved_and_never_while_locked() {
+        let setup = setup();
+        let owner = setup.owner();
+        let at = |text: &str| -> Timestamp { text.parse().unwrap() };
+        let turn = |number: u64, seq: u64, time: &str| {
+            TurnRecord::new(
+                number,
+                vec![Event::new(seq, Some(at(time)), b"turn-end\n".to_vec()).unwrap()],
+            )
+            .unwrap()
+        };
+        let tip = append_alices_turn(&setup, None, &turn(0, 0, "2026-11-16T13:02:00Z"));
+        let summaries = || threads::summarise(&setup.store, Some(&owner)).unwrap();
+        let mut cache = ActivityCache::default();
+        let read = |cache: &mut ActivityCache, identity: Option<LocalIdentity>| {
+            cache.read((&setup.store, Some(&owner)), identity, &summaries())
+        };
+        let first = read(&mut cache, Some(setup.identity.clone()));
+        assert_eq!(
+            first,
+            Some(BTreeMap::from([(setup.thread, at("2026-11-16T13:02:00Z"))]))
+        );
+        let stranger = LocalIdentity::generate();
+        assert_eq!(read(&mut cache, Some(stranger.clone())), first);
+        append_alices_turn(&setup, Some(&tip), &turn(1, 1, "2026-11-16T13:09:00Z"));
+        assert_eq!(read(&mut cache, Some(stranger)), Some(BTreeMap::new()));
+        assert_eq!(read(&mut cache, None), None);
+        assert_eq!(
+            read(&mut cache, Some(setup.identity.clone())),
+            Some(BTreeMap::from([(setup.thread, at("2026-11-16T13:09:00Z"))]))
+        );
+    }
 
     #[test]
     fn the_join_dialog_says_a_collaborator_needs_an_agent_that_reports_its_turn_ends() {
@@ -1445,6 +1589,7 @@ mod tests {
                 agents: "you.claude".to_owned(),
                 worktree: true,
                 owned: true,
+                last_active: None,
             })
             .to_vec()
     }

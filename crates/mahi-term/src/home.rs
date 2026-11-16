@@ -73,6 +73,7 @@ const THREADS_LEAST: u16 = 4;
 const THREAD_WIDTH: u16 = 34;
 const SHORT_THREAD: u16 = 8;
 const AGENTS_LEAST: u16 = 16;
+const LAST_ACTIVE: &str = "last active";
 const ALWAYS_HINTED: [(&str, &str); 2] = [("?", "help"), ("q", "quit")];
 
 /// One thread as the home screen lists it.
@@ -86,6 +87,8 @@ pub struct HomeRow {
     pub worktree: bool,
     /// Whether the user owns it, so it can be resumed.
     pub owned: bool,
+    /// When it was last active, such as `3m ago`, once mahi could read it.
+    pub last_active: Option<String>,
 }
 
 /// What the home screen shows besides its threads: the repository, the remote threads go to,
@@ -494,27 +497,34 @@ impl Home {
             .render(inner, buffer);
             return;
         }
-        let full = block.inner(area).width >= THREAD_WIDTH + 9 + 9 + 5 + AGENTS_LEAST;
-        let table = Table::new(
-            rows.iter().map(|thread| row(thread, full)),
-            [
-                Constraint::Length(if full { THREAD_WIDTH } else { SHORT_THREAD }),
-                Constraint::Fill(1),
-                Constraint::Length(9),
-                Constraint::Length(9),
-            ],
-        )
-        .header(
-            Row::new(["thread", "agents", "worktree", "owner"])
-                .style(Theme::muted().add_modifier(Modifier::BOLD)),
-        )
-        .block(block)
-        .row_highlight_style(if focused {
-            Theme::selected()
-        } else {
-            Style::new().add_modifier(Modifier::REVERSED)
-        })
-        .highlight_symbol("› ");
+        let wanted = rows
+            .iter()
+            .filter_map(|row| row.last_active.as_deref())
+            .map(|text| shown(text).chars().count())
+            .max()
+            .map(|width| u16::try_from(width.max(LAST_ACTIVE.len())).unwrap_or(u16::MAX));
+        let (full, active) = columns(block.inner(area).width, wanted);
+        let mut widths = vec![
+            Constraint::Length(if full { THREAD_WIDTH } else { SHORT_THREAD }),
+            Constraint::Fill(1),
+            Constraint::Length(9),
+        ];
+        let mut header = vec!["thread", "agents", "worktree"];
+        if let Some(width) = active {
+            widths.push(Constraint::Length(width));
+            header.push(LAST_ACTIVE);
+        }
+        widths.push(Constraint::Length(9));
+        header.push("owner");
+        let table = Table::new(rows.iter().map(|thread| row(thread, full, active)), widths)
+            .header(Row::new(header).style(Theme::muted().add_modifier(Modifier::BOLD)))
+            .block(block)
+            .row_highlight_style(if focused {
+                Theme::selected()
+            } else {
+                Style::new().add_modifier(Modifier::REVERSED)
+            })
+            .highlight_symbol("› ");
         let mut state = TableState::new().with_selected(self.selected);
         StatefulWidget::render(table, area, buffer, &mut state);
     }
@@ -648,7 +658,21 @@ fn panel<'a>(title: &str, focused: bool) -> Block<'a> {
         }))
 }
 
-fn row(row: &HomeRow, full: bool) -> Row<'_> {
+/// Returns the thread list's columns that fit in `width` cells: whether the whole thread id
+/// shows, and the last active column of `wanted` cells, kept only while the agents still get
+/// [`AGENTS_LEAST`] cells, before the whole id.
+fn columns(width: u16, wanted: Option<u16>) -> (bool, Option<u16>) {
+    let fits = |id: u16, active: Option<u16>| {
+        width >= id + 9 + 9 + 5 + AGENTS_LEAST + active.map_or(0, |active| active + 1)
+    };
+    match wanted {
+        Some(active) if fits(THREAD_WIDTH, Some(active)) => (true, Some(active)),
+        Some(active) if fits(SHORT_THREAD, Some(active)) => (false, Some(active)),
+        Some(_) | None => (fits(THREAD_WIDTH, None), None),
+    }
+}
+
+fn row(row: &HomeRow, full: bool, active: Option<u16>) -> Row<'_> {
     let thread = if full {
         shown(&row.thread)
     } else {
@@ -659,12 +683,16 @@ fn row(row: &HomeRow, full: bool) -> Row<'_> {
                 .collect(),
         )
     };
-    Row::new([
+    let last_active = active.map(|_| row.last_active.as_deref().map_or(Cow::Borrowed(""), shown));
+    let cells = [
         thread,
         shown(&row.agents),
         Cow::Borrowed(if row.worktree { "here" } else { "gone" }),
-        Cow::Borrowed(if row.owned { "you" } else { "teammate" }),
-    ])
+    ]
+    .into_iter()
+    .chain(last_active)
+    .chain([Cow::Borrowed(if row.owned { "you" } else { "teammate" })]);
+    Row::new(cells)
 }
 
 #[cfg(test)]
@@ -678,12 +706,14 @@ mod tests {
                 agents: "you.claude".to_owned(),
                 worktree: true,
                 owned: true,
+                last_active: None,
             },
             HomeRow {
                 thread: "t2".to_owned(),
                 agents: "bob.codex".to_owned(),
                 worktree: false,
                 owned: false,
+                last_active: None,
             },
         ]
     }
@@ -1021,6 +1051,7 @@ mod tests {
             agents: "you.claude, bob.codex".to_owned(),
             worktree: true,
             owned: true,
+            last_active: None,
         }];
         let home = Home::default();
         let drawn = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
@@ -1039,6 +1070,67 @@ mod tests {
         assert!(narrower.contains("› 01234567 "), "{narrower}");
         let short = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 13));
         assert!(short.contains("› 01234567"), "{short}");
+    }
+
+    #[test]
+    fn the_last_active_column_goes_before_the_whole_id_and_never_squeezes_the_agents() {
+        let base = 9 + 9 + 5 + AGENTS_LEAST;
+        assert_eq!(columns(THREAD_WIDTH + base, None), (true, None));
+        assert_eq!(columns(THREAD_WIDTH + base - 1, None), (false, None));
+        assert_eq!(
+            columns(THREAD_WIDTH + base + 12, Some(11)),
+            (true, Some(11))
+        );
+        assert_eq!(
+            columns(THREAD_WIDTH + base + 11, Some(11)),
+            (false, Some(11))
+        );
+        assert_eq!(
+            columns(SHORT_THREAD + base + 12, Some(11)),
+            (false, Some(11))
+        );
+        assert_eq!(columns(SHORT_THREAD + base + 11, Some(11)), (false, None));
+    }
+
+    #[test]
+    fn an_80_column_screen_leaves_the_last_active_column_out_so_the_agents_show() {
+        let rows = vec![HomeRow {
+            thread: "0123456789abcdef0123456789abcdef".to_owned(),
+            agents: "you.claude, bob.codex".to_owned(),
+            worktree: true,
+            owned: true,
+            last_active: Some("Nov 4 2025 09:30 UTC".to_owned()),
+        }];
+        let drawn = screen_in(&Home::default(), &rows, "", Rect::new(0, 0, 80, 24));
+        assert!(drawn.contains("you.claude, bob.codex"), "{drawn}");
+        assert!(!drawn.contains("last active"), "{drawn}");
+    }
+
+    #[test]
+    fn a_last_active_column_shows_only_once_a_thread_has_a_time() {
+        let mut rows = rows();
+        let home = Home::default();
+        let drawn = screen(&home, &rows, "");
+        assert!(!drawn.contains("last active"), "{drawn}");
+        rows[1].last_active = Some("Nov 4 09:30".to_owned());
+        let drawn = screen(&home, &rows, "");
+        let header = drawn
+            .lines()
+            .find(|line| line.contains("worktree"))
+            .unwrap_or_else(|| panic!("{drawn}"));
+        let (worktree, active, owner) = (
+            header.find("worktree").unwrap(),
+            header
+                .find("last active")
+                .unwrap_or_else(|| panic!("{drawn}")),
+            header.find("owner").unwrap(),
+        );
+        assert!(worktree < active && active < owner, "{drawn}");
+        let t2 = drawn.lines().find(|line| line.contains(" t2 ")).unwrap();
+        assert!(
+            t2.contains(" gone ") && t2.contains(" Nov 4 09:30 teammate "),
+            "{drawn}"
+        );
     }
 
     #[test]

@@ -144,6 +144,15 @@ pub(crate) fn current(file: &Path) -> Option<LocalIdentity> {
     take_kept(file, Instant::now())
 }
 
+/// Returns the key the home screen keeps unlocked for `file`, if it keeps one, without counting
+/// this as a use of it, so reading it to show something never keeps it unlocked longer.
+pub(crate) fn peek(file: &Path) -> Option<LocalIdentity> {
+    let kept = kept()?;
+    kept.as_ref()
+        .filter(|kept| kept.file == file && kept.is_fresh(Instant::now()))
+        .map(|kept| kept.identity.clone())
+}
+
 /// Takes the key a workspace handed over on the inherited pipe `fd` for the identity `file`,
 /// if it did, and keeps it for this mahi's whole run; one that cannot be read, or a pipe that
 /// has not ended, is reported and left, so the passphrase is asked as usual.
@@ -358,6 +367,22 @@ mod tests {
             current(file).unwrap().recipient().to_string(),
             identity.recipient().to_string()
         );
+    }
+
+    #[test]
+    fn peeking_at_the_kept_key_does_not_count_as_a_use() {
+        let identity = LocalIdentity::generate();
+        let file = Path::new("/config/identity");
+        let start = Instant::now();
+        keep(file, &identity, start);
+        assert!(peek(Path::new("/other/identity")).is_none());
+        assert_eq!(
+            peek(file).unwrap().recipient().to_string(),
+            identity.recipient().to_string()
+        );
+        assert_eq!(kept().unwrap().as_ref().unwrap().used, start);
+        forget();
+        assert!(peek(file).is_none());
     }
 
     #[test]

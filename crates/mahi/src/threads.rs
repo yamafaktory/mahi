@@ -10,15 +10,19 @@ use std::{
     },
     fs,
     io,
+    ops::ControlFlow,
 };
 
+use jiff::Timestamp;
 use mahi_core::{
     AgentSlot,
     RefKind,
     ThreadId,
 };
+use mahi_crypto::ThreadKey;
 use mahi_identity::{
     ConfigDir,
+    ConfigError,
     SigningKey,
 };
 use mahi_store::{
@@ -27,8 +31,10 @@ use mahi_store::{
 };
 use mahi_term::HomeRow;
 use mahi_thread::{
+    Event,
     ParticipantKey,
     remembered_owner,
+    walk_turns_while,
 };
 use serde::{
     Serialize,
@@ -41,7 +47,19 @@ use crate::{
     landed_branch::BranchRecord,
     purge,
     session,
+    thread_keys::{
+        MahiKey,
+        ThreadKeys,
+        UnlockError,
+    },
+    when::{
+        self,
+        Clock,
+        TimeText,
+    },
 };
+
+const ACTIVITY_TURNS: usize = 64;
 
 #[derive(Debug, Error)]
 pub(crate) enum ThreadsError {
@@ -51,6 +69,46 @@ pub(crate) enum ThreadsError {
     Store(#[from] StoreError),
     #[error("cannot write the threads as JSON")]
     Json(#[source] serde_json::Error),
+    #[error("mahi is not set up; run mahi init")]
+    NotSetUp,
+    #[error("cannot find mahi's configuration")]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Unlock(#[from] UnlockError),
+}
+
+/// Whether `mahi threads` reads when each thread was last active, which asks for the
+/// passphrase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Activity {
+    /// Reads no encrypted content.
+    Left,
+    /// Reads each agent's newest turns that carry a time.
+    Read,
+}
+
+/// What `mahi threads` prints: the threads, and one line for each thread it could not read.
+#[derive(Debug)]
+pub(crate) struct Listed {
+    pub(crate) listing: String,
+    pub(crate) unread: String,
+}
+
+/// When a thread was last active, in `mahi threads --json --activity`: the newest time its
+/// turns carry, or unknown when none carries one or the thread cannot be read.
+#[derive(Debug, Clone, Copy)]
+enum LastActive {
+    At(TimeText),
+    Unknown,
+}
+
+impl Serialize for LastActive {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::At(time) => time.serialize(serializer),
+            Self::Unknown => serializer.serialize_none(),
+        }
+    }
 }
 
 /// How `mahi threads` prints the threads.
@@ -77,6 +135,8 @@ struct ListedThread<'summary> {
     worktree: bool,
     purged: bool,
     gone_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_active: Option<LastActive>,
 }
 
 #[derive(Debug)]
@@ -98,9 +158,12 @@ impl<T: Display> Serialize for AsText<'_, T> {
     }
 }
 
+/// The repository's threads, each as its refs show it.
+pub(crate) type Summaries = BTreeMap<ThreadId, ThreadSummary>;
+
 /// One thread of the repository, as its refs show it.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ThreadSummary {
+pub(crate) struct ThreadSummary {
     agents: BTreeSet<AgentSlot>,
     worktree: bool,
     purged: bool,
@@ -119,20 +182,27 @@ pub(crate) fn own_key(environment: &Environment) -> Option<ParticipantKey> {
 }
 
 /// Returns the repository's threads as the home screen lists them, leaving out a thread purged
-/// here; a thread whose remembered owner cannot be read counts as a teammate's.
+/// here, each with when it was last active, as `activity` holds it and its clock shows it; a
+/// thread whose remembered owner cannot be read counts as a teammate's.
 pub(crate) fn home_rows(
     store: &Store,
-    own: Option<&ParticipantKey>,
-) -> Result<Vec<HomeRow>, StoreError> {
-    Ok(summarise(store, own)?
-        .into_iter()
-        .map(|(thread, summary)| HomeRow {
+    summaries: &Summaries,
+    activity: Option<(&BTreeMap<ThreadId, Timestamp>, &Clock)>,
+) -> Vec<HomeRow> {
+    summaries
+        .iter()
+        .map(|(&thread, summary)| HomeRow {
             thread: thread.to_string(),
-            agents: agents_of(&summary, None),
+            agents: agents_of(summary, None),
             worktree: summary.worktree,
             owned: matches!(remembered_owner(store, thread), Ok(None)),
+            last_active: activity.and_then(|(last, clock)| {
+                let mut shown = String::new();
+                clock.push(&mut shown, *last.get(&thread)?);
+                Some(shown)
+            }),
         })
-        .collect())
+        .collect()
 }
 
 /// Lists a thread's agents, or says it was purged by its owner and how to purge what is left
@@ -160,18 +230,105 @@ fn agents_of(summary: &ThreadSummary, thread: Option<ThreadId>) -> String {
 }
 
 /// Lists the threads of the repository around the current directory in `format`, with their
-/// agents and whether their worktree is still there, leaving out a thread purged here. Reads no
-/// encrypted content.
-pub(crate) fn threads(environment: &Environment, format: Format) -> Result<String, ThreadsError> {
+/// agents and whether their worktree is still there, leaving out a thread purged here. With
+/// [`Activity::Read`], it also says when each thread was last active, asking once for the
+/// passphrase of the user's mahi key; otherwise it reads no encrypted content.
+pub(crate) fn threads(
+    environment: &Environment,
+    format: Format,
+    activity: Activity,
+) -> Result<Listed, ThreadsError> {
     let cwd = env::current_dir()
         .and_then(fs::canonicalize)
         .map_err(ThreadsError::CurrentDirectory)?;
     let store = Store::discover(&cwd)?;
-    let summaries = summarise(&store, own_key(environment).as_ref())?;
-    match format {
-        Format::Text => Ok(listing_text(&store, &summaries)),
-        Format::Json => listing_json(&store, &summaries),
+    let own = own_key(environment);
+    let summaries = summarise(&store, own.as_ref())?;
+    let mut unread = String::new();
+    let last = match activity {
+        Activity::Left => None,
+        Activity::Read if readable(&summaries).next().is_none() => Some(BTreeMap::new()),
+        Activity::Read => {
+            let own = own.ok_or(ThreadsError::NotSetUp)?;
+            let config = ConfigDir::resolve(
+                environment.home.as_deref(),
+                environment.xdg_config_home.as_deref(),
+            )?;
+            let mut keys = ThreadKeys::new(&store, &own, MahiKey::Locked(&config));
+            Some(last_activity(&store, &mut keys, &summaries, &mut unread)?)
+        }
+    };
+    let clock = Clock::new(when::now(), environment.time_zone.clone());
+    let listing = match format {
+        Format::Text => listing_text(&store, &summaries, last.as_ref().map(|last| (last, &clock))),
+        Format::Json => listing_json(&store, &summaries, last.as_ref())?,
+    };
+    Ok(Listed { listing, unread })
+}
+
+/// Returns when each of the `summaries`' threads that `keys` opens was last active, reporting
+/// into `unread` what cannot be read.
+fn last_activity(
+    store: &Store,
+    keys: &mut ThreadKeys<'_>,
+    summaries: &Summaries,
+    unread: &mut String,
+) -> Result<BTreeMap<ThreadId, Timestamp>, UnlockError> {
+    let mut last = BTreeMap::new();
+    let threads = readable(summaries);
+    for (thread, agents) in threads {
+        if let Some(newest) = thread_last_active(store, keys, (thread, agents), unread)? {
+            last.insert(thread, newest);
+        }
     }
+    Ok(last)
+}
+
+/// Returns when `thread`, whose agents are `agents`, was last active: the newest time its
+/// agents' turns carry, once `keys` opens it; reports into `unread` what cannot be read.
+pub(crate) fn thread_last_active(
+    store: &Store,
+    keys: &mut ThreadKeys<'_>,
+    (thread, agents): (ThreadId, &BTreeSet<AgentSlot>),
+    unread: &mut String,
+) -> Result<Option<Timestamp>, UnlockError> {
+    let key = match keys.open(thread)? {
+        Ok(key) => key,
+        Err(error) => {
+            let _ = writeln!(unread, "mahi: cannot read thread {thread}: {error}");
+            return Ok(None);
+        }
+    };
+    let times = agents.iter().filter_map(|agent| {
+        newest_time(store, &key, (thread, agent)).unwrap_or_else(|error| {
+            let _ = writeln!(
+                unread,
+                "mahi: cannot read every turn of {agent} in thread {thread}: {error}"
+            );
+            None
+        })
+    });
+    Ok(times.max())
+}
+
+/// Returns the newest time `agent`'s turns in `thread` carry, looking back at most
+/// [`ACTIVITY_TURNS`] turns; or why its turns cannot be read.
+fn newest_time(
+    store: &Store,
+    key: &ThreadKey,
+    (thread, agent): (ThreadId, &AgentSlot),
+) -> Result<Option<Timestamp>, String> {
+    let mut newest = None;
+    walk_turns_while(store, key, thread, agent, ACTIVITY_TURNS, |turn| {
+        newest = turn.events().iter().filter_map(Event::time).max();
+        if newest.is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .map_err(|error| crate::describe(&error))?;
+    Ok(newest)
 }
 
 /// Returns the repository's threads a search reads, each with its agents, leaving out a thread
@@ -180,11 +337,21 @@ pub(crate) fn searchable(
     store: &Store,
     own: Option<&ParticipantKey>,
 ) -> Result<Vec<(ThreadId, BTreeSet<AgentSlot>)>, StoreError> {
-    Ok(summarise(store, own)?
-        .into_iter()
-        .filter(|(_, summary)| !summary.purged)
-        .map(|(thread, summary)| (thread, summary.agents))
+    let summaries = summarise(store, own)?;
+    Ok(readable(&summaries)
+        .map(|(thread, agents)| (thread, agents.clone()))
         .collect())
+}
+
+/// Returns the `summaries`' threads whose records a reader opens, each with its agents: every
+/// thread but those their owner purged.
+pub(crate) fn readable(
+    summaries: &Summaries,
+) -> impl Iterator<Item = (ThreadId, &BTreeSet<AgentSlot>)> {
+    summaries
+        .iter()
+        .filter(|(_, summary)| !summary.purged)
+        .map(|(&thread, summary)| (thread, &summary.agents))
 }
 
 fn gone_branch(store: &Store, thread: ThreadId) -> Option<String> {
@@ -193,7 +360,11 @@ fn gone_branch(store: &Store, thread: ThreadId) -> Option<String> {
         .map(|record| record.branch)
 }
 
-fn listing_text(store: &Store, summaries: &BTreeMap<ThreadId, ThreadSummary>) -> String {
+fn listing_text(
+    store: &Store,
+    summaries: &BTreeMap<ThreadId, ThreadSummary>,
+    activity: Option<(&BTreeMap<ThreadId, Timestamp>, &Clock)>,
+) -> String {
     if summaries.is_empty() {
         return "no threads in this repository\n".to_owned();
     }
@@ -206,6 +377,12 @@ fn listing_text(store: &Store, summaries: &BTreeMap<ThreadId, ThreadSummary>) ->
             "no worktree"
         };
         let _ = write!(listing, "{thread}  {agents}  {worktree}");
+        if let Some((last, clock)) = activity
+            && let Some(time) = last.get(&thread)
+        {
+            listing.push_str("  last active ");
+            clock.push(&mut listing, *time);
+        }
         if let Some(branch) = gone_branch(store, thread) {
             let branch = BranchRecord::shown(&branch);
             let _ = write!(
@@ -222,6 +399,7 @@ fn listing_text(store: &Store, summaries: &BTreeMap<ThreadId, ThreadSummary>) ->
 fn listing_json(
     store: &Store,
     summaries: &BTreeMap<ThreadId, ThreadSummary>,
+    activity: Option<&BTreeMap<ThreadId, Timestamp>>,
 ) -> Result<String, ThreadsError> {
     let listed: Vec<ListedThread<'_>> = summaries
         .iter()
@@ -231,6 +409,10 @@ fn listing_json(
             worktree: summary.worktree,
             purged: summary.purged,
             gone_branch: gone_branch(store, *thread),
+            last_active: activity.map(|last| {
+                last.get(thread)
+                    .map_or(LastActive::Unknown, |time| LastActive::At(TimeText(*time)))
+            }),
         })
         .collect();
     let mut listing = serde_json::to_string(&listed).map_err(ThreadsError::Json)?;
@@ -262,10 +444,12 @@ pub(crate) fn thread_agents(store: &Store, thread: ThreadId) -> Result<Vec<Agent
 /// and leaving out those whose `meta` is the owner's tombstone with nothing else left here: no
 /// other ref, fetched ref, worktree or agents' state.
 /// The owner of a thread with no remembered owner is `own`, the user.
-fn summarise(
+/// Returns the repository's threads as their refs show them, leaving out a thread purged here;
+/// `own` is the user's key, which tells a thread they own.
+pub(crate) fn summarise(
     store: &Store,
     own: Option<&ParticipantKey>,
-) -> Result<BTreeMap<ThreadId, ThreadSummary>, StoreError> {
+) -> Result<Summaries, StoreError> {
     let mut with_meta = BTreeMap::new();
     let mut agents: BTreeMap<ThreadId, BTreeSet<AgentSlot>> = BTreeMap::new();
     let mut with_state = BTreeSet::new();
@@ -382,6 +566,91 @@ mod tests {
     }
 
     #[test]
+    fn the_last_activity_read_unlocked_is_the_newest_time_a_threads_turns_carry() {
+        use mahi_thread::TurnRecord;
+
+        use crate::workspace_live::tests::{
+            append_alices_turn,
+            setup,
+        };
+
+        let setup = setup();
+        let owner = setup.owner();
+        let (asked, ended): (Timestamp, Timestamp) = (
+            "2026-11-16T13:00:00Z".parse().unwrap(),
+            "2026-11-16T13:02:00Z".parse().unwrap(),
+        );
+        let events = vec![
+            Event::new(0, Some(asked), b"prompt\n".to_vec()).unwrap(),
+            Event::new(1, Some(ended), b"turn-end\n".to_vec()).unwrap(),
+        ];
+        let tip = append_alices_turn(&setup, None, &TurnRecord::new(0, events).unwrap());
+        append_alices_turn(&setup, Some(&tip), &TurnRecord::new(1, Vec::new()).unwrap());
+        let summaries = summarise(&setup.store, Some(&owner)).unwrap();
+        let mut keys = ThreadKeys::new(
+            &setup.store,
+            &owner,
+            MahiKey::Unlocked(setup.identity.clone()),
+        );
+        let mut unread = String::new();
+        let last = last_activity(&setup.store, &mut keys, &summaries, &mut unread).unwrap();
+        assert_eq!(last, BTreeMap::from([(setup.thread, ended)]), "{unread}");
+    }
+
+    #[test]
+    fn last_activity_shows_after_the_worktree_and_in_json_only_when_read() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let tree = store.write_tree(&[]).unwrap();
+        let (active, quiet) = (ThreadId::random().unwrap(), ThreadId::random().unwrap());
+        for thread in [active, quiet] {
+            for thread_ref in [
+                ThreadRef::new(thread, RefKind::Meta),
+                ThreadRef::new(thread, RefKind::Snapshots(slot("alice", "claude"))),
+            ] {
+                store.append(&thread_ref, None, tree, "test").unwrap();
+            }
+        }
+        let summaries = summarise(&store, None).unwrap();
+        let now: Timestamp = "2026-11-16T13:05:00Z".parse().unwrap();
+        let then: Timestamp = "2026-11-16T13:02:00Z".parse().unwrap();
+        let last = BTreeMap::from([(active, then)]);
+        let text = listing_text(
+            &store,
+            &summaries,
+            Some((&last, &Clock::new(Some(now), None))),
+        );
+        assert!(
+            text.contains(&format!(
+                "{active}  alice.claude  no worktree  last active 3m ago\n"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{quiet}  alice.claude  no worktree\n")),
+            "{text}"
+        );
+        let json = listing_json(&store, &summaries, Some(&last)).unwrap();
+        assert!(
+            json.contains(&format!(
+                "\"id\":\"{active}\",\"agents\":[\"alice.claude\"],\"worktree\":false,\
+                 \"purged\":false,\"gone_branch\":null,\"last_active\":\"2026-11-16T13:02:00Z\"}}"
+            )),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!("\"id\":\"{quiet}\",")) && json.contains("\"last_active\":null"),
+            "{json}"
+        );
+        assert!(
+            !listing_json(&store, &summaries, None)
+                .unwrap()
+                .contains("last_active")
+        );
+    }
+
+    #[test]
     fn json_names_a_branch_the_forge_deleted_as_it_is_and_text_shows_it_cleaned() {
         let dir = tempfile::tempdir().unwrap();
         gix::init(dir.path()).unwrap();
@@ -409,14 +678,15 @@ mod tests {
         .unwrap();
         let summaries = summarise(&store, None).unwrap();
         assert_eq!(
-            listing_json(&store, &summaries).unwrap(),
+            listing_json(&store, &summaries, None).unwrap(),
             format!(
                 "[{{\"id\":\"{thread}\",\"agents\":[\"alice.claude\"],\"worktree\":false,\
                  \"purged\":false,\"gone_branch\":\"mahi/\\\"x\\\"\u{200b}\"}}]\n"
             )
         );
         assert!(
-            listing_text(&store, &summaries).contains("branch mahi/\"x\" gone from the remote"),
+            listing_text(&store, &summaries, None)
+                .contains("branch mahi/\"x\" gone from the remote"),
         );
     }
 }

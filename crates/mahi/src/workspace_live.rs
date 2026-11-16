@@ -608,8 +608,8 @@ pub(crate) mod tests {
         pub(crate) store: Store,
         pub(crate) config: ConfigDir,
         pub(crate) environment: Environment,
-        identity: LocalIdentity,
-        owner_key: PrivateKey,
+        pub(crate) identity: LocalIdentity,
+        pub(crate) owner_key: PrivateKey,
         pub(crate) thread: ThreadId,
     }
 
@@ -625,6 +625,30 @@ pub(crate) mod tests {
                 .unwrap();
         live.host_unlocked(setup.thread, &setup.identity).unwrap();
         live
+    }
+
+    /// Appends `record` to the transcript of alice's agent, `alice.claude`, after `tip`, sealed
+    /// to the thread's key and signed by alice.
+    pub(crate) fn append_alices_turn(
+        setup: &Setup,
+        tip: Option<&mahi_thread::TranscriptTip>,
+        record: &mahi_thread::TurnRecord,
+    ) -> mahi_thread::TranscriptTip {
+        let alice: AgentSlot = "alice.claude".parse().unwrap();
+        let key = mahi_thread::load_meta(&setup.store, setup.thread, &setup.owner(), 0)
+            .unwrap()
+            .thread_key(alice.participant(), setup.identity.as_age())
+            .unwrap();
+        mahi_thread::append_turn(
+            &setup.store,
+            &key,
+            setup.thread,
+            &alice,
+            tip,
+            record,
+            &mahi_thread::GitSigner(setup.owner_key.clone()),
+        )
+        .unwrap()
     }
 
     pub(crate) fn setup() -> Setup {
