@@ -33,6 +33,10 @@ use std::{
     },
 };
 
+use jiff::{
+    Timestamp,
+    tz::TimeZone,
+};
 use mahi_agent::{
     hook::HookKind,
     mcp::{
@@ -93,6 +97,10 @@ use crate::{
     palette::HELD_DETAIL,
     sync_view::SyncView,
     turns::split_event,
+    when::{
+        self,
+        Clock,
+    },
 };
 
 const RELAY_CHUNK: usize = 8192;
@@ -339,6 +347,7 @@ pub(crate) struct ThreadTools {
     meta: Mutex<Option<(Instant, MetaView)>>,
     note_by: NoteBy,
     lander: Option<Arc<Lander>>,
+    time_zone: Option<TimeZone>,
 }
 
 /// What the tools read of `meta`: the participants it lists, with their keys and whether each
@@ -356,11 +365,13 @@ fn failed(error: &dyn std::error::Error) -> ToolError {
 
 impl ThreadTools {
     /// Returns the tools of the agent `me` in `thread`, whose `meta` is `owner`'s and whose
-    /// records `key` opens, in the repository at `git_dir`; its claims are kept in `claims`.
+    /// records `key` opens, in the repository at `git_dir`; its claims are kept in `claims`,
+    /// and it shows times in `time_zone`, or in UTC without one.
     pub(crate) fn new(
         git_dir: PathBuf,
         (thread, owner, key): (ThreadId, ParticipantKey, Option<Arc<ThreadKey>>),
         (me, claims): (AgentSlot, Arc<Claims>),
+        time_zone: Option<TimeZone>,
     ) -> Self {
         Self {
             git_dir,
@@ -372,6 +383,7 @@ impl ThreadTools {
             meta: Mutex::new(None),
             note_by: NoteBy::ListAgents,
             lander: None,
+            time_zone,
         }
     }
 
@@ -557,7 +569,14 @@ impl ThreadTools {
                 .filter(|last| (1..=MAX_TURNS).contains(last))
                 .ok_or(ToolError::Arguments)?,
         };
-        transcript_text(&store, key, self.thread, &slot, last).map_err(ToolError::Failed)
+        transcript_text(
+            &store,
+            key,
+            (self.thread, &slot),
+            last,
+            Clock::new(when::now(), self.time_zone.clone()),
+        )
+        .map_err(ToolError::Failed)
     }
 }
 
@@ -605,18 +624,25 @@ pub(crate) fn changes_text(
 }
 
 /// Returns what `read_transcript` shows of the latest `last` turns of `slot` in `thread`,
-/// opened with `key`; or why they cannot be read.
+/// opened with `key`, each with when it started as `clock` shows it; or why they cannot be
+/// read.
 pub(crate) fn transcript_text(
     store: &Store,
     key: &ThreadKey,
-    thread: ThreadId,
-    slot: &AgentSlot,
+    (thread, slot): (ThreadId, &AgentSlot),
     last: usize,
+    clock: Clock,
 ) -> Result<String, String> {
-    let mut read = TurnsRead::default();
+    let mut read = TurnsRead {
+        clock,
+        ..TurnsRead::default()
+    };
     let walked = walk_turns(store, key, thread, slot, last, |turn| {
         read.take(
-            turn.turn(),
+            (
+                turn.turn(),
+                turn.events().iter().find_map(mahi_thread::Event::time),
+            ),
             turn.events().iter().map(mahi_thread::Event::payload),
         );
     });
@@ -638,22 +664,34 @@ pub(crate) fn transcript_text(
 }
 
 /// The turns `read_transcript` keeps, newest first, written into one buffer within
-/// [`MAX_TOOL_TEXT`]: past that, the rest of a turn and the older turns are left out.
+/// [`MAX_TOOL_TEXT`]: past that, the rest of a turn and the older turns are left out. Each
+/// turn says when it started, as `clock` shows it.
 #[derive(Debug, Default)]
 struct TurnsRead {
+    clock: Clock,
     text: String,
     kept: Vec<std::ops::Range<usize>>,
     left_out: usize,
 }
 
 impl TurnsRead {
-    fn take<'a>(&mut self, number: u64, events: impl Iterator<Item = &'a [u8]>) {
+    fn take<'a>(
+        &mut self,
+        (number, started): (u64, Option<Timestamp>),
+        events: impl Iterator<Item = &'a [u8]>,
+    ) {
         if self.text.len() >= TURNS_BUDGET {
             self.left_out += 1;
             return;
         }
         let start = self.text.len();
-        let _ = writeln!(self.text, "Turn {number}:");
+        let _ = write!(self.text, "Turn {number}");
+        if let Some(started) = started {
+            self.text.push_str(" (");
+            self.clock.push(&mut self.text, started);
+            self.text.push(')');
+        }
+        self.text.push_str(":\n");
         for payload in events {
             if self.text.len() > TURNS_BUDGET {
                 break;
@@ -1391,6 +1429,30 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_recorded_with_a_time_says_when_it_started() {
+        let now: Timestamp = "2026-11-16T13:05:00Z".parse().unwrap();
+        let paris = TimeZone::posix("CET-1CEST,M3.5.0,M10.5.0/3").unwrap();
+        let prompt = b"prompt\n{\"prompt\":\"fix it\"}".as_slice();
+        let mut read = TurnsRead {
+            clock: Clock::new(Some(now), Some(paris)),
+            ..TurnsRead::default()
+        };
+        read.take(
+            (2, Some("2026-11-16T12:02:00Z".parse().unwrap())),
+            [prompt].into_iter(),
+        );
+        read.take(
+            (1, Some("2026-11-04T08:30:00Z".parse().unwrap())),
+            [prompt].into_iter(),
+        );
+        read.take((0, None), [prompt].into_iter());
+        assert_eq!(
+            read.text,
+            "Turn 2 (1h ago):\n  asked: fix it\nTurn 1 (Nov 4 09:30):\n  asked: fix it\nTurn 0:\n  asked: fix it\n"
+        );
+    }
+
+    #[test]
     fn the_newest_turns_are_kept_within_the_budget_and_older_ones_left_out() {
         let prompt = |text: &str| format!("prompt\n{{\"prompt\":\"{text}\"}}").into_bytes();
         let long = "x".repeat(3000);
@@ -1399,7 +1461,7 @@ mod tests {
             let events: Vec<Vec<u8>> = (0..3)
                 .map(|_| prompt(&format!("{number} {long}")))
                 .collect();
-            read.take(number, events.iter().map(Vec::as_slice));
+            read.take((number, None), events.iter().map(Vec::as_slice));
         }
         assert!(read.text.len() <= TURNS_BUDGET + 4096);
         assert!(read.text.starts_with("Turn 40:\n  asked: 40 "));
@@ -1411,9 +1473,9 @@ mod tests {
             .map(|_| prompt(&long))
             .chain([prompt("last line")])
             .collect();
-        crossing.take(9, newest.iter().map(Vec::as_slice));
+        crossing.take((9, None), newest.iter().map(Vec::as_slice));
         let older: Vec<Vec<u8>> = (0..12).map(|_| prompt(&long)).collect();
-        crossing.take(8, older.iter().map(Vec::as_slice));
+        crossing.take((8, None), older.iter().map(Vec::as_slice));
         assert_eq!(crossing.kept.len(), 1);
         assert_eq!(crossing.left_out, 1);
         assert!(crossing.text.ends_with("asked: last line\n"));
@@ -1421,7 +1483,7 @@ mod tests {
 
         let mut huge = TurnsRead::default();
         let events: Vec<Vec<u8>> = (0..100).map(|_| prompt(&long)).collect();
-        huge.take(7, events.iter().map(Vec::as_slice));
+        huge.take((7, None), events.iter().map(Vec::as_slice));
         assert_eq!(huge.kept.len(), 1);
         assert!(
             huge.text
@@ -1439,6 +1501,7 @@ mod tests {
             setup.store.common_dir().to_path_buf(),
             (setup.thread, setup.owner(), None),
             (me.clone(), Arc::new(Claims::default())),
+            None,
         );
         assert!(tools.tools().iter().any(|tool| tool.name == "read_status"));
         let before = tools.call("read_status", &Map::new()).unwrap();
@@ -1471,6 +1534,7 @@ mod tests {
             setup.store.common_dir().to_path_buf(),
             (setup.thread, setup.owner(), None),
             ("bob.claude".parse().unwrap(), Arc::new(Claims::default())),
+            None,
         );
         assert!(tools.tools().iter().any(|tool| tool.name == "land"));
         let Value::Object(arguments) = json!({
@@ -1492,6 +1556,7 @@ mod tests {
             setup.store.common_dir().to_path_buf(),
             (setup.thread, setup.owner(), None),
             ("alice.claude".parse().unwrap(), Arc::new(Claims::default())),
+            None,
         );
         assert_eq!(
             owners.call("land", &arguments).unwrap(),

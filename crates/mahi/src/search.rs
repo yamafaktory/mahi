@@ -8,6 +8,7 @@ use std::{
 };
 
 use age::secrecy::SecretString;
+use jiff::Timestamp;
 use mahi_agent::{
     hook::HookKind,
     payload::HookFields,
@@ -52,6 +53,10 @@ use crate::{
     },
     turns::split_event,
     unlocked,
+    when::{
+        self,
+        Clock,
+    },
 };
 
 const MAX_SEARCHED_TURNS: usize = 100_000;
@@ -111,14 +116,26 @@ impl Serialize for Kind {
     }
 }
 
-/// One turn event that holds the text.
+/// One turn event that holds the text, with the time the host took it in, when it was
+/// recorded with one.
 #[derive(Debug, Serialize)]
 struct Match<'searched> {
     thread: AsText<'searched, ThreadId>,
     agent: AsText<'searched, AgentSlot>,
     turn: u64,
+    time: Option<TimeText>,
     kind: Kind,
     text: String,
+}
+
+/// A recorded time, written in RFC 3339 in UTC.
+#[derive(Debug, Clone, Copy)]
+struct TimeText(Timestamp);
+
+impl Serialize for TimeText {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&self.0)
+    }
 }
 
 /// Searches the prompts and tool calls of every thread of the repository around the current
@@ -157,7 +174,10 @@ pub(crate) fn search(
         );
     }
     let found = match format {
-        Format::Text => found_text(&matches),
+        Format::Text => found_text(
+            &matches,
+            &Clock::new(when::now(), environment.time_zone.clone()),
+        ),
         Format::Json => {
             let mut found = serde_json::to_string(&matches).map_err(SearchError::Json)?;
             found.push('\n');
@@ -253,6 +273,7 @@ fn find_all<'searched>(
                             thread: AsText(thread),
                             agent: AsText(agent),
                             turn: turn.turn(),
+                            time: event.time().map(TimeText),
                             kind,
                             text,
                         });
@@ -281,21 +302,22 @@ fn ask_passphrase() -> Result<SecretString, SearchError> {
         .map_err(SearchError::Terminal)
 }
 
-fn found_text(matches: &[Match<'_>]) -> String {
+fn found_text(matches: &[Match<'_>], clock: &Clock) -> String {
     if matches.is_empty() {
         return "no turn matches\n".to_owned();
     }
     let mut found = String::new();
     for found_match in matches {
-        let _ = writeln!(
+        let _ = write!(
             found,
-            "{}  {}  turn {}  {}: {}",
-            found_match.thread.0,
-            found_match.agent.0,
-            found_match.turn,
-            found_match.kind.as_str(),
-            found_match.text
+            "{}  {}  turn {}  ",
+            found_match.thread.0, found_match.agent.0, found_match.turn,
         );
+        if let Some(TimeText(time)) = found_match.time {
+            clock.push(&mut found, time);
+            found.push_str("  ");
+        }
+        let _ = writeln!(found, "{}: {}", found_match.kind.as_str(), found_match.text);
     }
     found
 }
@@ -446,6 +468,39 @@ mod tests {
 
     fn found(payload: &[u8], text: &str) -> Option<(Kind, String)> {
         matched(payload, &needle_of(text), &mut String::new())
+    }
+
+    #[test]
+    fn a_match_shows_when_its_event_was_taken_in_once_it_was_recorded_with_a_time() {
+        let thread = ThreadId::from_bytes([7; 16]);
+        let agent: AgentSlot = "bob.claude".parse().unwrap();
+        let now: Timestamp = "2026-11-16T13:05:00Z".parse().unwrap();
+        let found = |time: Option<Timestamp>| Match {
+            thread: AsText(&thread),
+            agent: AsText(&agent),
+            turn: 3,
+            time: time.map(TimeText),
+            kind: Kind::Asked,
+            text: "fix the login".to_owned(),
+        };
+        let timed = found(Some("2026-11-16T13:02:00Z".parse().unwrap()));
+        assert_eq!(
+            found_text(&[timed, found(None)], &Clock::new(Some(now), None)),
+            format!(
+                "{thread}  bob.claude  turn 3  3m ago  asked: fix the login\n\
+                 {thread}  bob.claude  turn 3  asked: fix the login\n"
+            )
+        );
+        let timed = found(Some("2026-11-16T13:02:00Z".parse().unwrap()));
+        assert_eq!(
+            serde_json::to_string(&[timed, found(None)]).unwrap(),
+            format!(
+                "[{{\"thread\":\"{thread}\",\"agent\":\"bob.claude\",\"turn\":3,\
+                 \"time\":\"2026-11-16T13:02:00Z\",\"kind\":\"asked\",\"text\":\"fix the login\"}},\
+                 {{\"thread\":\"{thread}\",\"agent\":\"bob.claude\",\"turn\":3,\
+                 \"time\":null,\"kind\":\"asked\",\"text\":\"fix the login\"}}]"
+            )
+        );
     }
 
     #[test]

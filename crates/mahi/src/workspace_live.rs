@@ -25,6 +25,7 @@ use std::{
     },
 };
 
+use jiff::tz::TimeZone;
 use mahi_core::{
     AgentName,
     AgentSlot,
@@ -90,6 +91,7 @@ use crate::{
     },
     threads,
     unlocked,
+    when::Clock,
 };
 
 /// How often the workspace checks whether the owner purged a thread it only watches, while
@@ -136,6 +138,7 @@ pub(crate) struct WorkspaceLive {
     hosted: HashMap<ThreadId, Hosted>,
     reach: Reach,
     purge_checks: PurgeChecks,
+    time_zone: Option<TimeZone>,
 }
 
 /// A thread the workspace hosts: its host, the socket its agents reach it on, and the
@@ -173,6 +176,7 @@ impl WorkspaceLive {
             shared: None,
             hosted: HashMap::new(),
             reach: Reach::gather(environment),
+            time_zone: environment.time_zone.clone(),
             purge_checks: PurgeChecks::default(),
         })
     }
@@ -328,7 +332,11 @@ impl WorkspaceLive {
         if !hosted.teammates.wants_record(slot) {
             return false;
         }
-        let record = record(&self.git_dir, (thread, &hosted.key, hosted.base), slot);
+        let record = record(
+            (&self.git_dir, self.time_zone.as_ref()),
+            (thread, &hosted.key, hosted.base),
+            slot,
+        );
         hosted.teammates.set_record(slot, &record, size);
         true
     }
@@ -503,9 +511,10 @@ impl Drop for WorkspaceLive {
 
 /// Returns the record of the work of `slot`'s agent in the thread of the repository at
 /// `git_dir`, whose records `key` opens and whose base is `base`: its latest turns, then the
-/// files it changed, or why each cannot be read.
+/// files it changed, or why each cannot be read. The record stays on screen as it was made, so
+/// its times show as days and times in `time_zone`, never as how long ago.
 fn record(
-    git_dir: &Path,
+    (git_dir, time_zone): (&Path, Option<&TimeZone>),
     (thread, key, base): (ThreadId, &ThreadKey, ObjectId),
     slot: &AgentSlot,
 ) -> String {
@@ -515,8 +524,14 @@ fn record(
             return format!("the repository cannot be read: {}", crate::describe(&error));
         }
     };
-    let mut record = mcp::transcript_text(&store, key, thread, slot, mcp::DEFAULT_TURNS)
-        .unwrap_or_else(|error| format!("{slot}'s turns cannot be read: {error}"));
+    let mut record = mcp::transcript_text(
+        &store,
+        key,
+        (thread, slot),
+        mcp::DEFAULT_TURNS,
+        Clock::new(None, time_zone.cloned()),
+    )
+    .unwrap_or_else(|error| format!("{slot}'s turns cannot be read: {error}"));
     record.push_str("\n\n");
     match mcp::changes_text(&store, thread, base, slot) {
         Ok(changes) => record.push_str(&changes),

@@ -8,6 +8,7 @@ use std::{
     str::FromStr,
 };
 
+use jiff::tz::TimeZone;
 use mahi_store::GlobalPatterns;
 use mahi_term::Background;
 use thiserror::Error;
@@ -105,6 +106,14 @@ pub(crate) struct Environment {
     pub(crate) key_fd: Option<i32>,
     pub(crate) report_fd: Option<i32>,
     pub(crate) command_fd: Option<i32>,
+    pub(crate) time_zone: Option<TimeZone>,
+}
+
+fn time_zone(tz: Option<&std::ffi::OsStr>) -> Option<TimeZone> {
+    if tz.is_some_and(std::ffi::OsStr::is_empty) {
+        return None;
+    }
+    TimeZone::try_system().ok()
 }
 
 /// Whether `mahi run` and `mahi resume` let teammates watch, from `MAHI_LIVE`.
@@ -154,6 +163,10 @@ impl fmt::Debug for Environment {
             .field("user", &self.user)
             .field("temp_dir", &self.temp_dir)
             .field("live", &self.live)
+            .field(
+                "time_zone",
+                &self.time_zone.as_ref().and_then(TimeZone::iana_name),
+            )
             .field(
                 "pass_env",
                 &self
@@ -212,6 +225,12 @@ impl fmt::Display for EnvName {
 }
 
 impl Environment {
+    /// Reads the time zone times show in, from `TZ` or the system's setting, for a command
+    /// that shows times; an empty `TZ` counts as unset, so it shows UTC as unknown.
+    pub(crate) fn read_time_zone(&mut self) {
+        self.time_zone = time_zone(env::var_os("TZ").as_deref());
+    }
+
     /// Reads the environment, including the variables named in `required` and `optional`.
     pub(crate) fn read(required: &[EnvName], optional: &[EnvName]) -> Self {
         let value = |name| env::var_os(name).filter(|value| !value.is_empty());
@@ -248,6 +267,7 @@ impl Environment {
             command_fd: text(COMMAND_FD)
                 .and_then(|fd| fd.parse().ok())
                 .filter(|fd| *fd > 2),
+            time_zone: None,
             whole: env::vars_os()
                 .map(|(name, value)| (name, Zeroizing::new(value.into_vec())))
                 .collect(),
@@ -356,6 +376,11 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn an_empty_tz_leaves_the_time_zone_unknown() {
+        assert!(time_zone(Some(std::ffi::OsStr::new(""))).is_none());
     }
 
     #[test]

@@ -891,16 +891,25 @@ content = '{{"bin": "{mahi_bin}"}}'
             in_terminal(&fixture, &["threads", "search", "LOGIN"], Some(PASSPHRASE));
         assert_eq!(code, 0, "{output}");
         assert_eq!(output.matches("Passphrase").count(), 1, "{output}");
-        let used = output
-            .find(&format!(
-                "{thread}  tester.sh  turn 1  used: Bash cargo test login"
-            ))
-            .unwrap_or_else(|| panic!("{output}"));
-        let asked = output
-            .find(&format!(
-                "{thread}  tester.sh  turn 0  asked: Fix the Login page"
-            ))
-            .unwrap_or_else(|| panic!("{output}"));
+        let line_at = |head: &str, tail: &str| {
+            output
+                .match_indices(head)
+                .find(|(at, _)| {
+                    output[*at..]
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.ends_with(tail))
+                })
+                .map_or_else(|| panic!("{output}"), |(at, _)| at)
+        };
+        let used = line_at(
+            &format!("{thread}  tester.sh  turn 1  "),
+            " ago  used: Bash cargo test login",
+        );
+        let asked = line_at(
+            &format!("{thread}  tester.sh  turn 0  "),
+            " ago  asked: Fix the Login page",
+        );
         assert!(used < asked, "{output}");
         assert!(!output.contains("add a test"), "{output}");
 
@@ -910,13 +919,14 @@ content = '{{"bin": "{mahi_bin}"}}'
             Some(PASSPHRASE),
         );
         assert_eq!(code, 0, "{output}");
-        assert!(
-            output.contains(&format!(
-                "[{{\"thread\":\"{thread}\",\"agent\":\"tester.sh\",\"turn\":0,\
-                 \"kind\":\"asked\",\"text\":\"Fix the Login page\"}}]"
-            )),
-            "{output}"
-        );
+        let head =
+            format!("[{{\"thread\":\"{thread}\",\"agent\":\"tester.sh\",\"turn\":0,\"time\":\"");
+        let tail = "Z\",\"kind\":\"asked\",\"text\":\"Fix the Login page\"}]";
+        let json = output
+            .find(&head)
+            .and_then(|at| output[at..].lines().next())
+            .unwrap_or_else(|| panic!("{output}"));
+        assert!(json.trim_end().ends_with(tail), "{output}");
 
         let (code, output) = in_terminal(
             &fixture,
@@ -2686,6 +2696,11 @@ call() {
             transcript.contains("asked: build the parser"),
             "{transcript}"
         );
+        let heading = transcript
+            .lines()
+            .find(|line| line.starts_with("Turn 0 ("))
+            .unwrap_or_else(|| panic!("{transcript}"));
+        assert!(heading.ends_with(" ago):"), "{transcript}");
         assert!(transcript.contains("used: Write parser.rs"), "{transcript}");
         assert!(text(2).contains("added \"parser.rs\""), "{}", text(2));
         assert!(text(3).contains("+fn parse() {}"), "{}", text(3));

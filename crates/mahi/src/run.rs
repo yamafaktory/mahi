@@ -58,6 +58,7 @@ use age::secrecy::{
     ExposeSecret,
     SecretString,
 };
+use jiff::tz::TimeZone;
 use mahi_agent::{
     codex::HookTrust,
     profile::ProfileCredential,
@@ -1352,7 +1353,7 @@ impl Prepared {
         let tools = serve_tools(
             self.mcp,
             (self.owner, key, live.as_ref()),
-            &self.git_dir,
+            (&self.git_dir, environment.time_zone.clone()),
             (
                 &started,
                 note_by,
@@ -1420,7 +1421,7 @@ fn serve_tools(
         Option<Arc<ThreadKey>>,
         Option<&Link>,
     ),
-    git_dir: &Path,
+    (git_dir, time_zone): (&Path, Option<TimeZone>),
     (started, note_by, lander): (&Started, NoteBy, Option<Arc<Lander>>),
 ) -> Arc<AtomicBool> {
     let serving = Arc::new(AtomicBool::new(true));
@@ -1433,6 +1434,7 @@ fn serve_tools(
         git_dir.to_path_buf(),
         (started.thread, owner, key),
         (started.slot.clone(), claims),
+        time_zone,
     )
     .with_note_by(note_by);
     let tools = match lander {

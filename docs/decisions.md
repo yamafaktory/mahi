@@ -931,3 +931,15 @@ version 2 of the turn record. Thread commits keep the time zero. The other choic
 commit date on snapshots and turns, which anyone who reads the remote would see. During the
 work, not by the user: version 1 turns still read, with no time, and a time that goes back
 within a turn is accepted, since a clock can step back.
+
+## D120 · 2026-11-16 · Times read as how long ago, then as a day and time
+
+Chosen by the user (#178). A time under a day old shows as how long ago it was, such as `3m ago`,
+and an older one as its day and time in the local time zone, such as `Nov 14 14:05`. The other
+choices were always an absolute local time, or always UTC. During the work, not by the user: a
+time from another year adds the year (`Jul 1 2025 10:30`); a time after now, from a teammate
+whose clock runs ahead, shows its day and time; without a time zone mahi shows UTC and writes
+`UTC` after the time; `read_transcript` heads a turn as `Turn 3 (2h ago):`; the JSON of
+`mahi threads search` carries `time` in RFC 3339, in UTC; the workspace's record of an offline
+teammate always shows days and times, since it stays on screen as it was made; and an empty `TZ`
+counts as unset.

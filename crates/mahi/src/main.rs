@@ -57,6 +57,7 @@ mod turns;
 mod ui;
 mod unlocked;
 mod viewer_palette;
+mod when;
 mod workspace;
 mod workspace_live;
 
@@ -115,6 +116,28 @@ fn make_config_private(environment: &Environment) {
     }
 }
 
+/// Says whether `command` shows recorded times: the home screen, a run whose tools read
+/// transcripts, and `mahi threads search`.
+fn shows_times(command: Option<&Command>) -> bool {
+    match command {
+        None | Some(Command::Run(_) | Command::Resume(_)) => true,
+        Some(Command::Join(join)) => join.agent().is_some(),
+        Some(Command::Threads(threads)) => threads.search.is_some(),
+        Some(
+            Command::Init
+            | Command::End(_)
+            | Command::Purge(_)
+            | Command::Id
+            | Command::Apparmor
+            | Command::Invite(_)
+            | Command::Remote(_)
+            | Command::Credential(_)
+            | Command::Hook(_)
+            | Command::Mcp,
+        ) => false,
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let required = match &cli.command {
@@ -127,6 +150,9 @@ fn main() {
         _ => None,
     };
     let mut environment = Environment::read(required.as_deref().unwrap_or_default(), &[]);
+    if shows_times(cli.command.as_ref()) {
+        environment.read_time_zone();
+    }
     if let Some(fd) = environment.key_fd
         && let Ok(config) = ConfigDir::resolve(
             environment.home.as_deref(),
@@ -485,6 +511,28 @@ mod tests {
         let mut all = vec!["mahi"];
         all.extend_from_slice(words);
         Cli::parse_from(all).command
+    }
+
+    #[test]
+    fn only_a_command_that_shows_times_reads_the_time_zone() {
+        for words in [
+            &[][..],
+            &["run", "claude"],
+            &["resume", "0123456789abcdef0123456789abcdef"],
+            &["join", "--", "claude"],
+            &["threads", "search", "login"],
+        ] {
+            assert!(shows_times(command(words).as_ref()), "{words:?}");
+        }
+        for words in [
+            &["hook", "tool"][..],
+            &["mcp"],
+            &["threads"],
+            &["join"],
+            &["id"],
+        ] {
+            assert!(!shows_times(command(words).as_ref()), "{words:?}");
+        }
     }
 
     #[test]
