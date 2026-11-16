@@ -4,6 +4,7 @@ use std::{
     ops::ControlFlow,
 };
 
+use jiff::Timestamp;
 use mahi_core::{
     AgentSlot,
     RefKind,
@@ -44,15 +45,18 @@ pub const MAX_EVENTS_PER_TURN: usize = 100_000;
 pub const MAX_TURN_BYTES: usize = 64 * 1024 * 1024;
 
 const MAX_SEALED_TURN_BYTES: u64 = (MAX_TURN_BYTES + MAX_TURN_BYTES / 255 + 64 * 1024) as u64;
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
+const UNTIMED_VERSION: u16 = 1;
 const TURN_MESSAGE: &str = "turn";
 
-/// One event of an agent's session, as the adapter recorded it.
+/// One event of an agent's session, as the adapter recorded it, with the time the host took it
+/// in, when it was recorded with one.
 ///
 /// Its payload never appears in `Debug` output.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Event {
     seq: u64,
+    time: Option<Timestamp>,
     payload: Vec<u8>,
 }
 
@@ -119,27 +123,44 @@ pub enum TranscriptError {
 }
 
 #[derive(Serialize, Deserialize)]
-struct WireBody<'a> {
+#[serde(bound(deserialize = "E: Deserialize<'de>"))]
+struct WireBody<E> {
     turn: u64,
     last_seq: Option<u64>,
-    #[serde(borrow)]
-    events: WireEvents<'a>,
+    events: WireEvents<E>,
 }
 
 #[derive(Serialize)]
 #[serde(transparent)]
-struct WireEvents<'a>(Vec<WireEvent<'a>>);
+struct WireEvents<E>(Vec<E>);
 
 #[derive(Serialize, Deserialize)]
 struct WireEvent<'a> {
     seq: u64,
+    time: Option<(i64, i32)>,
     payload: &'a [u8],
 }
 
-struct BoundedEvents<'a>(PhantomData<&'a ()>);
+#[derive(Deserialize)]
+struct UntimedWireEvent<'a> {
+    seq: u64,
+    payload: &'a [u8],
+}
 
-impl<'de: 'a, 'a> Visitor<'de> for BoundedEvents<'a> {
-    type Value = WireEvents<'a>;
+impl<'a> From<UntimedWireEvent<'a>> for WireEvent<'a> {
+    fn from(event: UntimedWireEvent<'a>) -> Self {
+        Self {
+            seq: event.seq,
+            time: None,
+            payload: event.payload,
+        }
+    }
+}
+
+struct BoundedEvents<E>(PhantomData<E>);
+
+impl<'de, E: Deserialize<'de>> Visitor<'de> for BoundedEvents<E> {
+    type Value = WireEvents<E>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "at most {MAX_EVENTS_PER_TURN} events")
@@ -147,7 +168,7 @@ impl<'de: 'a, 'a> Visitor<'de> for BoundedEvents<'a> {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut events = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1024));
-        while let Some(event) = seq.next_element::<WireEvent<'de>>()? {
+        while let Some(event) = seq.next_element::<E>()? {
             if events.len() == MAX_EVENTS_PER_TURN {
                 return Err(de::Error::custom("too many events"));
             }
@@ -157,30 +178,40 @@ impl<'de: 'a, 'a> Visitor<'de> for BoundedEvents<'a> {
     }
 }
 
-impl<'de: 'a, 'a> Deserialize<'de> for WireEvents<'a> {
+impl<'de, E: Deserialize<'de>> Deserialize<'de> for WireEvents<E> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_seq(BoundedEvents(PhantomData))
     }
 }
 
 impl Event {
-    /// Creates an event with sequence number `seq`.
+    /// Creates an event with sequence number `seq`, taken in at `time` when it is known.
     ///
     /// # Errors
     ///
     /// Returns [`TranscriptError::EventTooLarge`] if `payload` is larger than
     /// [`MAX_EVENT_BYTES`].
-    pub fn new(seq: u64, payload: Vec<u8>) -> Result<Self, TranscriptError> {
+    pub fn new(
+        seq: u64,
+        time: Option<Timestamp>,
+        payload: Vec<u8>,
+    ) -> Result<Self, TranscriptError> {
         if payload.len() > MAX_EVENT_BYTES {
             return Err(TranscriptError::EventTooLarge);
         }
-        Ok(Self { seq, payload })
+        Ok(Self { seq, time, payload })
     }
 
     /// Returns the event's sequence number, assigned by the host.
     #[must_use]
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    /// Returns when the host took the event in, unless it was recorded without a time.
+    #[must_use]
+    pub fn time(&self) -> Option<Timestamp> {
+        self.time
     }
 
     /// Returns the event's payload.
@@ -237,6 +268,9 @@ impl TurnRecord {
                     .iter()
                     .map(|event| WireEvent {
                         seq: event.seq,
+                        time: event
+                            .time
+                            .map(|time| (time.as_second(), time.subsec_nanosecond())),
                         payload: &event.payload,
                     })
                     .collect(),
@@ -254,6 +288,7 @@ impl fmt::Debug for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Event")
             .field("seq", &self.seq)
+            .field("timed", &self.time.is_some())
             .field("payload_len", &self.payload.len())
             .finish()
     }
@@ -297,30 +332,48 @@ pub(crate) fn decode(bytes: &[u8], commit: ObjectId) -> Result<Decoded, Transcri
     let malformed = || TranscriptError::Malformed(commit);
     let (version, rest): (u16, &[u8]) =
         postcard::take_from_bytes(bytes).map_err(|_| malformed())?;
-    if version != VERSION {
-        return Err(TranscriptError::UnsupportedVersion(version));
-    }
-    let (body, rest): (WireBody<'_>, &[u8]) =
-        postcard::take_from_bytes(rest).map_err(|_| malformed())?;
-    if !rest.is_empty() {
-        return Err(malformed());
-    }
-    let events = body
-        .events
+    let body: WireBody<WireEvent<'_>> = match version {
+        VERSION => take_body(rest).ok_or_else(malformed)?,
+        UNTIMED_VERSION => {
+            let body: WireBody<UntimedWireEvent<'_>> = take_body(rest).ok_or_else(malformed)?;
+            WireBody {
+                turn: body.turn,
+                last_seq: body.last_seq,
+                events: WireEvents(body.events.0.into_iter().map(WireEvent::from).collect()),
+            }
+        }
+        other => return Err(TranscriptError::UnsupportedVersion(other)),
+    };
+    let WireBody {
+        turn,
+        last_seq,
+        events,
+    } = body;
+    let events = events
         .0
         .into_iter()
-        .map(|event| Event::new(event.seq, event.payload.to_vec()))
+        .map(|event| {
+            let time = event
+                .time
+                .map(|(second, nanosecond)| Timestamp::new(second, nanosecond))
+                .transpose()
+                .map_err(|_| malformed())?;
+            Event::new(event.seq, time, event.payload.to_vec())
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let record = TurnRecord::new(body.turn, events)?;
+    let record = TurnRecord::new(turn, events)?;
     if let Some(last) = record.events.last()
-        && body.last_seq != Some(last.seq)
+        && last_seq != Some(last.seq)
     {
         return Err(malformed());
     }
-    Ok(Decoded {
-        record,
-        last_seq: body.last_seq,
-    })
+    Ok(Decoded { record, last_seq })
+}
+
+fn take_body<'de, E: Deserialize<'de>>(bytes: &'de [u8]) -> Option<WireBody<E>> {
+    postcard::take_from_bytes(bytes)
+        .ok()
+        .and_then(|(body, rest): (WireBody<E>, &[u8])| rest.is_empty().then_some(body))
 }
 
 /// Seals `record` to `thread_key` and commits it on top of `slot`'s transcript in `thread`,
@@ -587,7 +640,7 @@ mod tests {
     fn turn(number: u64, seqs: &[u64]) -> TurnRecord {
         let events = seqs
             .iter()
-            .map(|seq| Event::new(*seq, format!("{{\"seq\":{seq}}}").into_bytes()).unwrap())
+            .map(|seq| Event::new(*seq, None, format!("{{\"seq\":{seq}}}").into_bytes()).unwrap())
             .collect();
         TurnRecord::new(number, events).unwrap()
     }
@@ -748,7 +801,7 @@ mod tests {
                 .collect()
         };
         let events: Vec<Event> = (0..63)
-            .map(|seq| Event::new(seq, noise(MAX_EVENT_BYTES - 64)).unwrap())
+            .map(|seq| Event::new(seq, None, noise(MAX_EVENT_BYTES - 64)).unwrap())
             .collect();
         let record = TurnRecord::new(0, events).unwrap();
         assert!(record.encode(Some(62)).unwrap().len() > MAX_TURN_BYTES - 2 * MAX_EVENT_BYTES);
@@ -789,8 +842,8 @@ mod tests {
     #[test]
     fn sequence_numbers_must_increase_within_and_across_turns() {
         let events = vec![
-            Event::new(5, Vec::new()).unwrap(),
-            Event::new(5, Vec::new()).unwrap(),
+            Event::new(5, None, Vec::new()).unwrap(),
+            Event::new(5, None, Vec::new()).unwrap(),
         ];
         assert!(matches!(
             TurnRecord::new(0, events),
@@ -807,11 +860,11 @@ mod tests {
     #[test]
     fn size_limits_are_enforced() {
         assert!(matches!(
-            Event::new(0, vec![0; MAX_EVENT_BYTES + 1]),
+            Event::new(0, None, vec![0; MAX_EVENT_BYTES + 1]),
             Err(TranscriptError::EventTooLarge)
         ));
         let events = (0..=MAX_EVENTS_PER_TURN as u64)
-            .map(|seq| Event::new(seq, Vec::new()).unwrap())
+            .map(|seq| Event::new(seq, None, Vec::new()).unwrap())
             .collect();
         assert!(matches!(
             TurnRecord::new(0, events),
@@ -820,10 +873,77 @@ mod tests {
     }
 
     #[test]
+    fn each_events_time_is_sealed_with_its_turn_and_reads_back() {
+        let setup = setup();
+        let first = Timestamp::new(1_794_759_229, 446_000_000).unwrap();
+        let later = Timestamp::new(1_794_759_233, 0).unwrap();
+        let events = vec![
+            Event::new(0, Some(first), b"prompt\nhi".to_vec()).unwrap(),
+            Event::new(1, None, b"tool\n".to_vec()).unwrap(),
+            Event::new(2, Some(later), b"turn-end\n".to_vec()).unwrap(),
+        ];
+        let record = TurnRecord::new(0, events).unwrap();
+        append(&setup, None, &record);
+        let read = read(&setup, 1).unwrap();
+        let times: Vec<Option<Timestamp>> = read[0].events().iter().map(Event::time).collect();
+        assert_eq!(times, [Some(first), None, Some(later)]);
+        assert_eq!(read, [record]);
+    }
+
+    #[test]
+    fn a_turn_recorded_before_times_reads_back_without_them() {
+        let setup = setup();
+        let untimed = (
+            UNTIMED_VERSION,
+            (
+                0_u64,
+                Some(5_u64),
+                vec![(4_u64, &b"prompt\nhi"[..]), (5, b"turn-end\n")],
+            ),
+        );
+        put_raw(&setup, None, &postcard::to_allocvec(&untimed).unwrap());
+        let read = read(&setup, 1).unwrap();
+        let events = read[0].events();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| event.time().is_none()));
+        assert_eq!(events[1].seq(), 5);
+        assert_eq!(events[1].payload(), b"turn-end\n");
+    }
+
+    #[test]
+    fn a_time_out_of_range_makes_the_turn_malformed() {
+        for time in [(i64::MAX, 0), (0, 1_000_000_000), (0, -1_000_000_000)] {
+            let setup = setup();
+            let body = WireBody {
+                turn: 0,
+                last_seq: Some(0),
+                events: WireEvents(vec![WireEvent {
+                    seq: 0,
+                    time: Some(time),
+                    payload: b"",
+                }]),
+            };
+            put_raw(
+                &setup,
+                None,
+                &postcard::to_allocvec(&(VERSION, body)).unwrap(),
+            );
+            assert!(
+                matches!(read(&setup, 1), Err(TranscriptError::Malformed(_))),
+                "{time:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_hostile_turn_with_too_many_events_stops_decoding() {
         let setup = setup();
         let events: Vec<WireEvent<'_>> = (0..=MAX_EVENTS_PER_TURN as u64)
-            .map(|seq| WireEvent { seq, payload: b"" })
+            .map(|seq| WireEvent {
+                seq,
+                time: None,
+                payload: b"",
+            })
             .collect();
         let body = WireBody {
             turn: 0,
@@ -955,11 +1075,11 @@ mod tests {
             garbage(b"not postcard at all, too long"),
             Err(TranscriptError::Malformed(_) | TranscriptError::UnsupportedVersion(_))
         ));
-        let mut v2 = turn(0, &[1]).encode(Some(1)).unwrap();
-        v2[0] = 2;
+        let mut v3 = turn(0, &[1]).encode(Some(1)).unwrap();
+        v3[0] = 3;
         assert!(matches!(
-            garbage(&v2),
-            Err(TranscriptError::UnsupportedVersion(2))
+            garbage(&v3),
+            Err(TranscriptError::UnsupportedVersion(3))
         ));
         let mut trailing = turn(0, &[1]).encode(Some(1)).unwrap();
         trailing.push(0);
@@ -973,7 +1093,7 @@ mod tests {
     fn debug_output_carries_no_payloads() {
         let record = TurnRecord::new(
             7,
-            vec![Event::new(3, b"secret prompt text".to_vec()).unwrap()],
+            vec![Event::new(3, None, b"secret prompt text".to_vec()).unwrap()],
         )
         .unwrap();
         let debug = format!("{record:?}");

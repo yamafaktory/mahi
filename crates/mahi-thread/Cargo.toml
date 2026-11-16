@@ -20,6 +20,7 @@ ed25519-dalek = { workspace = true }
 gix-hash = { workspace = true }
 gix-lock = { workspace = true }
 gix-validate = { workspace = true }
+jiff = { workspace = true }
 mahi-core = { workspace = true }
 mahi-crypto = { workspace = true }
 mahi-identity = { workspace = true }

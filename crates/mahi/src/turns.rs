@@ -12,6 +12,7 @@ use std::{
     thread,
 };
 
+use jiff::Timestamp;
 use mahi_core::{
     AgentSlot,
     ThreadId,
@@ -171,15 +172,15 @@ fn record_turns(
 ) -> Summary {
     let mut turns = Turns::after(transcript.tip);
     while let Ok(delivery) = inputs.recv() {
-        let message = match delivery {
-            Delivery::Message(message) => message,
+        let (message, time) = match delivery {
+            Delivery::Message { message, time } => (message, time),
             Delivery::End { dropped } => {
                 turns.summary.dropped += dropped;
                 break;
             }
         };
         let ends = message.kind == HookKind::TurnEnd;
-        turns.push(&message);
+        turns.push(&message, time);
         if ends && turns.seal_or_note(store, transcript) {
             let _ = sessions.try_send(());
             pushes.inspect(|pushes| pushes.poke());
@@ -212,7 +213,7 @@ impl Turns {
         }
     }
 
-    fn push(&mut self, message: &HookMessage) {
+    fn push(&mut self, message: &HookMessage, time: Option<Timestamp>) {
         let name = message.kind.as_str().as_bytes();
         let size = name.len() + 1 + message.payload.len() + EVENT_OVERHEAD;
         if self.events.len() >= MAX_EVENTS_PER_TURN || self.bytes + size > MAX_TURN_BYTES {
@@ -223,7 +224,7 @@ impl Turns {
         payload.extend_from_slice(name);
         payload.push(b'\n');
         payload.extend_from_slice(&message.payload);
-        match Event::new(self.next_seq, payload) {
+        match Event::new(self.next_seq, time, payload) {
             Ok(event) => {
                 self.next_seq += 1;
                 self.bytes += size;
@@ -305,10 +306,13 @@ mod tests {
     };
 
     fn hook(kind: HookKind, payload: &[u8]) -> Delivery {
-        Delivery::Message(HookMessage {
-            kind,
-            payload: payload.to_vec(),
-        })
+        Delivery::Message {
+            message: HookMessage {
+                kind,
+                payload: payload.to_vec(),
+            },
+            time: None,
+        }
     }
 
     fn texts(record: &TurnRecord) -> Vec<String> {
@@ -559,15 +563,38 @@ mod tests {
     }
 
     #[test]
+    fn each_event_takes_the_time_it_was_taken_in() {
+        let mut turns = Turns::default();
+        let times = [
+            Timestamp::new(1_794_759_229, 0).unwrap(),
+            Timestamp::new(1_794_759_233, 500).unwrap(),
+        ];
+        for (kind, time) in [HookKind::Prompt, HookKind::TurnEnd].into_iter().zip(times) {
+            turns.push(
+                &HookMessage {
+                    kind,
+                    payload: Vec::new(),
+                },
+                Some(time),
+            );
+        }
+        let taken: Vec<Option<Timestamp>> = turns.events.iter().map(Event::time).collect();
+        assert_eq!(taken, times.map(Some));
+    }
+
+    #[test]
     fn events_beyond_a_turns_limits_are_dropped_and_counted() {
         let mut turns = Turns::default();
         let large = vec![b'x'; crate::hook::MAX_PAYLOAD_BYTES];
         let fits = MAX_TURN_BYTES / ("tool\n".len() + large.len() + EVENT_OVERHEAD);
         for _ in 0..=fits {
-            turns.push(&HookMessage {
-                kind: HookKind::Tool,
-                payload: large.clone(),
-            });
+            turns.push(
+                &HookMessage {
+                    kind: HookKind::Tool,
+                    payload: large.clone(),
+                },
+                None,
+            );
         }
         assert_eq!(turns.events.len(), fits);
         assert_eq!(turns.summary.dropped, 1);

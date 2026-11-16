@@ -25,9 +25,11 @@ use std::{
     time::{
         Duration,
         Instant,
+        SystemTime,
     },
 };
 
+use jiff::Timestamp;
 pub(crate) use mahi_agent::hook::{
     HookKind,
     HookMessage,
@@ -58,10 +60,14 @@ const POLL: Timespec = Timespec {
     tv_nsec: 50_000_000,
 };
 
-/// What the hook server hands on: a message, or its end once the agent is gone.
+/// What the hook server hands on: a message with the time it took it in, unless the clock is
+/// outside what a timestamp holds, or its end once the agent is gone.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Delivery {
-    Message(HookMessage),
+    Message {
+        message: HookMessage,
+        time: Option<Timestamp>,
+    },
     End {
         /// How many messages were malformed, too large, too slow, or found the queue full.
         dropped: u64,
@@ -230,6 +236,7 @@ fn serve_connections(
             dropped += 1;
             continue;
         };
+        let time = Timestamp::try_from(SystemTime::now()).ok();
         if message.kind == HookKind::Prompt && payload::from_subagent(&message.payload) {
             continue;
         }
@@ -242,7 +249,7 @@ fn serve_connections(
         if matches!(message.kind, HookKind::Asks | HookKind::SessionStart) {
             continue;
         }
-        match messages.try_send(Delivery::Message(message)) {
+        match messages.try_send(Delivery::Message { message, time }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => dropped += 1,
             Err(TrySendError::Disconnected(_)) => break,
@@ -347,18 +354,49 @@ mod tests {
         bytes
     }
 
-    fn next(server: &Server) -> Delivery {
+    fn next_timed(server: &Server) -> Delivery {
         server
             .deliveries
             .recv_timeout(Duration::from_secs(10))
             .unwrap()
     }
 
+    fn next(server: &Server) -> Delivery {
+        untimed(next_timed(server))
+    }
+
+    fn untimed(delivery: Delivery) -> Delivery {
+        match delivery {
+            Delivery::Message { message, .. } => Delivery::Message {
+                message,
+                time: None,
+            },
+            end @ Delivery::End { .. } => end,
+        }
+    }
+
     fn message(kind: HookKind, payload: &[u8]) -> Delivery {
-        Delivery::Message(HookMessage {
-            kind,
-            payload: payload.to_vec(),
-        })
+        Delivery::Message {
+            message: HookMessage {
+                kind,
+                payload: payload.to_vec(),
+            },
+            time: None,
+        }
+    }
+
+    #[test]
+    fn a_message_carries_the_time_the_server_took_it_in() {
+        let server = server();
+        let before = Timestamp::now();
+        send(&server.socket, HookKind::Tool, io::empty()).unwrap();
+        let Delivery::Message {
+            time: Some(time), ..
+        } = next_timed(&server)
+        else {
+            panic!("the message carries no time");
+        };
+        assert!(before <= time && time <= Timestamp::now(), "{time}");
     }
 
     #[test]
@@ -601,14 +639,17 @@ mod tests {
             (&Activity::default(), None),
         );
         assert_eq!(
-            deliveries.try_recv().unwrap(),
+            untimed(deliveries.try_recv().unwrap()),
             message(HookKind::TurnEnd, b"")
         );
         assert_eq!(
-            deliveries.try_recv().unwrap(),
+            untimed(deliveries.try_recv().unwrap()),
             message(HookKind::Prompt, b"last")
         );
-        assert_eq!(deliveries.try_recv().unwrap(), Delivery::End { dropped: 0 });
+        assert_eq!(
+            untimed(deliveries.try_recv().unwrap()),
+            Delivery::End { dropped: 0 }
+        );
     }
 
     #[test]
@@ -627,7 +668,7 @@ mod tests {
             1
         );
         assert_eq!(
-            deliveries.try_recv().unwrap(),
+            untimed(deliveries.try_recv().unwrap()),
             message(HookKind::Prompt, b"ok")
         );
     }
@@ -650,6 +691,9 @@ mod tests {
             ),
             2
         );
-        assert_eq!(deliveries.try_recv().unwrap(), message(HookKind::Tool, b""));
+        assert_eq!(
+            untimed(deliveries.try_recv().unwrap()),
+            message(HookKind::Tool, b"")
+        );
     }
 }

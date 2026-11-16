@@ -920,3 +920,14 @@ back only one level of a nested dialog, and that Ctrl-U clears one line of a mul
 So the user chose Backspace back to zero only. Those keys still empty the line for merges, and
 a prompt hook clears it for the report. An arrow or Tab on an empty line also leaves it not
 clear for the report.
+
+## D119 · 2026-11-16 · Real times, sealed in the transcript turns
+
+Chosen by the user (#177, #178). mahi kept no time at all: thread commits carry the time zero
+to limit metadata leakage, and ages counted from when a run first saw a turn. The user wants
+real times. They chose to seal them in the records only the thread's participants read, so
+each transcript event now carries the time the host took it in, as a `jiff` `Timestamp`, in
+version 2 of the turn record. Thread commits keep the time zero. The other choice was a real
+commit date on snapshots and turns, which anyone who reads the remote would see. During the
+work, not by the user: version 1 turns still read, with no time, and a time that goes back
+within a turn is accepted, since a clock can step back.
