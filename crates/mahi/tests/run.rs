@@ -2537,6 +2537,8 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         let mut reader = mahi.reader().unwrap();
         let mut seen = Vec::new();
         read_until(&mut reader, &mut seen, "Threads · 2");
+        read_until(&mut reader, &mut seen, &first);
+        read_until(&mut reader, &mut seen, &second);
         let mut parser = vt100::Parser::new(24, 200, 0);
         parser.process(&seen);
         let listed = parser.screen().contents();
