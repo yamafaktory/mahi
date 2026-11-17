@@ -72,6 +72,7 @@ just try-teammate … # the same as a second user, bob, with a key, config, data
 just try-reset  # remove the scratch repos, config and data of try and try-teammate
 just test-git   # the tests that run the git program (not part of just test)
 just test-wsl   # the tests that need WSL 2 (not part of just test; CI runs them on Windows)
+just bombadil t # explore the home screen with Bombadil for t (1m by default), against tests/bombadil/home.ts (not part of just test; CI runs it on main)
 just release v  # check, bump to version v through a pull request, then tag v<v> (dry run without --execute)
 just dogfood    # the real Claude Code and Codex end to end, token in ~/.config/mahi-test-token, Codex signs in through the browser (not in CI)
 just apparmor-parse # parse mahi apparmor's profile (needs apparmor_parser and sudo)

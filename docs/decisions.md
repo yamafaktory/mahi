@@ -981,3 +981,14 @@ entry without a key takes a letter no other entry uses: the shown tab's other ag
 first free letters in order, and "Leave this tab" takes `x`. A tab past the 9th keeps no key. The
 other choices were to keep the side menu and the footer, built from the table, or to keep a full
 footer. The fixes to the Remote dialog went to their own issue (#184).
+
+## D124 · 2026-11-17 · Bombadil explores the home screen on each push to main
+
+Chosen by the user (#171). `just bombadil [time]` explores the home screen with Bombadil against
+the properties in `tests/bombadil/home.ts`, and CI runs it for 5 minutes on each push to `main`,
+next to the fuzz shards. The other choices were a required check on every pull request, which adds
+minutes to each one, or local runs only. During the work, not by the user: Bombadil 0.7.10 is
+downloaded once and checked against a pinned SHA-256, since its releases publish no checksums;
+the specifications are TypeScript that the Bombadil binary runs itself, so the repository takes no
+npm package; and mahi runs with no agent on `PATH` and `MAHI_LIVE=off`, so a run reaches no agent
+and no network.

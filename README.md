@@ -288,7 +288,9 @@ The workspace is split where a part has a clear boundary:
 The commands are in the `justfile`, and [AGENTS.md](AGENTS.md) describes how the project is
 worked on. `just check` runs formatting, lints, tests and the dependency policy;
 `just test-git` runs the tests that need the `git` program, and `just test-wsl` the ones that
-need WSL 2. `just dogfood` runs the real Claude Code and Codex through mahi end to end in a
+need WSL 2. `just bombadil 5m` explores the home screen with
+[Bombadil](https://github.com/antithesishq/bombadil) for five minutes against the properties in
+`tests/bombadil/home.ts`. `just dogfood` runs the real Claude Code and Codex through mahi end to end in a
 throwaway home, with your own sign-in. Two tests run a Claude thread and its landing. The
 landing pushes to a remote that OpenSSH's `sshd` serves on your machine. A third test has a
 second user join a Claude thread with the real Codex, over that remote. Codex opens its ChatGPT

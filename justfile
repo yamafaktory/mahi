@@ -77,6 +77,11 @@ try *args:
 try-teammate *args:
     @scripts/try-teammate.sh "$@"
 
+# Explore the home screen with Bombadil for the time given, such as 30s or 5m, against tests/bombadil/home.ts
+[positional-arguments]
+bombadil time="1m":
+    @scripts/bombadil.sh "$1"
+
 # Remove the scratch repositories, config and data that try and try-teammate use
 try-reset:
     @scripts/try-reset.sh

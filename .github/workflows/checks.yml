@@ -124,6 +124,24 @@ jobs:
           tool: just
       - run: just shellcheck
 
+  bombadil:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - run: just bombadil 5m
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bombadil-traces
+          path: work/scratch/bombadil
+
   fuzz:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
