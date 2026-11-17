@@ -2321,6 +2321,68 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
     }
 
     #[test]
+    fn changing_the_url_threads_are_pushed_to_asks_again_whether_it_is_private() {
+        let fixture = fixture();
+        let mut store = Store::open(&fixture.repo).unwrap();
+        store
+            .add_remote("origin", "git@example.org:team/project.git")
+            .unwrap();
+        drop(store);
+        let chosen = fixture.mahi(&["remote", "origin", "--private"]);
+        assert!(chosen.status.success(), "{chosen:?}");
+        let erase = "\x7f".repeat("project.git".len());
+        let changed = format!("{erase}public.git\r");
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("Threads", b"m"),
+                ("Change the URL of origin", b"3"),
+                ("git@example.org:team/project.git", changed.as_bytes()),
+                ("Push threads to origin?", b"2"),
+                ("remote: origin (public)", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let setting = fixture.mahi(&["remote"]);
+        assert!(
+            String::from_utf8_lossy(&setting.stdout).contains("public"),
+            "{setting:?}"
+        );
+    }
+
+    #[test]
+    fn a_remote_from_another_config_file_is_offered_to_push_to_but_not_to_change_or_remove() {
+        let fixture = fixture();
+        let git = fixture.repo.join(".git");
+        let mut text = fs::read_to_string(git.join("config")).unwrap();
+        text.push_str("[include]\n\tpath = extra\n");
+        fs::write(git.join("config"), text).unwrap();
+        fs::write(
+            git.join("extra"),
+            "[remote \"shared\"]\n\turl = git@example.org:s.git\n",
+        )
+        .unwrap();
+        let mut mahi = terminal_command(&fixture, &[]).spawn().unwrap();
+        let mut terminal = mahi.writer().unwrap();
+        let (seen, _ended) = collect(&mahi);
+        let shows = |text: &str| {
+            waited(Duration::from_secs(10), || {
+                String::from_utf8_lossy(&seen.lock().unwrap()).contains(text)
+            })
+        };
+        assert!(shows("Threads"));
+        terminal.write_all(b"m").unwrap();
+        assert!(shows("shared · public"));
+        terminal.write_all(b"\x1b").unwrap();
+        thread::sleep(Duration::from_millis(800));
+        terminal.write_all(b"q").unwrap();
+        assert_eq!(exit_within(&mut mahi, Duration::from_secs(20)), 0);
+        let output = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+        assert!(!output.contains("Change the URL of shared"), "{output}");
+        assert!(!output.contains("Remove shared"), "{output}");
+    }
+
+    #[test]
     fn the_remote_dialog_removes_the_remote_threads_are_pushed_to_after_asking_and_stops_pushing() {
         let fixture = fixture();
         let mut store = Store::open(&fixture.repo).unwrap();

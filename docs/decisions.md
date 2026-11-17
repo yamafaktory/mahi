@@ -1011,4 +1011,6 @@ choice was to refuse while it is chosen. Only the dialog does this: on the comma
 `git remote set-url` and `git remote remove` already do, and adding `mahi remote` flags was the
 other choice. During the work, not by the user: a refused name or URL is asked again with what was
 typed and why, a name with `:`, `/` or `@` is taken for a URL, changing a URL sets the push URL
-when the remote has one, and removing follows `git remote remove`.
+when the remote has one and asks again whether a remote threads are pushed to is private, only a
+remote in the repository's own `config` can be changed or removed, and removing follows
+`git remote remove`, stopping pushing first.

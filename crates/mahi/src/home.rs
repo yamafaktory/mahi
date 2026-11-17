@@ -88,6 +88,7 @@ use crate::{
     },
     remote::{
         self,
+        RemoteError,
         RemoteName,
         Visibility,
     },
@@ -1405,10 +1406,12 @@ fn choose_remote(store: &mut Store, why: Option<&str>) -> String {
         choices.push(RemoteChoice::Push(remote.clone(), Visibility::Private));
         items.push(format!("{name} · public: keep the snapshots here"));
         choices.push(RemoteChoice::Push(remote.clone(), Visibility::Public));
-        items.push(format!("Change the URL of {name}"));
-        choices.push(RemoteChoice::ChangeUrl(remote.clone()));
-        items.push(format!("Remove {name}"));
-        choices.push(RemoteChoice::Remove(remote));
+        if store.has_local_remote(name) {
+            items.push(format!("Change the URL of {name}"));
+            choices.push(RemoteChoice::ChangeUrl(remote.clone()));
+            items.push(format!("Remove {name}"));
+            choices.push(RemoteChoice::Remove(remote));
+        }
     }
     items.push("Add a git remote to this repository".to_owned());
     choices.push(RemoteChoice::Add);
@@ -1433,23 +1436,21 @@ fn choose_remote(store: &mut Store, why: Option<&str>) -> String {
     };
     let told = match picked {
         Some(RemoteChoice::Push(name, visibility)) => remote::choose(store, &name, visibility),
-        Some(RemoteChoice::ChangeUrl(name)) => {
-            return if change_url(store, &name) {
-                format!("changed the URL of the git remote {name}")
-            } else {
-                String::new()
-            };
-        }
+        Some(RemoteChoice::ChangeUrl(name)) => match change_url(store, &name) {
+            Ok(told) => return told.unwrap_or_default(),
+            Err(error) => Err(error),
+        },
         Some(RemoteChoice::Remove(name)) => match remove_remote(store, &name) {
             Ok(told) => return told.unwrap_or_default(),
             Err(error) => Err(error),
         },
         Some(RemoteChoice::Add) => match add_remote(store) {
-            Added::Chosen(name, visibility) => remote::choose(store, &name, visibility),
-            Added::NotChosen(name) => {
+            Ok(Added::Chosen(name, visibility)) => remote::choose(store, &name, visibility),
+            Ok(Added::NotChosen(name)) => {
                 return format!("added the git remote {name}; threads are not pushed to it yet");
             }
-            Added::Nothing => return String::new(),
+            Ok(Added::Nothing) => return String::new(),
+            Err(error) => Err(error),
         },
         Some(RemoteChoice::Off) => {
             remote::stop_pushing(store).map(|()| "threads are not pushed".to_owned())
@@ -1475,38 +1476,71 @@ enum Added {
     Chosen(RemoteName, Visibility),
 }
 
+/// Why a line typed in a dialog was not taken: a reason to ask again, or a failure that
+/// typing cannot fix.
+enum Refused<E> {
+    Again(String),
+    Failed(E),
+}
+
 /// Asks for a line in a dialog titled `title` that says `lines`, starting with `typed`, and
-/// asks again, with what was typed and why `take` refused it, until `take` accepts it;
-/// `None` when the dialog is cancelled.
-fn ask_until<T>(
+/// asks again, with what was typed and why `take` refused it, until `take` takes it; `None`
+/// when the dialog is cancelled, and the failure when `take` fails.
+fn ask_until<T, E>(
     prompt: &mut DialogPrompt,
     (title, lines): (&str, &[String]),
     mut typed: String,
-    mut take: impl FnMut(&str) -> Result<T, String>,
-) -> Option<T> {
+    mut take: impl FnMut(&str) -> Result<T, Refused<E>>,
+) -> Result<Option<T>, E> {
     let mut refused = None;
     loop {
         let mut shown = lines.to_vec();
         shown.extend(refused.take());
         let dialog = Dialog::input(title, shown, false).with_text(&typed);
         let Ok(Answer::Text(text)) = prompt.ask(dialog) else {
-            return None;
+            return Ok(None);
         };
         match take(text.trim()) {
-            Ok(taken) => return Some(taken),
-            Err(why) => {
+            Ok(taken) => return Ok(Some(taken)),
+            Err(Refused::Again(why)) => {
                 refused = Some(why);
                 typed = text.to_string();
             }
+            Err(Refused::Failed(error)) => return Err(error),
         }
     }
 }
 
-/// Returns what `error` says, with each of its causes.
-fn said(error: &dyn std::error::Error) -> String {
-    let mut message = error.to_string();
-    crate::causes(&mut message, error);
-    message
+/// Sorts a failure to take a remote's URL: one the user can type again, or one typing cannot
+/// fix.
+fn url_refused(error: RemoteError) -> Refused<RemoteError> {
+    match &error {
+        RemoteError::NotSsh { .. } | RemoteError::NotHttps { .. } => {
+            Refused::Again(crate::describe(&error))
+        }
+        RemoteError::Add(_, cause) | RemoteError::ChangeUrl(_, cause)
+            if matches!(**cause, StoreError::InvalidRemoteUrl(_)) =>
+        {
+            Refused::Again(crate::describe(&error))
+        }
+        _ => Refused::Failed(error),
+    }
+}
+
+/// Returns the remote name `text` gives, `origin` when it is empty, or why it is not one: a
+/// URL typed in its place, a name git does not take, or one of `known`.
+fn remote_name_from(text: &str, known: &[String]) -> Result<RemoteName, String> {
+    let text = if text.is_empty() { "origin" } else { text };
+    if text.contains([':', '/', '@']) {
+        return Err(LOOKS_LIKE_URL.to_owned());
+    }
+    let name = text
+        .parse::<RemoteName>()
+        .map_err(|error| crate::describe(&error))?;
+    if known.iter().any(|known| known == name.as_str()) {
+        return Err(crate::describe(&StoreError::RemoteExists(name.to_string())));
+    }
+    Ok(name)
 }
 
 /// Returns the lines that ask for the URL of the git remote `name`.
@@ -1517,42 +1551,9 @@ fn url_lines(name: &RemoteName) -> [String; 2] {
     ]
 }
 
-/// Asks for the name and URL of a git remote, each again until it is one mahi takes, adds it
-/// to the repository, and asks whether it is private.
-fn add_remote(store: &mut Store) -> Added {
-    let mut prompt = DialogPrompt::default();
-    let known = store.remote_names();
-    let asked = ["Its name, as git calls it; empty for `origin`.".to_owned()];
-    let named = ask_until(
-        &mut prompt,
-        ("Add a git remote", &asked),
-        String::new(),
-        |text| {
-            let text = if text.is_empty() { "origin" } else { text };
-            if text.contains([':', '/', '@']) {
-                return Err(LOOKS_LIKE_URL.to_owned());
-            }
-            let name = text.parse::<RemoteName>().map_err(|error| said(&error))?;
-            if known.iter().any(|known| known == name.as_str()) {
-                return Err(said(&StoreError::RemoteExists(name.to_string())));
-            }
-            Ok(name)
-        },
-    );
-    let Some(name) = named else {
-        return Added::Nothing;
-    };
-    let added = ask_until(
-        &mut prompt,
-        ("Add a git remote", &url_lines(&name)),
-        String::new(),
-        |url| remote::add(store, &name, url).map_err(|error| said(&error)),
-    );
-    if added.is_none() {
-        return Added::Nothing;
-    }
-    eprintln!("added the git remote {name}");
-    let visibility = match prompt.ask(Dialog::choose(
+/// Asks whether threads pushed to `name` are private; `None` when it is not answered.
+fn ask_visibility(prompt: &mut DialogPrompt, name: &RemoteName) -> Option<Visibility> {
+    match prompt.ask(Dialog::choose(
         "Remote",
         vec![format!("Push threads to {name}?")],
         vec![
@@ -1560,52 +1561,92 @@ fn add_remote(store: &mut Store) -> Added {
             "Public: keep the snapshots here".to_owned(),
         ],
     )) {
-        Ok(Answer::Choice(0)) => Visibility::Private,
-        Ok(Answer::Choice(1)) => Visibility::Public,
-        _ => return Added::NotChosen(name),
-    };
-    Added::Chosen(name, visibility)
+        Ok(Answer::Choice(0)) => Some(Visibility::Private),
+        Ok(Answer::Choice(1)) => Some(Visibility::Public),
+        _ => None,
+    }
 }
 
-/// Asks for the URL the git remote `name` pushes to, starting with the one it has, again
-/// until it is one mahi takes, and changes it; returns whether it changed.
-fn change_url(store: &mut Store, name: &RemoteName) -> bool {
-    let current = store
-        .remote_url(name.as_str(), true)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    ask_until(
-        &mut DialogPrompt::default(),
+/// Asks for the name and URL of a git remote, each again until it is one mahi takes, adds it
+/// to the repository, and asks whether it is private.
+fn add_remote(store: &mut Store) -> Result<Added, RemoteError> {
+    let mut prompt = DialogPrompt::default();
+    let known = store.remote_names();
+    let asked = ["Its name, as git calls it; empty for `origin`.".to_owned()];
+    let named = ask_until(
+        &mut prompt,
+        ("Add a git remote", &asked),
+        String::new(),
+        |text| remote_name_from(text, &known).map_err(Refused::<RemoteError>::Again),
+    )?;
+    let Some(name) = named else {
+        return Ok(Added::Nothing);
+    };
+    let added = ask_until(
+        &mut prompt,
+        ("Add a git remote", &url_lines(&name)),
+        String::new(),
+        |url| remote::add(store, &name, url).map_err(url_refused),
+    )?;
+    if added.is_none() {
+        return Ok(Added::Nothing);
+    }
+    eprintln!("added the git remote {name}");
+    Ok(match ask_visibility(&mut prompt, &name) {
+        Some(visibility) => Added::Chosen(name, visibility),
+        None => Added::NotChosen(name),
+    })
+}
+
+/// Asks for the URL the git remote `name` pushes to, starting with the one its configuration
+/// writes, again until it is one mahi takes, and changes it; when threads are pushed to it,
+/// asks again whether it is private, and stops pushing them when that is not answered.
+/// Returns what to tell, or `None` when it was not changed.
+fn change_url(store: &mut Store, name: &RemoteName) -> Result<Option<String>, RemoteError> {
+    let mut prompt = DialogPrompt::default();
+    let written = store.written_push_url(name.as_str()).unwrap_or_default();
+    let changed = ask_until(
+        &mut prompt,
         ("Change a git remote", &url_lines(name)),
-        current,
-        |url| remote::change_url(store, name, url).map_err(|error| said(&error)),
-    )
-    .is_some()
+        written,
+        |url| remote::change_url(store, name, url).map_err(url_refused),
+    )?;
+    if changed.is_none() {
+        return Ok(None);
+    }
+    let changed = format!("changed the URL of the git remote {name}");
+    if remote::pushing_to(store, name) == remote::Pushing::Elsewhere {
+        return Ok(Some(changed));
+    }
+    if let Some(visibility) = ask_visibility(&mut prompt, name) {
+        eprintln!("{}", remote::choose(store, name, visibility)?);
+        return Ok(Some(format!(
+            "{changed}; remote: {}",
+            remote::summary(store)
+        )));
+    }
+    remote::stop_pushing(store)?;
+    Ok(Some(format!("{changed}; threads are not pushed")))
 }
 
 /// Asks whether to remove the git remote `name`, saying when threads are pushed to it, and
 /// removes it on yes; returns what to tell, or `None` when it was not removed.
-fn remove_remote(
-    store: &mut Store,
-    name: &RemoteName,
-) -> Result<Option<String>, remote::RemoteError> {
-    let chosen = matches!(remote::sync_remote(store), Ok(Some(chosen)) if chosen.name == *name);
+fn remove_remote(store: &mut Store, name: &RemoteName) -> Result<Option<String>, RemoteError> {
+    let pushing = remote::pushing_to(store, name);
     let mut lines = vec![format!(
         "Remove the git remote {name} from this repository?"
     )];
-    if chosen {
+    if pushing == remote::Pushing::ToIt {
         lines.push("Threads are pushed to it, so mahi stops pushing them.".to_owned());
     }
     let asked = DialogPrompt::default().ask(Dialog::confirm("Remote", lines, Preselected::No));
     if !matches!(asked, Ok(Answer::Confirmed(true))) {
         return Ok(None);
     }
-    Ok(Some(match remote::remove(store, name)? {
-        remote::Removed::StoppedPushing => {
-            format!("removed the git remote {name}; threads are not pushed")
-        }
-        remote::Removed::Unchosen => format!("removed the git remote {name}"),
+    remote::remove(store, name, pushing)?;
+    Ok(Some(match pushing {
+        remote::Pushing::ToIt => format!("removed the git remote {name}; threads are not pushed"),
+        remote::Pushing::Elsewhere => format!("removed the git remote {name}"),
     }))
 }
 
@@ -1653,6 +1694,30 @@ mod tests {
         assert_eq!(
             read(&mut cache, Some(setup.identity.clone())),
             Some(BTreeMap::from([(setup.thread, at("2026-11-16T13:09:00Z"))]))
+        );
+    }
+
+    #[test]
+    fn a_remotes_name_is_origin_when_empty_and_a_url_or_a_taken_name_is_refused_with_why() {
+        let known = vec!["team".to_owned()];
+        assert_eq!(remote_name_from("", &known).unwrap().as_str(), "origin");
+        assert_eq!(remote_name_from("work", &known).unwrap().as_str(), "work");
+        for url in [
+            "https://github.com/team/project.git",
+            "git@github.com:team/project.git",
+            "team/project",
+        ] {
+            assert_eq!(remote_name_from(url, &known).unwrap_err(), LOOKS_LIKE_URL);
+        }
+        assert!(
+            remote_name_from("team", &known)
+                .unwrap_err()
+                .contains("already has a remote called team")
+        );
+        assert!(
+            remote_name_from("a b", &known)
+                .unwrap_err()
+                .contains("is not a remote name")
         );
     }
 

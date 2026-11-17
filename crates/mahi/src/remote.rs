@@ -309,27 +309,38 @@ pub(crate) fn change_url(
         .map_err(|error| RemoteError::ChangeUrl(name.clone(), Box::new(error)))
 }
 
-/// What removing a git remote did to where threads are pushed.
+/// Whether the clone pushes its threads to a git remote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Removed {
-    /// Threads were pushed to it, and are no longer pushed.
-    StoppedPushing,
-    /// Threads were not pushed to it.
-    Unchosen,
+pub(crate) enum Pushing {
+    /// Threads are pushed to it.
+    ToIt,
+    /// Threads are pushed elsewhere, or nowhere.
+    Elsewhere,
 }
 
-/// Removes the git remote `name` from the repository, then stops pushing the clone's threads
-/// when they were pushed to it.
-pub(crate) fn remove(store: &mut Store, name: &RemoteName) -> Result<Removed, RemoteError> {
-    let chosen = matches!(sync_remote(store), Ok(Some(remote)) if remote.name == *name);
+/// Returns whether the clone pushes its threads to the git remote `name`.
+pub(crate) fn pushing_to(store: &Store, name: &RemoteName) -> Pushing {
+    if matches!(sync_remote(store), Ok(Some(remote)) if remote.name == *name) {
+        Pushing::ToIt
+    } else {
+        Pushing::Elsewhere
+    }
+}
+
+/// Removes the git remote `name` from the repository, first stopping pushing the clone's
+/// threads when `pushing` says they go to it, so a removal that fails part way never leaves
+/// them pushed to a remote that is gone.
+pub(crate) fn remove(
+    store: &mut Store,
+    name: &RemoteName,
+    pushing: Pushing,
+) -> Result<(), RemoteError> {
+    if pushing == Pushing::ToIt {
+        turn_off(store)?;
+    }
     store
         .remove_remote(name.as_str())
-        .map_err(|error| RemoteError::Remove(name.clone(), Box::new(error)))?;
-    if !chosen {
-        return Ok(Removed::Unchosen);
-    }
-    turn_off(store)?;
-    Ok(Removed::StoppedPushing)
+        .map_err(|error| RemoteError::Remove(name.clone(), Box::new(error)))
 }
 
 /// Stops pushing the clone's threads, as `mahi remote --off` does.
@@ -644,19 +655,16 @@ mod tests {
         ));
         add(&mut store, &name("other"), "git@example.org:other.git").unwrap();
         choose(&store, &origin, Visibility::Private).unwrap();
-        assert_eq!(
-            remove(&mut store, &name("other")).unwrap(),
-            Removed::Unchosen
-        );
+        let other = name("other");
+        assert_eq!(pushing_to(&store, &other), Pushing::Elsewhere);
+        remove(&mut store, &other, Pushing::Elsewhere).unwrap();
         assert_eq!(summary(&store).text(), "origin (private)");
-        assert_eq!(
-            remove(&mut store, &origin).unwrap(),
-            Removed::StoppedPushing
-        );
+        assert_eq!(pushing_to(&store, &origin), Pushing::ToIt);
+        remove(&mut store, &origin, Pushing::ToIt).unwrap();
         assert_eq!(summary(&store).text(), "off");
         assert!(store.remote_names().is_empty());
         assert!(matches!(
-            remove(&mut store, &origin),
+            remove(&mut store, &origin, Pushing::Elsewhere),
             Err(RemoteError::Remove(..))
         ));
     }

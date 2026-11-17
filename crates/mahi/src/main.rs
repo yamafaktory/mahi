@@ -502,7 +502,7 @@ pub(crate) fn describe(error: &dyn Error) -> String {
     message
 }
 
-pub(crate) fn causes(message: &mut String, error: &dyn Error) {
+fn causes(message: &mut String, error: &dyn Error) {
     let mut source = error.source();
     while let Some(cause) = source {
         let _ = write!(message, ": {cause}");
