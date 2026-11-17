@@ -1001,3 +1001,14 @@ the thread list's palette, and an explanation in help. The palettes and the thre
 one short label, and help keeps the explanations. The user chose the labels "Resume this thread",
 "End this thread", "Invite a teammate" and "Purge this thread". The other choices were the long
 label everywhere, or keeping them as they were.
+
+## D126 · 2026-11-17 · The Remote dialog changes and removes a git remote
+
+Chosen by the user (#184). A git remote added with a wrong URL could not be fixed from mahi. The
+Remote dialog now offers `Change the URL of <name>` and `Remove <name>` for each remote, and
+removing asks first. Removing the remote threads are pushed to also stops pushing them; the other
+choice was to refuse while it is chosen. Only the dialog does this: on the command line,
+`git remote set-url` and `git remote remove` already do, and adding `mahi remote` flags was the
+other choice. During the work, not by the user: a refused name or URL is asked again with what was
+typed and why, a name with `:`, `/` or `@` is taken for a URL, changing a URL sets the push URL
+when the remote has one, and removing follows `git remote remove`.

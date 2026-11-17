@@ -441,6 +441,17 @@ impl Dialog {
         )
     }
 
+    /// Returns the dialog with `typed` already in its line, as when a line is asked again;
+    /// any other dialog is returned as it is.
+    #[must_use]
+    pub fn with_text(mut self, typed: &str) -> Self {
+        if let Kind::Input { text, .. } = &mut self.kind {
+            text.clear();
+            text.extend(typed.chars().filter(|c| !hidden(*c)).take(MAX_INPUT_CHARS));
+        }
+        self
+    }
+
     /// Makes a list to pick one of `items` from.
     #[must_use]
     pub fn choose(title: &str, lines: Vec<String>, items: Vec<String>) -> Self {
@@ -1325,6 +1336,29 @@ mod tests {
             dialog.key(PaletteInput::Enter),
             Some(Answer::Confirmed(false))
         );
+    }
+
+    #[test]
+    fn a_line_asked_again_starts_with_what_was_typed_and_keeps_taking_keys() {
+        let mut input = Dialog::input("Add a git remote", Vec::new(), false)
+            .with_text("https://example.org/r.git\u{1b}");
+        assert!(
+            drawn(&input).contains("https://example.org/r.git"),
+            "{}",
+            drawn(&input)
+        );
+        input.key(PaletteInput::Backspace);
+        input.key(PaletteInput::Text('X'));
+        let Some(Answer::Text(typed)) = input.key(PaletteInput::Enter) else {
+            panic!("no text");
+        };
+        assert_eq!(typed.as_str(), "https://example.org/r.giX");
+        let long = "a".repeat(MAX_INPUT_CHARS + 10);
+        let mut capped = Dialog::input("t", Vec::new(), false).with_text(&long);
+        let Some(Answer::Text(text)) = capped.key(PaletteInput::Enter) else {
+            panic!("no text");
+        };
+        assert_eq!(text.chars().count(), MAX_INPUT_CHARS);
     }
 
     #[test]

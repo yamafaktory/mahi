@@ -2241,7 +2241,8 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
     }
 
     #[test]
-    fn the_home_screen_refuses_a_remote_url_mahi_cannot_push_to_and_adds_one_left_unchosen() {
+    fn the_home_screen_asks_again_for_a_remote_url_mahi_cannot_push_to_and_adds_one_left_unchosen()
+    {
         let fixture = fixture();
         let (code, output) = in_terminal_typing(
             terminal_command(&fixture, &[]),
@@ -2250,10 +2251,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
                 ("no git remote yet", b"1"),
                 ("Its name", b"team\r"),
                 ("The URL of team", b"http://example.org/project.git\r"),
-                ("the remote was not changed", b"m"),
-                ("no git remote yet", b"1"),
-                ("Its name", b"team\r"),
-                ("The URL of team", b"git@example.org:team/project.git\r"),
+                ("is not an ssh remote", b"\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7f\x7fgit@example.org:team/project.git\r"),
                 ("Push threads to team?", b"\x1b"),
                 (
                     "added the git remote team; threads are not pushed to it yet",
@@ -2262,12 +2260,119 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
             ],
         );
         assert_eq!(code, 0, "{output}");
+        assert!(!output.contains("the remote was not changed"), "{output}");
         let store = Store::open(&fixture.repo).unwrap();
         assert_eq!(store.remote_names(), ["team"]);
-        let shown = fixture.mahi(&["remote"]);
+        assert_eq!(
+            store.remote_url("team", true).unwrap().as_deref(),
+            Some("git@example.org:team/project.git")
+        );
+    }
+
+    #[test]
+    fn a_url_typed_as_a_remotes_name_is_asked_again_with_a_word_on_which_comes_first() {
+        let fixture = fixture();
+        let url = "https://example.org/team/project.git";
+        let erase = "\x7f".repeat(url.len());
+        let fixed = format!("{erase}\r");
+        let typed = format!("{url}\r");
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("Threads", b"m"),
+                ("no git remote yet", b"1"),
+                ("Its name", typed.as_bytes()),
+                ("The name comes first", fixed.as_bytes()),
+                ("The URL of origin", b"git@example.org:team/project.git\r"),
+                ("Push threads to origin?", b"1"),
+                ("remote: origin (private)", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let store = Store::open(&fixture.repo).unwrap();
+        assert_eq!(store.remote_names(), ["origin"]);
+    }
+
+    #[test]
+    fn the_remote_dialog_changes_a_remotes_url_starting_from_the_one_it_has() {
+        let fixture = fixture();
+        let mut store = Store::open(&fixture.repo).unwrap();
+        store
+            .add_remote("origin", "git@example.org:team/typo.git")
+            .unwrap();
+        drop(store);
+        let erase = "\x7f".repeat("typo.git".len());
+        let changed = format!("{erase}project.git\r");
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("Threads", b"m"),
+                ("Change the URL of origin", b"3"),
+                ("git@example.org:team/typo.git", changed.as_bytes()),
+                ("changed the URL of the git remote origin", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let store = Store::open(&fixture.repo).unwrap();
+        assert_eq!(
+            store.remote_url("origin", true).unwrap().as_deref(),
+            Some("git@example.org:team/project.git")
+        );
+    }
+
+    #[test]
+    fn the_remote_dialog_removes_the_remote_threads_are_pushed_to_after_asking_and_stops_pushing() {
+        let fixture = fixture();
+        let mut store = Store::open(&fixture.repo).unwrap();
+        store
+            .add_remote("origin", "git@example.org:team/project.git")
+            .unwrap();
+        store
+            .add_remote("spare", "git@example.org:team/spare.git")
+            .unwrap();
+        drop(store);
+        let chosen = fixture.mahi(&["remote", "origin", "--private"]);
+        assert!(chosen.status.success(), "{chosen:?}");
+        let mut mahi = terminal_command(&fixture, &[]).spawn().unwrap();
+        let mut terminal = mahi.writer().unwrap();
+        let (seen, _ended) = collect(&mahi);
+        let shows = |text: &str| {
+            waited(Duration::from_secs(10), || {
+                String::from_utf8_lossy(&seen.lock().unwrap()).contains(text)
+            })
+        };
+        assert!(shows("Threads"));
+        terminal.write_all(b"m").unwrap();
+        assert!(shows("Remove origin"));
+        terminal.write_all(b"4").unwrap();
+        assert!(shows("so mahi stops pushing them"));
+        terminal.write_all(b"n").unwrap();
+        thread::sleep(Duration::from_millis(800));
+        terminal.write_all(b"q").unwrap();
+        assert_eq!(exit_within(&mut mahi, Duration::from_secs(20)), 0);
+        assert_eq!(
+            Store::open(&fixture.repo).unwrap().remote_names(),
+            ["origin", "spare"]
+        );
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("Threads", b"m"),
+                ("Remove origin", b"4"),
+                ("so mahi stops pushing them", b"y"),
+                (
+                    "removed the git remote origin; threads are not pushed",
+                    b"q",
+                ),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let store = Store::open(&fixture.repo).unwrap();
+        assert_eq!(store.remote_names(), ["spare"]);
+        let setting = fixture.mahi(&["remote"]);
         assert!(
-            String::from_utf8_lossy(&shown.stdout).contains("not pushed"),
-            "{shown:?}"
+            String::from_utf8_lossy(&setting.stdout).contains("not pushed"),
+            "{setting:?}"
         );
     }
 

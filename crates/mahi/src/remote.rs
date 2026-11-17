@@ -105,10 +105,12 @@ pub(crate) enum RemoteError {
     Corrupt,
     #[error("cannot ask the user")]
     Prompt(#[source] io::Error),
-    #[error("that is not a remote name")]
-    InvalidName(#[source] RemoteNameError),
     #[error("cannot add the git remote {0}")]
     Add(RemoteName, #[source] Box<StoreError>),
+    #[error("cannot change the url of the git remote {0}")]
+    ChangeUrl(RemoteName, #[source] Box<StoreError>),
+    #[error("cannot remove the git remote {0}")]
+    Remove(RemoteName, #[source] Box<StoreError>),
 }
 
 /// A remote name that holds characters git remote names do not, or starts with `-` or `.`.
@@ -292,6 +294,42 @@ pub(crate) fn add(store: &mut Store, name: &RemoteName, url: &str) -> Result<(),
     store
         .add_remote(name.as_str(), url)
         .map_err(|error| RemoteError::Add(name.clone(), Box::new(error)))
+}
+
+/// Changes the URL the git remote `name` pushes to, once `url` reads as an SSH or HTTPS
+/// remote mahi can push to.
+pub(crate) fn change_url(
+    store: &mut Store,
+    name: &RemoteName,
+    url: &str,
+) -> Result<(), RemoteError> {
+    parse_remote_url(name, url)?;
+    store
+        .set_remote_push_url(name.as_str(), url)
+        .map_err(|error| RemoteError::ChangeUrl(name.clone(), Box::new(error)))
+}
+
+/// What removing a git remote did to where threads are pushed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Removed {
+    /// Threads were pushed to it, and are no longer pushed.
+    StoppedPushing,
+    /// Threads were not pushed to it.
+    Unchosen,
+}
+
+/// Removes the git remote `name` from the repository, then stops pushing the clone's threads
+/// when they were pushed to it.
+pub(crate) fn remove(store: &mut Store, name: &RemoteName) -> Result<Removed, RemoteError> {
+    let chosen = matches!(sync_remote(store), Ok(Some(remote)) if remote.name == *name);
+    store
+        .remove_remote(name.as_str())
+        .map_err(|error| RemoteError::Remove(name.clone(), Box::new(error)))?;
+    if !chosen {
+        return Ok(Removed::Unchosen);
+    }
+    turn_off(store)?;
+    Ok(Removed::StoppedPushing)
 }
 
 /// Stops pushing the clone's threads, as `mahi remote --off` does.
@@ -584,6 +622,43 @@ mod tests {
         assert!(summary(&store).chosen());
         assert!(choose(&store, &name("missing"), Visibility::Public).is_err());
         assert_eq!(store.remote_names(), ["origin"]);
+    }
+
+    #[test]
+    fn a_remotes_url_changes_only_to_one_mahi_pushes_to_and_removing_the_chosen_one_stops_pushing()
+    {
+        let (_dir, mut store) = store_with(ORIGIN_OVER_SSH);
+        let origin = name("origin");
+        assert!(matches!(
+            change_url(&mut store, &origin, "http://example.org/repo.git"),
+            Err(RemoteError::NotSsh { .. })
+        ));
+        change_url(&mut store, &origin, "git@example.org:team/project.git").unwrap();
+        assert_eq!(
+            store.remote_url("origin", true).unwrap().as_deref(),
+            Some("git@example.org:team/project.git")
+        );
+        assert!(matches!(
+            change_url(&mut store, &name("missing"), "git@example.org:a.git"),
+            Err(RemoteError::ChangeUrl(..))
+        ));
+        add(&mut store, &name("other"), "git@example.org:other.git").unwrap();
+        choose(&store, &origin, Visibility::Private).unwrap();
+        assert_eq!(
+            remove(&mut store, &name("other")).unwrap(),
+            Removed::Unchosen
+        );
+        assert_eq!(summary(&store).text(), "origin (private)");
+        assert_eq!(
+            remove(&mut store, &origin).unwrap(),
+            Removed::StoppedPushing
+        );
+        assert_eq!(summary(&store).text(), "off");
+        assert!(store.remote_names().is_empty());
+        assert!(matches!(
+            remove(&mut store, &origin),
+            Err(RemoteError::Remove(..))
+        ));
     }
 
     #[test]
