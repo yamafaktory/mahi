@@ -900,10 +900,13 @@ mod tests {
         let terminal = FakeTerminal::default();
         let waiting = Arc::new(HeldQueue::default());
         let screen = screen(&terminal).with_waiting(Arc::clone(&waiting));
-        waiting.show(vec![
-            held("bob.claude", 1, &["CLAUDE.md"]),
-            held("carol.codex", 2, &["AGENTS.md"]),
-        ]);
+        waiting.show(
+            vec![
+                held("bob.claude", 1, &["CLAUDE.md"]),
+                held("carol.codex", 2, &["AGENTS.md"]),
+            ],
+            |_, _| None,
+        );
         screen.open().unwrap();
         let drawn = String::from_utf8_lossy(&written(&screen)).into_owned();
         assert!(drawn.contains(TITLE), "{drawn}");
@@ -928,11 +931,14 @@ mod tests {
         );
         screen.typed(b"\x1b[A").unwrap();
         assert_eq!(screen.lock().unwrap().selected_id, Some(bob.clone()));
-        waiting.show(vec![
-            held("bob.claude", 1, &["CLAUDE.md"]),
-            held("carol.codex", 2, &["AGENTS.md"]),
-            held("dave.claude", 3, &[".mcp.json"]),
-        ]);
+        waiting.show(
+            vec![
+                held("bob.claude", 1, &["CLAUDE.md"]),
+                held("carol.codex", 2, &["AGENTS.md"]),
+                held("dave.claude", 3, &[".mcp.json"]),
+            ],
+            |_, _| None,
+        );
         written(&screen);
         screen.tick().unwrap();
         let ticked = String::from_utf8_lossy(&written(&screen)).into_owned();
@@ -980,7 +986,7 @@ mod tests {
         let terminal = FakeTerminal::default();
         let waiting = Arc::new(HeldQueue::default());
         let filtered = screen(&terminal).with_waiting(Arc::clone(&waiting));
-        waiting.show(vec![held("bob.claude", 1, &["CLAUDE.md"])]);
+        waiting.show(vec![held("bob.claude", 1, &["CLAUDE.md"])], |_, _| None);
         filtered.open().unwrap();
         filtered.typed(b"xyz").unwrap();
         let drawn = String::from_utf8_lossy(&written(&filtered)).into_owned();
@@ -1000,7 +1006,7 @@ mod tests {
                 ".claude/set\x1b]0;x\x07.json".to_owned(),
             ],
         );
-        waiting.show(vec![("bob.claude".parse().unwrap(), record)]);
+        waiting.show(vec![("bob.claude".parse().unwrap(), record)], |_, _| None);
         (screen, waiting)
     }
 
@@ -1030,12 +1036,12 @@ mod tests {
         let waiting = Arc::new(HeldQueue::default());
         let screen = screen(&terminal).with_waiting(Arc::clone(&waiting));
         let (bob, record) = held("bob.claude", 1, &["CLAUDE.md"]);
-        waiting.show(vec![(bob.clone(), record.clone())]);
+        waiting.show(vec![(bob.clone(), record.clone())], |_, _| None);
         waiting.failed(
             (&bob, record.commit),
             "the merge write went over its limit".to_owned(),
         );
-        waiting.show(vec![(bob, record)]);
+        waiting.show(vec![(bob, record)], |_, _| None);
         screen.open().unwrap();
         let drawn = String::from_utf8_lossy(&written(&screen)).into_owned();
         assert!(
@@ -1069,7 +1075,10 @@ mod tests {
             mahi_store::ObjectId::from_bytes_or_panic(&[2; 20]),
             &["CLAUDE.md".to_owned()],
         );
-        waiting.show(vec![("landing:up:main".parse().unwrap(), record)]);
+        waiting.show(
+            vec![("landing:up:main".parse().unwrap(), record)],
+            |_, _| None,
+        );
         screen.open().unwrap();
         let drawn = String::from_utf8_lossy(&written(&screen)).into_owned();
         assert!(drawn.contains("main"), "{drawn}");
@@ -1146,7 +1155,7 @@ mod tests {
         let screen = screen(&terminal).with_waiting(Arc::clone(&waiting));
         let paths: Vec<String> = (1..=20).map(|n| format!("dir{n}/CLAUDE.md")).collect();
         let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
-        waiting.show(vec![held("bob.claude", 1, &paths)]);
+        waiting.show(vec![held("bob.claude", 1, &paths)], |_, _| None);
         screen.open().unwrap();
         let first = shown(&written(&screen));
         assert!(

@@ -15,7 +15,10 @@ use std::{
         },
     },
     thread,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use mahi_core::{
@@ -25,6 +28,7 @@ use mahi_core::{
     ThreadId,
     ThreadRef,
 };
+use mahi_crypto::ThreadKey;
 use mahi_store::{
     ObjectId,
     Store,
@@ -78,18 +82,20 @@ use crate::{
     },
     sync_state,
     turn_end,
+    when,
 };
 
 const LOOK_EVERY: Duration = Duration::from_secs(1);
 
-/// Where the user's agent takes its teammates' work from: the repository, the thread and its
-/// owner's key, and the agent's own slot; and the snapshots that wait for the user, as the
-/// palette shows them.
+/// Where the user's agent takes its teammates' work from: the repository, the thread, its
+/// owner's key and the thread key that opens its transcripts, and the agent's own slot; and the
+/// snapshots that wait for the user, as the palette shows them.
 #[derive(Debug, Clone)]
 pub(crate) struct AutoMerge {
     pub(crate) git_dir: PathBuf,
     pub(crate) thread: ThreadId,
     pub(crate) owner: ParticipantKey,
+    pub(crate) key: Option<Arc<ThreadKey>>,
     pub(crate) own: AgentSlot,
     pub(crate) waiting: Arc<HeldQueue>,
 }
@@ -304,6 +310,21 @@ impl AutoMerge {
         true
     }
 
+    /// Returns the instant of this run's clock at which the turn that `slot`'s turn-end
+    /// snapshot `commit` names ended, when its transcript carries that turn's time.
+    pub(crate) fn ended_at(
+        &self,
+        store: &Store,
+        slot: &AgentSlot,
+        commit: ObjectId,
+    ) -> Option<Instant> {
+        let at = Instant::now();
+        let now = when::now()?;
+        let key = self.key.as_deref()?;
+        let time = turn_end::turn_time(store, key, (self.thread, slot), commit)?;
+        Some(when::instant_of(time, (now, at)))
+    }
+
     /// Returns the merges that wait for the user: each teammate's snapshot that changes agent
     /// settings, and the landing branch's merge that does, while the last landing still brings
     /// it.
@@ -427,7 +448,11 @@ impl AutoMerge {
                 (activity, agent, writer),
                 pace,
             );
-            self.waiting.show(self.held_now(&store));
+            self.waiting
+                .show(self.held_now(&store), |from, commit| match from {
+                    Source::Agent(slot) => self.ended_at(&store, slot, commit),
+                    Source::Landing(_) => None,
+                });
             for (from, record, choice) in self.waiting.take_choices() {
                 seen.clear();
                 if !self.choose(
@@ -659,6 +684,7 @@ mod tests {
                 start_with,
             },
         },
+        turn_end::EndedTurn,
     };
 
     struct Closed;
@@ -674,7 +700,7 @@ mod tests {
         store: Store,
         alice: PrivateKey,
         started: Started,
-        thread_key: mahi_crypto::ThreadKey,
+        thread_key: Arc<ThreadKey>,
         bob: (CommitKey, Participant),
         carol: (CommitKey, Participant),
     }
@@ -683,7 +709,7 @@ mod tests {
         let (dir, store) = repository_on_main();
         let alice = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let mut started = start_with(&store, &alice).unwrap();
-        let thread_key = started.key.take().unwrap();
+        let thread_key = Arc::new(started.key.take().unwrap());
         let list = |name: &str, role: Role| {
             let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
             let participant = Participant::new(
@@ -726,6 +752,7 @@ mod tests {
                 git_dir: self.store.common_dir().to_path_buf(),
                 thread: self.started.thread,
                 owner: ParticipantKey::from_public_key(self.alice.public_key()).unwrap(),
+                key: Some(Arc::clone(&self.thread_key)),
                 own: self.started.slot.clone(),
                 waiting: Arc::default(),
             }
@@ -770,7 +797,7 @@ mod tests {
                     &snapshots,
                     head,
                     tree,
-                    &turn_end::message(&slot),
+                    &turn_end::message(&slot, EndedTurn::Unsealed),
                     signer.signer(),
                 )
                 .unwrap()
@@ -792,7 +819,7 @@ mod tests {
                     ("notes.txt", EntryKind::Blob, notes),
                 ])
                 .unwrap();
-            let message = turn_end::message(&slot);
+            let message = turn_end::message(&slot, EndedTurn::Unsealed);
             match signer {
                 Some(signer) => self
                     .store
@@ -801,6 +828,75 @@ mod tests {
                 None => self.store.append(&snapshots, head, tree, &message).unwrap(),
             }
         }
+    }
+
+    #[test]
+    fn a_turn_end_is_dated_from_the_newest_time_of_the_turn_it_names() {
+        let team = team();
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let now = when::now().unwrap();
+        let ago = |secs: i64| {
+            now.checked_sub(jiff::SignedDuration::from_secs(secs))
+                .unwrap()
+        };
+        let mut tip = None;
+        for (turn, secs) in [(0, 3600), (1, 600), (2, 60)] {
+            let events = vec![
+                mahi_thread::Event::new(turn * 2, Some(ago(secs + 30)), b"prompt\n".to_vec())
+                    .unwrap(),
+                mahi_thread::Event::new(turn * 2 + 1, Some(ago(secs)), b"turn-end\n".to_vec())
+                    .unwrap(),
+            ];
+            let record = mahi_thread::TurnRecord::new(turn, events).unwrap();
+            tip = Some(
+                mahi_thread::append_turn(
+                    &team.store,
+                    &team.thread_key,
+                    team.started.thread,
+                    &bob,
+                    tip.as_ref(),
+                    &record,
+                    team.bob.0.signer(),
+                )
+                .unwrap(),
+            );
+        }
+        let snapshots = ThreadRef::new(team.started.thread, RefKind::Snapshots(bob.clone()));
+        let tree = team
+            .store
+            .commit_tree(team.store.head_commit().unwrap())
+            .unwrap();
+        let ending = |ended| {
+            let head = team.store.head(&snapshots).unwrap();
+            team.store
+                .append_signed(
+                    &snapshots,
+                    head,
+                    tree,
+                    &turn_end::message(&bob, ended),
+                    team.bob.0.signer(),
+                )
+                .unwrap()
+        };
+        let named = ending(EndedTurn::Sealed(1));
+        let auto = team.auto_merge();
+
+        let at = auto.ended_at(&team.store, &bob, named).unwrap();
+        let age = Instant::now().duration_since(at).as_secs();
+        assert!((600..610).contains(&age), "{age}");
+        assert!(
+            auto.ended_at(&team.store, &bob, ending(EndedTurn::Unsealed))
+                .is_none()
+        );
+        assert!(
+            auto.ended_at(&team.store, &bob, ending(EndedTurn::Sealed(7)))
+                .is_none()
+        );
+        let keyless = AutoMerge {
+            key: None,
+            ..team.auto_merge()
+        };
+        assert!(keyless.ended_at(&team.store, &bob, named).is_none());
     }
 
     #[test]
@@ -1584,7 +1680,7 @@ mod tests {
             assert_ne!(merged.of(&"bob.claude".parse().unwrap()), Some(later));
             assert!(!team.started.worktree.join("notes.txt").exists());
             fs::write(&readme, "alice and bob\n").unwrap();
-            merging.recorder.events().turn_ended();
+            merging.recorder.events().turn_ended(EndedTurn::Unsealed);
             merging.activity.saw(HookKind::TurnEnd, b"");
             let bob = "bob.claude".parse().unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);

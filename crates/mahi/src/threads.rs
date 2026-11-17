@@ -31,7 +31,6 @@ use mahi_store::{
 };
 use mahi_term::HomeRow;
 use mahi_thread::{
-    Event,
     ParticipantKey,
     remembered_owner,
     walk_turns_while,
@@ -320,7 +319,7 @@ fn newest_time(
 ) -> Result<Option<Timestamp>, String> {
     let mut newest = None;
     walk_turns_while(store, key, thread, agent, ACTIVITY_TURNS, |turn| {
-        newest = turn.events().iter().filter_map(Event::time).max();
+        newest = turn.newest_time();
         if newest.is_some() {
             ControlFlow::Break(())
         } else {
@@ -502,6 +501,7 @@ mod tests {
         ThreadRef,
     };
     use mahi_store::ObjectId;
+    use mahi_thread::Event;
 
     use super::*;
 

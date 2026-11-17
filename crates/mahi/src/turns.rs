@@ -48,6 +48,7 @@ use crate::{
         SyncError,
     },
     sync::PushPoker,
+    turn_end::EndedTurn,
 };
 
 const EVENT_OVERHEAD: usize = 64;
@@ -105,11 +106,11 @@ pub(crate) fn record(
             .session
             .as_ref()
             .map(|source| scope.spawn(move || record_sessions(transcript, source, &woken, pushes)));
-        let told = |kind: HookKind| {
+        let told = |kind: HookKind, ended: EndedTurn| {
             if let Some(events) = events {
                 match kind {
                     HookKind::Tool => events.changed(),
-                    HookKind::TurnEnd => events.turn_ended(),
+                    HookKind::TurnEnd => events.turn_ended(ended),
                     HookKind::Prompt | HookKind::Asks | HookKind::SessionStart => {}
                 }
             }
@@ -167,7 +168,7 @@ fn record_turns(
     store: &Store,
     transcript: &Transcript,
     inputs: &Receiver<Delivery>,
-    told: &dyn Fn(HookKind),
+    told: &dyn Fn(HookKind, EndedTurn),
     (pushes, sessions): (Option<&PushPoker>, &SyncSender<()>),
 ) -> Summary {
     let mut turns = Turns::after(transcript.tip);
@@ -181,11 +182,16 @@ fn record_turns(
         };
         let ends = message.kind == HookKind::TurnEnd;
         turns.push(&message, time);
-        if ends && turns.seal_or_note(store, transcript) {
+        let ended = if ends {
+            turns.seal_or_note(store, transcript)
+        } else {
+            EndedTurn::Unsealed
+        };
+        if let EndedTurn::Sealed(_) = ended {
             let _ = sessions.try_send(());
             pushes.inspect(|pushes| pushes.poke());
         }
-        told(message.kind);
+        told(message.kind, ended);
     }
     turns.seal_or_note(store, transcript);
     turns.summary
@@ -234,21 +240,21 @@ impl Turns {
         }
     }
 
-    fn seal_or_note(&mut self, store: &Store, transcript: &Transcript) -> bool {
+    fn seal_or_note(&mut self, store: &Store, transcript: &Transcript) -> EndedTurn {
         let pending = u64::try_from(self.events.len()).unwrap_or(u64::MAX);
         match self.seal(store, transcript) {
-            Ok(sealed) => sealed,
+            Ok(ended) => ended,
             Err(error) => {
                 self.summary.dropped = self.summary.dropped.saturating_add(pending);
                 self.summary.error.get_or_insert(error);
-                false
+                EndedTurn::Unsealed
             }
         }
     }
 
-    fn seal(&mut self, store: &Store, transcript: &Transcript) -> Result<bool, TurnError> {
+    fn seal(&mut self, store: &Store, transcript: &Transcript) -> Result<EndedTurn, TurnError> {
         if self.events.is_empty() {
-            return Ok(false);
+            return Ok(EndedTurn::Unsealed);
         }
         self.bytes = 0;
         let record = TurnRecord::new(self.next_turn, mem::take(&mut self.events))?;
@@ -264,7 +270,7 @@ impl Turns {
         self.tip = Some(tip);
         self.next_turn += 1;
         self.summary.turns += 1;
-        Ok(true)
+        Ok(EndedTurn::Sealed(record.turn()))
     }
 }
 
@@ -459,7 +465,7 @@ mod tests {
         assert_eq!(
             store.commit_message(ended).unwrap(),
             format!(
-                "snapshot\n\nMahi-Turn-End: {}\nMahi-Thread: {}\n",
+                "snapshot\n\nMahi-Turn-End: {}\nMahi-Turn: 0\nMahi-Thread: {}\n",
                 started.slot, started.thread
             )
         );
@@ -486,14 +492,18 @@ mod tests {
             started.thread,
             mahi_core::RefKind::Transcript(started.slot.clone()),
         );
-        let held_at_turn_end = std::cell::Cell::new(None);
-        let told = |kind: HookKind| {
+        let held_at_turn_end = std::cell::RefCell::new(Vec::new());
+        let told = |kind: HookKind, ended: EndedTurn| {
             if kind == HookKind::TurnEnd {
-                held_at_turn_end.set(Some(store.head(&turns).unwrap()));
+                held_at_turn_end
+                    .borrow_mut()
+                    .push((store.head(&turns).unwrap(), ended));
             }
         };
         let (sender, inputs) = mpsc::channel();
         sender.send(hook(HookKind::Prompt, b"ask")).unwrap();
+        sender.send(hook(HookKind::TurnEnd, b"")).unwrap();
+        sender.send(hook(HookKind::Prompt, b"again")).unwrap();
         sender.send(hook(HookKind::TurnEnd, b"")).unwrap();
         sender.send(Delivery::End { dropped: 0 }).unwrap();
         let (wake, _woken) = mpsc::sync_channel(1);
@@ -501,7 +511,10 @@ mod tests {
         let summary = record_turns(&store, &transcript, &inputs, &told, (None, &wake));
         assert!(summary.error.is_none());
         let held = held_at_turn_end.take();
-        assert!(matches!(held, Some(Some(_))), "{held:?}");
+        assert_eq!(held.len(), 2);
+        assert!(held[0].0.is_some() && held[0].0 != held[1].0, "{held:?}");
+        assert_eq!(held[0].1, EndedTurn::Sealed(0));
+        assert_eq!(held[1].1, EndedTurn::Sealed(1));
     }
 
     #[test]

@@ -65,6 +65,7 @@ use crate::{
         Reach,
         SyncSetup,
     },
+    when::Since,
 };
 
 const SNAPSHOT_ATTEMPTS: usize = 3;
@@ -757,21 +758,24 @@ pub(crate) struct Lander {
 }
 
 #[derive(Debug, Default)]
-struct FirstSeen(Mutex<HashMap<AgentSlot, (ObjectId, Instant)>>);
+struct FirstSeen(Mutex<HashMap<AgentSlot, (ObjectId, Since)>>);
 
 impl FirstSeen {
-    fn note(&self, slot: &AgentSlot, commit: ObjectId) -> Instant {
-        let now = Instant::now();
-        let Ok(mut seen) = self.0.lock() else {
-            return now;
-        };
-        match seen.get(slot) {
-            Some(&(noted, since)) if noted == commit => since,
-            Some(_) | None => {
-                seen.insert(slot.clone(), (commit, now));
-                now
-            }
+    fn note(
+        &self,
+        slot: &AgentSlot,
+        commit: ObjectId,
+        dated: impl FnOnce() -> Option<Instant>,
+    ) -> Instant {
+        let known = self.0.lock().ok().and_then(|seen| {
+            let (noted, since) = seen.get(slot)?;
+            (*noted == commit).then_some(*since)
+        });
+        let since = Since::settle(known, dated, Instant::now());
+        if let Ok(mut seen) = self.0.lock() {
+            seen.insert(slot.clone(), (commit, since));
         }
+        since.instant()
     }
 }
 
@@ -803,7 +807,9 @@ pub(crate) fn watch_turn_ends(lander: &Arc<Lander>) {
                 continue;
             };
             for (slot, commit) in &behind {
-                lander.first_seen.note(slot, *commit);
+                lander.first_seen.note(slot, *commit, || {
+                    lander.query.ended_at(&store, slot, *commit)
+                });
             }
             seen = now;
         }
@@ -985,7 +991,9 @@ impl Lander {
             .behind(store)
             .map_err(|error| ToolError::Failed(crate::describe(&error)))?;
         let dated = behind.into_iter().map(|(slot, commit)| {
-            let since = self.first_seen.note(&slot, commit);
+            let since = self
+                .first_seen
+                .note(&slot, commit, || self.query.ended_at(store, &slot, commit));
             (slot, since)
         });
         Ok(dated.collect())
@@ -1631,6 +1639,7 @@ pub(crate) mod tests {
                     git_dir: store.common_dir().to_path_buf(),
                     thread: started.thread,
                     owner: started.commits.key().clone(),
+                    key: None,
                     own: started.slot.clone(),
                     waiting: Arc::default(),
                 },
@@ -1961,18 +1970,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_turn_end_is_dated_from_when_its_commit_was_first_seen() {
+    fn a_turn_end_is_dated_from_its_turn_or_else_from_when_its_commit_was_first_seen() {
         let seen = FirstSeen::default();
         let bob: AgentSlot = "bob.claude".parse().unwrap();
-        let (first, later) = (
+        let (first, later, dated) = (
             ObjectId::from_bytes_or_panic(&[1; 20]),
             ObjectId::from_bytes_or_panic(&[2; 20]),
+            ObjectId::from_bytes_or_panic(&[3; 20]),
         );
-        let noted = seen.note(&bob, first);
+        let noted = seen.note(&bob, first, || None);
         thread::sleep(Duration::from_millis(10));
-        assert_eq!(seen.note(&bob, first), noted);
-        assert!(seen.note(&bob, later) > noted);
+        assert_eq!(seen.note(&bob, first, || None), noted);
+        assert!(seen.note(&bob, later, || None) > noted);
         assert_eq!(seen.0.lock().unwrap().len(), 1);
+        let ended = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap();
+        assert_eq!(seen.note(&bob, dated, || Some(ended)), ended);
+        assert_eq!(seen.note(&bob, dated, || unreachable!()), ended);
+    }
+
+    #[test]
+    fn a_turn_end_first_seen_without_a_time_takes_its_turns_time_once_it_arrives() {
+        let seen = FirstSeen::default();
+        let bob: AgentSlot = "bob.claude".parse().unwrap();
+        let commit = ObjectId::from_bytes_or_panic(&[1; 20]);
+        let ended = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap();
+        let first_seen = seen.note(&bob, commit, || None);
+        assert_eq!(seen.note(&bob, commit, || None), first_seen);
+        assert_eq!(seen.note(&bob, commit, || Some(ended)), ended);
+        assert_eq!(seen.note(&bob, commit, || unreachable!()), ended);
     }
 
     #[test]

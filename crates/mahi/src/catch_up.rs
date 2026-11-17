@@ -797,7 +797,10 @@ mod tests {
     #[test]
     fn a_teammates_transcript_turns_come_in_with_their_turn_end_snapshot() {
         let bob = bob_in_alices_thread();
-        let ended = snapshot_message(&turn_end::message(&bob.slot), bob.catch_up.thread);
+        let ended = snapshot_message(
+            &turn_end::message(&bob.slot, crate::turn_end::EndedTurn::Unsealed),
+            bob.catch_up.thread,
+        );
         let snapshot = bob.commits(&[&ended]);
         let turns = bob.commits(&["turn 0", "turn 1"]);
         let answer = SnapshotsAnswer {
@@ -823,7 +826,10 @@ mod tests {
     #[test]
     fn an_answer_without_transcript_turns_still_takes_the_snapshot() {
         let bob = bob_in_alices_thread();
-        let ended = snapshot_message(&turn_end::message(&bob.slot), bob.catch_up.thread);
+        let ended = snapshot_message(
+            &turn_end::message(&bob.slot, crate::turn_end::EndedTurn::Unsealed),
+            bob.catch_up.thread,
+        );
         let snapshot = bob.commits(&[&ended]);
         let answer = SnapshotsAnswer {
             snapshots: HistoryPack {
@@ -844,7 +850,10 @@ mod tests {
     #[test]
     fn transcript_turns_another_participant_signed_are_refused() {
         let bob = bob_in_alices_thread();
-        let ended = snapshot_message(&turn_end::message(&bob.slot), bob.catch_up.thread);
+        let ended = snapshot_message(
+            &turn_end::message(&bob.slot, crate::turn_end::EndedTurn::Unsealed),
+            bob.catch_up.thread,
+        );
         let snapshot = bob.commits(&[&ended]);
         let stranger =
             CommitKey::new(PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap()).unwrap();
@@ -886,7 +895,10 @@ mod tests {
     #[test]
     fn an_announced_transcript_commit_not_held_is_asked_for_even_with_the_snapshot_held() {
         let bob = bob_in_alices_thread();
-        let ended = snapshot_message(&turn_end::message(&bob.slot), bob.catch_up.thread);
+        let ended = snapshot_message(
+            &turn_end::message(&bob.slot, crate::turn_end::EndedTurn::Unsealed),
+            bob.catch_up.thread,
+        );
         let snapshot = bob.commits(&[&ended]);
         let turns = bob.commits(&["turn 0"]);
         let never = AtomicBool::new(false);
@@ -927,7 +939,10 @@ mod tests {
     #[test]
     fn an_asker_ahead_of_the_announced_snapshot_still_takes_the_transcript_turns() {
         let bob = bob_in_alices_thread();
-        let ended = snapshot_message(&turn_end::message(&bob.slot), bob.catch_up.thread);
+        let ended = snapshot_message(
+            &turn_end::message(&bob.slot, crate::turn_end::EndedTurn::Unsealed),
+            bob.catch_up.thread,
+        );
         let earlier = bob.commits(&[&ended]);
         let later = bob.commits_after(Some(earlier), &[&ended]);
         let turns = bob.commits(&["turn 0"]);
@@ -959,7 +974,10 @@ mod tests {
     #[test]
     fn a_transcript_left_out_with_the_whole_room_is_given_up_until_it_changes() {
         let bob = bob_in_alices_thread();
-        let ended = snapshot_message(&turn_end::message(&bob.slot), bob.catch_up.thread);
+        let ended = snapshot_message(
+            &turn_end::message(&bob.slot, crate::turn_end::EndedTurn::Unsealed),
+            bob.catch_up.thread,
+        );
         let snapshot = bob.commits(&[&ended]);
         let turns = bob.commits(&["turn 0"]);
         let left_out = SnapshotsAnswer {
@@ -1013,7 +1031,10 @@ mod tests {
     #[test]
     fn snapshots_past_the_announced_one_are_taken_with_the_transcript_turns() {
         let bob = bob_in_alices_thread();
-        let ended = snapshot_message(&turn_end::message(&bob.slot), bob.catch_up.thread);
+        let ended = snapshot_message(
+            &turn_end::message(&bob.slot, crate::turn_end::EndedTurn::Unsealed),
+            bob.catch_up.thread,
+        );
         let announced = bob.commits(&[&ended]);
         let first = SnapshotsAnswer {
             snapshots: HistoryPack {

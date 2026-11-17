@@ -12,6 +12,7 @@ use mahi_store::ObjectId;
 use crate::{
     held::HeldSettings,
     source::Source,
+    when::Since,
 };
 
 /// The teammates' snapshots that wait for the user because they change agent settings, as the
@@ -25,12 +26,12 @@ pub(crate) struct HeldQueue {
 struct State {
     waiting: Vec<Waiting>,
     choices: VecDeque<(Source, HeldSettings, Choice)>,
-    seen: HashMap<(Source, ObjectId), (Instant, Option<String>)>,
+    seen: HashMap<(Source, ObjectId), (Since, Option<String>)>,
     open: bool,
 }
 
-/// A snapshot that waits for the user: its teammate, the record of it, and when this run
-/// first saw it.
+/// A snapshot that waits for the user: its teammate, the record of it, and when its turn ended,
+/// or else when this run first saw it.
 #[derive(Debug, Clone)]
 pub(crate) struct Waiting {
     pub(crate) from: Source,
@@ -54,12 +55,38 @@ impl HeldQueue {
     }
 
     /// Shows the snapshots in `held` as the ones that wait, but those the user already chose
-    /// for, and asks for the palette to open when one comes that this run had not shown.
-    pub(crate) fn show(&self, held: Vec<(Source, HeldSettings)>) {
+    /// for, and asks for the palette to open when one comes that this run had not shown. A
+    /// snapshot waits since the instant `dated` gives it, asked until it gives one, and since
+    /// this run first saw it meanwhile.
+    pub(crate) fn show(
+        &self,
+        held: Vec<(Source, HeldSettings)>,
+        dated: impl Fn(&Source, ObjectId) -> Option<Instant>,
+    ) {
+        let undated: Vec<((Source, ObjectId), Option<Since>)> = {
+            let Some(state) = self.lock() else {
+                return;
+            };
+            held.iter()
+                .map(|(from, record)| {
+                    let key = (from.clone(), record.commit);
+                    let known = state.seen.get(&key).map(|(since, _)| *since);
+                    (key, known)
+                })
+                .filter(|(_, known)| !matches!(known, Some(Since::TurnEnded(_))))
+                .collect()
+        };
+        let now = Instant::now();
+        let settled: HashMap<(Source, ObjectId), Since> = undated
+            .into_iter()
+            .map(|(key, known)| {
+                let since = Since::settle(known, || dated(&key.0, key.1), now);
+                (key, since)
+            })
+            .collect();
         let Some(mut state) = self.lock() else {
             return;
         };
-        let now = Instant::now();
         let mut waiting = Vec::with_capacity(held.len());
         for (from, record) in held {
             let chosen = state
@@ -70,13 +97,16 @@ impl HeldQueue {
                 continue;
             }
             let key = (from.clone(), record.commit);
-            let (since, failure) = if let Some((since, failure)) = state.seen.get(&key) {
-                (*since, failure.clone())
-            } else {
-                state.seen.insert(key, (now, None));
-                state.open = true;
-                (now, None)
-            };
+            let settled = settled.get(&key).copied();
+            state.open |= !state.seen.contains_key(&key);
+            let entry = state
+                .seen
+                .entry(key)
+                .or_insert((Since::FirstSeen(now), None));
+            if let Some(since) = settled {
+                entry.0 = since;
+            }
+            let (since, failure) = (entry.0.instant(), entry.1.clone());
             waiting.push(Waiting {
                 from,
                 held: record,
@@ -153,7 +183,13 @@ impl HeldQueue {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    fn undated(_: &Source, _: ObjectId) -> Option<Instant> {
+        None
+    }
 
     fn record(byte: u8) -> HeldSettings {
         HeldSettings::new(
@@ -167,52 +203,81 @@ mod tests {
         let queue = HeldQueue::default();
         let bob: Source = "bob.claude".parse().unwrap();
         assert!(!queue.wants_open());
-        queue.show(vec![(bob.clone(), record(1))]);
+        queue.show(vec![(bob.clone(), record(1))], undated);
         assert!(queue.wants_open());
         assert!(!queue.wants_open());
         let since = queue.waiting(&bob).unwrap().since;
-        queue.show(vec![(bob.clone(), record(1))]);
+        queue.show(vec![(bob.clone(), record(1))], undated);
         assert!(!queue.wants_open());
         assert_eq!(queue.waiting(&bob).unwrap().since, since);
         assert!(queue.choose((&bob, record(1).commit), Choice::Skip));
         assert!(!queue.choose((&bob, record(1).commit), Choice::Skip));
-        queue.show(vec![(bob.clone(), record(1))]);
+        queue.show(vec![(bob.clone(), record(1))], undated);
         assert!(queue.waiting(&bob).is_none());
         let choices = queue.take_choices();
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].2, Choice::Skip);
         assert!(queue.take_choices().is_empty());
-        queue.show(vec![(bob.clone(), record(2))]);
+        queue.show(vec![(bob.clone(), record(2))], undated);
         assert!(queue.wants_open());
         assert_eq!(queue.waiting(&bob).unwrap().held.commit, record(2).commit);
-        queue.show(Vec::new());
+        queue.show(Vec::new(), undated);
         assert!(queue.waiting(&bob).is_none());
+    }
+
+    #[test]
+    fn a_held_snapshot_waits_since_its_turn_ended_once_that_time_arrives_and_is_not_dated_again() {
+        let queue = HeldQueue::default();
+        let bob: Source = "bob.claude".parse().unwrap();
+        let ended = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .unwrap();
+        let asked = std::cell::Cell::new(0);
+        let arrived = std::cell::Cell::new(false);
+        let dated = |_: &Source, _: ObjectId| {
+            asked.set(asked.get() + 1);
+            arrived.get().then_some(ended)
+        };
+        queue.show(vec![(bob.clone(), record(1))], dated);
+        let first_seen = queue.waiting(&bob).unwrap().since;
+        assert!(first_seen > ended);
+        assert!(queue.wants_open());
+        queue.show(vec![(bob.clone(), record(1))], dated);
+        assert_eq!(queue.waiting(&bob).unwrap().since, first_seen);
+        arrived.set(true);
+        queue.show(vec![(bob.clone(), record(1))], dated);
+        assert_eq!(queue.waiting(&bob).unwrap().since, ended);
+        assert!(!queue.wants_open());
+        let asked_before = asked.get();
+        queue.show(vec![(bob.clone(), record(1))], dated);
+        assert_eq!(asked.get(), asked_before);
+        assert_eq!(queue.waiting(&bob).unwrap().since, ended);
     }
 
     #[test]
     fn a_failed_take_keeps_its_reason_until_the_user_chooses_again() {
         let queue = HeldQueue::default();
         let bob: Source = "bob.claude".parse().unwrap();
-        queue.show(vec![(bob.clone(), record(1))]);
+        queue.show(vec![(bob.clone(), record(1))], undated);
         assert!(queue.waiting(&bob).unwrap().failure.is_none());
         assert!(queue.choose((&bob, record(1).commit), Choice::Take));
         queue.take_choices();
         queue.wants_open();
         queue.failed((&bob, record(1).commit), "the merge failed".to_owned());
         assert!(queue.wants_open());
-        queue.show(vec![(bob.clone(), record(1))]);
+        queue.show(vec![(bob.clone(), record(1))], undated);
         assert_eq!(
             queue.waiting(&bob).unwrap().failure.as_deref(),
             Some("the merge failed")
         );
-        queue.show(vec![(bob.clone(), record(2))]);
+        queue.show(vec![(bob.clone(), record(2))], undated);
         assert!(queue.waiting(&bob).unwrap().failure.is_none());
-        queue.show(vec![(bob.clone(), record(1))]);
+        queue.show(vec![(bob.clone(), record(1))], undated);
         assert!(queue.choose((&bob, record(1).commit), Choice::Take));
-        queue.show(vec![(bob.clone(), record(1))]);
+        queue.show(vec![(bob.clone(), record(1))], undated);
         assert!(queue.waiting(&bob).is_none());
         queue.take_choices();
-        queue.show(vec![(bob.clone(), record(1))]);
+        queue.show(vec![(bob.clone(), record(1))], undated);
         assert!(queue.waiting(&bob).unwrap().failure.is_none());
     }
 }

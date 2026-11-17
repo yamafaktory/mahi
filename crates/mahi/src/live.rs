@@ -2433,7 +2433,10 @@ mod tests {
                 &snapshots,
                 None,
                 tree,
-                &mahi_thread::snapshot_message(&turn_end::message(&slot), hosted.thread),
+                &mahi_thread::snapshot_message(
+                    &turn_end::message(&slot, crate::turn_end::EndedTurn::Unsealed),
+                    hosted.thread,
+                ),
                 commits.signer(),
             )
             .unwrap();
@@ -2557,7 +2560,10 @@ mod tests {
                 &snapshots,
                 None,
                 tree,
-                &mahi_thread::snapshot_message(&turn_end::message(&slot), hosted.thread),
+                &mahi_thread::snapshot_message(
+                    &turn_end::message(&slot, crate::turn_end::EndedTurn::Unsealed),
+                    hosted.thread,
+                ),
                 commits.signer(),
             )
             .unwrap();
@@ -2821,7 +2827,10 @@ mod tests {
                                 None,
                                 tree,
                                 &mahi_thread::snapshot_message(
-                                    &crate::turn_end::message(&slot),
+                                    &crate::turn_end::message(
+                                        &slot,
+                                        crate::turn_end::EndedTurn::Unsealed,
+                                    ),
                                     hosted.thread,
                                 ),
                             )
@@ -3138,7 +3147,12 @@ mod tests {
             .unwrap();
         let ended = hosted
             .store
-            .append(&snapshots, None, tree, &turn_end::message(slot))
+            .append(
+                &snapshots,
+                None,
+                tree,
+                &turn_end::message(slot, crate::turn_end::EndedTurn::Unsealed),
+            )
             .unwrap();
         hosted
             .store

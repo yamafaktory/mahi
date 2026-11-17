@@ -255,6 +255,12 @@ impl TurnRecord {
         &self.events
     }
 
+    /// Returns the newest time the turn's events carry, or `None` when none carries one.
+    #[must_use]
+    pub fn newest_time(&self) -> Option<Timestamp> {
+        self.events.iter().filter_map(Event::time).max()
+    }
+
     fn first_seq(&self) -> Option<u64> {
         self.events.first().map(Event::seq)
     }
@@ -887,6 +893,7 @@ mod tests {
         let read = read(&setup, 1).unwrap();
         let times: Vec<Option<Timestamp>> = read[0].events().iter().map(Event::time).collect();
         assert_eq!(times, [Some(first), None, Some(later)]);
+        assert_eq!(read[0].newest_time(), Some(later));
         assert_eq!(read, [record]);
     }
 

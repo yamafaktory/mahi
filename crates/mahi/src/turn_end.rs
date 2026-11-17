@@ -2,18 +2,21 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     io,
+    ops::ControlFlow,
     path::{
         Path,
         PathBuf,
     },
 };
 
+use jiff::Timestamp;
 use mahi_core::{
     AgentSlot,
     RefKind,
     ThreadId,
     ThreadRef,
 };
+use mahi_crypto::ThreadKey;
 use mahi_live::{
     COMMIT_BYTES,
     TurnEnd,
@@ -23,6 +26,7 @@ use mahi_store::{
     Store,
     StoreError,
 };
+use mahi_thread::walk_turns_while;
 
 use crate::{
     profile::Profile,
@@ -31,7 +35,9 @@ use crate::{
 };
 
 const TRAILER: &str = "Mahi-Turn-End: ";
+const TURN_TRAILER: &str = "Mahi-Turn: ";
 const MAX_WALK: usize = 4096;
+const MAX_TURNS_BACK: usize = 1024;
 const UNREPORTED_FILE: &str = "turn-ends-unreported";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,9 +84,37 @@ pub(crate) fn unreported_name(program: &OsStr, profile: Option<&Profile>) -> Opt
     Some(name.to_string_lossy().into_owned())
 }
 
-/// Returns the message of the snapshot that ends a turn of `slot`.
-pub(crate) fn message(slot: &AgentSlot) -> String {
-    format!("{SNAPSHOT_MESSAGE}\n\n{TRAILER}{slot}\n")
+/// A turn that ended: sealed into the transcript as the turn it numbers, or left out of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndedTurn {
+    /// The transcript holds it as this turn.
+    Sealed(u64),
+    /// The transcript does not hold it.
+    Unsealed,
+}
+
+/// Returns the message of the snapshot that ends the turn `ended` of `slot`, which names the
+/// turn when the transcript holds it.
+pub(crate) fn message(slot: &AgentSlot, ended: EndedTurn) -> String {
+    match ended {
+        EndedTurn::Sealed(turn) => {
+            format!("{SNAPSHOT_MESSAGE}\n\n{TRAILER}{slot}\n{TURN_TRAILER}{turn}\n")
+        }
+        EndedTurn::Unsealed => format!("{SNAPSHOT_MESSAGE}\n\n{TRAILER}{slot}\n"),
+    }
+}
+
+/// Returns the transcript turn a turn-end snapshot's `message` names, when exactly one line of
+/// its trailers names one in decimal digits.
+fn turn_of(message: &[u8]) -> Option<u64> {
+    let mut named = message
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(TURN_TRAILER.as_bytes()));
+    let turn = named.next()?;
+    if named.next().is_some() || turn.is_empty() || !turn.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(turn).ok()?.parse().ok()
 }
 
 /// Says whether a snapshot's `message` ends a turn of the slot written `slot`: a line of its
@@ -90,6 +124,31 @@ pub(crate) fn ends_turn_of(message: &[u8], slot: &str) -> bool {
         .split(|byte| *byte == b'\n')
         .filter_map(|line| line.strip_prefix(TRAILER.as_bytes()))
         .any(|named| named == slot.as_bytes())
+}
+
+/// Returns when the turn that `slot`'s turn-end snapshot `commit` in `thread` names happened:
+/// the newest time its events carry, found within the newest [`MAX_TURNS_BACK`] turns of
+/// `slot`'s transcript, which `key` opens.
+pub(crate) fn turn_time(
+    store: &Store,
+    key: &ThreadKey,
+    (thread, slot): (ThreadId, &AgentSlot),
+    commit: ObjectId,
+) -> Option<Timestamp> {
+    let named = turn_of(&store.commit_message(commit).ok()?)?;
+    let mut time = None;
+    walk_turns_while(store, key, thread, slot, MAX_TURNS_BACK, |turn| {
+        if turn.turn() == named {
+            time = turn.newest_time();
+        }
+        if turn.turn() <= named {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .ok()?;
+    time
 }
 
 /// The latest turn-end snapshot of each agent a host serves, read from its snapshots ref, with
@@ -291,8 +350,13 @@ mod tests {
     #[test]
     fn only_a_trailer_that_names_the_slot_ends_its_turn() {
         let alice = slot("alice.claude");
-        assert!(ends_turn_of(message(&alice).as_bytes(), "alice.claude"));
-        assert!(!ends_turn_of(message(&alice).as_bytes(), "bob.claude"));
+        let ended = message(&alice, EndedTurn::Unsealed);
+        assert!(ends_turn_of(ended.as_bytes(), "alice.claude"));
+        assert!(!ends_turn_of(ended.as_bytes(), "bob.claude"));
+        assert!(ends_turn_of(
+            message(&alice, EndedTurn::Sealed(3)).as_bytes(),
+            "alice.claude"
+        ));
         assert!(!ends_turn_of(SNAPSHOT_MESSAGE.as_bytes(), "alice.claude"));
         assert!(!ends_turn_of(
             b"snapshot\n\nMahi-Turn-End: alice.claude2\n",
@@ -302,6 +366,33 @@ mod tests {
             b"snapshot\n\nMahi-Turn-End:  alice.claude\n",
             "alice.claude"
         ));
+    }
+
+    #[test]
+    fn a_turn_end_names_its_sealed_turn_and_only_one_decimal_turn_counts() {
+        let alice = slot("alice.claude");
+        let sealed = message(&alice, EndedTurn::Sealed(42));
+        assert_eq!(
+            sealed,
+            "snapshot\n\nMahi-Turn-End: alice.claude\nMahi-Turn: 42\n"
+        );
+        assert_eq!(turn_of(sealed.as_bytes()), Some(42));
+        let thread = ThreadId::random().unwrap();
+        let signed = mahi_thread::snapshot_message(&sealed, thread);
+        assert_eq!(turn_of(signed.as_bytes()), Some(42));
+        assert_eq!(
+            turn_of(message(&alice, EndedTurn::Unsealed).as_bytes()),
+            None
+        );
+        assert_eq!(turn_of(b"snapshot\n\nMahi-Turn: 1\nMahi-Turn: 1\n"), None);
+        assert_eq!(turn_of(b"snapshot\n\nMahi-Turn: +1\n"), None);
+        assert_eq!(turn_of(b"snapshot\n\nMahi-Turn: \n"), None);
+        assert_eq!(turn_of(b"snapshot\n\nMahi-Turn:  1\n"), None);
+        assert_eq!(
+            turn_of(b"snapshot\n\nMahi-Turn: 99999999999999999999\n"),
+            None
+        );
+        assert_eq!(turn_of(b"snapshot\n\nMahi-Turn-End: alice.claude\n"), None);
     }
 
     #[test]
@@ -319,7 +410,12 @@ mod tests {
         assert_eq!(latest.refresh(&store, &slots), []);
 
         let ended = store
-            .append(&snapshots, Some(first), tree, &message(&alice))
+            .append(
+                &snapshots,
+                Some(first),
+                tree,
+                &message(&alice, EndedTurn::Unsealed),
+            )
             .unwrap();
         let after = store
             .append(&snapshots, Some(ended), tree, SNAPSHOT_MESSAGE)
@@ -336,7 +432,12 @@ mod tests {
         assert_eq!(latest.refresh(&store, &slots), []);
 
         let other = store
-            .append(&snapshots, Some(after), tree, &message(&slot("bob.claude")))
+            .append(
+                &snapshots,
+                Some(after),
+                tree,
+                &message(&slot("bob.claude"), EndedTurn::Unsealed),
+            )
             .unwrap();
         store
             .append(&snapshots, Some(other), tree, SNAPSHOT_MESSAGE)
@@ -358,7 +459,12 @@ mod tests {
         let tree = store.write_tree(&[]).unwrap();
         let first = store.append(&transcript, None, tree, "turn 0").unwrap();
         let ended = store
-            .append(&snapshots, None, tree, &message(&alice))
+            .append(
+                &snapshots,
+                None,
+                tree,
+                &message(&alice, EndedTurn::Unsealed),
+            )
             .unwrap();
         let mut latest = LatestTurnEnds::new(thread);
         let slots = [alice.clone()];
@@ -379,7 +485,12 @@ mod tests {
             .append(&transcript, Some(second), tree, "turn 2")
             .unwrap();
         let next = store
-            .append(&snapshots, Some(ended), tree, &message(&alice))
+            .append(
+                &snapshots,
+                Some(ended),
+                tree,
+                &message(&alice, EndedTurn::Unsealed),
+            )
             .unwrap();
         assert_eq!(latest.refresh(&store, &slots), [named(next, third)]);
     }
@@ -392,10 +503,20 @@ mod tests {
         let snapshots = ThreadRef::new(thread, RefKind::Snapshots(alice.clone()));
         let tree = store.write_tree(&[]).unwrap();
         let older = store
-            .append(&snapshots, None, tree, &message(&alice))
+            .append(
+                &snapshots,
+                None,
+                tree,
+                &message(&alice, EndedTurn::Unsealed),
+            )
             .unwrap();
         let newer = store
-            .append(&snapshots, Some(older), tree, &message(&alice))
+            .append(
+                &snapshots,
+                Some(older),
+                tree,
+                &message(&alice, EndedTurn::Unsealed),
+            )
             .unwrap();
         let mut latest = LatestTurnEnds::new(thread);
         let slots = [alice.clone()];
@@ -425,7 +546,12 @@ mod tests {
         };
         assert_eq!(latest.known(), std::slice::from_ref(&rewound));
         let next = store
-            .append(&snapshots, Some(older), tree, &message(&alice))
+            .append(
+                &snapshots,
+                Some(older),
+                tree,
+                &message(&alice, EndedTurn::Unsealed),
+            )
             .unwrap();
         assert_eq!(
             latest.refresh(&store, &slots),
@@ -456,10 +582,20 @@ mod tests {
             .unwrap();
         assert_eq!(latest(&store, &alice, plain), None);
         let ended = store
-            .append(&snapshots, Some(plain), tree, &message(&alice))
+            .append(
+                &snapshots,
+                Some(plain),
+                tree,
+                &message(&alice, EndedTurn::Unsealed),
+            )
             .unwrap();
         let others = store
-            .append(&snapshots, Some(ended), tree, &message(&slot("bob.claude")))
+            .append(
+                &snapshots,
+                Some(ended),
+                tree,
+                &message(&slot("bob.claude"), EndedTurn::Unsealed),
+            )
             .unwrap();
         let after = store
             .append(&snapshots, Some(others), tree, SNAPSHOT_MESSAGE)

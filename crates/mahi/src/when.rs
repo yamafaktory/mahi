@@ -2,6 +2,7 @@ use std::{
     fmt::Write,
     time::{
         Duration,
+        Instant,
         SystemTime,
     },
 };
@@ -23,6 +24,49 @@ const SAID_AGO_FOR: SignedDuration = SignedDuration::from_hours(24);
 /// Returns the time now, unless the clock is outside what a timestamp holds.
 pub(crate) fn now() -> Option<Timestamp> {
     Timestamp::try_from(SystemTime::now()).ok()
+}
+
+/// Returns the instant of this run's clock at which `time` was, given that `now` is `at`; `at`
+/// itself when `time` is not before `now`, or lies further back than the clock reaches.
+pub(crate) fn instant_of(time: Timestamp, (now, at): (Timestamp, Instant)) -> Instant {
+    Duration::try_from(now.duration_since(time))
+        .ok()
+        .and_then(|ago| at.checked_sub(ago))
+        .unwrap_or(at)
+}
+
+/// When a teammate's snapshot that waits began: when its turn ended, or, while that time is
+/// not known, when this run first saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Since {
+    /// When its turn ended.
+    TurnEnded(Instant),
+    /// When this run first saw it.
+    FirstSeen(Instant),
+}
+
+impl Since {
+    /// Returns what `known` becomes now that `dated` may give its turn's end: a turn's end
+    /// stays as it is, without asking `dated`, and a time `dated` gives replaces when it was
+    /// first seen, which is `now` when it was not seen yet.
+    pub(crate) fn settle(
+        known: Option<Self>,
+        dated: impl FnOnce() -> Option<Instant>,
+        now: Instant,
+    ) -> Self {
+        if let Some(Self::TurnEnded(at)) = known {
+            return Self::TurnEnded(at);
+        }
+        let first_seen = known.map_or(now, Self::instant);
+        dated().map_or(Self::FirstSeen(first_seen), Self::TurnEnded)
+    }
+
+    /// Returns the instant it began.
+    pub(crate) fn instant(self) -> Instant {
+        match self {
+            Self::TurnEnded(at) | Self::FirstSeen(at) => at,
+        }
+    }
 }
 
 /// What recorded times are shown against: the time now, when known, and the time zone, when
@@ -140,5 +184,18 @@ mod tests {
         let mut out = String::new();
         Clock::default().push(&mut out, then);
         assert_eq!(out, "Nov 16 2026 13:04 UTC");
+    }
+
+    #[test]
+    fn a_past_time_falls_as_far_back_on_the_runs_clock_and_a_later_one_at_now() {
+        let now: Timestamp = "2026-11-16T13:05:00Z".parse().unwrap();
+        let at = Instant::now();
+        let earlier: Timestamp = "2026-11-16T13:02:00Z".parse().unwrap();
+        assert_eq!(
+            at.duration_since(instant_of(earlier, (now, at))),
+            Duration::from_secs(180)
+        );
+        let later: Timestamp = "2026-11-16T13:07:00Z".parse().unwrap();
+        assert_eq!(instant_of(later, (now, at)), at);
     }
 }

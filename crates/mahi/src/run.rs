@@ -1333,22 +1333,22 @@ impl Prepared {
             .map(|setup| start_pusher(setup, &self.git_dir, &started));
         let activity = spawned.activity(live.as_ref(), first);
         let key = started.key.take().map(Arc::new);
-        let globals = self.globals.clone();
         let (recorder, turns) = start_background(
             &mut started,
             &self.git_dir,
-            self.globals,
+            self.globals.clone(),
             (self.hooks, Arc::clone(&activity)),
             pusher.as_ref().map(|(pusher, _)| pusher.poker()),
             session,
             key.clone(),
         );
-        let auto_merge = auto_merge(self.profile, self.owner.as_ref(), (&self.git_dir, &started));
+        let thread_keys = (self.owner.as_ref(), key.as_ref());
+        let auto_merge = auto_merge(self.profile, thread_keys, (&self.git_dir, &started));
         let note_by = self.profile.map_or(NoteBy::ListAgents, Profile::note_by);
         let landing = landing_desk(
             (&self.store, environment, &self.git_dir, &self.settings),
-            (self.owner.as_ref(), key.as_deref(), spawned.raw.is_some()),
-            (&started, globals),
+            (thread_keys, spawned.raw.is_some()),
+            (&started, self.globals),
         );
         let tools = serve_tools(
             self.mcp,
@@ -1451,7 +1451,7 @@ fn serve_tools(
 
 fn landing_desk(
     (store, environment, git_dir, limits): (&Store, &Environment, &Path, &Settings),
-    (owner, key, raw): (Option<&ParticipantKey>, Option<&ThreadKey>, bool),
+    ((owner, key), raw): ((Option<&ParticipantKey>, Option<&Arc<ThreadKey>>), bool),
     (started, globals): (&Started, GlobalPatterns),
 ) -> Option<(Arc<Desk>, Arc<Lander>)> {
     if !(raw && terminal::is_interactive()) {
@@ -1459,7 +1459,8 @@ fn landing_desk(
     }
     let owner = owner.filter(|owner| *owner == started.commits.key())?;
     let meta = load_meta(store, started.thread, owner, 0).ok()?;
-    let landing = meta.private(key?).ok()?.landing_branch().to_owned();
+    let key = key?;
+    let landing = meta.private(key).ok()?.landing_branch().to_owned();
     let reach = (crate::sync::Reach::gather(environment), limits.clone());
     let (thread, slot) = (started.thread, &started.slot);
     let desk = Arc::new(Desk::new(
@@ -1471,6 +1472,7 @@ fn landing_desk(
         git_dir: git_dir.to_path_buf(),
         thread,
         owner: owner.clone(),
+        key: Some(Arc::clone(key)),
         own: slot.clone(),
         waiting: Arc::default(),
     };
@@ -1519,7 +1521,7 @@ fn spawn_auto_merge<A: AgentInput + Send + Sync + 'static, W: Write + Send + 'st
 /// profile reports turn ends and the thread's owner is known.
 fn auto_merge(
     profile: Option<&Profile>,
-    owner: Option<&ParticipantKey>,
+    (owner, key): (Option<&ParticipantKey>, Option<&Arc<ThreadKey>>),
     (git_dir, started): (&Path, &Started),
 ) -> Option<AutoMerge> {
     profile.and_then(Profile::turn_end_agent)?;
@@ -1527,6 +1529,7 @@ fn auto_merge(
         git_dir: git_dir.to_path_buf(),
         thread: started.thread,
         owner: owner?.clone(),
+        key: key.map(Arc::clone),
         own: started.slot.clone(),
         waiting: Arc::default(),
     })

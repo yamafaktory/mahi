@@ -5,10 +5,8 @@ use std::{
     },
     sync::{
         Arc,
-        atomic::{
-            AtomicBool,
-            Ordering,
-        },
+        Mutex,
+        atomic::AtomicBool,
         mpsc::{
             self,
             Receiver,
@@ -56,7 +54,10 @@ use crate::{
         SNAPSHOT_MESSAGE,
     },
     source::LandingBranch,
-    turn_end,
+    turn_end::{
+        self,
+        EndedTurn,
+    },
 };
 
 const FINAL_ATTEMPTS: usize = 3;
@@ -67,7 +68,7 @@ pub(crate) struct Recorder {
     poker: Poker,
     worker: JoinHandle<Result<usize, RecordError>>,
     abandon: Arc<AtomicBool>,
-    turn_ended: Arc<AtomicBool>,
+    turn_ended: Arc<TurnEnds>,
     merges: Sender<MergeJob>,
 }
 
@@ -104,7 +105,23 @@ pub(crate) struct Merger {
 #[derive(Debug, Clone)]
 pub(crate) struct AgentEvents {
     poker: Poker,
-    turn_ended: Arc<AtomicBool>,
+    turn_ended: Arc<TurnEnds>,
+}
+
+/// The turn end the recorder has yet to snapshot, the latest one when several came.
+#[derive(Debug, Default)]
+struct TurnEnds(Mutex<Option<EndedTurn>>);
+
+impl TurnEnds {
+    fn note(&self, ended: EndedTurn) {
+        if let Ok(mut pending) = self.0.lock() {
+            *pending = Some(ended);
+        }
+    }
+
+    fn take(&self) -> Option<EndedTurn> {
+        self.0.lock().ok().and_then(|mut pending| pending.take())
+    }
 }
 
 impl AgentEvents {
@@ -113,10 +130,10 @@ impl AgentEvents {
         self.poker.poke();
     }
 
-    /// Asks for a turn-end snapshot at once, taken before any merge and even when the
-    /// worktree did not change.
-    pub(crate) fn turn_ended(&self) {
-        self.turn_ended.store(true, Ordering::SeqCst);
+    /// Asks for a turn-end snapshot of `ended` at once, taken before any merge and even when
+    /// the worktree did not change.
+    pub(crate) fn turn_ended(&self, ended: EndedTurn) {
+        self.turn_ended.note(ended);
         self.poker.poke_now();
     }
 }
@@ -189,7 +206,7 @@ enum SnapshotKind<'msg> {
 struct Signals<'sig> {
     scheduler: Scheduler,
     merges: &'sig Receiver<MergeJob>,
-    turn_ended: &'sig AtomicBool,
+    turn_ended: &'sig TurnEnds,
     abandon: &'sig AtomicBool,
 }
 
@@ -198,7 +215,7 @@ impl Recorder {
     pub(crate) fn start(target: Target, first: Recorded, schedule: Schedule) -> Self {
         let (scheduler, poker) = Scheduler::new(schedule);
         let abandon = Arc::new(AtomicBool::new(false));
-        let turn_ended = Arc::new(AtomicBool::new(false));
+        let turn_ended = Arc::new(TurnEnds::default());
         let (stop, ended) = (Arc::clone(&abandon), Arc::clone(&turn_ended));
         let (merges, jobs) = mpsc::channel();
         let worker = thread::spawn(move || {
@@ -260,14 +277,14 @@ fn record(
     let abandon = signals.abandon;
     let mut first_error = None;
     let mut skipped = 0;
-    let turn_end = turn_end::message(&target.slot);
     let mut last_ended = None;
     let kept = conflicts::file(&store, target.snapshots.thread(), &target.slot);
     loop {
         let trigger = signals.scheduler.wait();
         let closing = trigger == Trigger::Closed;
         let mut changed = false;
-        if signals.turn_ended.swap(false, Ordering::SeqCst) {
+        if let Some(ended) = signals.turn_ended.take() {
+            let turn_end = turn_end::message(&target.slot, ended);
             let kind = SnapshotKind::TurnEnd {
                 message: &turn_end,
                 last_ended,
@@ -542,7 +559,7 @@ mod tests {
             started.first_snapshot.take().unwrap(),
             fast(),
         );
-        recorder.events().turn_ended();
+        recorder.events().turn_ended(EndedTurn::Unsealed);
         let deadline = Instant::now() + Duration::from_secs(20);
         while store.head(&started.snapshots).unwrap() == Some(zero) {
             assert!(Instant::now() < deadline, "the turn end was never recorded");
@@ -596,7 +613,7 @@ mod tests {
             fast(),
         );
         let events = recorder.events();
-        events.turn_ended();
+        events.turn_ended(EndedTurn::Unsealed);
         let ended = wait_for_new_head(&store, &started.snapshots, zero);
         fs::write(started.worktree.join("next"), "next turn").unwrap();
         events.changed();
@@ -605,9 +622,9 @@ mod tests {
             store.commit_message(plain).unwrap(),
             format!("snapshot\n\nMahi-Thread: {}\n", started.thread)
         );
-        events.turn_ended();
+        events.turn_ended(EndedTurn::Unsealed);
         let ended_again = wait_for_new_head(&store, &started.snapshots, Some(plain));
-        events.turn_ended();
+        events.turn_ended(EndedTurn::Unsealed);
         recorder.finish().unwrap();
 
         assert_eq!(store.head(&started.snapshots).unwrap(), Some(ended_again));
@@ -661,7 +678,7 @@ mod tests {
             .unwrap(),
         );
         fs::write(started.worktree.join("mine"), "my turn").unwrap();
-        recorder.events().turn_ended();
+        recorder.events().turn_ended(EndedTurn::Unsealed);
         let MergeDone::Merged {
             commit: merge_commit,
             ..
@@ -1611,9 +1628,9 @@ mod tests {
         ));
         assert!(!merging.started.worktree.join("notes.txt").exists());
         let events = merging.recorder.events();
-        events.turn_ended();
+        events.turn_ended(EndedTurn::Unsealed);
         fs::write(merging.started.worktree.join("later"), "after").unwrap();
-        events.turn_ended();
+        events.turn_ended(EndedTurn::Unsealed);
         merging.recorder.finish().unwrap();
         assert_eq!(
             turn_ends_after(&merging.store, &merging.started.snapshots, merge_commit),
@@ -1669,7 +1686,7 @@ mod tests {
         );
         let merging = merging.restarted();
         let merger = merging.recorder.merger();
-        merging.recorder.events().turn_ended();
+        merging.recorder.events().turn_ended(EndedTurn::Unsealed);
         assert!(matches!(
             merger.merge(
                 merging.bobs(&[("notes.txt", "more\n")]),
@@ -1679,7 +1696,7 @@ mod tests {
         ));
         assert!(merging.kept().exists());
         fs::write(&readme, "alice and bob\n").unwrap();
-        merging.recorder.events().turn_ended();
+        merging.recorder.events().turn_ended(EndedTurn::Unsealed);
         merging.note();
         let later = merging.bobs(&[("README", "bob\n"), ("notes.txt", "more\n")]);
         assert!(matches!(
@@ -1709,7 +1726,7 @@ mod tests {
         };
         let text = fs::read_to_string(merging.started.worktree.join(marked)).unwrap();
         assert!(text.contains(" mahi "), "{text}");
-        merging.recorder.events().turn_ended();
+        merging.recorder.events().turn_ended(EndedTurn::Unsealed);
         assert!(matches!(
             merger.merge(merging.bobs(&[("late.txt", "late\n")]), AgentSettings::Take),
             Err(MergeError::MarkersUnresolved(_))
@@ -1768,7 +1785,7 @@ mod tests {
         assert!(!merging.kept().exists());
         let later = merging.bobs(&[("logo.bin", "\0theirs\0"), ("notes.txt", "more\n")]);
         merger.merge(later, AgentSettings::Take).unwrap();
-        merging.recorder.events().turn_ended();
+        merging.recorder.events().turn_ended(EndedTurn::Unsealed);
         merging.recorder.finish().unwrap();
         assert_eq!(
             turn_ends_after(&merging.store, &merging.started.snapshots, merge_commit),
@@ -1802,7 +1819,7 @@ mod tests {
             merger.merge(again, AgentSettings::Take),
             Err(MergeError::MarkersUnresolved(_))
         ));
-        merging.recorder.events().turn_ended();
+        merging.recorder.events().turn_ended(EndedTurn::Unsealed);
         let _ = merging.recorder.finish();
         let message = |commit| merging.store.commit_message(commit).unwrap().to_string();
         let head = merging

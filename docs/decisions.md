@@ -954,3 +954,17 @@ home screen alone, or no last activity. During the work, not by the user: the te
 `last active 3m ago`, the JSON field is `last_active` and appears only with `--activity`, and
 each agent's turns are read back at most 64 turns for a time; on the home screen, the column
 goes when the agents would get fewer than 16 cells, before the whole thread id does.
+
+## D122 · 2026-11-17 · A turn-end snapshot names its turn in a signed trailer
+
+Chosen by the user (#178). The held turns palette and the landing confirmation now count a
+teammate's snapshot's age from when its turn ended. No record tied a turn-end snapshot to its
+transcript turn, so the snapshot now names the turn in the signed trailer `Mahi-Turn: <number>`.
+The receiver reads that turn from the teammate's transcript and takes the newest time its events
+carry. The trailer is plaintext on the remote. It shows how many turns an agent took, not when.
+The other choices were the newest turn when the run first sees the snapshot, which is wrong when
+a later turn changed no file, or to keep the ages from when the run first saw each snapshot.
+During the work, not by the user: the receiver looks back at most 1,024 turns. A snapshot without
+the trailer, with a turn not found or with no time still counts from when the run first saw it.
+A snapshot can come before its transcript, so the run reads the turn again at each look until it
+finds the time. A time after now counts as now.
