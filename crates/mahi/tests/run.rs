@@ -2006,6 +2006,62 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
     }
 
     #[test]
+    fn a_dialog_is_drawn_again_whole_after_a_resize_without_a_key() {
+        let fixture = fixture();
+        let (command, _fresh) = fresh_user(&fixture, "off");
+        let mut mahi = command.spawn().unwrap();
+        let mut terminal = mahi.writer().unwrap();
+        let reader = mahi.reader().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&output);
+        thread::spawn(move || {
+            let mut reader = reader;
+            let mut chunk = [0_u8; 4096];
+            while let Ok(read) = reader.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                collected.lock().unwrap().extend_from_slice(&chunk[..read]);
+            }
+        });
+        let shows = |from: usize, text: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let seen = output.lock().unwrap();
+                if String::from_utf8_lossy(&seen[from.min(seen.len())..]).contains(text) {
+                    return true;
+                }
+                drop(seen);
+                if Instant::now() > deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert!(shows(0, "Threads"));
+        terminal.write_all(b"J").unwrap();
+        assert!(shows(0, "New passphrase"));
+        thread::sleep(Duration::from_millis(300));
+        let resized_at = output.lock().unwrap().len();
+        mahi.resize(WindowSize { rows: 21, cols: 90 }).unwrap();
+        let drawn = shows(resized_at, "New passphrase");
+        let after = output.lock().unwrap()[resized_at..].to_vec();
+        let mut parser = vt100::Parser::new(21, 90, 0);
+        parser.process(&after);
+        let screen = parser.screen().contents();
+        terminal.write_all(b"\x1b").unwrap();
+        thread::sleep(Duration::from_millis(800));
+        terminal.write_all(b"q").unwrap();
+        assert_eq!(exit_within(&mut mahi, Duration::from_secs(20)), 0);
+        assert!(drawn, "the dialog was not drawn again: {screen}");
+        let title = screen
+            .lines()
+            .find(|line| line.contains("╭ New passphrase"))
+            .unwrap_or_else(|| panic!("no dialog: {screen}"));
+        assert!(title.trim_end().ends_with('╮'), "{screen}");
+    }
+
+    #[test]
     fn a_cancelled_token_dialog_opens_no_tab_and_declines_nothing() {
         let fixture = fixture();
         let (command, fresh) = fresh_user(&fixture, "off");

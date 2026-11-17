@@ -30,6 +30,7 @@ use base64::Engine as _;
 use mahi_sandbox::{
     InputWait,
     TerminationSignals,
+    WindowSize,
 };
 use mahi_term::{
     AnsiBackend,
@@ -566,9 +567,12 @@ impl DialogPrompt {
         let takes_keys_at = Instant::now() + guard;
         let mut buffer = zeroize::Zeroizing::new([0_u8; MAX_READ]);
         loop {
+            let drawn = terminal::size();
             show(dialog)?;
-            let Some(read) = read_keys(signals.as_ref(), &mut buffer)? else {
-                return Ok(Answer::Cancelled);
+            let read = match read_keys(signals.as_ref(), &mut buffer, drawn)? {
+                Waited::Keys(read) => read,
+                Waited::Resized => continue,
+                Waited::Ended => return Ok(Answer::Cancelled),
             };
             if Instant::now() < takes_keys_at {
                 continue;
@@ -594,12 +598,24 @@ impl DialogPrompt {
     }
 }
 
+/// What waiting for the keys of a dialog gave.
+enum Waited {
+    /// This many bytes were typed.
+    Keys(usize),
+    /// The terminal is no longer the size the dialog was drawn at.
+    Resized,
+    /// The input ended.
+    Ended,
+}
+
 /// Reads what was typed, waiting briefly for the rest of a sequence that starts with an escape
-/// when it can wait with a timeout; `None` at the end of the input.
+/// when it can wait with a timeout, and telling, while it waits, when the terminal is no longer
+/// of the size `drawn`.
 fn read_keys(
     signals: Option<&TerminationSignals>,
     buffer: &mut [u8; MAX_READ],
-) -> io::Result<Option<usize>> {
+    drawn: WindowSize,
+) -> io::Result<Waited> {
     if let Some(signals) = signals {
         loop {
             match signals
@@ -607,6 +623,7 @@ fn read_keys(
                 .map_err(io::Error::other)?
             {
                 InputWait::Input => break,
+                InputWait::Timeout if terminal::size() != drawn => return Ok(Waited::Resized),
                 InputWait::Timeout => {}
                 InputWait::Signal(signal) => {
                     before_dying();
@@ -618,7 +635,7 @@ fn read_keys(
     }
     let mut read = read_input(buffer)?;
     if read == 0 {
-        return Ok(None);
+        return Ok(Waited::Ended);
     }
     while let Some(signals) = signals
         && buffer.get(read - 1) == Some(&ESC)
@@ -638,7 +655,7 @@ fn read_keys(
             InputWait::Timeout | InputWait::Signal(_) => break,
         }
     }
-    Ok(Some(read))
+    Ok(Waited::Keys(read))
 }
 
 /// Returns what follows the end of a bracketed paste that `chunk` ends without starting it:
