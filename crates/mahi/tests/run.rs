@@ -1782,7 +1782,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
     }
 
     #[test]
-    fn the_palette_key_twice_in_the_workspace_reaches_the_agent_and_p_opens_its_palette() {
+    fn the_palette_key_twice_in_the_workspace_reaches_the_agent_and_h_opens_its_palette() {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho agent-ready\nstty raw -echo\nexec cat -v\n";
         let claude = script(&fixture, "palette-relay", "claude", agent);
@@ -1794,7 +1794,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
                 ("agent-ready", b"x\x00\x00y"),
-                ("x^@y", b"\x00p"),
+                ("x^@y", b"\x00h"),
                 ("Held turns", b"z"),
                 ("› z", b"\x00\x00w"),
                 ("^@w", b"\x00q"),
@@ -2161,6 +2161,26 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         let shown = fixture.mahi(&["remote"]);
         assert!(
             String::from_utf8_lossy(&shown.stdout).contains("pushed to origin"),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn the_palette_opens_on_the_home_screen_without_a_tab_and_runs_what_it_lists() {
+        let fixture = fixture();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                ("Threads", b"\x00"),
+                ("Go to the thread list", b"m"),
+                ("no git remote yet", b"2"),
+                ("remote: off", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let shown = fixture.mahi(&["remote"]);
+        assert!(
+            String::from_utf8_lossy(&shown.stdout).contains("not pushed"),
             "{shown:?}"
         );
     }

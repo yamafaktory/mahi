@@ -532,8 +532,7 @@ fn route_keys(workspace: &mut Workspace, typed: &[u8], for_threads: &mut Vec<u8>
     if workspace.has_tabs() {
         workspace.type_keys(typed, for_threads)
     } else {
-        workspace.type_without_tabs(typed, for_threads);
-        Moved::Nothing
+        workspace.type_without_tabs(typed, for_threads)
     }
 }
 
@@ -576,6 +575,7 @@ fn draw(
             }
             .render(top, frame.buffer_mut());
             home.render(view, status, body, frame.buffer_mut());
+            workspace.render_palette(body, frame.buffer_mut());
             return;
         }
         let header = Header {
