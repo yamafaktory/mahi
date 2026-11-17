@@ -667,10 +667,7 @@ enum Entry {
     Quit,
 }
 
-const THREAD_ACTIONS: [(ThreadChoice, &str); 2] = [
-    (ThreadChoice::End, "End this thread"),
-    (ThreadChoice::Invite, "Invite a teammate"),
-];
+const THREAD_ACTIONS: [ThreadChoice; 2] = [ThreadChoice::End, ThreadChoice::Invite];
 
 const HELD_TURNS_KEY: char = 'h';
 const LEAVE_KEY: char = 'x';
@@ -751,8 +748,8 @@ impl Listing {
 fn list_actions(shown: Option<&Tab>, choices: &[ThreadChoice], listing: &mut Listing) {
     if let Some(tab) = shown {
         if tab.thread.is_some() {
-            for (choice, label) in THREAD_ACTIONS {
-                listing.add(label.to_owned(), Some(choice.key()), Entry::Act(choice));
+            for choice in THREAD_ACTIONS {
+                listing.add_command(HomeCommand::Thread(choice), Entry::Act(choice));
             }
         }
         if tab.watch_only && tab.agents.is_empty() {
@@ -2707,10 +2704,7 @@ mod tests {
             .collect();
         assert_eq!(
             actions,
-            THREAD_ACTIONS
-                .map(|(choice, _)| Entry::Act(choice))
-                .iter()
-                .collect::<Vec<_>>()
+            THREAD_ACTIONS.map(Entry::Act).iter().collect::<Vec<_>>()
         );
         assert_eq!(entries.last(), Some(&Entry::Quit));
         let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
@@ -2762,6 +2756,43 @@ mod tests {
                 Moved::Act(choice, thread)
             );
             assert!(!workspace.palette_open());
+        }
+    }
+
+    #[test]
+    fn the_thread_lists_palette_shows_each_thread_action_by_its_short_label_and_key() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        workspace.list_thread_choices(vec![
+            ThreadChoice::Resume,
+            ThreadChoice::End,
+            ThreadChoice::Invite,
+            ThreadChoice::Purge,
+        ]);
+        let mut threads = Vec::new();
+        workspace.type_without_tabs(b"\x00", &mut threads);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 30));
+        workspace.render_palette(buffer.area, &mut buffer);
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        for (label, key) in [
+            ("Resume this thread", " r"),
+            ("End this thread", " e"),
+            ("Invite a teammate", " i"),
+            ("Purge this thread", " p"),
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| row.contains(label))
+                .unwrap_or_else(|| panic!("{label} missing: {rows:#?}"));
+            assert!(row.trim_end_matches(['│', ' ']).ends_with(key), "{rows:#?}");
         }
     }
 

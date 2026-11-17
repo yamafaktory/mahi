@@ -2361,7 +2361,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
                 (&thread, b"\r"),
-                ("Resume: start", b"r"),
+                ("Resume this thread", b"r"),
                 ("Passphrase", passphrase.as_bytes()),
                 (&format!("mahi resume {thread}: done"), b"q"),
             ],
@@ -2372,7 +2372,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         parser.process(&output.as_bytes()[..asked]);
         let screen = parser.screen().contents();
         assert!(screen.contains("Threads"), "{screen}");
-        assert!(!screen.contains("End: save"), "{screen}");
+        assert!(!screen.contains("End this thread"), "{screen}");
     }
 
     #[test]
@@ -6746,7 +6746,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             thread::sleep(Duration::from_millis(500));
             assert_eq!(home.text().len(), drawn, "{}", screen(&home));
             let code_screen = screen(&home);
-            assert!(code_screen.contains("Invite a teammate"), "{code_screen}");
+            assert!(code_screen.contains("╭ Invite a teammate"), "{code_screen}");
             assert!(code_screen.contains("ctrl-c stop"), "{code_screen}");
             let code_line = code_screen
                 .lines()
@@ -6767,7 +6767,7 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(
-                !screen(&home).contains("Invite a teammate"),
+                !screen(&home).contains("Tell this code to your teammate"),
                 "{}",
                 screen(&home)
             );

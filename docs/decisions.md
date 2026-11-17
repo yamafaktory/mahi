@@ -992,3 +992,12 @@ downloaded once and checked against a pinned SHA-256, since its releases publish
 the specifications are TypeScript that the Bombadil binary runs itself, so the repository takes no
 npm package; and mahi runs with an empty `PATH` and `MAHI_LIVE=off`, so a run starts no agent and
 reaches no network.
+
+## D125 · 2026-11-17 · One short label for each thread action in every menu
+
+Chosen by the user (#188). An action had up to three labels: End was "End this thread" in a tab's
+palette, "End: save its work in a last snapshot and remove its worktrees" in the thread menu and
+the thread list's palette, and an explanation in help. The palettes and the thread menu now show
+one short label, and help keeps the explanations. The user chose the labels "Resume this thread",
+"End this thread", "Invite a teammate" and "Purge this thread". The other choices were the long
+label everywhere, or keeping them as they were.

@@ -118,7 +118,7 @@ enum Pending {
     Help,
 }
 
-/// An action on a thread, as its menu lists it.
+/// An action on a thread, as every menu and palette lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadChoice {
     /// Start the user's agent again where it stopped.
@@ -132,16 +132,14 @@ pub enum ThreadChoice {
 }
 
 impl ThreadChoice {
-    /// Returns what the menu says of the choice.
+    /// Returns the short label every menu and palette shows for the choice; help explains it.
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Resume => "Resume: start your agent again where it stopped",
-            Self::End => "End: save its work in a last snapshot and remove its worktrees",
-            Self::Purge => "Purge: delete it here and on the remote, for good",
-            Self::Invite => {
-                "Invite: show a pairing code so a teammate can watch and prompt it live"
-            }
+            Self::Resume => "Resume this thread",
+            Self::End => "End this thread",
+            Self::Purge => "Purge this thread",
+            Self::Invite => "Invite a teammate",
         }
     }
 
@@ -927,13 +925,10 @@ mod tests {
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
         let menu = screen(&home, &rows, "");
         for (label, key) in [
-            ("Resume: start", " r"),
-            ("End: save", " e"),
-            (
-                "Invite: show a pairing code so a teammate can watch and prompt it live",
-                " i",
-            ),
-            ("Purge: delete", " p"),
+            ("Resume this thread", " r"),
+            ("End this thread", " e"),
+            ("Invite a teammate", " i"),
+            ("Purge this thread", " p"),
         ] {
             let line = menu
                 .lines()
@@ -956,7 +951,7 @@ mod tests {
         home.key(PaletteInput::Down, &rows);
         home.key(PaletteInput::Enter, &rows);
         let teammate = screen(&home, &rows, "");
-        assert!(!teammate.contains("Resume:"), "{teammate}");
+        assert!(!teammate.contains("Resume this thread"), "{teammate}");
         assert_eq!(home.key(PaletteInput::Text('r'), &rows), None);
         assert_eq!(home.key(PaletteInput::Down, &rows), None);
         assert_eq!(
