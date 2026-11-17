@@ -36,8 +36,10 @@ pub use dialog::{
     key_hints,
 };
 pub use home::{
+    HOME_COMMANDS,
     Home,
     HomeAction,
+    HomeCommand,
     HomeRow,
     HomeView,
     ThreadChoice,

@@ -55,7 +55,6 @@ use crate::{
 };
 
 const NO_THREADS: &str = "no threads yet: press n to start one";
-const THREAD_KEYS: &str = "rilep";
 const MENU: [(&str, &str); 8] = [
     ("Threads", "t"),
     ("New thread", "n"),
@@ -181,6 +180,127 @@ impl ThreadChoice {
     }
 }
 
+impl ThreadChoice {
+    /// Returns the key that takes the choice on the selected thread.
+    #[must_use]
+    pub fn key(self) -> char {
+        match self {
+            Self::Resume => 'r',
+            Self::End => 'e',
+            Self::Purge => 'p',
+            Self::Invite => 'i',
+        }
+    }
+}
+
+/// What the user can do on the home screen, each with the key that does it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeCommand {
+    /// Act on the selected thread.
+    Thread(ThreadChoice),
+    /// Start a new thread.
+    New,
+    /// Join a thread with a pairing code.
+    Join,
+    /// Choose the remote threads are pushed to.
+    Remote,
+    /// Add or remove the tokens agents and remotes sign in with.
+    Credentials,
+    /// Show the user's participant card.
+    Card,
+    /// Show the keys and what they do.
+    Help,
+    /// Leave mahi.
+    Quit,
+}
+
+/// Every command of the home screen, in the order its palette and its help list them.
+pub const HOME_COMMANDS: [HomeCommand; 11] = [
+    HomeCommand::Thread(ThreadChoice::Resume),
+    HomeCommand::Thread(ThreadChoice::End),
+    HomeCommand::Thread(ThreadChoice::Invite),
+    HomeCommand::Thread(ThreadChoice::Purge),
+    HomeCommand::New,
+    HomeCommand::Join,
+    HomeCommand::Remote,
+    HomeCommand::Credentials,
+    HomeCommand::Card,
+    HomeCommand::Help,
+    HomeCommand::Quit,
+];
+
+impl HomeCommand {
+    /// Returns the key that runs the command.
+    #[must_use]
+    pub fn key(self) -> char {
+        match self {
+            Self::Thread(choice) => choice.key(),
+            Self::New => 'n',
+            Self::Join => 'J',
+            Self::Remote => 'm',
+            Self::Credentials => 's',
+            Self::Card => 'u',
+            Self::Help => '?',
+            Self::Quit => 'q',
+        }
+    }
+
+    /// Returns the command `key` runs, if any.
+    #[must_use]
+    pub fn from_key(key: char) -> Option<Self> {
+        HOME_COMMANDS
+            .into_iter()
+            .find(|command| command.key() == key)
+    }
+
+    /// Returns what a menu says of the command.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thread(choice) => choice.label(),
+            Self::New => "New thread",
+            Self::Join => "Join with a code",
+            Self::Remote => "Remote",
+            Self::Credentials => "Credentials",
+            Self::Card => "Your card",
+            Self::Help => "Help",
+            Self::Quit => "Quit mahi",
+        }
+    }
+
+    fn help(self) -> Option<[&'static str; 2]> {
+        Some(match self {
+            Self::Thread(ThreadChoice::Resume) => {
+                ["resume", "start your agent again where it stopped"]
+            }
+            Self::Thread(ThreadChoice::End) => {
+                ["end", "snapshot its work and remove its worktrees"]
+            }
+            Self::Thread(ThreadChoice::Invite) => [
+                "invite",
+                "show a code so a teammate can watch and prompt it",
+            ],
+            Self::Thread(ThreadChoice::Purge) => [
+                "purge",
+                "delete the thread here and on the remote, for good",
+            ],
+            Self::New => ["new", "start a thread with an agent"],
+            Self::Join => ["join", "type a teammate's code to join their thread"],
+            Self::Remote => [
+                "remote",
+                "choose or add where threads are pushed to be shared",
+            ],
+            Self::Credentials => [
+                "credentials",
+                "keep the tokens agents and remotes sign in with",
+            ],
+            Self::Card => ["card", "show the line a thread's owner invites you with"],
+            Self::Quit => ["quit", "leave mahi"],
+            Self::Help => return None,
+        })
+    }
+}
+
 impl HomeAction {
     /// Returns the question asked before the action runs, for the actions confirmed first.
     #[must_use]
@@ -243,6 +363,11 @@ impl Home {
         self.fit(rows);
         self.note = None;
         if let Some((mut dialog, pending)) = self.dialog.take() {
+            if let (Pending::ThreadMenu(_, choices), PaletteInput::Text(typed)) = (&pending, input)
+                && let Some(index) = choices.iter().position(|choice| choice.key() == typed)
+            {
+                return self.answered(Answer::Choice(index), pending);
+            }
             return match dialog.key(input) {
                 None => {
                     self.dialog = Some((dialog, pending));
@@ -251,15 +376,8 @@ impl Home {
                 Some(answer) => self.answered(answer, pending),
             };
         }
-        let selected = rows.get(self.selected);
-        if selected.is_none()
-            && matches!(input, PaletteInput::Text(key) if THREAD_KEYS.contains(key))
-        {
-            self.note = Some(NO_THREADS);
-            return None;
-        }
         match input {
-            PaletteInput::Escape | PaletteInput::Text('q') => return Some(HomeAction::Quit),
+            PaletteInput::Escape => return Some(HomeAction::Quit),
             PaletteInput::Tab => {
                 self.focus = match self.focus {
                     Focus::Menu => Focus::Threads,
@@ -272,33 +390,47 @@ impl Home {
                 return match self.focus {
                     Focus::Menu => self.activate(self.menu, rows),
                     Focus::Threads => {
-                        self.open_thread_menu(selected);
+                        self.open_thread_menu(rows.get(self.selected));
                         None
                     }
                 };
             }
             PaletteInput::Text('t') => self.focus = Focus::Threads,
-            PaletteInput::Text('n') => return Some(HomeAction::New),
-            PaletteInput::Text('J') => return Some(HomeAction::Join),
-            PaletteInput::Text('m') => return Some(HomeAction::Remote),
-            PaletteInput::Text('u') => return Some(HomeAction::Card),
-            PaletteInput::Text('s') => return Some(HomeAction::Credentials),
-            PaletteInput::Text('?') => self.open_help(),
-            PaletteInput::Text('r') => match selected {
-                Some(row) if row.owned => return Some(HomeAction::Resume(row.thread.clone())),
-                Some(_) => self.note = Some("only the thread's owner resumes it"),
-                None => {}
-            },
-            PaletteInput::Text('i') => {
-                return selected.map(|row| HomeAction::Invite(row.thread.clone()));
-            }
-            PaletteInput::Text('e') => self.ask(selected, HomeAction::End),
-            PaletteInput::Text('p') => {
-                return selected.map(|row| HomeAction::Purge(row.thread.clone()));
+            PaletteInput::Text(typed) => {
+                return HomeCommand::from_key(typed).and_then(|command| self.run(command, rows));
             }
             _ => {}
         }
         None
+    }
+
+    /// Runs `command` as its key does on the thread list of `rows`, and returns the action it
+    /// completes, if any: a thread's command acts on the selected one, ending asks first.
+    pub fn run(&mut self, command: HomeCommand, rows: &[HomeRow]) -> Option<HomeAction> {
+        self.fit(rows);
+        self.note = None;
+        let choice = match command {
+            HomeCommand::Thread(choice) => choice,
+            HomeCommand::New => return Some(HomeAction::New),
+            HomeCommand::Join => return Some(HomeAction::Join),
+            HomeCommand::Remote => return Some(HomeAction::Remote),
+            HomeCommand::Credentials => return Some(HomeAction::Credentials),
+            HomeCommand::Card => return Some(HomeAction::Card),
+            HomeCommand::Quit => return Some(HomeAction::Quit),
+            HomeCommand::Help => {
+                self.open_help();
+                return None;
+            }
+        };
+        let Some(row) = rows.get(self.selected) else {
+            self.note = Some(NO_THREADS);
+            return None;
+        };
+        if choice == ThreadChoice::Resume && !row.owned {
+            self.note = Some("only the thread's owner resumes it");
+            return None;
+        }
+        self.confirm(choice.action(row.thread.clone()))
     }
 
     fn move_by(&mut self, down: bool, rows: usize) {
@@ -320,16 +452,13 @@ impl Home {
                 }
                 None
             }
-            1 => Some(HomeAction::New),
-            2 => Some(HomeAction::Join),
-            3 => Some(HomeAction::Remote),
-            4 => Some(HomeAction::Credentials),
-            5 => Some(HomeAction::Card),
-            6 => {
-                self.open_help();
-                None
-            }
-            _ => Some(HomeAction::Quit),
+            1 => self.run(HomeCommand::New, rows),
+            2 => self.run(HomeCommand::Join, rows),
+            3 => self.run(HomeCommand::Remote, rows),
+            4 => self.run(HomeCommand::Credentials, rows),
+            5 => self.run(HomeCommand::Card, rows),
+            6 => self.run(HomeCommand::Help, rows),
+            _ => self.run(HomeCommand::Quit, rows),
         }
     }
 
@@ -343,22 +472,13 @@ impl Home {
             choices.push(ThreadChoice::Resume);
         }
         choices.extend([ThreadChoice::End, ThreadChoice::Invite, ThreadChoice::Purge]);
-        let labels = choices
+        let items = choices
             .iter()
-            .map(|choice| choice.label().to_owned())
+            .map(|choice| (choice.label().to_owned(), choice.key().to_string()))
             .collect();
-        let dialog = Dialog::choose(
-            "Thread",
-            vec![format!("{} · {}", row.thread, row.agents)],
-            labels,
-        );
+        let mut dialog = Dialog::menu("Thread", items);
+        dialog.push_line(&format!("{} · {}", row.thread, row.agents));
         self.dialog = Some((dialog, Pending::ThreadMenu(row.thread.clone(), choices)));
-    }
-
-    fn ask(&mut self, selected: Option<&HomeRow>, action: fn(String) -> HomeAction) {
-        if let Some(row) = selected {
-            self.confirm(action(row.thread.clone()));
-        }
     }
 
     fn confirm(&mut self, action: HomeAction) -> Option<HomeAction> {
@@ -379,46 +499,25 @@ impl Home {
             "Ending a thread keeps its history; resuming brings its worktrees back. Purging \
              deletes it.",
         ];
-        let rows = [
-            ["tab", "switch", "move between the menu and the threads"],
-            ["↑↓ j k", "move", "go up and down the focused list"],
-            ["enter", "open", "open the menu of what is selected"],
-            ["n", "new", "start a thread with an agent"],
-            ["r", "resume", "start your agent again where it stopped"],
-            ["e", "end", "snapshot its work and remove its worktrees"],
-            [
-                "p",
-                "purge",
-                "delete the thread here and on the remote, for good",
-            ],
-            [
-                "i",
-                "invite",
-                "show a code so a teammate can watch and prompt it",
-            ],
-            ["J", "join", "type a teammate's code to join their thread"],
-            [
-                "m",
-                "remote",
-                "choose or add where threads are pushed to be shared",
-            ],
-            [
-                "s",
-                "credentials",
-                "keep the tokens agents and remotes sign in with",
-            ],
-            [
-                "u",
-                "card",
-                "show the line a thread's owner invites you with",
-            ],
-            ["q esc", "quit", "leave mahi"],
+        let mut rows = vec![
+            ["tab", "switch", "move between the menu and the threads"].map(str::to_owned),
+            ["↑↓ j k", "move", "go up and down the focused list"].map(str::to_owned),
+            ["enter", "open", "open the menu of what is selected"].map(str::to_owned),
         ];
+        let commands = HOME_COMMANDS.into_iter().filter_map(|command| {
+            let [action, what] = command.help()?;
+            let mut key = command.key().to_string();
+            if command == HomeCommand::Quit {
+                key.push_str(" esc");
+            }
+            Some([key, action.to_owned(), what.to_owned()])
+        });
+        rows.extend(commands);
         let dialog = Dialog::table(
             "Help",
             lines.iter().map(|line| (*line).to_owned()).collect(),
             ["key", "action", "what it does"].map(str::to_owned),
-            rows.iter().map(|row| row.map(str::to_owned)).collect(),
+            rows,
         );
         self.dialog = Some((dialog, Pending::Help));
     }
@@ -822,6 +921,24 @@ mod tests {
     }
 
     #[test]
+    fn each_home_command_has_a_key_of_its_own_that_runs_it() {
+        let rows = rows();
+        let keys: std::collections::BTreeSet<char> =
+            HOME_COMMANDS.iter().map(|command| command.key()).collect();
+        assert_eq!(keys.len(), HOME_COMMANDS.len());
+        for command in HOME_COMMANDS {
+            assert_eq!(HomeCommand::from_key(command.key()), Some(command));
+            let (mut typed, mut run) = (Home::default(), Home::default());
+            assert_eq!(
+                typed.key(PaletteInput::Text(command.key()), &rows),
+                run.run(command, &rows),
+                "{command:?}"
+            );
+            assert_eq!(typed.has_dialog(), run.has_dialog(), "{command:?}");
+        }
+    }
+
+    #[test]
     fn the_menu_opens_what_it_names() {
         let rows = rows();
         let mut home = Home::default();
@@ -885,24 +1002,33 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_a_thread_opens_its_actions_and_ending_asks_first() {
+    fn enter_on_a_thread_opens_its_actions_with_their_keys_and_ending_asks_first() {
         let rows = rows();
         let mut home = Home::default();
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
         let menu = screen(&home, &rows, "");
-        assert!(
-            menu.contains("Resume: start")
-                && menu.contains(
-                    "Invite: show a pairing code so a teammate can watch and prompt it live"
-                ),
-            "{menu}"
-        );
+        for (label, key) in [
+            ("Resume: start", " r"),
+            ("End: save", " e"),
+            (
+                "Invite: show a pairing code so a teammate can watch and prompt it live",
+                " i",
+            ),
+            ("Purge: delete", " p"),
+        ] {
+            let line = menu
+                .lines()
+                .find(|line| line.contains(label))
+                .unwrap_or_else(|| panic!("{label} missing: {menu}"));
+            assert!(line.trim_end_matches(['│', ' ']).ends_with(key), "{menu}");
+        }
+        assert_eq!(home.key(PaletteInput::Text('3'), &rows), None);
         assert_eq!(
-            home.key(PaletteInput::Text('3'), &rows),
+            home.key(PaletteInput::Text('i'), &rows),
             Some(HomeAction::Invite("t1".to_owned()))
         );
         home.key(PaletteInput::Enter, &rows);
-        assert_eq!(home.key(PaletteInput::Text('2'), &rows), None);
+        assert_eq!(home.key(PaletteInput::Text('e'), &rows), None);
         assert!(screen(&home, &rows, "").contains("End thread t1?"));
         assert_eq!(
             home.key(PaletteInput::Text('y'), &rows),
@@ -912,13 +1038,15 @@ mod tests {
         home.key(PaletteInput::Enter, &rows);
         let teammate = screen(&home, &rows, "");
         assert!(!teammate.contains("Resume:"), "{teammate}");
+        assert_eq!(home.key(PaletteInput::Text('r'), &rows), None);
+        assert_eq!(home.key(PaletteInput::Down, &rows), None);
         assert_eq!(
-            home.key(PaletteInput::Text('2'), &rows),
+            home.key(PaletteInput::Enter, &rows),
             Some(HomeAction::Invite("t2".to_owned()))
         );
         home.key(PaletteInput::Enter, &rows);
         assert_eq!(
-            home.key(PaletteInput::Text('3'), &rows),
+            home.key(PaletteInput::Text('p'), &rows),
             Some(HomeAction::Purge("t2".to_owned()))
         );
         assert_eq!(
@@ -1180,7 +1308,12 @@ mod tests {
 
     #[test]
     fn a_thread_key_without_threads_says_how_to_start_one() {
-        let thread_keys = THREAD_KEYS.chars().map(PaletteInput::Text);
+        let thread_keys = HOME_COMMANDS
+            .into_iter()
+            .filter_map(|command| match command {
+                HomeCommand::Thread(choice) => Some(PaletteInput::Text(choice.key())),
+                _ => None,
+            });
         for input in thread_keys.chain([PaletteInput::Enter]) {
             let mut home = Home::default();
             assert_eq!(home.key(input, &[]), None, "{input:?}");

@@ -968,3 +968,16 @@ During the work, not by the user: the receiver looks back at most 1,024 turns. A
 the trailer, with a turn not found or with no time still counts from when the run first saw it.
 A snapshot can come before its transcript, so the run reads the turn again at each look until it
 finds the time. A time after now counts as now.
+
+## D123 · 2026-11-17 · One palette lists every action with its key
+
+Chosen by the user (#183). The keys lived in five places, written by hand: the home screen's side
+menu, its footer, the thread menu, the workspace's palette and help. They disagreed, and some
+actions had no key. Now one table names each action with its key and label, and the palette, the
+thread menu, the footer and help read from it. The side menu goes, so the thread list takes its
+width. The footer shrinks to the palette key, `?` help and `q` quit. Each action still runs on its
+own key without the palette. Purge keeps `p`, and the held turns palette moves to `h`. A palette
+entry without a key takes a letter no other entry uses: the shown tab's other agents take the
+first free letters in order, and "Leave this tab" takes `x`. A tab past the 9th keeps no key. The
+other choices were to keep the side menu and the footer, built from the table, or to keep a full
+footer. The fixes to the Remote dialog went to their own issue (#184).

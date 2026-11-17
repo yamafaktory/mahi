@@ -2286,7 +2286,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
             terminal_command(&fixture, &[]).env("PATH", &path),
             &[
                 (&thread, b"\r"),
-                ("Resume: start", b"1"),
+                ("Resume: start", b"r"),
                 ("Passphrase", passphrase.as_bytes()),
                 (&format!("mahi resume {thread}: done"), b"q"),
             ],
