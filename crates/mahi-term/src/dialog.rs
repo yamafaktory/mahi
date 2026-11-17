@@ -687,8 +687,7 @@ impl Dialog {
         let widest = match &self.kind {
             Kind::Choose { items, .. } => items
                 .iter()
-                .enumerate()
-                .map(|(index, item)| digits(index + 1) + Span::raw(shown(item)).width() + 7)
+                .map(|item| Span::raw(shown(item)).width() + 8)
                 .max(),
             Kind::Menu { items, .. } => {
                 let (action, key) = menu_widths(items);
@@ -854,10 +853,6 @@ fn column_widths(header: &[String; 3], rows: &[[String; 3]]) -> [usize; 3] {
     widths
 }
 
-fn digits(number: usize) -> usize {
-    number.checked_ilog10().map_or(1, |log| log as usize + 1)
-}
-
 fn menu_widths(items: &[MenuItem]) -> (usize, usize) {
     items.iter().fold((0, 0), |(action, key), item| {
         (
@@ -895,8 +890,15 @@ fn cut_to(text: &str, width: usize) -> Cow<'_, str> {
     Cow::Owned(cut)
 }
 
+/// Draws the choice at `index` with the digit that picks it, or with a blank in its place past
+/// the ninth, which no single key picks.
 fn choice(index: usize, item: &str) -> Line<'static> {
-    Line::from(format!(" {} {} ", index + 1, shown(item)))
+    let number = index + 1;
+    if number <= 9 {
+        Line::from(format!(" {number} {} ", shown(item)))
+    } else {
+        Line::from(format!("   {} ", shown(item)))
+    }
 }
 
 fn button(label: &str, on: bool) -> Span<'static> {
@@ -1339,6 +1341,25 @@ mod tests {
     }
 
     #[test]
+    fn only_the_choices_a_digit_picks_show_a_number() {
+        let items: Vec<String> = (1..=11).map(|n| format!("choice {n}")).collect();
+        let mut list = Dialog::choose("Remote", Vec::new(), items);
+        let shown = drawn(&list);
+        assert!(shown.contains(" 9 choice 9 "), "{shown}");
+        for item in ["choice 10", "choice 11"] {
+            let row = shown
+                .lines()
+                .find(|row| row.contains(item))
+                .unwrap_or_else(|| panic!("{item} missing: {shown}"));
+            assert!(
+                !row.contains("10 choice") && !row.contains("11 choice"),
+                "{shown}"
+            );
+        }
+        assert_eq!(list.key(PaletteInput::Text('9')), Some(Answer::Choice(8)));
+    }
+
+    #[test]
     fn a_line_asked_again_starts_with_what_was_typed_and_keeps_taking_keys() {
         let mut input = Dialog::input("Add a git remote", Vec::new(), false)
             .with_text("https://example.org/r.git\u{1b}");
@@ -1438,10 +1459,6 @@ mod tests {
             })
             .collect();
         assert!(screen.contains(key), "{screen}");
-        assert_eq!(
-            [digits(1), digits(9), digits(10), digits(100)],
-            [1, 1, 2, 3]
-        );
         let narrow = Rect::new(0, 0, 40, 12);
         let mut buffer = Buffer::empty(narrow);
         dialog.render(narrow, &mut buffer);
