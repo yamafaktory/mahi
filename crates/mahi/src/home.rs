@@ -357,18 +357,7 @@ fn choose(
         give_mouse(workspace, home, size);
         dirty |= follow_children(workspace, status, &mut passed)?;
         if read_at.elapsed() >= REREAD {
-            let fresh = self::rows(place, last_active);
-            if fresh != rows {
-                rows = fresh;
-                home.fit(&rows);
-                dirty = true;
-            }
-            let summary = remote::summary(place.store);
-            if summary != remote {
-                remote = summary;
-                dirty = true;
-            }
-            crate::unlocked::forget_unused(Instant::now());
+            dirty |= read_again(place, (home, last_active), (&mut rows, &mut remote));
             read_at = Instant::now();
         }
         let now_seen = place.captured.map(Captured::generation);
@@ -401,14 +390,19 @@ fn choose(
             Chunk::End => return Ok(Chosen::InputEnded),
             Chunk::Stopped(signal) => return Ok(Chosen::Stopped(signal)),
         };
-        match route_keys(
+        workspace.list_thread_choices(home.thread_choices(&rows));
+        let palette_command = match route_keys(
             workspace,
             buffer.get(..read).unwrap_or_default(),
             &mut for_threads,
         ) {
-            Moved::Nothing => {}
-            Moved::Shown => dirty = true,
+            Moved::Nothing => None,
+            Moved::Shown => {
+                dirty = true;
+                None
+            }
             Moved::New => return Ok(Chosen::Action(HomeAction::New)),
+            Moved::Home(command) => Some(command),
             moved => {
                 let view = home_view(place, &remote, &rows, &activity);
                 draw(&mut terminal, home, &view, status, workspace)?;
@@ -417,12 +411,14 @@ fn choose(
                 }
                 terminal.clear()?;
                 dirty = true;
+                None
             }
-        }
-        if for_threads.is_empty() {
-            continue;
-        }
-        let chosen = keys.read(home, &rows, &mut for_threads, Instant::now());
+        };
+        let chosen = match palette_command {
+            Some(command) => home.run(command, &rows),
+            None if for_threads.is_empty() => continue,
+            None => keys.read(home, &rows, &mut for_threads, Instant::now()),
+        };
         dirty = true;
         match chosen {
             Some(HomeAction::Quit) => return Ok(Chosen::Quit),
@@ -434,6 +430,30 @@ fn choose(
             None => {}
         }
     }
+}
+
+/// Reads the thread list and the remote again into `rows` and `remote`, keeping `home`'s
+/// selection on a row that exists, and forgets the mahi key once unused; returns whether
+/// either changed.
+fn read_again(
+    place: &Place<'_>,
+    (home, last_active): (&mut Home, &mut ActivityCache),
+    (rows, remote): (&mut Vec<HomeRow>, &mut remote::Summary),
+) -> bool {
+    let mut changed = false;
+    let fresh = self::rows(place, last_active);
+    if fresh != *rows {
+        *rows = fresh;
+        home.fit(rows);
+        changed = true;
+    }
+    let summary = remote::summary(place.store);
+    if summary != *remote {
+        *remote = summary;
+        changed = true;
+    }
+    crate::unlocked::forget_unused(Instant::now());
+    changed
 }
 
 /// Leaves the mouse to the terminal while the home screen shows a dialog, and takes it back
@@ -769,7 +789,7 @@ fn chosen_in_palette(moved: Moved) -> Option<Chosen> {
         Moved::Act(choice, thread) => Some(choice.action(thread.to_string()))
             .filter(confirmed)
             .map(Chosen::Action),
-        Moved::Nothing | Moved::Shown | Moved::New => None,
+        Moved::Nothing | Moved::Shown | Moved::New | Moved::Home(_) => None,
     }
 }
 

@@ -30,6 +30,7 @@ pub use background::{
 pub use dialog::{
     Answer,
     Dialog,
+    MenuItem,
     Palette,
     Preselected,
     Theme,

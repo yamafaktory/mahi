@@ -41,6 +41,7 @@ use crate::{
     Answer,
     Dialog,
     Header,
+    MenuItem,
     PaletteInput,
     PaletteKey,
     Preselected,
@@ -154,9 +155,7 @@ impl ThreadChoice {
             Self::Invite => HomeAction::Invite(thread),
         }
     }
-}
 
-impl ThreadChoice {
     /// Returns the key that takes the choice on the selected thread.
     #[must_use]
     pub fn key(self) -> char {
@@ -221,9 +220,7 @@ impl HomeCommand {
         }
     }
 
-    /// Returns the command `key` runs, if any.
-    #[must_use]
-    pub fn from_key(key: char) -> Option<Self> {
+    fn from_key(key: char) -> Option<Self> {
         HOME_COMMANDS
             .into_iter()
             .find(|command| command.key() == key)
@@ -291,8 +288,8 @@ impl HomeAction {
     }
 }
 
-/// The home screen's state: where the focus is, what is selected, and a dialog of its own
-/// that waits for an answer.
+/// The home screen's state: the key that opens the palette, what is selected, and a dialog of
+/// its own that waits for an answer.
 #[derive(Debug, Default)]
 pub struct Home {
     palette_key: PaletteKey,
@@ -347,11 +344,6 @@ impl Home {
         self.fit(rows);
         self.note = None;
         if let Some((mut dialog, pending)) = self.dialog.take() {
-            if let (Pending::ThreadMenu(_, choices), PaletteInput::Text(typed)) = (&pending, input)
-                && let Some(index) = choices.iter().position(|choice| choice.key() == typed)
-            {
-                return self.answered(Answer::Choice(index), pending);
-            }
             return match dialog.key(input) {
                 None => {
                     self.dialog = Some((dialog, pending));
@@ -368,7 +360,7 @@ impl Home {
             PaletteInput::Down | PaletteInput::Text('j') if self.selected + 1 < rows.len() => {
                 self.selected += 1;
             }
-            PaletteInput::Enter => self.open_thread_menu(rows.get(self.selected)),
+            PaletteInput::Enter => self.open_thread_menu(rows),
             PaletteInput::Text(typed) => {
                 return HomeCommand::from_key(typed).and_then(|command| self.run(command, rows));
             }
@@ -377,9 +369,11 @@ impl Home {
         None
     }
 
-    /// Runs `command` as its key does on the thread list of `rows`, and returns the action it
-    /// completes, if any: a thread's command acts on the selected one, ending asks first.
+    /// Runs `command` as its key does on the thread list of `rows`, in place of a dialog of the
+    /// home screen's own that is open, and returns the action it completes, if any: a thread's
+    /// command acts on the selected one, ending asks first.
     pub fn run(&mut self, command: HomeCommand, rows: &[HomeRow]) -> Option<HomeAction> {
+        self.dialog = None;
         self.fit(rows);
         self.note = None;
         let choice = match command {
@@ -406,19 +400,30 @@ impl Home {
         self.confirm(choice.action(row.thread.clone()))
     }
 
-    fn open_thread_menu(&mut self, selected: Option<&HomeRow>) {
-        let Some(row) = selected else {
-            self.note = Some(NO_THREADS);
-            return;
+    /// Returns what can be done with the selected thread of `rows`, as its menu lists it:
+    /// resume when the user owns it, end, invite and purge; nothing without a thread.
+    #[must_use]
+    pub fn thread_choices(&self, rows: &[HomeRow]) -> Vec<ThreadChoice> {
+        let Some(row) = rows.get(self.selected) else {
+            return Vec::new();
         };
         let mut choices = Vec::with_capacity(4);
         if row.owned {
             choices.push(ThreadChoice::Resume);
         }
         choices.extend([ThreadChoice::End, ThreadChoice::Invite, ThreadChoice::Purge]);
+        choices
+    }
+
+    fn open_thread_menu(&mut self, rows: &[HomeRow]) {
+        let Some(row) = rows.get(self.selected) else {
+            self.note = Some(NO_THREADS);
+            return;
+        };
+        let choices = self.thread_choices(rows);
         let items = choices
             .iter()
-            .map(|choice| (choice.label().to_owned(), choice.key().to_string()))
+            .map(|choice| MenuItem::new(choice.label().to_owned(), Some(choice.key())))
             .collect();
         let mut dialog = Dialog::menu("Thread", items);
         dialog.push_line(&format!("{} · {}", row.thread, row.agents));
@@ -486,13 +491,12 @@ impl Home {
     pub fn render(&self, view: &HomeView<'_>, status: &str, area: Rect, buffer: &mut Buffer) {
         let [body, footer] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-        let main = body;
         let activity_rows = ACTIVITY_HEIGHT
-            .min(main.height.saturating_sub(THREADS_LEAST))
+            .min(body.height.saturating_sub(THREADS_LEAST))
             .max(ACTIVITY_LEAST)
-            .min(main.height);
+            .min(body.height);
         let [threads, activity] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(activity_rows)]).areas(main);
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(activity_rows)]).areas(body);
         self.render_threads(view.rows, threads, buffer);
         Self::render_activity(view.activity, self.note.unwrap_or(status), activity, buffer);
         Line::from(self.footer_hints()).render(footer, buffer);
@@ -502,7 +506,7 @@ impl Home {
     }
 
     fn render_threads(&self, rows: &[HomeRow], area: Rect, buffer: &mut Buffer) {
-        let block = panel(&format!("Threads · {}", rows.len()), true);
+        let block = panel(&format!("Threads · {}", rows.len()), Border::Lit);
         if rows.is_empty() {
             let inner = block.inner(area);
             block.render(area, buffer);
@@ -550,7 +554,7 @@ impl Home {
     /// Draws what mahi's commands printed, oldest first, with `status`, the outcome of the last
     /// action, on the last row below them.
     fn render_activity(activity: &[String], status: &str, area: Rect, buffer: &mut Buffer) {
-        let block = panel("Activity", false);
+        let block = panel("Activity", Border::Plain);
         let inner = block.inner(area);
         block.render(area, buffer);
         let status = format!(" {}", shown(status));
@@ -634,20 +638,25 @@ fn status_lines(text: &str, width: usize) -> Vec<&str> {
     lines
 }
 
-fn panel<'a>(title: &str, focused: bool) -> Block<'a> {
-    let border = Style::new().fg(if focused {
-        Theme::palette().accent
-    } else {
-        Theme::palette().border
-    });
+/// How a pane's border is drawn: lit, as the pane the keys act on, or plain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Border {
+    Lit,
+    Plain,
+}
+
+fn panel<'a>(title: &str, border: Border) -> Block<'a> {
+    let (colour, title_style) = match border {
+        Border::Lit => (Theme::palette().accent, Theme::title()),
+        Border::Plain => (
+            Theme::palette().border,
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+    };
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(border)
-        .title(Line::from(format!(" {title} ")).style(if focused {
-            Theme::title()
-        } else {
-            Style::new().add_modifier(Modifier::BOLD)
-        }))
+        .border_style(Style::new().fg(colour))
+        .title(Line::from(format!(" {title} ")).style(title_style))
 }
 
 /// Returns the thread list's columns that fit in `width` cells: whether the whole thread id
@@ -813,16 +822,61 @@ mod tests {
         let keys: std::collections::BTreeSet<char> =
             HOME_COMMANDS.iter().map(|command| command.key()).collect();
         assert_eq!(keys.len(), HOME_COMMANDS.len());
+        let thread = || "t1".to_owned();
         for command in HOME_COMMANDS {
             assert_eq!(HomeCommand::from_key(command.key()), Some(command));
-            let (mut typed, mut run) = (Home::default(), Home::default());
+            let expected = match command {
+                HomeCommand::Thread(ThreadChoice::Resume) => Some(HomeAction::Resume(thread())),
+                HomeCommand::Thread(ThreadChoice::Invite) => Some(HomeAction::Invite(thread())),
+                HomeCommand::Thread(ThreadChoice::Purge) => Some(HomeAction::Purge(thread())),
+                HomeCommand::Thread(ThreadChoice::End) | HomeCommand::Help => None,
+                HomeCommand::New => Some(HomeAction::New),
+                HomeCommand::Join => Some(HomeAction::Join),
+                HomeCommand::Remote => Some(HomeAction::Remote),
+                HomeCommand::Credentials => Some(HomeAction::Credentials),
+                HomeCommand::Card => Some(HomeAction::Card),
+                HomeCommand::Quit => Some(HomeAction::Quit),
+            };
+            let mut home = Home::default();
             assert_eq!(
-                typed.key(PaletteInput::Text(command.key()), &rows),
-                run.run(command, &rows),
+                home.key(PaletteInput::Text(command.key()), &rows),
+                expected,
                 "{command:?}"
             );
-            assert_eq!(typed.has_dialog(), run.has_dialog(), "{command:?}");
+            let asks = matches!(
+                command,
+                HomeCommand::Thread(ThreadChoice::End) | HomeCommand::Help
+            );
+            assert_eq!(home.has_dialog(), asks, "{command:?}");
         }
+    }
+
+    #[test]
+    fn the_thread_choices_are_what_the_selected_threads_menu_lists() {
+        let rows = rows();
+        let mut home = Home::default();
+        assert_eq!(
+            home.thread_choices(&rows),
+            [
+                ThreadChoice::Resume,
+                ThreadChoice::End,
+                ThreadChoice::Invite,
+                ThreadChoice::Purge
+            ]
+        );
+        home.key(PaletteInput::Down, &rows);
+        assert_eq!(
+            home.thread_choices(&rows),
+            [ThreadChoice::End, ThreadChoice::Invite, ThreadChoice::Purge]
+        );
+        assert!(home.thread_choices(&[]).is_empty());
+        home.key(PaletteInput::Text('e'), &rows);
+        assert!(home.has_dialog());
+        assert_eq!(
+            home.run(HomeCommand::Remote, &rows),
+            Some(HomeAction::Remote)
+        );
+        assert!(!home.has_dialog());
     }
 
     #[test]

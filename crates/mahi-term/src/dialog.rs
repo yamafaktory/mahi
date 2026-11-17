@@ -257,9 +257,43 @@ enum Kind {
         selected: usize,
     },
     Menu {
-        items: Vec<(String, String)>,
+        items: Vec<MenuItem>,
         selected: usize,
     },
+}
+
+/// An action of a menu: what it says, its key as the menu shows it, and the key that picks it
+/// at once, when one does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuItem {
+    label: String,
+    shown: String,
+    key: Option<char>,
+}
+
+impl MenuItem {
+    /// Returns the action `label`, picked with `key` when there is one, which shows as typed,
+    /// or `Space` for a space.
+    #[must_use]
+    pub fn new(label: String, key: Option<char>) -> Self {
+        let shown = match key {
+            Some(' ') => "Space".to_owned(),
+            Some(key) => key.to_string(),
+            None => String::new(),
+        };
+        Self { label, shown, key }
+    }
+
+    /// Returns the action `label`, which no key picks, with `shown` where its key would be,
+    /// for a key the menu does not read, such as the palette key.
+    #[must_use]
+    pub fn shown_as(label: String, shown: String) -> Self {
+        Self {
+            label,
+            shown,
+            key: None,
+        }
+    }
 }
 
 /// What a dialog's user chose; a typed line never shows in `Debug` output.
@@ -413,11 +447,19 @@ impl Dialog {
         Self::with(title, lines, Kind::Choose { items, selected: 0 })
     }
 
-    /// Makes a menu of `items`, each an action and the key that does it at once, which the
-    /// caller reads; the menu itself only moves between them and picks one.
+    /// Makes a menu of `items`, each an action and the key that picks it at once.
     #[must_use]
-    pub fn menu(title: &str, items: Vec<(String, String)>) -> Self {
+    pub fn menu(title: &str, items: Vec<MenuItem>) -> Self {
         Self::with(title, Vec::new(), Kind::Menu { items, selected: 0 })
+    }
+
+    /// Returns the key that picks each item of a menu, if any; none for any other dialog.
+    #[must_use]
+    pub fn menu_keys(&self) -> Vec<Option<char>> {
+        match &self.kind {
+            Kind::Menu { items, .. } => items.iter().map(|item| item.key).collect(),
+            _ => Vec::new(),
+        }
     }
 
     fn with(title: &str, lines: Vec<String>, kind: Kind) -> Self {
@@ -531,6 +573,10 @@ impl Dialog {
                     None
                 }
                 PaletteInput::Enter if !items.is_empty() => Some(Answer::Choice(*selected)),
+                PaletteInput::Text(typed) => items
+                    .iter()
+                    .position(|item| item.key == Some(typed))
+                    .map(Answer::Choice),
                 _ => None,
             },
         }
@@ -715,12 +761,11 @@ impl Dialog {
                 let (widest, key_width) = menu_widths(items);
                 let action_width =
                     widest.min(usize::from(area.width).saturating_sub(key_width + 4));
-                let list = List::new(
-                    items
-                        .iter()
-                        .map(|(item, key)| ListItem::new(menu_line(item, key, action_width))),
-                )
-                .highlight_style(Theme::selected());
+                let list =
+                    List::new(items.iter().map(|item| {
+                        ListItem::new(menu_line(&item.label, &item.shown, action_width))
+                    }))
+                    .highlight_style(Theme::selected());
                 let mut state = ListState::default().with_selected(Some(*selected));
                 StatefulWidget::render(list, area, buffer, &mut state);
             }
@@ -802,15 +847,13 @@ fn digits(number: usize) -> usize {
     number.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
-fn menu_widths(items: &[(String, String)]) -> (usize, usize) {
-    items
-        .iter()
-        .fold((0, 0), |(action, key), (item, item_key)| {
-            (
-                action.max(Span::raw(shown(item)).width()),
-                key.max(Span::raw(shown(item_key)).width()),
-            )
-        })
+fn menu_widths(items: &[MenuItem]) -> (usize, usize) {
+    items.iter().fold((0, 0), |(action, key), item| {
+        (
+            action.max(Span::raw(shown(&item.label)).width()),
+            key.max(Span::raw(shown(&item.shown)).width()),
+        )
+    })
 }
 
 fn menu_line(item: &str, key: &str, action_width: usize) -> Line<'static> {
@@ -1141,14 +1184,15 @@ mod tests {
     }
 
     #[test]
-    fn a_menu_shows_each_action_with_its_key_and_leaves_the_keys_to_its_caller() {
+    fn a_menu_shows_each_action_with_its_key_and_its_key_picks_it() {
         let mut menu = Dialog::menu(
             "4799a3af",
             vec![
-                ("Threads".to_owned(), "0".to_owned()),
-                ("Next agent waiting for you".to_owned(), "Space".to_owned()),
+                MenuItem::new("Threads".to_owned(), Some('0')),
+                MenuItem::new("Next agent waiting for you".to_owned(), Some(' ')),
             ],
         );
+        assert_eq!(menu.menu_keys(), [Some('0'), Some(' ')]);
         let shown = drawn(&menu);
         assert!(shown.contains(" 4799a3af "), "{shown}");
         assert!(shown.contains(" Threads                     0 "), "{shown}");
@@ -1159,6 +1203,8 @@ mod tests {
         assert!(shown.contains("↑↓ move  enter run  esc close"), "{shown}");
         assert_eq!(menu.key(PaletteInput::Text('2')), None);
         assert_eq!(menu.key(PaletteInput::Text('q')), None);
+        assert_eq!(menu.key(PaletteInput::Text(' ')), Some(Answer::Choice(1)));
+        assert_eq!(menu.key(PaletteInput::Text('0')), Some(Answer::Choice(0)));
         assert_eq!(menu.key(PaletteInput::Down), None);
         assert_eq!(menu.key(PaletteInput::Down), None);
         assert_eq!(menu.selected(), Some(1));
@@ -1174,12 +1220,12 @@ mod tests {
         let menu = Dialog::menu(
             "4799a3af",
             vec![
-                (long.clone(), String::new()),
-                (
+                MenuItem::new(long.clone(), None),
+                MenuItem::shown_as(
                     "Pass Ctrl-Space through to the agent".to_owned(),
                     "Ctrl-Space".to_owned(),
                 ),
-                ("Quit mahi".to_owned(), "q".to_owned()),
+                MenuItem::new("Quit mahi".to_owned(), Some('q')),
             ],
         );
         let shown = drawn(&menu);
@@ -1208,8 +1254,8 @@ mod tests {
         let menu = Dialog::menu(
             "4799a3af",
             vec![
-                (widest.clone(), "k".to_owned()),
-                ("Quit".to_owned(), "q".to_owned()),
+                MenuItem::new(widest.clone(), Some('k')),
+                MenuItem::new("Quit".to_owned(), Some('q')),
             ],
         );
         let area = Rect::new(0, 0, 140, 20);

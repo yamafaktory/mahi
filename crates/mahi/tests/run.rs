@@ -2186,6 +2186,25 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
     }
 
     #[test]
+    fn a_home_action_chosen_in_the_palette_over_a_home_dialog_closes_the_dialog_and_runs() {
+        let fixture = fixture();
+        let (thread, _claude) = worked_thread(&fixture);
+        let worktree = fixture.thread_worktrees().pop().unwrap();
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]),
+            &[
+                (&thread, b"e"),
+                ("End thread", b"\x00"),
+                ("Go to the thread list", b"m"),
+                ("no git remote yet", b"2"),
+                ("remote: off", b"q"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(worktree.exists());
+    }
+
+    #[test]
     fn the_home_screen_refuses_a_remote_url_mahi_cannot_push_to_and_adds_one_left_unchosen() {
         let fixture = fixture();
         let (code, output) = in_terminal_typing(
