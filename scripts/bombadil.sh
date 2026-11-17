@@ -20,19 +20,15 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 limit=${1:-1m}
-case "$limit" in
-    *s) seconds=${limit%s} ;;
-    *m) seconds=$((${limit%m} * 60)) ;;
-    *h) seconds=$((${limit%h} * 3600)) ;;
-    *)
-        echo "the time limit takes a unit, such as 30s, 5m or 1h: $limit" >&2
-        exit 1
-        ;;
-esac
-if ! [[ $seconds =~ ^[0-9]+$ ]] || [ "$seconds" -eq 0 ]; then
-    echo "the time limit is not a whole number of seconds, minutes or hours: $limit" >&2
+if ! [[ $limit =~ ^0*([1-9][0-9]{0,5})([smh])$ ]]; then
+    echo "the time limit is a whole number with a unit, such as 30s, 5m or 1h: $limit" >&2
     exit 1
 fi
+case "${BASH_REMATCH[2]}" in
+    s) seconds=${BASH_REMATCH[1]} ;;
+    m) seconds=$((BASH_REMATCH[1] * 60)) ;;
+    h) seconds=$((BASH_REMATCH[1] * 3600)) ;;
+esac
 
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/mahi-bombadil"
 bombadil="$cache/$version/bombadil"
@@ -54,28 +50,31 @@ binary=$(mahi_binary)
 check_binary "$binary"
 specification="$PWD/tests/bombadil/home.ts"
 output="$PWD/work/scratch/bombadil"
-root="$cache/run"
-rm -rf "$root" "$output"
-mkdir -p "$root/config" "$root/data" "$root/home" "$output"
-make_project "$root/project" ""
+rm -rf "$output"
 
 deadline=$((SECONDS + seconds))
 run=0
-while [ "$SECONDS" -lt "$deadline" ]; do
+while left=$((deadline - SECONDS)) && [ "$left" -gt 0 ]; do
     run=$((run + 1))
+    root="$output/$run"
+    mkdir -p "$root/config" "$root/data" "$root/home" "$root/no-programs"
+    make_project "$root/project" ""
     (
         cd "$root/project"
-        env -i HOME="$root/home" PATH=/usr/bin:/bin TERM=xterm-256color \
+        env -i HOME="$root/home" PATH="$root/no-programs" TERM=xterm-256color \
             XDG_CONFIG_HOME="$root/config" XDG_DATA_HOME="$root/data" MAHI_LIVE=off \
             "$bombadil" terminal test --specification "$specification" --exit-on-violation \
-            --time-limit "$((deadline - SECONDS))s" --output-path "$output/$run" "$binary" \
-            > "$output/$run.log" 2>&1
+            --time-limit "${left}s" --output-path "$root/trace" "$binary" \
+            > "$root/bombadil.log" 2>&1
     ) || {
-        tail -n 40 "$output/$run.log" >&2
-        grep -h 'was violated' "$output/$run.log" >&2 || true
-        echo "bombadil found a violation in run $run, logged in $output/$run.log; replay it with:" >&2
-        echo "  $bombadil terminal test --specification $specification --reproduce $output/$run $binary" >&2
-        echo "  (in $root/project, with the environment this script sets)" >&2
+        tail -n 40 "$root/bombadil.log" >&2
+        if grep -h 'was violated' "$root/bombadil.log" >&2; then
+            echo "bombadil found a violation in run $run, logged in $root/bombadil.log; replay it with:" >&2
+            echo "  $bombadil terminal test --specification $specification --reproduce $root/trace $binary" >&2
+            echo "  (in $root/project, with the environment this script sets)" >&2
+        else
+            echo "bombadil run $run failed without a violation; see $root/bombadil.log" >&2
+        fi
         exit 1
     }
 done

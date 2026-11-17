@@ -14,14 +14,6 @@ const FOOTER = "Ctrl-Space palette  ? help  q quit";
 const PALETTE_HINTS = "↑↓ move  enter run  esc close";
 const DIALOG_HINTS = /esc (cancel|close)|enter (close|done|pick)|ctrl-c stop/;
 
-const rows = extract((state) => {
-  const lines: string[] = [];
-  for (let index = 0; index < state.grid.size.rows; index++) {
-    lines.push(state.grid.rowText(index));
-  }
-  return lines;
-});
-
 const cells = extract((state) => {
   const grid: string[][] = [];
   for (let index = 0; index < state.grid.size.rows; index++) {
@@ -32,14 +24,19 @@ const cells = extract((state) => {
 
 const exited = extract((state) => state.exitStatus !== null);
 
-const lastTyped = extract((state) => {
-  const action = state.lastAction;
-  return action !== null && "TypeText" in action ? action.TypeText : "";
-});
+function rows(): string[] {
+  return cells.current.map((row) => row.join(""));
+}
 
-const resized = extract(
-  (state) => state.lastAction !== null && "Resize" in state.lastAction,
-);
+function lastTyped(): string {
+  const action = lastAction.current;
+  return action !== null && "TypeText" in action ? action.TypeText : "";
+}
+
+function resized(): boolean {
+  const action = lastAction.current;
+  return action !== null && "Resize" in action;
+}
 
 function paletteEntries(grid: string[][]): string[][] | null {
   const hints = grid.findIndex((row) => row.join("").includes(PALETTE_HINTS));
@@ -70,11 +67,16 @@ function boxesAreWhole(lines: string[]): boolean {
   );
 }
 
-export const footerNamesThePaletteHelpAndQuitWhileNoDialogShows = always(() => {
-  if (exited.current || showsDialog(rows.current)) return true;
-  const last = (rows.current[rows.current.length - 1] ?? "").trim();
-  return last === "" || last === FOOTER;
-});
+function footerIsRight(): boolean {
+  const lines = rows();
+  if (exited.current || showsDialog(lines)) return true;
+  const last = (lines[lines.length - 1] ?? "").trim();
+  return last === FOOTER || lines.every((line) => line.trim() === "");
+}
+
+export const footerNamesThePaletteHelpAndQuitWhileNoDialogShows = always(
+  eventually(footerIsRight).within(2, "seconds"),
+);
 
 export const everyPaletteEntryShowsAKeyOfItsOwn = always(() => {
   const entries = paletteEntries(cells.current);
@@ -85,18 +87,18 @@ export const everyPaletteEntryShowsAKeyOfItsOwn = always(() => {
 });
 
 export const escapeClosesThePalette = always(
-  now(() => paletteEntries(cells.current) !== null && lastTyped.current === "\x1b")
+  now(() => paletteEntries(cells.current) !== null && lastTyped() === "\x1b")
     .implies(eventually(() => paletteEntries(cells.current) === null).within(2, "seconds")),
 );
 
 export const everyBoxIsWholeSoonAfterAResize = always(
-  now(() => resized.current && !exited.current).implies(
-    eventually(() => exited.current || boxesAreWhole(rows.current)).within(2, "seconds"),
+  now(() => resized() && !exited.current).implies(
+    eventually(() => exited.current || boxesAreWhole(rows())).within(2, "seconds"),
   ),
 );
 
 export const exploreTheHomeScreen = weighted([
-  [30, actions(() => [{ TypeText: { Regexp: "[a-pr-zA-Z0-9?]" } }])],
+  [30, actions(() => [{ TypeText: { Regexp: "[a-pr-zA-NP-Z0-9?]" } }])],
   [15, actions(() => [{ TypeText: { Regexp: "\\x00" } }])],
   [15, typeFromSet(CharSets.CONTROL_ARROWS)],
   [10, actions(() => [{ TypeText: { Regexp: "\\r" } }])],

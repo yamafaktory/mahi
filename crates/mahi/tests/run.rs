@@ -2011,32 +2011,12 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         let (command, _fresh) = fresh_user(&fixture, "off");
         let mut mahi = command.spawn().unwrap();
         let mut terminal = mahi.writer().unwrap();
-        let reader = mahi.reader().unwrap();
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let collected = Arc::clone(&output);
-        thread::spawn(move || {
-            let mut reader = reader;
-            let mut chunk = [0_u8; 4096];
-            while let Ok(read) = reader.read(&mut chunk) {
-                if read == 0 {
-                    break;
-                }
-                collected.lock().unwrap().extend_from_slice(&chunk[..read]);
-            }
-        });
+        let (output, _ended) = collect(&mahi);
         let shows = |from: usize, text: &str| {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
+            waited(Duration::from_secs(10), || {
                 let seen = output.lock().unwrap();
-                if String::from_utf8_lossy(&seen[from.min(seen.len())..]).contains(text) {
-                    return true;
-                }
-                drop(seen);
-                if Instant::now() > deadline {
-                    return false;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
+                String::from_utf8_lossy(&seen[from.min(seen.len())..]).contains(text)
+            })
         };
         assert!(shows(0, "Threads"));
         terminal.write_all(b"J").unwrap();

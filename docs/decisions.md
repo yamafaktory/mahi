@@ -990,5 +990,5 @@ next to the fuzz shards. The other choices were a required check on every pull r
 minutes to each one, or local runs only. During the work, not by the user: Bombadil 0.7.10 is
 downloaded once and checked against a pinned SHA-256, since its releases publish no checksums;
 the specifications are TypeScript that the Bombadil binary runs itself, so the repository takes no
-npm package; and mahi runs with no agent on `PATH` and `MAHI_LIVE=off`, so a run reaches no agent
-and no network.
+npm package; and mahi runs with an empty `PATH` and `MAHI_LIVE=off`, so a run starts no agent and
+reaches no network.
