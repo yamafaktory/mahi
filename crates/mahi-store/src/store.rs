@@ -214,6 +214,10 @@ pub enum StoreError {
     /// The repository already has a remote of that name.
     #[error("this repository already has a remote called {0}")]
     RemoteExists(String),
+    /// The repository's own configuration file has no remote of that name, though another
+    /// configuration may.
+    #[error("this repository's config file has no remote called {0}")]
+    NoLocalRemote(String),
     /// A remote's URL is not UTF-8.
     #[error("the url of remote {0} is not UTF-8")]
     NonUtf8Url(String),
@@ -632,6 +636,104 @@ impl Store {
         if taken {
             return Err(StoreError::RemoteExists(name.to_owned()));
         }
+        self.edit_config(|file| {
+            if file.section("remote", Some(name.into())).is_ok() {
+                return Err(StoreError::RemoteExists(name.to_owned()));
+            }
+            add_remote_section(file, name, url)
+        })
+    }
+
+    /// Sets the URL the git remote called `name` pushes to, in the repository's own
+    /// configuration file, as `git remote set-url` does: its push URL when it has one, or else
+    /// its URL. Its other settings stay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidRemoteUrl`] if `url` is empty or holds a control character,
+    /// [`StoreError::NoLocalRemote`] if the configuration file has no remote called `name`, or
+    /// the errors of writing the configuration that [`Store::add_remote`] returns.
+    pub fn set_remote_push_url(&mut self, name: &str, url: &str) -> Result<(), StoreError> {
+        if url.is_empty() || url.chars().any(char::is_control) {
+            return Err(StoreError::InvalidRemoteUrl(name.to_owned()));
+        }
+        self.edit_config(|file| {
+            let mut section = file
+                .section_mut("remote", Some(name.into()))
+                .map_err(|_| StoreError::NoLocalRemote(name.to_owned()))?;
+            let key = if section.value("pushurl").is_some() {
+                "pushurl"
+            } else {
+                "url"
+            };
+            section
+                .set(key, url)
+                .map_err(|_| StoreError::InvalidRemoteUrl(name.to_owned()))?;
+            Ok(())
+        })
+    }
+
+    /// Removes the git remote called `name` from the repository's own configuration file, as
+    /// `git remote remove` does: its sections, the upstream of each branch that follows it, and
+    /// its remote-tracking refs under `refs/remotes/<name>/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NoLocalRemote`] if the configuration file has no remote called
+    /// `name`, the errors of writing the configuration that [`Store::add_remote`] returns, or
+    /// [`StoreError::Git`] if its refs cannot be read or deleted.
+    pub fn remove_remote(&mut self, name: &str) -> Result<(), StoreError> {
+        self.edit_config(|file| {
+            if file.remove_section("remote", Some(name.into())).is_none() {
+                return Err(StoreError::NoLocalRemote(name.to_owned()));
+            }
+            while file.remove_section("remote", Some(name.into())).is_some() {}
+            let following: Vec<_> = file
+                .sections_and_ids()
+                .filter(|(section, _)| {
+                    section.header().name() == "branch"
+                        && section
+                            .value("remote")
+                            .is_some_and(|remote| remote == name.as_bytes())
+                })
+                .map(|(_, id)| id)
+                .collect();
+            for id in following {
+                if let Some(mut section) = file.section_mut_by_id(id) {
+                    section.remove("remote");
+                    section.remove("merge");
+                }
+            }
+            Ok(())
+        })?;
+        let prefix = format!("refs/remotes/{name}/");
+        let platform = self.repo.references().map_err(gix::Error::from_error)?;
+        let mut edits = Vec::new();
+        for reference in platform
+            .prefixed(prefix.as_str())
+            .map_err(gix::Error::from_error)?
+        {
+            let reference = reference.map_err(gix::Error::from_error)?;
+            edits.push(RefEdit::new(
+                reference.name().to_owned(),
+                Change::Delete {
+                    expected: PreviousValue::MustExistAndMatch(reference.target().into_owned()),
+                    log: RefLog::AndReference,
+                },
+            ));
+        }
+        if !edits.is_empty() {
+            self.repo.edit_references_as(edits, None)?;
+        }
+        Ok(())
+    }
+
+    /// Edits the repository's own configuration file under its lock with `edit`, keeping its
+    /// mode, its link and the text `edit` leaves, then reads the repository again.
+    fn edit_config(
+        &mut self,
+        edit: impl FnOnce(&mut gix::config::File) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         let path = self.repo.common_dir().join(CONFIG_FILE);
         let original = std::fs::metadata(&path)?.permissions();
         let keep_mode = move |_| original.clone();
@@ -650,10 +752,7 @@ impl Store {
             gix::config::file::init::Options::default(),
         )
         .map_err(|_| StoreError::UnreadableConfig)?;
-        if file.section("remote", Some(name.into())).is_ok() {
-            return Err(StoreError::RemoteExists(name.to_owned()));
-        }
-        add_remote_section(&mut file, name, url)?;
+        edit(&mut file)?;
         file.write_to(&mut lock)?;
         lock.with_mut(|file| file.sync_all())?;
         lock.commit()
@@ -1925,6 +2024,130 @@ pub(crate) mod tests {
             Some("me@host:repo")
         );
         assert_eq!(store.remote_names(), ["origin"]);
+    }
+
+    #[test]
+    fn a_remotes_push_url_is_set_where_it_is_read_and_only_in_this_repositorys_config() {
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        let git = dir.path().join(".git");
+        let mut text = std::fs::read_to_string(git.join("config")).unwrap();
+        text.push_str(
+            "[remote \"origin\"]\n\turl = me@host:typo\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+             [remote \"split\"]\n\turl = https://example.org/r.git\n\tpushurl = me@host:old\n\
+             [include]\n\tpath = extra\n",
+        );
+        std::fs::write(git.join("config"), text).unwrap();
+        std::fs::write(
+            git.join("extra"),
+            "[remote \"included\"]\n\turl = me@host:inc\n",
+        )
+        .unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.set_remote_push_url("origin", "me@host:repo").unwrap();
+        store.set_remote_push_url("split", "me@host:new").unwrap();
+        assert_eq!(
+            store.remote_url("origin", true).unwrap().as_deref(),
+            Some("me@host:repo")
+        );
+        assert_eq!(
+            store.remote_url("split", false).unwrap().as_deref(),
+            Some("https://example.org/r.git")
+        );
+        assert_eq!(
+            store.remote_url("split", true).unwrap().as_deref(),
+            Some("me@host:new")
+        );
+        let after = std::fs::read_to_string(git.join("config")).unwrap();
+        assert!(
+            after.contains("fetch = +refs/heads/*:refs/remotes/origin/*"),
+            "{after}"
+        );
+        assert!(!after.contains("typo"), "{after}");
+        for name in ["included", "missing"] {
+            assert!(
+                matches!(
+                    store.set_remote_push_url(name, "me@host:x"),
+                    Err(StoreError::NoLocalRemote(_))
+                ),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            store.set_remote_push_url("origin", "me@host:a\n[core]"),
+            Err(StoreError::InvalidRemoteUrl(_))
+        ));
+        assert_eq!(
+            store.remote_url("origin", true).unwrap().as_deref(),
+            Some("me@host:repo")
+        );
+    }
+
+    #[test]
+    fn removing_a_remote_takes_its_sections_its_branches_upstream_and_its_refs_only() {
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        let git = dir.path().join(".git");
+        let mut text = std::fs::read_to_string(git.join("config")).unwrap();
+        text.push_str(
+            "[remote \"gone\"]\n\turl = me@host:gone\n\
+             [remote \"kept\"]\n\turl = me@host:kept\n\
+             [branch \"main\"]\n\tremote = gone\n\tmerge = refs/heads/main\n\trebase = true\n\
+             [branch \"other\"]\n\tremote = kept\n\tmerge = refs/heads/other\n\
+             [remote \"gone\"]\n\tpushurl = me@host:gone-too\n",
+        );
+        std::fs::write(git.join("config"), text).unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let commit = commit_on_main(&store);
+        for name in [
+            "refs/remotes/gone/main",
+            "refs/remotes/gone/HEAD",
+            "refs/remotes/kept/main",
+        ] {
+            store
+                .repo
+                .reference(name, commit, PreviousValue::Any, "test")
+                .unwrap();
+        }
+        store.remove_remote("gone").unwrap();
+        assert_eq!(store.remote_names(), ["kept"]);
+        assert_eq!(store.remote_url("gone", true).unwrap(), None);
+        let after = std::fs::read_to_string(git.join("config")).unwrap();
+        assert!(!after.contains("gone"), "{after}");
+        assert!(after.contains("rebase = true"), "{after}");
+        assert!(after.contains("remote = kept"), "{after}");
+        assert!(
+            store
+                .repo
+                .try_find_reference("refs/remotes/gone/main")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .repo
+                .try_find_reference("refs/remotes/gone/HEAD")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .repo
+                .try_find_reference("refs/remotes/kept/main")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .repo
+                .try_find_reference("refs/heads/main")
+                .unwrap()
+                .is_some()
+        );
+        assert!(matches!(
+            store.remove_remote("gone"),
+            Err(StoreError::NoLocalRemote(_))
+        ));
     }
 
     #[test]
