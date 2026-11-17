@@ -1477,7 +1477,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         );
         assert_eq!(code, 0, "{output}");
         let ready = output.find("agent-ready").unwrap();
-        let home = ready + output[ready..].find("Threads · ").unwrap();
+        let home = threads_back_at(&output, ready);
         let end = output[..home]
             .rfind("\x1b[?25")
             .filter(|&back| back > ready)
@@ -1516,7 +1516,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
                 ("agent-ready", b"\x000"),
-                ("Menu", b"q"),
+                ("Threads · ", b"q"),
                 ("stop it and quit?", b"n"),
                 ("the agents keep running", b"\x001"),
                 ("Ctrl-Space palette", b"hello\r"),
@@ -1854,7 +1854,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
                 ("agent-ready", b"\x000"),
-                ("Menu", b"q"),
+                ("Threads · ", b"q"),
                 ("1 agent is running: stop it and quit?", b"y"),
             ],
         );
@@ -1893,7 +1893,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
                 ("claude (● working)", b"\x000"),
-                ("Menu", b"q"),
+                ("Threads · ", b"q"),
                 ("stop it and quit?", b"y"),
             ],
         );
@@ -1960,7 +1960,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
                 ("Threads", b"n"),
                 ("Which agent should start the thread?", b"1"),
                 ("close it", b"x"),
-                ("Menu", b"q"),
+                ("Threads · ", b"q"),
             ],
         );
         assert_eq!(code, 0, "{output}");
@@ -2393,7 +2393,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         read_until(&mut reader, &mut seen, "End thread");
         terminal.write_all(b"\x1b").unwrap();
         seen.clear();
-        read_until(&mut reader, &mut seen, "actions");
+        read_until(&mut reader, &mut seen, "? help");
         drain(reader);
         terminal.write_all(b"[200~ey\r\x1b[201~").unwrap();
         thread::sleep(Duration::from_millis(800));
@@ -2505,19 +2505,28 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
     #[test]
     fn an_arrow_typed_just_after_escape_closes_the_help_moves_the_selection() {
         let fixture = fixture();
-        let agent = "#!/bin/sh\nexit 0\n";
-        let claude = script(&fixture, "help-agents", "claude", agent);
-        script(&fixture, "help-agents", "codex", agent);
-        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
-        let mut mahi = terminal_command(&fixture, &[])
-            .env("PATH", &path)
-            .spawn()
+        let (first, claude) = worked_thread(&fixture);
+        let again = fixture
+            .command(&["run", claude.to_str().unwrap()])
+            .output()
             .unwrap();
+        let stderr = String::from_utf8_lossy(&again.stderr);
+        assert_eq!(again.status.code(), Some(0), "{stderr}");
+        let second = thread_of(&worktree_of(&stderr));
+        let mut mahi = terminal_command(&fixture, &[]).spawn().unwrap();
         let mut terminal = mahi.writer().unwrap();
         let mut reader = mahi.reader().unwrap();
         let mut seen = Vec::new();
-        read_until(&mut reader, &mut seen, "Threads");
-        terminal.write_all(b"\t?").unwrap();
+        read_until(&mut reader, &mut seen, "Threads · 2");
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        parser.process(&seen);
+        let listed = parser.screen().contents();
+        let below = if listed.find(&first) < listed.find(&second) {
+            second.clone()
+        } else {
+            first.clone()
+        };
+        terminal.write_all(b"?").unwrap();
         read_until(&mut reader, &mut seen, "enter close");
         let output = Arc::new(Mutex::new(seen));
         let collected = Arc::clone(&output);
@@ -2534,10 +2543,7 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
             let mut parser = vt100::Parser::new(24, 200, 0);
             output.lock().unwrap().chunks(16).any(|chunk| {
                 parser.process(chunk);
-                parser
-                    .screen()
-                    .contents()
-                    .contains("Which agent should start the thread?")
+                parser.screen().contents().contains(&format!("{below} · "))
             })
         };
         for keys in [&b"\x1b"[..], b"\x1b[B", b"\r"] {
@@ -2569,15 +2575,31 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
     /// Returns the screen, as text, of the agent's pane that showed `marker`, before the home
     /// screen came back.
     fn pane_at(output: &str, marker: &str) -> String {
-        let at = output.find(marker).unwrap();
-        let end = ["\x1b[?1049h", "Threads · "]
-            .iter()
-            .filter_map(|next| output[at..].find(next))
-            .min()
-            .map_or(output.len(), |back| at + back);
+        let at = output.find(marker).unwrap() + marker.len();
         let mut parser = vt100::Parser::new(24, 200, 0);
-        parser.process(&output.as_bytes()[..end]);
+        parser.process(&output.as_bytes()[..threads_back_at(output, at)]);
         parser.screen().contents()
+    }
+
+    /// Returns where in `output`, after `from`, the home screen's thread list starts to be
+    /// drawn again, or where mahi enters its screen again, whichever comes first; the end of
+    /// `output` when neither does.
+    fn threads_back_at(output: &str, from: usize) -> usize {
+        let bytes = output.as_bytes();
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        parser.process(&bytes[..from]);
+        let mut at = from;
+        for piece in bytes[from..].split_inclusive(|byte| *byte == 0x1b) {
+            if piece.starts_with(b"[?1049h") {
+                return at.saturating_sub(1);
+            }
+            parser.process(piece);
+            if parser.screen().contents().contains("Threads · ") {
+                return at.saturating_sub(1);
+            }
+            at += piece.len();
+        }
+        bytes.len()
     }
 
     fn read_until(reader: &mut impl Read, seen: &mut Vec<u8>, text: &str) {

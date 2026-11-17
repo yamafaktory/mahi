@@ -26,11 +26,6 @@ use ratatui_core::{
 use ratatui_widgets::{
     block::Block,
     borders::BorderType,
-    list::{
-        List,
-        ListItem,
-        ListState,
-    },
     paragraph::{
         Paragraph,
         Wrap,
@@ -41,13 +36,13 @@ use ratatui_widgets::{
         TableState,
     },
 };
-use unicode_width::UnicodeWidthStr as _;
 
 use crate::{
     Answer,
     Dialog,
     Header,
     PaletteInput,
+    PaletteKey,
     Preselected,
     Theme,
     dialog::shown,
@@ -55,17 +50,6 @@ use crate::{
 };
 
 const NO_THREADS: &str = "no threads yet: press n to start one";
-const MENU: [(&str, &str); 8] = [
-    ("Threads", "t"),
-    ("New thread", "n"),
-    ("Join with a code", "J"),
-    ("Remote", "m"),
-    ("Credentials", "s"),
-    ("Your card", "u"),
-    ("Help", "?"),
-    ("Quit", "q"),
-];
-const SIDEBAR_WIDTH: u16 = 24;
 const ACTIVITY_HEIGHT: u16 = 8;
 const ACTIVITY_LEAST: u16 = 3;
 const THREADS_LEAST: u16 = 4;
@@ -73,7 +57,6 @@ const THREAD_WIDTH: u16 = 34;
 const SHORT_THREAD: u16 = 8;
 const AGENTS_LEAST: u16 = 16;
 const LAST_ACTIVE: &str = "last active";
-const ALWAYS_HINTED: [(&str, &str); 2] = [("?", "help"), ("q", "quit")];
 
 /// One thread as the home screen lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,13 +108,6 @@ pub enum HomeAction {
     Card,
     /// Add or remove the tokens agents and remotes sign in with.
     Credentials,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Focus {
-    Menu,
-    #[default]
-    Threads,
 }
 
 #[derive(Debug)]
@@ -319,14 +295,22 @@ impl HomeAction {
 /// that waits for an answer.
 #[derive(Debug, Default)]
 pub struct Home {
-    focus: Focus,
-    menu: usize,
+    palette_key: PaletteKey,
     selected: usize,
     dialog: Option<(Dialog, Pending)>,
     note: Option<&'static str>,
 }
 
 impl Home {
+    /// Returns the home screen whose palette opens with `palette_key`.
+    #[must_use]
+    pub fn new(palette_key: PaletteKey) -> Self {
+        Self {
+            palette_key,
+            ..Self::default()
+        }
+    }
+
     /// Returns the selected row.
     #[must_use]
     pub fn selected(&self) -> usize {
@@ -378,24 +362,13 @@ impl Home {
         }
         match input {
             PaletteInput::Escape => return Some(HomeAction::Quit),
-            PaletteInput::Tab => {
-                self.focus = match self.focus {
-                    Focus::Menu => Focus::Threads,
-                    Focus::Threads => Focus::Menu,
-                };
+            PaletteInput::Up | PaletteInput::Text('k') => {
+                self.selected = self.selected.saturating_sub(1);
             }
-            PaletteInput::Up | PaletteInput::Text('k') => self.move_by(false, rows.len()),
-            PaletteInput::Down | PaletteInput::Text('j') => self.move_by(true, rows.len()),
-            PaletteInput::Enter => {
-                return match self.focus {
-                    Focus::Menu => self.activate(self.menu, rows),
-                    Focus::Threads => {
-                        self.open_thread_menu(rows.get(self.selected));
-                        None
-                    }
-                };
+            PaletteInput::Down | PaletteInput::Text('j') if self.selected + 1 < rows.len() => {
+                self.selected += 1;
             }
-            PaletteInput::Text('t') => self.focus = Focus::Threads,
+            PaletteInput::Enter => self.open_thread_menu(rows.get(self.selected)),
             PaletteInput::Text(typed) => {
                 return HomeCommand::from_key(typed).and_then(|command| self.run(command, rows));
             }
@@ -433,35 +406,6 @@ impl Home {
         self.confirm(choice.action(row.thread.clone()))
     }
 
-    fn move_by(&mut self, down: bool, rows: usize) {
-        match (self.focus, down) {
-            (Focus::Menu, false) => self.menu = self.menu.saturating_sub(1),
-            (Focus::Menu, true) => self.menu = (self.menu + 1).min(MENU.len() - 1),
-            (Focus::Threads, false) => self.selected = self.selected.saturating_sub(1),
-            (Focus::Threads, true) if self.selected + 1 < rows => self.selected += 1,
-            (Focus::Threads, true) => {}
-        }
-    }
-
-    fn activate(&mut self, item: usize, rows: &[HomeRow]) -> Option<HomeAction> {
-        match item {
-            0 => {
-                self.focus = Focus::Threads;
-                if rows.is_empty() {
-                    self.note = Some(NO_THREADS);
-                }
-                None
-            }
-            1 => self.run(HomeCommand::New, rows),
-            2 => self.run(HomeCommand::Join, rows),
-            3 => self.run(HomeCommand::Remote, rows),
-            4 => self.run(HomeCommand::Credentials, rows),
-            5 => self.run(HomeCommand::Card, rows),
-            6 => self.run(HomeCommand::Help, rows),
-            _ => self.run(HomeCommand::Quit, rows),
-        }
-    }
-
     fn open_thread_menu(&mut self, selected: Option<&HomeRow>) {
         let Some(row) = selected else {
             self.note = Some(NO_THREADS);
@@ -493,15 +437,20 @@ impl Home {
     }
 
     fn open_help(&mut self) {
-        let lines = [
+        let lines = vec![
             "mahi runs coding agents in a sandbox. A thread is one piece of work: its agents, \
-             each in its own worktree, and the history of what they did.",
+             each in its own worktree, and the history of what they did."
+                .to_owned(),
             "Ending a thread keeps its history; resuming brings its worktrees back. Purging \
-             deletes it.",
+             deletes it."
+                .to_owned(),
+            format!(
+                "{} opens the palette, which lists every action with its key.",
+                self.palette_key
+            ),
         ];
         let mut rows = vec![
-            ["tab", "switch", "move between the menu and the threads"].map(str::to_owned),
-            ["↑↓ j k", "move", "go up and down the focused list"].map(str::to_owned),
+            ["↑↓ j k", "move", "go up and down the threads"].map(str::to_owned),
             ["enter", "open", "open the menu of what is selected"].map(str::to_owned),
         ];
         let commands = HOME_COMMANDS.into_iter().filter_map(|command| {
@@ -515,7 +464,7 @@ impl Home {
         rows.extend(commands);
         let dialog = Dialog::table(
             "Help",
-            lines.iter().map(|line| (*line).to_owned()).collect(),
+            lines,
             ["key", "action", "what it does"].map(str::to_owned),
             rows,
         );
@@ -537,10 +486,7 @@ impl Home {
     pub fn render(&self, view: &HomeView<'_>, status: &str, area: Rect, buffer: &mut Buffer) {
         let [body, footer] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
-        let [sidebar, main] =
-            Layout::horizontal([Constraint::Length(SIDEBAR_WIDTH), Constraint::Fill(1)])
-                .areas(body);
-        self.render_menu(sidebar, buffer);
+        let main = body;
         let activity_rows = ACTIVITY_HEIGHT
             .min(main.height.saturating_sub(THREADS_LEAST))
             .max(ACTIVITY_LEAST)
@@ -549,37 +495,14 @@ impl Home {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(activity_rows)]).areas(main);
         self.render_threads(view.rows, threads, buffer);
         Self::render_activity(view.activity, self.note.unwrap_or(status), activity, buffer);
-        Line::from(self.footer_hints(usize::from(footer.width))).render(footer, buffer);
+        Line::from(self.footer_hints()).render(footer, buffer);
         if let Some((dialog, _)) = &self.dialog {
             dialog.render(area, buffer);
         }
     }
 
-    fn render_menu(&self, area: Rect, buffer: &mut Buffer) {
-        let focused = self.focus == Focus::Menu;
-        let items: Vec<ListItem<'_>> = MENU
-            .iter()
-            .map(|(label, key)| {
-                ListItem::new(Line::from(vec![
-                    Span::raw(format!(" {label}")),
-                    Span::styled(format!("  {key}"), Theme::muted()),
-                ]))
-            })
-            .collect();
-        let list = List::new(items)
-            .block(panel("Menu", focused))
-            .highlight_style(if focused {
-                Theme::selected()
-            } else {
-                Style::new().add_modifier(Modifier::BOLD)
-            });
-        let mut state = ListState::default().with_selected(Some(self.menu));
-        StatefulWidget::render(list, area, buffer, &mut state);
-    }
-
     fn render_threads(&self, rows: &[HomeRow], area: Rect, buffer: &mut Buffer) {
-        let focused = self.focus == Focus::Threads;
-        let block = panel(&format!("Threads · {}", rows.len()), focused);
+        let block = panel(&format!("Threads · {}", rows.len()), true);
         if rows.is_empty() {
             let inner = block.inner(area);
             block.render(area, buffer);
@@ -618,11 +541,7 @@ impl Home {
         let table = Table::new(rows.iter().map(|thread| row(thread, full, active)), widths)
             .header(Row::new(header).style(Theme::muted().add_modifier(Modifier::BOLD)))
             .block(block)
-            .row_highlight_style(if focused {
-                Theme::selected()
-            } else {
-                Style::new().add_modifier(Modifier::REVERSED)
-            })
+            .row_highlight_style(Theme::selected())
             .highlight_symbol("› ");
         let mut state = TableState::new().with_selected(self.selected);
         StatefulWidget::render(table, area, buffer, &mut state);
@@ -672,40 +591,14 @@ impl Home {
         }
     }
 
-    /// Returns the keys of the focused part that fit in `width` columns, dropping the last of
-    /// them first, but never help and quit.
-    fn footer_hints(&self, width: usize) -> Vec<Span<'static>> {
+    /// Returns the keys the footer names: the palette's, which lists every action, help and
+    /// quitting; none while a dialog shows.
+    fn footer_hints(&self) -> Vec<Span<'static>> {
         if self.dialog.is_some() {
             return Vec::new();
         }
-        let focused: &[(&str, &str)] = match self.focus {
-            Focus::Menu => &[("↑↓ jk", "move"), ("enter", "open"), ("tab", "threads")],
-            Focus::Threads => &[
-                ("↑↓ jk", "move"),
-                ("enter", "actions"),
-                ("r", "resume"),
-                ("e", "end"),
-                ("p", "purge"),
-                ("i", "invite"),
-                ("n", "new"),
-                ("J", "join"),
-                ("tab", "menu"),
-            ],
-        };
-        let hint_width = |(key, what): &(&str, &str)| key.width() + what.width() + 3;
-        let mut left = (width + 2).saturating_sub(ALWAYS_HINTED.iter().map(hint_width).sum());
-        let mut pairs: Vec<(&str, &str)> = focused
-            .iter()
-            .take_while(|pair| {
-                let wanted = hint_width(pair);
-                let fits = wanted <= left;
-                left = left.saturating_sub(wanted);
-                fits
-            })
-            .copied()
-            .collect();
-        pairs.extend(ALWAYS_HINTED);
-        key_hints(&pairs)
+        let palette = self.palette_key.to_string();
+        key_hints(&[(palette.as_str(), "palette"), ("?", "help"), ("q", "quit")])
     }
 }
 
@@ -796,6 +689,8 @@ fn row(row: &HomeRow, full: bool, active: Option<u16>) -> Row<'_> {
 
 #[cfg(test)]
 mod tests {
+    use unicode_width::UnicodeWidthStr as _;
+
     use super::*;
 
     fn rows() -> Vec<HomeRow> {
@@ -857,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    fn arrows_move_the_selection_within_the_focused_list() {
+    fn arrows_move_the_selection_within_the_thread_list() {
         let rows = rows();
         let mut home = Home::default();
         home.key(PaletteInput::Up, &rows);
@@ -867,10 +762,8 @@ mod tests {
         assert_eq!(home.selected(), 1);
         home.fit(&rows[..1]);
         assert_eq!(home.selected(), 0);
-        home.key(PaletteInput::Tab, &rows);
-        home.key(PaletteInput::Down, &rows);
+        home.key(PaletteInput::Down, &rows[..1]);
         assert_eq!(home.selected(), 0);
-        assert!(screen(&home, &rows, "").contains("enter open"));
     }
 
     #[test]
@@ -883,17 +776,11 @@ mod tests {
         assert_eq!(home.selected(), 1);
         home.key(PaletteInput::Text('k'), &rows);
         assert_eq!(home.selected(), 0);
-        home.key(PaletteInput::Tab, &rows);
-        home.key(PaletteInput::Text('j'), &rows);
-        home.key(PaletteInput::Text('j'), &rows);
-        home.key(PaletteInput::Text('k'), &rows);
-        assert_eq!(home.key(PaletteInput::Enter, &rows), Some(HomeAction::New));
         assert_eq!(home.key(PaletteInput::Text('c'), &rows), None);
         assert_eq!(
             home.key(PaletteInput::Text('J'), &rows),
             Some(HomeAction::Join)
         );
-        assert!(screen(&home, &rows, "").contains("↑↓ jk move"));
     }
 
     #[test]
@@ -939,37 +826,22 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_opens_what_it_names() {
+    fn help_lists_the_palette_key_and_each_action_with_its_key() {
         let rows = rows();
-        let mut home = Home::default();
-        home.key(PaletteInput::Tab, &rows);
-        home.key(PaletteInput::Down, &rows);
-        assert_eq!(home.key(PaletteInput::Enter, &rows), Some(HomeAction::New));
-        home.key(PaletteInput::Down, &rows);
-        home.key(PaletteInput::Down, &rows);
-        assert_eq!(
-            home.key(PaletteInput::Enter, &rows),
-            Some(HomeAction::Remote)
-        );
-        home.key(PaletteInput::Down, &rows);
-        assert_eq!(
-            home.key(PaletteInput::Enter, &rows),
-            Some(HomeAction::Credentials)
-        );
-        home.key(PaletteInput::Down, &rows);
-        assert_eq!(home.key(PaletteInput::Enter, &rows), Some(HomeAction::Card));
-        home.key(PaletteInput::Down, &rows);
-        assert_eq!(home.key(PaletteInput::Enter, &rows), None);
+        let mut home = Home::new(PaletteKey::default());
+        assert_eq!(home.key(PaletteInput::Text('?'), &rows), None);
         assert!(home.has_dialog());
         let help = screen(&home, &rows, "");
         assert!(help.contains("Help"), "{help}");
         for row in [
+            "Ctrl-Space opens the palette, which lists every action with its key.",
             "key     action       what it does",
             "e       end          snapshot its work and remove its worktrees",
             "q esc   quit         leave mahi",
         ] {
             assert!(help.contains(row), "{help}");
         }
+        assert!(!help.contains("tab "), "{help}");
         let narrow = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 23));
         for row in [
             "r       resume       start your agent again where it stopped",
@@ -992,13 +864,6 @@ mod tests {
         }
         assert_eq!(home.key(PaletteInput::Enter, &rows), None);
         assert!(!home.has_dialog());
-        home.key(PaletteInput::Tab, &rows);
-        assert_eq!(home.key(PaletteInput::Enter, &rows), None);
-        let menu = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
-        assert!(
-            menu.contains("Invite: show a pairing code so a teammate can watch and prompt it "),
-            "{menu}"
-        );
     }
 
     #[test]
@@ -1115,7 +980,7 @@ mod tests {
         assert!(printed < told, "{drawn}");
         assert!(lines[told].trim_end().ends_with('│'), "{drawn}");
         assert!(lines[told + 1].contains('╰'), "{drawn}");
-        assert!(lines[told + 2].contains("tab menu"), "{drawn}");
+        assert!(lines[told + 2].contains("? help"), "{drawn}");
     }
 
     #[test]
@@ -1126,15 +991,7 @@ mod tests {
         let drawn = screen_in(&Home::default(), &rows, &outcome, Rect::new(0, 0, 80, 24));
         let joined: String = drawn
             .lines()
-            .map(|line| {
-                line.chars()
-                    .skip(usize::from(SIDEBAR_WIDTH) + 1)
-                    .collect::<String>()
-                    .trim_end()
-                    .trim_end_matches('│')
-                    .trim()
-                    .to_owned()
-            })
+            .map(|line| line.trim_end().trim_matches('│').trim().to_owned())
             .collect::<Vec<_>>()
             .join(" ");
         assert!(joined.contains("failed with exit code 1"), "{drawn}");
@@ -1173,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn an_80_column_screen_keeps_help_quit_and_the_agents_and_a_short_one_a_thread() {
+    fn a_narrow_screen_keeps_the_footer_and_the_agents_and_a_short_one_a_thread() {
         let rows = vec![HomeRow {
             thread: "0123456789abcdef0123456789abcdef".to_owned(),
             agents: "you.claude, bob.codex".to_owned(),
@@ -1182,21 +1039,23 @@ mod tests {
             last_active: None,
         }];
         let home = Home::default();
-        let drawn = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 24));
+        let drawn = screen_in(&home, &rows, "", Rect::new(0, 0, 56, 24));
         let keys = drawn.lines().last().unwrap();
-        assert!(keys.contains("? help  q quit"), "{drawn}");
-        assert!(keys.contains("r resume"), "{drawn}");
+        assert!(
+            keys.contains("Ctrl-Space palette  ? help  q quit"),
+            "{drawn}"
+        );
         assert!(drawn.contains("you.claude, bob.codex"), "{drawn}");
         assert!(drawn.contains("› 01234567 "), "{drawn}");
-        let wide = screen_in(&home, &rows, "", Rect::new(0, 0, 99, 24));
+        let wide = screen_in(&home, &rows, "", Rect::new(0, 0, 75, 24));
         assert!(
             wide.contains("› 0123456789abcdef0123456789abcdef"),
             "{wide}"
         );
         assert!(wide.contains("you.claude"), "{wide}");
-        let narrower = screen_in(&home, &rows, "", Rect::new(0, 0, 98, 24));
+        let narrower = screen_in(&home, &rows, "", Rect::new(0, 0, 74, 24));
         assert!(narrower.contains("› 01234567 "), "{narrower}");
-        let short = screen_in(&home, &rows, "", Rect::new(0, 0, 80, 13));
+        let short = screen_in(&home, &rows, "", Rect::new(0, 0, 56, 13));
         assert!(short.contains("› 01234567"), "{short}");
     }
 
@@ -1221,7 +1080,7 @@ mod tests {
     }
 
     #[test]
-    fn an_80_column_screen_leaves_the_last_active_column_out_so_the_agents_show() {
+    fn a_narrow_screen_leaves_the_last_active_column_out_so_the_agents_show() {
         let rows = vec![HomeRow {
             thread: "0123456789abcdef0123456789abcdef".to_owned(),
             agents: "you.claude, bob.codex".to_owned(),
@@ -1229,7 +1088,7 @@ mod tests {
             owned: true,
             last_active: Some("Nov 4 2025 09:30 UTC".to_owned()),
         }];
-        let drawn = screen_in(&Home::default(), &rows, "", Rect::new(0, 0, 80, 24));
+        let drawn = screen_in(&Home::default(), &rows, "", Rect::new(0, 0, 56, 24));
         assert!(drawn.contains("you.claude, bob.codex"), "{drawn}");
         assert!(!drawn.contains("last active"), "{drawn}");
     }
@@ -1262,13 +1121,11 @@ mod tests {
     }
 
     #[test]
-    fn the_screen_shows_menu_threads_and_activity() {
+    fn the_screen_shows_threads_activity_and_the_palette_key_without_a_menu() {
         let rows = rows();
         let home = Home::default();
         let drawn = screen(&home, &rows, "resumed t1\u{1b}[2J");
         for wanted in [
-            "Menu",
-            "New thread",
             "Threads · 2",
             "› t1",
             "you.claude",
@@ -1281,11 +1138,12 @@ mod tests {
             assert!(drawn.contains(wanted), "{wanted:?} missing:\n{drawn}");
         }
         assert!(!drawn.contains("Selected"), "{drawn}");
+        assert!(!drawn.contains("Menu"), "{drawn}");
+        assert!(!drawn.contains("New thread"), "{drawn}");
         let keys = screen(&home, &rows, "");
-        assert!(
-            keys.contains("enter actions  r resume  e end  p purge  i invite  n new"),
-            "{keys}"
-        );
+        let footer = keys.lines().last().unwrap().trim_end();
+        assert_eq!(footer, "Ctrl-Space palette  ? help  q quit", "{keys}");
+        assert!(keys.starts_with("╭ Threads"), "{keys}");
         let empty = screen(&home, &[], "");
         assert!(empty.contains("No threads yet"), "{empty}");
         for (width, height) in [(0, 0), (1, 1), (20, 6), (60, 12)] {

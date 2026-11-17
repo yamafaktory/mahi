@@ -177,7 +177,6 @@ pub(crate) fn home(environment: &Environment) -> i32 {
     };
     let showing = Showing::start(saved);
     let captured = Captured::start().ok();
-    let mut home = Home::default();
     let mut status = String::new();
     let config = ConfigDir::resolve(
         environment.home.as_deref(),
@@ -189,6 +188,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
         .and_then(|config| Settings::load(config).ok())
         .map(|settings| settings.palette_key)
         .unwrap_or_default();
+    let mut home = Home::new(palette_key);
     let mut workspace = Workspace::new(palette_key, crate::run::notice(environment));
     workspace.host_with(workspace_live(environment, config.as_ref(), &store));
     let mut last_active = ActivityCache::default();
