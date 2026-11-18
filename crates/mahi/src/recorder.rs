@@ -51,7 +51,6 @@ use crate::{
     session::{
         CommitKey,
         Recorded,
-        SNAPSHOT_MESSAGE,
     },
     source::LandingBranch,
     turn_end::{
@@ -68,7 +67,7 @@ pub(crate) struct Recorder {
     poker: Poker,
     worker: JoinHandle<Result<usize, RecordError>>,
     abandon: Arc<AtomicBool>,
-    turn_ended: Arc<TurnEnds>,
+    turns: Arc<TurnNews>,
     merges: Sender<MergeJob>,
 }
 
@@ -100,31 +99,71 @@ pub(crate) struct Merger {
     merges: Sender<MergeJob>,
 }
 
-/// Tells the recorder what the agent did: a change that asks for a snapshot soon, or the end
-/// of a turn, which a turn-end snapshot records.
+/// Tells the recorder what the agent did: a change that asks for a snapshot soon, the end of a
+/// turn, which a turn-end snapshot records, or the transcript turn open now.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentEvents {
     poker: Poker,
-    turn_ended: Arc<TurnEnds>,
+    turns: Arc<TurnNews>,
 }
 
-/// The turn end the recorder has yet to snapshot, the latest one when several came.
+/// What the recorder knows of the agent's turns, changed and read under one lock: the turn end
+/// it has yet to snapshot, the latest one when several came, and the transcript turn open now.
 #[derive(Debug, Default)]
-struct TurnEnds(Mutex<Option<EndedTurn>>);
+struct TurnNews(Mutex<TurnState>);
 
-impl TurnEnds {
-    fn note(&self, ended: EndedTurn) {
-        if let Ok(mut pending) = self.0.lock() {
-            *pending = Some(ended);
+#[derive(Debug, Default, Clone, Copy)]
+struct TurnState {
+    ended: Option<EndedTurn>,
+    open: Option<u64>,
+}
+
+impl TurnState {
+    /// Returns the turn a plain snapshot taken after this state names: the turn open, or else
+    /// the turn that ended when its turn-end snapshot was not `end_committed`, such as one that
+    /// unresolved conflicts held, so the turn's last edits still name it.
+    fn plain_turn(self, end_committed: bool) -> Option<u64> {
+        self.open.or(match self.ended {
+            Some(EndedTurn::Sealed(turn)) if !end_committed => Some(turn),
+            Some(EndedTurn::Sealed(_) | EndedTurn::Unsealed) | None => None,
+        })
+    }
+}
+
+impl TurnNews {
+    fn end(&self, ended: EndedTurn) {
+        if let Ok(mut state) = self.0.lock() {
+            *state = TurnState {
+                ended: Some(ended),
+                open: None,
+            };
         }
     }
 
-    fn take(&self) -> Option<EndedTurn> {
-        self.0.lock().ok().and_then(|mut pending| pending.take())
+    fn open(&self, turn: Option<u64>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.open = turn;
+        }
+    }
+
+    fn take(&self) -> TurnState {
+        self.0.lock().map_or_else(
+            |_| TurnState::default(),
+            |mut state| TurnState {
+                ended: state.ended.take(),
+                open: state.open,
+            },
+        )
     }
 }
 
 impl AgentEvents {
+    /// Takes in the transcript turn open now, which the snapshots taken until the next call
+    /// name, or that none is.
+    pub(crate) fn turn_open(&self, turn: Option<u64>) {
+        self.turns.open(turn);
+    }
+
     /// Asks for a snapshot soon, as when the agent used a tool.
     pub(crate) fn changed(&self) {
         self.poker.poke();
@@ -133,7 +172,7 @@ impl AgentEvents {
     /// Asks for a turn-end snapshot of `ended` at once, taken before any merge and even when
     /// the worktree did not change.
     pub(crate) fn turn_ended(&self, ended: EndedTurn) {
-        self.turn_ended.note(ended);
+        self.turns.end(ended);
         self.poker.poke_now();
     }
 }
@@ -193,7 +232,9 @@ pub(crate) enum RecordError {
 /// or its tree leaves a conflict kept in `kept` unresolved.
 #[derive(Debug, Clone, Copy)]
 enum SnapshotKind<'msg> {
-    Plain,
+    Plain {
+        turn: Option<u64>,
+    },
     TurnEnd {
         message: &'msg str,
         last_ended: Option<ObjectId>,
@@ -206,7 +247,7 @@ enum SnapshotKind<'msg> {
 struct Signals<'sig> {
     scheduler: Scheduler,
     merges: &'sig Receiver<MergeJob>,
-    turn_ended: &'sig TurnEnds,
+    turns: &'sig TurnNews,
     abandon: &'sig AtomicBool,
 }
 
@@ -215,8 +256,8 @@ impl Recorder {
     pub(crate) fn start(target: Target, first: Recorded, schedule: Schedule) -> Self {
         let (scheduler, poker) = Scheduler::new(schedule);
         let abandon = Arc::new(AtomicBool::new(false));
-        let turn_ended = Arc::new(TurnEnds::default());
-        let (stop, ended) = (Arc::clone(&abandon), Arc::clone(&turn_ended));
+        let turns = Arc::new(TurnNews::default());
+        let (stop, news) = (Arc::clone(&abandon), Arc::clone(&turns));
         let (merges, jobs) = mpsc::channel();
         let worker = thread::spawn(move || {
             record(
@@ -225,7 +266,7 @@ impl Recorder {
                 Signals {
                     scheduler,
                     merges: &jobs,
-                    turn_ended: &ended,
+                    turns: &news,
                     abandon: &stop,
                 },
             )
@@ -234,7 +275,7 @@ impl Recorder {
             poker,
             worker,
             abandon,
-            turn_ended,
+            turns,
             merges,
         }
     }
@@ -243,7 +284,7 @@ impl Recorder {
     pub(crate) fn events(&self) -> AgentEvents {
         AgentEvents {
             poker: self.poker.clone(),
-            turn_ended: Arc::clone(&self.turn_ended),
+            turns: Arc::clone(&self.turns),
         }
     }
 
@@ -283,7 +324,9 @@ fn record(
         let trigger = signals.scheduler.wait();
         let closing = trigger == Trigger::Closed;
         let mut changed = false;
-        if let Some(ended) = signals.turn_ended.take() {
+        let state = signals.turns.take();
+        let mut end_committed = false;
+        if let Some(ended) = state.ended {
             let turn_end = turn_end::message(&target.slot, ended);
             let kind = SnapshotKind::TurnEnd {
                 message: &turn_end,
@@ -296,6 +339,7 @@ fn record(
                 skipped = *left_out;
             }
             if last.commit != before {
+                end_committed = true;
                 last_ended = Some(last.commit);
             }
             let (ended_changed, error) = settle(outcome.map(|(changed, _)| changed), closing);
@@ -319,7 +363,9 @@ fn record(
             &store,
             target,
             &mut last,
-            SnapshotKind::Plain,
+            SnapshotKind::Plain {
+                turn: state.plain_turn(end_committed),
+            },
             attempts,
             abandon,
         );
@@ -401,8 +447,9 @@ fn snapshot(
     };
     let skipped = taken.skipped.len();
     let changed = taken.tree != last.tree;
+    let plain;
     let message = match kind {
-        SnapshotKind::Plain if !changed => return Ok((false, skipped)),
+        SnapshotKind::Plain { .. } if !changed => return Ok((false, skipped)),
         SnapshotKind::TurnEnd { last_ended, .. } if !changed && last_ended == Some(last.commit) => {
             return Ok((false, skipped));
         }
@@ -411,7 +458,10 @@ fn snapshot(
         {
             return Ok((false, skipped));
         }
-        SnapshotKind::Plain => SNAPSHOT_MESSAGE,
+        SnapshotKind::Plain { turn } => {
+            plain = turn_end::snapshot_message(None, turn);
+            &plain
+        }
         SnapshotKind::TurnEnd { message, .. } => message,
     };
     last.commit = append_snapshot(
@@ -448,9 +498,12 @@ mod tests {
     use super::*;
     use crate::{
         merged::MergedFrom,
-        session::tests::{
-            repository_on_main,
-            start_with,
+        session::{
+            SNAPSHOT_MESSAGE,
+            tests::{
+                repository_on_main,
+                start_with,
+            },
         },
         source::Source,
     };
@@ -635,6 +688,47 @@ mod tests {
                 "snapshot\n\nMahi-Turn-End: {}\nMahi-Thread: {}\n",
                 started.slot, started.thread
             )
+        );
+    }
+
+    #[test]
+    fn a_snapshot_taken_while_a_turn_is_open_names_that_turn_and_one_between_turns_none() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut started = start_with(&store, &signer).unwrap();
+        let zero = store.head(&started.snapshots).unwrap();
+        let recorder = Recorder::start(
+            Target {
+                git_dir: store.common_dir().to_path_buf(),
+                slot: started.slot.clone(),
+                worktree: crate::session::worktree_name(started.thread, started.slot.agent()),
+                snapshots: started.snapshots.clone(),
+                globals: GlobalPatterns::default(),
+                commits: CommitKey::new(signer.clone()).unwrap(),
+            },
+            started.first_snapshot.take().unwrap(),
+            fast(),
+        );
+        let events = recorder.events();
+        events.turn_open(Some(3));
+        fs::write(started.worktree.join("during"), "in turn 3").unwrap();
+        events.changed();
+        let during = wait_for_new_head(&store, &started.snapshots, zero);
+        events.turn_open(None);
+        fs::write(started.worktree.join("between"), "between turns").unwrap();
+        events.changed();
+        let between = wait_for_new_head(&store, &started.snapshots, Some(during));
+        recorder.finish().unwrap();
+        assert_eq!(
+            store.commit_message(during).unwrap(),
+            format!(
+                "snapshot\n\nMahi-Turn: 3\nMahi-Thread: {}\n",
+                started.thread
+            )
+        );
+        assert_eq!(
+            store.commit_message(between).unwrap(),
+            format!("snapshot\n\nMahi-Thread: {}\n", started.thread)
         );
     }
 
@@ -1635,6 +1729,29 @@ mod tests {
         assert_eq!(
             turn_ends_after(&merging.store, &merging.started.snapshots, merge_commit),
             0
+        );
+    }
+
+    #[test]
+    fn a_plain_snapshot_names_the_open_turn_or_a_turn_whose_end_took_no_snapshot() {
+        let state = |ended, open| TurnState { ended, open };
+        assert_eq!(state(None, Some(3)).plain_turn(false), Some(3));
+        assert_eq!(state(None, None).plain_turn(false), None);
+        assert_eq!(
+            state(Some(EndedTurn::Sealed(5)), None).plain_turn(false),
+            Some(5)
+        );
+        assert_eq!(
+            state(Some(EndedTurn::Sealed(5)), None).plain_turn(true),
+            None
+        );
+        assert_eq!(
+            state(Some(EndedTurn::Unsealed), None).plain_turn(false),
+            None
+        );
+        assert_eq!(
+            state(Some(EndedTurn::Sealed(5)), Some(6)).plain_turn(false),
+            Some(6)
         );
     }
 

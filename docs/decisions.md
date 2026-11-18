@@ -1109,6 +1109,24 @@ the notice's title: `Removing an earlier pairing from origin…`, only when this
 `Publishing where to find you on origin…`. The other choices were numbered steps, or a checklist
 that keeps each finished step.
 
+## D134 · 2026-11-18 · Every snapshot taken in a turn names that turn
+
+Step 1 of the plan the user approved for #148 (D111). Only a turn-end snapshot named its transcript
+turn (D122). Now a snapshot taken while a turn is open, after a tool call, on the timer or at exit,
+names that turn in the same signed trailer, `Mahi-Turn: <number>`. During the work, not by the user:
+- A turn is open from the first hook message after the last turn end, the session start included,
+  and one too large to record, until the next turn end. The transcript seals that turn with those
+  events.
+- A snapshot taken between turns names none: the session's first snapshot, a merge, a resume and an
+  exit outside a turn.
+- When unresolved conflicts hold a turn-end snapshot back, the snapshot of that turn's last edits
+  names the turn that ended.
+- The recorder reads the turn end and the open turn together, once per pass, so a turn's last edits
+  cannot lose their number between the two.
+- A turn whose seal fails leaves its number to the next turn the transcript seals, since the
+  transcript refuses a gap. Its snapshots then name that later turn, so a reader that traces a line
+  to a turn must check that the turn holds the line's change.
+
 ## D136 · 2026-11-20 · A new agent shows ready until its first turn
 
 Chosen by the user (#202). A new agent showed `✓ done` before the user sent any prompt, which read

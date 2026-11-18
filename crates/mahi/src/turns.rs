@@ -106,12 +106,17 @@ pub(crate) fn record(
             .session
             .as_ref()
             .map(|source| scope.spawn(move || record_sessions(transcript, source, &woken, pushes)));
-        let told = |kind: HookKind, ended: EndedTurn| {
+        let told = |kind: HookKind, ended: EndedTurn, open: Option<u64>| {
             if let Some(events) = events {
                 match kind {
-                    HookKind::Tool => events.changed(),
                     HookKind::TurnEnd => events.turn_ended(ended),
-                    HookKind::Prompt | HookKind::Asks | HookKind::SessionStart => {}
+                    HookKind::Tool => {
+                        events.turn_open(open);
+                        events.changed();
+                    }
+                    HookKind::Prompt | HookKind::Asks | HookKind::SessionStart => {
+                        events.turn_open(open);
+                    }
                 }
             }
         };
@@ -168,7 +173,7 @@ fn record_turns(
     store: &Store,
     transcript: &Transcript,
     inputs: &Receiver<Delivery>,
-    told: &dyn Fn(HookKind, EndedTurn),
+    told: &dyn Fn(HookKind, EndedTurn, Option<u64>),
     (pushes, sessions): (Option<&PushPoker>, &SyncSender<()>),
 ) -> Summary {
     let mut turns = Turns::after(transcript.tip);
@@ -191,7 +196,7 @@ fn record_turns(
             let _ = sessions.try_send(());
             pushes.inspect(|pushes| pushes.poke());
         }
-        told(message.kind, ended);
+        told(message.kind, ended, turns.open_turn());
     }
     turns.seal_or_note(store, transcript);
     turns.summary
@@ -202,6 +207,7 @@ struct Turns {
     tip: Option<TranscriptTip>,
     next_turn: u64,
     next_seq: u64,
+    open: bool,
     events: Vec<Event>,
     bytes: usize,
     summary: Summary,
@@ -219,7 +225,12 @@ impl Turns {
         }
     }
 
+    fn open_turn(&self) -> Option<u64> {
+        self.open.then_some(self.next_turn)
+    }
+
     fn push(&mut self, message: &HookMessage, time: Option<Timestamp>) {
+        self.open = true;
         let name = message.kind.as_str().as_bytes();
         let size = name.len() + 1 + message.payload.len() + EVENT_OVERHEAD;
         if self.events.len() >= MAX_EVENTS_PER_TURN || self.bytes + size > MAX_TURN_BYTES {
@@ -241,6 +252,7 @@ impl Turns {
     }
 
     fn seal_or_note(&mut self, store: &Store, transcript: &Transcript) -> EndedTurn {
+        self.open = false;
         let pending = u64::try_from(self.events.len()).unwrap_or(u64::MAX);
         match self.seal(store, transcript) {
             Ok(ended) => ended,
@@ -475,6 +487,66 @@ mod tests {
     }
 
     #[test]
+    fn a_message_too_large_to_record_still_opens_the_turn() {
+        let mut turns = Turns::default();
+        assert_eq!(turns.open_turn(), None);
+        let Delivery::Message { message, time } =
+            hook(HookKind::Prompt, &vec![b'x'; MAX_TURN_BYTES + 1])
+        else {
+            unreachable!()
+        };
+        turns.push(&message, time);
+        assert!(turns.events.is_empty());
+        assert_eq!(turns.open_turn(), Some(0));
+    }
+
+    #[test]
+    fn each_message_tells_the_turn_it_leaves_open() {
+        let (_dir, store) = repository_on_main();
+        let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut started = start_with(&store, &signer).unwrap();
+        let transcript = Transcript {
+            git_dir: store.common_dir().to_path_buf(),
+            key: Arc::new(started.key.take().unwrap()),
+            thread: started.thread,
+            slot: started.slot.clone(),
+            tip: None,
+            commits: started.commits.clone(),
+            session: None,
+        };
+        let open_after = std::cell::RefCell::new(Vec::new());
+        let told = |kind: HookKind, _: EndedTurn, open: Option<u64>| {
+            open_after.borrow_mut().push((kind, open));
+        };
+        let (sender, inputs) = mpsc::channel();
+        for (kind, payload) in [
+            (HookKind::SessionStart, &b""[..]),
+            (HookKind::Prompt, b"ask"),
+            (HookKind::Tool, b"edit"),
+            (HookKind::TurnEnd, b""),
+            (HookKind::Prompt, b"again"),
+            (HookKind::TurnEnd, b""),
+        ] {
+            sender.send(hook(kind, payload)).unwrap();
+        }
+        sender.send(Delivery::End { dropped: 0 }).unwrap();
+        let (wake, _woken) = mpsc::sync_channel(1);
+        let summary = record_turns(&store, &transcript, &inputs, &told, (None, &wake));
+        assert!(summary.error.is_none());
+        assert_eq!(
+            open_after.take(),
+            [
+                (HookKind::SessionStart, Some(0)),
+                (HookKind::Prompt, Some(0)),
+                (HookKind::Tool, Some(0)),
+                (HookKind::TurnEnd, None),
+                (HookKind::Prompt, Some(1)),
+                (HookKind::TurnEnd, None),
+            ]
+        );
+    }
+
+    #[test]
     fn a_turn_is_in_the_transcript_before_its_turn_end_asks_for_a_snapshot() {
         let (_dir, store) = repository_on_main();
         let signer = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
@@ -493,7 +565,7 @@ mod tests {
             mahi_core::RefKind::Transcript(started.slot.clone()),
         );
         let held_at_turn_end = std::cell::RefCell::new(Vec::new());
-        let told = |kind: HookKind, ended: EndedTurn| {
+        let told = |kind: HookKind, ended: EndedTurn, _: Option<u64>| {
             if kind == HookKind::TurnEnd {
                 held_at_turn_end
                     .borrow_mut()
@@ -570,7 +642,10 @@ mod tests {
         let taken = store.head(&started.snapshots).unwrap().unwrap();
         assert_eq!(
             store.commit_message(taken).unwrap(),
-            format!("snapshot\n\nMahi-Thread: {}\n", started.thread)
+            format!(
+                "snapshot\n\nMahi-Turn: 0\nMahi-Thread: {}\n",
+                started.thread
+            )
         );
         recorder.finish().unwrap();
     }

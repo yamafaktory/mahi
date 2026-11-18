@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
+    fmt::Write,
     io,
     ops::ControlFlow,
     path::{
@@ -96,16 +97,31 @@ pub(crate) enum EndedTurn {
 /// Returns the message of the snapshot that ends the turn `ended` of `slot`, which names the
 /// turn when the transcript holds it.
 pub(crate) fn message(slot: &AgentSlot, ended: EndedTurn) -> String {
-    match ended {
-        EndedTurn::Sealed(turn) => {
-            format!("{SNAPSHOT_MESSAGE}\n\n{TRAILER}{slot}\n{TURN_TRAILER}{turn}\n")
-        }
-        EndedTurn::Unsealed => format!("{SNAPSHOT_MESSAGE}\n\n{TRAILER}{slot}\n"),
-    }
+    let turn = match ended {
+        EndedTurn::Sealed(turn) => Some(turn),
+        EndedTurn::Unsealed => None,
+    };
+    snapshot_message(Some(slot), turn)
 }
 
-/// Returns the transcript turn a turn-end snapshot's `message` names, when exactly one line of
-/// its trailers names one in decimal digits.
+/// Returns the message of a snapshot, with the trailer that ends a turn of `ended_by` when it
+/// ends one, and the one that names the transcript `turn` it was taken in, when it was.
+pub(crate) fn snapshot_message(ended_by: Option<&AgentSlot>, turn: Option<u64>) -> String {
+    let mut message = String::from(SNAPSHOT_MESSAGE);
+    if ended_by.is_some() || turn.is_some() {
+        message.push_str("\n\n");
+    }
+    if let Some(slot) = ended_by {
+        let _ = writeln!(message, "{TRAILER}{slot}");
+    }
+    if let Some(turn) = turn {
+        let _ = writeln!(message, "{TURN_TRAILER}{turn}");
+    }
+    message
+}
+
+/// Returns the transcript turn a snapshot's `message` names, when exactly one line of its
+/// trailers names one in decimal digits.
 fn turn_of(message: &[u8]) -> Option<u64> {
     let mut named = message
         .split(|byte| *byte == b'\n')
@@ -126,7 +142,7 @@ pub(crate) fn ends_turn_of(message: &[u8], slot: &str) -> bool {
         .any(|named| named == slot.as_bytes())
 }
 
-/// Returns when the turn that `slot`'s turn-end snapshot `commit` in `thread` names happened:
+/// Returns when the turn that `slot`'s snapshot `commit` in `thread` names happened:
 /// the newest time its events carry, found within the newest [`MAX_TURNS_BACK`] turns of
 /// `slot`'s transcript, which `key` opens.
 pub(crate) fn turn_time(
