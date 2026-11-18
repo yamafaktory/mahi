@@ -66,6 +66,7 @@ pub(crate) struct TestServer {
     pending_opener: Option<Opener>,
     session_id: Option<[u8; 32]>,
     first: bool,
+    held: Vec<Vec<u8>>,
 }
 
 pub(crate) fn host_key(algorithm: HostKeyAlgorithm) -> PrivateKey {
@@ -109,10 +110,20 @@ impl TestServer {
             pending_opener: None,
             session_id: None,
             first: true,
+            held: Vec::new(),
         }
     }
 
     pub(crate) fn send(&mut self, payload: &[u8]) {
+        let allowed = matches!(payload.first(), Some(1..=4 | 7..=49));
+        if self.server_kexinit.is_some() && !allowed {
+            self.held.push(payload.to_vec());
+        } else {
+            self.seal(payload);
+        }
+    }
+
+    fn seal(&mut self, payload: &[u8]) {
         self.sealer
             .seal(self.send_sequence, payload, &mut self.output)
             .unwrap();
@@ -295,11 +306,19 @@ impl TestServer {
             .unwrap(),
         );
         if let Some(payload) = self.before_newkeys.take() {
-            self.send(&payload);
+            self.seal(&payload);
         }
+        self.send_newkeys(sealer);
+    }
+
+    fn send_newkeys(&mut self, sealer: Sealer) {
         self.send(&[message::NEWKEYS]);
         self.sealer = sealer;
         self.send_sequence = 0;
+        self.server_kexinit = None;
+        for payload in std::mem::take(&mut self.held) {
+            self.seal(&payload);
+        }
     }
 }
 

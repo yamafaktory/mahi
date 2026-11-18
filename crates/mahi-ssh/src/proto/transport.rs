@@ -980,6 +980,40 @@ mod tests {
     }
 
     #[test]
+    fn what_the_server_answers_during_a_rekey_reaches_the_client_after_the_new_keys() {
+        let (mut client, mut server) = connected(
+            HostKeyAlgorithm::Ed25519,
+            "curve25519-sha256",
+            "aes128-gcm@openssh.com",
+        );
+        client.set_authenticated();
+        client.start_rekey().unwrap();
+        let kexinit = client.output().to_vec();
+        client.advance_output(kexinit.len());
+        server.receive(&kexinit);
+        let mut answers = [Vec::new(), Vec::new()];
+        Message::ChannelOpenConfirmation {
+            recipient: 0,
+            sender: 0,
+            window: 1 << 20,
+            max_packet: 32 << 10,
+            data: b"",
+        }
+        .encode(&mut answers[0])
+        .unwrap();
+        Message::ChannelEof { recipient: 0 }
+            .encode(&mut answers[1])
+            .unwrap();
+        for answer in &answers {
+            server.send(answer);
+        }
+        for answer in &answers {
+            assert_eq!(pump(&mut client, &mut server), Ok(Poll::Message));
+            assert_eq!(client.message(), answer);
+        }
+    }
+
+    #[test]
     fn at_most_256_kib_is_held_during_a_rekey() {
         let (mut client, _server) = connected(
             HostKeyAlgorithm::Ed25519,
@@ -1221,9 +1255,12 @@ mod tests {
             "curve25519-sha256",
             "aes256-gcm@openssh.com",
         );
-        server.auto_reply = false;
+        let mut eof = Vec::new();
+        Message::ChannelEof { recipient: 0 }
+            .encode(&mut eof)
+            .unwrap();
+        server.before_newkeys = Some(eof);
         server.send_kexinit();
-        server.send_message(Message::ChannelEof { recipient: 0 });
         assert_eq!(
             pump(&mut client, &mut server),
             Err(TransportError::Unexpected(message::CHANNEL_EOF))
