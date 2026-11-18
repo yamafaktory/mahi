@@ -1,11 +1,15 @@
 use std::ops::Range;
 
-use crate::key::PaletteKey;
+use crate::{
+    key::PaletteKey,
+    sequence::{
+        PASTE_START,
+        PasteEnd,
+    },
+};
 
 const ESC: u8 = 0x1b;
-const PASTE_START: &[u8] = b"200";
-const PASTE_START_SEQUENCE: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
+const PASTE_START_PARAMS: &[u8] = b"200";
 const MODIFY_OTHER_KEYS: u32 = 27;
 const LOCKS: u32 = 64 | 128;
 const LONGEST_NUMBER: usize = 10;
@@ -30,9 +34,8 @@ const TILDE_FUNCTIONS: [(u32, u8); 12] = [
 #[derive(Debug)]
 pub struct KeyScanner {
     key: PaletteKey,
-    pasting: bool,
+    paste: Option<PasteEnd>,
     paste_start_matched: usize,
-    paste_end_matched: usize,
 }
 
 /// A piece of what the user typed.
@@ -65,9 +68,8 @@ impl KeyScanner {
     pub fn new(key: PaletteKey) -> Self {
         Self {
             key,
-            pasting: false,
+            paste: None,
             paste_start_matched: 0,
-            paste_end_matched: 0,
         }
     }
 
@@ -86,18 +88,6 @@ impl KeyScanner {
             chunk,
             at: 0,
             pending: None,
-        }
-    }
-
-    fn follow_paste(&mut self, byte: u8) {
-        if PASTE_END.get(self.paste_end_matched) == Some(&byte) {
-            self.paste_end_matched += 1;
-            if self.paste_end_matched == PASTE_END.len() {
-                self.pasting = false;
-                self.paste_end_matched = 0;
-            }
-        } else {
-            self.paste_end_matched = usize::from(byte == ESC);
         }
     }
 }
@@ -143,18 +133,20 @@ impl Segments<'_, '_> {
     fn step(&mut self) -> Option<Found> {
         let start = self.at;
         let &byte = self.chunk.get(start)?;
-        if self.scanner.pasting {
+        if let Some(end) = &mut self.scanner.paste {
             self.at += 1;
-            self.scanner.follow_paste(byte);
+            if end.ends(byte) {
+                self.scanner.paste = None;
+            }
             return None;
         }
         if self.scanner.paste_start_matched > 0 {
             let matched = self.scanner.paste_start_matched;
             self.scanner.paste_start_matched = 0;
-            if PASTE_START_SEQUENCE.get(matched) == Some(&byte) {
+            if PASTE_START.get(matched) == Some(&byte) {
                 self.at += 1;
-                if matched + 1 == PASTE_START_SEQUENCE.len() {
-                    self.scanner.pasting = true;
+                if matched + 1 == PASTE_START.len() {
+                    self.scanner.paste = Some(PasteEnd::default());
                 } else {
                     self.scanner.paste_start_matched = matched + 1;
                 }
@@ -251,7 +243,7 @@ impl Segments<'_, '_> {
             self.at = end;
             if end == chunk.len()
                 && let Some(partial) = chunk.get(start..)
-                && PASTE_START_SEQUENCE.starts_with(partial)
+                && PASTE_START.starts_with(partial)
             {
                 self.scanner.paste_start_matched = partial.len();
             }
@@ -262,8 +254,8 @@ impl Segments<'_, '_> {
         if params_end != end {
             return None;
         }
-        if last == b'~' && params == PASTE_START {
-            self.scanner.pasting = true;
+        if last == b'~' && params == PASTE_START_PARAMS {
+            self.scanner.paste = Some(PasteEnd::default());
             return None;
         }
         let press = csi_key(self.scanner.key, params, last)?;
@@ -509,8 +501,8 @@ mod tests {
 
     #[test]
     fn a_paste_start_split_between_reads_still_starts_a_paste() {
-        for split in 1..PASTE_START_SEQUENCE.len() {
-            let (head, tail) = PASTE_START_SEQUENCE.split_at(split);
+        for split in 1..PASTE_START.len() {
+            let (head, tail) = PASTE_START.split_at(split);
             let mut rest = tail.to_vec();
             rest.extend_from_slice(b"a\0\x1b[15~b");
             assert_eq!(

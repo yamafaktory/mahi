@@ -36,6 +36,8 @@ use mahi_term::{
     AnsiBackend,
     Answer,
     Dialog,
+    PASTE_END,
+    PASTE_START,
     PaletteInput,
     PaletteKeys,
     Preselected,
@@ -70,8 +72,6 @@ const MAX_READ: usize = 1024;
 const SEQUENCE_WAIT: Duration = Duration::from_millis(30);
 const KEY_WAIT: Duration = Duration::from_millis(500);
 const ESC: u8 = 0x1b;
-const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
 const LEAVE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l";
 pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub(crate) const SPIN_EVERY: Duration = Duration::from_millis(100);

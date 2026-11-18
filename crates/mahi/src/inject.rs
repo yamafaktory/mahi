@@ -27,6 +27,8 @@ use mahi_agent::{
 use mahi_live::TurnState;
 use mahi_term::{
     Csi,
+    PASTE_START,
+    PasteEnd,
     Report,
     is_terminal_answer,
     starts_answer,
@@ -171,12 +173,15 @@ impl Line {
 }
 
 /// What reading the user's keys keeps from one read to the next: the end of a read that can
-/// still become a terminal answer, the Escapes in a row, and the input line.
+/// still become a terminal answer, the Escapes in a row, the input line, and whether a bracketed
+/// paste is open.
 #[derive(Debug)]
 struct Reading {
     unfinished: Vec<u8>,
     escapes: Escapes,
     line: Line,
+    paste: Option<PasteEnd>,
+    paste_start: usize,
 }
 
 impl Reading {
@@ -185,6 +190,8 @@ impl Reading {
             unfinished: Vec::new(),
             escapes: Escapes::new(rule),
             line: Line::Clear,
+            paste: None,
+            paste_start: 0,
         }
     }
 }
@@ -300,8 +307,9 @@ impl Activity {
         }
     }
 
-    /// Notes `bytes` the user typed, or the terminal answered, that went to the agent: text
-    /// leaves the line unfinished, Backspace takes back a character typed, Enter, Ctrl-C,
+    /// Notes `bytes` the user typed, or the terminal answered, that went to the agent: text, a
+    /// paste that holds anything or Ctrl-J leaves the line unfinished; Backspace takes back a
+    /// character typed or a Ctrl-J; Enter, Ctrl-C,
     /// Ctrl-U or Escape alone empties it, and Ctrl-C or Escape interrupts a turn; another key,
     /// such as an arrow, may open a picker or bring text back, so it leaves an empty line
     /// [`Line::Moved`] and makes typed text [`Line::Unsure`]; the terminal's answers change
@@ -315,13 +323,15 @@ impl Activity {
         }
         self.touched();
         let Ok(mut reading) = self.reading.lock() else {
-            self.took(&line_effect(Line::Unsure, bytes));
+            self.took(&line_effect(LineEffect::on(Line::Unsure), bytes));
             return;
         };
         let Reading {
             unfinished,
             escapes,
             line,
+            paste,
+            paste_start,
         } = &mut *reading;
         if bytes == [ESC] {
             if unfinished.as_slice() == [ESC] {
@@ -336,17 +346,21 @@ impl Activity {
         let read = if joined { unfinished.as_slice() } else { bytes };
         let head = read.get(..unfinished_answer_at(read)).unwrap_or_default();
         let effect = (!is_terminal_answer(head)).then(|| {
-            let opens = press_of(head).is_some_and(|press| escapes.press(press, Instant::now()));
-            let effect = if opens {
-                let mut effect = LineEffect::on(*line);
+            let opens = paste.is_none()
+                && press_of(head).is_some_and(|press| escapes.press(press, Instant::now()));
+            let mut effect = LineEffect::on(*line);
+            effect.paste = *paste;
+            effect.paste_start = *paste_start;
+            if opens {
                 effect.unsure();
-                effect
             } else {
-                line_effect(*line, read)
-            };
+                effect = line_effect(effect, read);
+            }
             if !self.asking.load(Ordering::SeqCst) {
                 *line = effect.line;
             }
+            *paste = effect.paste;
+            *paste_start = effect.paste_start;
             effect
         });
         let finished = head.len();
@@ -367,6 +381,8 @@ impl Activity {
     fn sent_prompt(&self) {
         if let Ok(mut reading) = self.reading.lock() {
             reading.escapes.forget();
+            reading.paste = None;
+            reading.paste_start = 0;
             if reading.line == Line::Moved {
                 reading.line = Line::Clear;
             }
@@ -483,12 +499,15 @@ impl Activity {
 }
 
 /// What keys did to the input line: the line they left, whether they edited it, as text,
-/// Enter or an interrupt does, and whether they interrupt a turn.
+/// Enter or an interrupt does, whether they interrupt a turn, the bracketed paste they left
+/// open, and how much of the start of a paste they ended with.
 #[derive(Debug, PartialEq, Eq)]
 struct LineEffect {
     line: Line,
     edits: bool,
     interrupts: bool,
+    paste: Option<PasteEnd>,
+    paste_start: usize,
 }
 
 impl LineEffect {
@@ -497,6 +516,8 @@ impl LineEffect {
             line,
             edits: false,
             interrupts: false,
+            paste: None,
+            paste_start: 0,
         }
     }
 
@@ -539,17 +560,44 @@ fn unfinished_answer_at(bytes: &[u8]) -> usize {
     bytes.len()
 }
 
-fn line_effect(line: Line, bytes: &[u8]) -> LineEffect {
-    let mut effect = LineEffect::on(line);
-    if bytes == [ESC] {
+fn line_effect(mut effect: LineEffect, bytes: &[u8]) -> LineEffect {
+    if bytes == [ESC] && effect.paste.is_none() {
         effect.empties(true);
         return effect;
     }
     let mut at = 0;
-    while let Some(&byte) = bytes.get(at) {
+    while let Some(rest @ &[byte, ..]) = bytes.get(at..) {
+        if let Some(end) = &mut effect.paste {
+            if end.ends(byte) {
+                effect.paste = None;
+            } else if !end.is_matching() {
+                effect.unsure();
+            }
+            at += 1;
+            continue;
+        }
+        let matched = std::mem::take(&mut effect.paste_start);
+        if matched > 0 && PASTE_START.get(matched) == Some(&byte) {
+            at += 1;
+            if matched + 1 == PASTE_START.len() {
+                effect.paste = Some(PasteEnd::default());
+            } else {
+                effect.paste_start = matched + 1;
+            }
+            continue;
+        }
+        if rest.starts_with(PASTE_START) {
+            effect.paste = Some(PasteEnd::default());
+            at += PASTE_START.len();
+            continue;
+        }
+        if rest == &PASTE_START[..2] {
+            effect.paste_start = 2;
+        }
         at += 1;
         match byte {
-            b'\r' | b'\n' | KILL_LINE => effect.empties(false),
+            b'\r' | KILL_LINE => effect.empties(false),
+            b'\n' => effect.types(),
             INTERRUPT => effect.empties(true),
             ESC => at = escape(bytes, at, &mut effect),
             BACKSPACE | CTRL_H => effect.line = effect.line.backspace(),
@@ -683,7 +731,7 @@ fn kitty_key(params: &[u8], effect: &mut LineEffect) {
         (Some(27), 0) | (Some(99), 4) => effect.empties(true),
         (Some(13), 0) | (Some(117), 4) => effect.empties(false),
         (Some(127), 0) => effect.line = effect.line.backspace(),
-        (Some(32..=126), 0 | 1) => effect.types(),
+        (Some(32..=126), 0 | 1) | (Some(106), 4) => effect.types(),
         (Some(code), 0 | 1) if code > 127 && !KITTY_PRIVATE_USE.contains(&code) => effect.unsure(),
         (Some(code), _) if code == 13 || KITTY_KEYPAD_TEXT.contains(&code) => effect.unsure(),
         (Some(code), _)
@@ -1304,11 +1352,103 @@ mod tests {
     }
 
     #[test]
+    fn a_newline_in_a_paste_keeps_merges_out_in_one_read_or_several() {
+        let pace = fast();
+        for reads in [
+            &[&b"\x1b[200~fix the parser\n\x1b[201~"[..]][..],
+            &[b"\x1b[200~fix the", b" parser\r\n", b"\x1b[201~"],
+            &[b"\x1b[200~\n\x1b[201~"],
+        ] {
+            let activity = Activity::default();
+            for read in reads {
+                activity.keys(read);
+            }
+            thread::sleep(pace.quiet);
+            assert!(!activity.is_idle(&pace), "{reads:?}");
+            activity.keys(b"\x7f");
+            thread::sleep(pace.quiet);
+            assert!(!activity.is_idle(&pace), "{reads:?}");
+            activity.keys(b"\r");
+            thread::sleep(pace.quiet);
+            assert!(activity.is_idle(&pace), "{reads:?}");
+        }
+    }
+
+    #[test]
+    fn a_paste_split_inside_either_marker_still_opens_and_closes() {
+        let pace = fast();
+        let whole: &[u8] = b"draft \x1b[200~fix\r\x1b[201~";
+        let markers = [6..12, 16..22];
+        let cuts = markers
+            .into_iter()
+            .flat_map(|marker| marker.start + 2..marker.end);
+        for cut in cuts {
+            let activity = Activity::default();
+            activity.keys(&whole[..cut]);
+            activity.keys(&whole[cut..]);
+            thread::sleep(pace.quiet);
+            assert!(!activity.is_idle(&pace), "cut at {cut}");
+            activity.keys(b"\r");
+            thread::sleep(pace.quiet);
+            assert!(activity.is_idle(&pace), "cut at {cut}");
+        }
+        let activity = Activity::default();
+        activity.keys(b"\x1b[200~fix\x1b");
+        activity.keys(b"\x1b");
+        activity.keys(b"[201~");
+        activity.keys(b"\r");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+    }
+
+    #[test]
+    fn a_prompt_ends_a_paste_whose_end_mahi_never_saw() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.keys(b"\x1b[200~fix");
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(HookKind::TurnEnd, b"");
+        activity.keys(b"\r");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+    }
+
+    #[test]
+    fn escapes_inside_a_paste_open_no_picker() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.keys(b"\x1b[200~x");
+        activity.keys(b"\x1b\x1b");
+        activity.keys(b"[201~");
+        activity.keys(b"\r");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+    }
+
+    #[test]
+    fn ctrl_j_adds_a_newline_that_backspace_takes_back() {
+        let pace = fast();
+        let activity = Activity::default();
+        activity.keys(b"first line\n");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+        let activity = Activity::default();
+        activity.keys(b"\n");
+        thread::sleep(pace.quiet);
+        assert!(!activity.is_idle(&pace));
+        activity.keys(b"\x7f");
+        thread::sleep(pace.quiet);
+        assert!(activity.is_idle(&pace));
+    }
+
+    #[test]
     fn an_escape_before_another_escape_leaves_the_line_unfinished_in_one_read_or_two() {
         let unfinished = LineEffect {
             line: Line::Unsure,
             edits: true,
             interrupts: false,
+            paste: None,
+            paste_start: 0,
         };
         for bytes in [
             &b"\x1b\x1b"[..],
@@ -1316,7 +1456,11 @@ mod tests {
             b"\x1b\x1b[12;40R",
             b"\x1b[I\x1b\x1b[O",
         ] {
-            assert_eq!(line_effect(Line::Clear, bytes), unfinished, "{bytes:?}");
+            assert_eq!(
+                line_effect(LineEffect::on(Line::Clear), bytes),
+                unfinished,
+                "{bytes:?}"
+            );
         }
         let pace = fast();
         for reads in [
@@ -1338,11 +1482,13 @@ mod tests {
 
     #[test]
     fn the_line_state_comes_from_keys_not_from_sequences() {
-        let effect = |bytes: &[u8]| line_effect(Line::Clear, bytes);
+        let effect = |bytes: &[u8]| line_effect(LineEffect::on(Line::Clear), bytes);
         let left = |line: Line, edits: bool, interrupts: bool| LineEffect {
             line,
             edits,
             interrupts,
+            paste: None,
+            paste_start: 0,
         };
         assert_eq!(effect(b"abc"), left(Line::Typed(3), true, false));
         assert_eq!(effect(b"abc\r"), left(Line::Moved, true, false));
@@ -1354,6 +1500,19 @@ mod tests {
         assert_eq!(effect(b"\x1b[13u"), left(Line::Moved, true, false));
         assert_eq!(effect(b"\x1b[97u"), left(Line::Typed(1), true, false));
         assert_eq!(effect(b"\x1bx"), left(Line::Unsure, true, false));
+        assert_eq!(effect(b"abc\n"), left(Line::Typed(4), true, false));
+        assert_eq!(effect(b"\x1b[106;5u"), left(Line::Typed(1), true, false));
+        assert_eq!(
+            effect(b"\x1b[200~\x1b[201~"),
+            left(Line::Clear, false, false)
+        );
+        assert_eq!(
+            effect(b"\x1b[200~a\r"),
+            LineEffect {
+                paste: Some(PasteEnd::default()),
+                ..left(Line::Unsure, true, false)
+            }
+        );
         for answer in [
             &b"\x1b[12;40R"[..],
             b"\x1b[?62;22c",
@@ -1385,7 +1544,7 @@ mod tests {
 
     #[test]
     fn backspace_takes_back_each_character_typed_and_any_other_edit_leaves_the_line_unsure() {
-        let after = |line: Line, bytes: &[u8]| line_effect(line, bytes).line;
+        let after = |line: Line, bytes: &[u8]| line_effect(LineEffect::on(line), bytes).line;
         assert_eq!(after(Line::Clear, b"ab\x7f"), Line::Typed(1));
         assert_eq!(after(Line::Clear, b"ab\x7f\x08"), Line::Clear);
         assert_eq!(after(Line::Typed(2), b"\x1b[127u\x1b[127u"), Line::Clear);
@@ -1409,7 +1568,7 @@ mod tests {
 
     #[test]
     fn a_kitty_chord_or_a_split_sequence_never_counts_a_line_back_to_empty() {
-        let after = |line: Line, bytes: &[u8]| line_effect(line, bytes).line;
+        let after = |line: Line, bytes: &[u8]| line_effect(LineEffect::on(line), bytes).line;
         for unsure in [
             &b"ab\x1b[97;5u\x7f\x7f"[..],
             b"ab\x1b[98;3u\x7f\x7f",

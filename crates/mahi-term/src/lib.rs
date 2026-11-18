@@ -82,6 +82,9 @@ pub use scan::{
 pub use screen::AnsiBackend;
 pub use sequence::{
     Csi,
+    PASTE_END,
+    PASTE_START,
+    PasteEnd,
     is_terminal_answer,
     starts_answer,
     string_end,

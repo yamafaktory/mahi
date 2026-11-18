@@ -1,6 +1,40 @@
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 
+/// The sequence that starts a bracketed paste.
+pub const PASTE_START: &[u8] = b"\x1b[200~";
+/// The sequence that ends a bracketed paste.
+pub const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Follows the bytes of an open bracketed paste, one at a time and across reads, to find
+/// [`PASTE_END`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PasteEnd {
+    matched: usize,
+}
+
+impl PasteEnd {
+    /// Takes in the next byte of the paste, and returns whether it ends the paste.
+    pub fn ends(&mut self, byte: u8) -> bool {
+        if PASTE_END.get(self.matched) == Some(&byte) {
+            self.matched += 1;
+            if self.matched == PASTE_END.len() {
+                self.matched = 0;
+                return true;
+            }
+        } else {
+            self.matched = usize::from(byte == ESC);
+        }
+        false
+    }
+
+    /// Whether the bytes taken in last may start [`PASTE_END`], so they are not pasted text yet.
+    #[must_use]
+    pub fn is_matching(&self) -> bool {
+        self.matched > 0
+    }
+}
+
 /// The parts of a control sequence (`ESC [`) whose parameters start at a given byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Csi<'bytes> {
@@ -149,6 +183,22 @@ fn two_numbers(params: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paste_ends_at_its_end_marker_however_the_bytes_are_split() {
+        let pasted: &[u8] = b"a\x1b[201b\x1b\x1b[201~";
+        let mut end = PasteEnd::default();
+        let ended: Vec<usize> = (0..pasted.len())
+            .filter(|&at| end.ends(pasted[at]))
+            .collect();
+        assert_eq!(ended, [pasted.len() - 1]);
+        assert!(!end.is_matching());
+        let mut end = PasteEnd::default();
+        assert!(!end.ends(0x1b));
+        assert!(end.is_matching());
+        assert!(!end.ends(b'x'));
+        assert!(!end.is_matching());
+    }
 
     #[test]
     fn a_string_ends_past_bel_or_esc_backslash_and_at_a_control_byte_that_cuts_it() {

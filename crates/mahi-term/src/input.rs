@@ -1,10 +1,12 @@
 use mahi_core::is_invisible;
 
-use crate::sequence::string_end;
+use crate::sequence::{
+    PASTE_START,
+    PasteEnd,
+    string_end,
+};
 
 const ESC: u8 = 0x1b;
-const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
 const LONGEST_NUMBER: usize = 10;
 const SHIFT: u32 = 1;
 const CTRL: u32 = 4;
@@ -47,16 +49,15 @@ pub enum PaletteInput {
 /// accept or reject.
 #[derive(Debug, Default)]
 pub struct PaletteKeys {
-    pasting: bool,
+    paste: Option<PasteEnd>,
     paste_start_matched: usize,
-    paste_end_matched: usize,
 }
 
 impl PaletteKeys {
     /// Returns whether a bracketed paste has started and not ended.
     #[must_use]
     pub fn is_pasting(&self) -> bool {
-        self.pasting
+        self.paste.is_some()
     }
 
     /// Reads `chunk` and calls `on` with each key it holds, until `on` returns `false`, and
@@ -66,7 +67,7 @@ impl PaletteKeys {
     pub fn read(&mut self, chunk: &[u8], mut on: impl FnMut(PaletteInput) -> bool) -> usize {
         let mut at = 0;
         while let Some(rest) = chunk.get(at..).filter(|rest| !rest.is_empty()) {
-            let (used, input) = if self.pasting {
+            let (used, input) = if self.paste.is_some() {
                 self.pasted(rest)
             } else {
                 self.typed(rest)
@@ -85,17 +86,15 @@ impl PaletteKeys {
         let Some(&byte) = rest.first() else {
             return (0, None);
         };
-        if PASTE_END.get(self.paste_end_matched) == Some(&byte) {
-            self.paste_end_matched += 1;
-            if self.paste_end_matched == PASTE_END.len() {
-                self.pasting = false;
-                self.paste_end_matched = 0;
-            }
+        let Some(end) = &mut self.paste else {
+            return self.typed(rest);
+        };
+        if end.ends(byte) {
+            self.paste = None;
             return (1, None);
         }
-        if self.paste_end_matched > 0 {
-            self.paste_end_matched = 0;
-            return (0, None);
+        if end.is_matching() {
+            return (1, None);
         }
         match byte {
             b'\r' | b'\n' => return (1, Some(PaletteInput::Pasted('\n'))),
@@ -116,14 +115,14 @@ impl PaletteKeys {
         let matched = std::mem::take(&mut self.paste_start_matched);
         if matched > 0 && PASTE_START.get(matched) == Some(&byte) {
             if matched + 1 == PASTE_START.len() {
-                self.pasting = true;
+                self.paste = Some(PasteEnd::default());
             } else {
                 self.paste_start_matched = matched + 1;
             }
             return (1, None);
         }
         if rest.starts_with(PASTE_START) {
-            self.pasting = true;
+            self.paste = Some(PasteEnd::default());
             return (PASTE_START.len(), None);
         }
         if rest.len() > 1 && PASTE_START.starts_with(rest) {
@@ -274,6 +273,7 @@ fn number(digits: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sequence::PASTE_END;
 
     fn inputs(chunks: &[&[u8]]) -> Vec<PaletteInput> {
         let mut keys = PaletteKeys::default();

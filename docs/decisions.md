@@ -1050,3 +1050,16 @@ answers nothing. The other choice was to ask every terminal. During the work, no
 - The home screen's key reader skips a whole OSC or DCS string that ends in the same read.
 - The terminal modes go back to the user's own after the query, as before. A late reply that comes
   before raw mode turns on can still echo once.
+
+## D129 · 2026-11-18 · A paste and Ctrl-J leave the agent's input line unfinished
+
+From the issue the user wrote (#176). mahi emptied the line on every `\r` and `\n`, so a
+bracketed paste that held a newline, and Codex's Ctrl-J newline, left the line counted as empty
+while text stayed in it. Merges could then come in over a draft. Now a newline inside a paste, and
+Ctrl-J (`\n`, or `CSI 106;5u` in the kitty keyboard protocol), leave the line unfinished. During
+the work, not by the user: a paste that holds anything makes the line unsure, since an agent can
+fold a paste into one placeholder that a single Backspace removes. An empty paste changes nothing.
+Ctrl-J counts as one character typed, which Backspace takes back. A paste marker split between two
+reads still counts, and a prompt hook closes a paste whose end mahi never saw, such as one the
+palette took. `mahi-term` now holds the paste markers and `PasteEnd`, the one rule that finds the
+end of a paste, which the palette's key readers use too.
