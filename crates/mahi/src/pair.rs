@@ -83,6 +83,7 @@ use crate::{
         Prompt,
         TerminalPrompt,
     },
+    remote::RemoteName,
     sync::{
         self,
         PairRemoteError,
@@ -195,14 +196,15 @@ pub(crate) fn invite_by_code(
             .map_err(|error| PairingError::Remote(PairRemoteError::Setup(error.into())))?
             .ok_or(PairingError::NoRemote)?
             .name;
-        crate::ui::show_notice(vec![format!("Getting a pairing code ready on {remote}…")]);
         let _lock = lock_pairing(store)?;
-        clear_leftover(store, environment)?;
+        clear_leftover(store, environment, &remote)?;
+        PairStep::Reach(inviter.relays).show();
         let listener = PairListener::bind(inviter.relays)?;
         let found = listener.address(RELAY_WAIT)?;
         let host = place_of(&found, inviter.relays)?;
         let place = place_bytes(&host, inviter.relays).map_err(PairingError::Place)?;
         let commit = store.write_pairing(&place)?;
+        PairStep::Publish(&remote).show();
         let slot = publish(store, environment, commit)?;
         let deadline = Instant::now() + PAIRING_WAIT;
         let paired = PairingCode::random(slot)
@@ -213,7 +215,7 @@ pub(crate) fn invite_by_code(
                 drop(prompt);
                 owner_pairs(&listener, &code, deadline, (store, (thread, role), inviter))
             });
-        crate::ui::show_notice(vec![format!("Removing the pairing code from {remote}…")]);
+        PairStep::Unpublish(&remote).show();
         unpublish(store, environment, slot, commit);
         paired.map(|name| {
             format!("added {name} to thread {thread}; they join with the ticket mahi sent them\n")
@@ -334,12 +336,51 @@ fn unpublish(store: &Store, environment: &Environment, slot: u16, commit: Object
 
 /// Removes a pairing ref an earlier pairing in this clone left behind, as its record says; a
 /// new pairing does not start while that ref cannot be removed, so its record is never lost.
-fn clear_leftover(store: &Store, environment: &Environment) -> Result<(), PairingError> {
-    match read_record(store) {
-        Some((slot, commit)) if !unpublish(store, environment, slot, commit) => {
-            Err(PairingError::Leftover(slot))
+fn clear_leftover(
+    store: &Store,
+    environment: &Environment,
+    remote: &RemoteName,
+) -> Result<(), PairingError> {
+    let Some((slot, commit)) = read_record(store) else {
+        return Ok(());
+    };
+    PairStep::RemoveLeftover(remote).show();
+    if unpublish(store, environment, slot, commit) {
+        Ok(())
+    } else {
+        Err(PairingError::Leftover(slot))
+    }
+}
+
+/// A step mahi goes through while it gets a pairing code ready on a remote, or removes it, which
+/// the invite dialog shows while it runs.
+#[derive(Debug, Clone, Copy)]
+enum PairStep<'remote> {
+    /// Removing the pairing an earlier run left on the remote.
+    RemoveLeftover(&'remote RemoteName),
+    /// Finding where the teammate reaches this mahi, on the relay or on the local network.
+    Reach(Relays),
+    /// Publishing where to find this mahi on the remote.
+    Publish(&'remote RemoteName),
+    /// Removing the pairing code from the remote once the wait ends.
+    Unpublish(&'remote RemoteName),
+}
+
+impl PairStep<'_> {
+    fn text(self) -> String {
+        match self {
+            Self::RemoveLeftover(remote) => format!("Removing an earlier pairing from {remote}…"),
+            Self::Reach(Relays::Public) => "Reaching the relay…".to_owned(),
+            Self::Reach(Relays::Disabled) => {
+                "Finding your address on the local network…".to_owned()
+            }
+            Self::Publish(remote) => format!("Publishing where to find you on {remote}…"),
+            Self::Unpublish(remote) => format!("Removing the pairing code from {remote}…"),
         }
-        _ => Ok(()),
+    }
+
+    fn show(self) {
+        crate::ui::show_notice(vec![self.text()]);
     }
 }
 
@@ -619,6 +660,26 @@ mod tests {
         gix::init(dir.path()).unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn each_step_of_getting_a_pairing_code_ready_names_what_it_does() {
+        assert_eq!(
+            PairStep::RemoveLeftover(&"origin".parse().unwrap()).text(),
+            "Removing an earlier pairing from origin…"
+        );
+        assert_eq!(
+            PairStep::Reach(Relays::Public).text(),
+            "Reaching the relay…"
+        );
+        assert_eq!(
+            PairStep::Reach(Relays::Disabled).text(),
+            "Finding your address on the local network…"
+        );
+        assert_eq!(
+            PairStep::Publish(&"origin".parse().unwrap()).text(),
+            "Publishing where to find you on origin…"
+        );
     }
 
     #[test]

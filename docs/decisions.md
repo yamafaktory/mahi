@@ -1099,3 +1099,12 @@ on the terminal. During the work, not by the user:
 - What the threads the workspace hosts report while the agents stop waits until the row is
   cleared.
 - A stop signal while the agents stop clears the row, then ends mahi with that signal, as before.
+
+## D133 · 2026-11-18 · The invite dialog shows each step of getting a pairing code ready
+
+Chosen by the user (#163). The invite dialog showed only `Getting a pairing code ready on origin…`
+until the code appeared. Now each step shows while it runs, each line in place of the last, under
+the notice's title: `Removing an earlier pairing from origin…`, only when this clone recorded one;
+`Reaching the relay…`, or `Finding your address on the local network…` when relays are off; then
+`Publishing where to find you on origin…`. The other choices were numbered steps, or a checklist
+that keeps each finished step.

@@ -6914,7 +6914,19 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             home.terminal.write_all(b"i").unwrap();
             home.wait_for("What may they do with your agents?");
             home.terminal.write_all(b"1").unwrap();
-            let before = home.wait_for("Getting a pairing code ready on up…");
+            let before = home.wait_for("Publishing where to find you on up…");
+            let reaching = before
+                .find("Finding your address on the local network…")
+                .unwrap_or_else(|| panic!("no step before publishing: {before}"));
+            assert!(
+                reaching < before.find("Publishing where to find you on up…").unwrap(),
+                "{before}"
+            );
+            assert!(!before.contains("Removing an earlier pairing"), "{before}");
+            let mut parser = vt100::Parser::new(24, 200, 0);
+            parser.process(before.as_bytes());
+            let shown = parser.screen().contents();
+            assert!(!shown.contains("Finding your address"), "{shown}");
             assert!(!before.contains("Tell this code"), "{before}");
             let spun = home.wait_for("⠙");
             assert!(!spun.contains("Tell this code"), "{spun}");
@@ -7008,9 +7020,9 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             home.terminal.write_all(b"i").unwrap();
             home.wait_for("What may they do with your agents?");
             home.terminal.write_all(b"1").unwrap();
-            home.wait_for("Getting a pairing code ready on up…");
+            home.wait_for("Publishing where to find you on up…");
             let size = WindowSize { rows: 21, cols: 90 };
-            let spinning = drawn_again(&home, size, "Getting a pairing code ready on up…");
+            let spinning = drawn_again(&home, size, "Publishing where to find you on up…");
             whole_box(&spinning, "mahi");
             home.wait_for("Tell this code to your teammate");
             let size = WindowSize { rows: 20, cols: 80 };
@@ -7021,6 +7033,44 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());
             assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
+        }
+
+        #[test]
+        fn inviting_first_removes_a_pairing_an_earlier_run_left() {
+            let fixture = fixture();
+            let (thread, _claude) = worked_thread(&fixture);
+            let (_server, remote) = serve_remote(&fixture);
+            let head = git(&fixture.repo, &["rev-parse", "HEAD"]);
+            let record = fixture.repo.join(".git/mahi/pairing");
+            fs::create_dir_all(record.parent().unwrap()).unwrap();
+            fs::write(&record, format!("7 {}\n", head.trim())).unwrap();
+            let mut home = Driven::start(
+                terminal_command(&fixture, &[])
+                    .env("MAHI_LIVE", "local")
+                    .spawn()
+                    .unwrap(),
+            );
+            home.wait_for(&thread);
+            home.terminal.write_all(b"i").unwrap();
+            home.wait_for("What may they do with your agents?");
+            home.terminal.write_all(b"1").unwrap();
+            let shown = home.wait_for("Tell this code to your teammate");
+            let removing = shown
+                .find("Removing an earlier pairing from up…")
+                .unwrap_or_else(|| panic!("no leftover step: {shown}"));
+            assert!(
+                removing
+                    < shown
+                        .find("Finding your address on the local network…")
+                        .unwrap(),
+                "{shown}"
+            );
+            home.terminal.write_all(b"\x03").unwrap();
+            home.wait_for(&format!("mahi invite --collaborator {thread} failed"));
+            home.terminal.write_all(b"q").unwrap();
+            assert_eq!(home.exit_code(), 0, "{}", home.text());
+            assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
+            assert!(!record.exists());
         }
 
         fn resume_quietly(fixture: &Fixture, thread: &str, agent: &Path) -> (i32, String) {
