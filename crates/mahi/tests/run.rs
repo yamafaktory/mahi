@@ -6901,7 +6901,9 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
             let (server, remote) = serve_remote(&fixture);
             let forced = server.dir.path().join("forced.sh");
             let script = fs::read_to_string(&forced).unwrap();
-            fs::write(&forced, script.replacen("\nexec ", "\nsleep 1\nexec ", 1)).unwrap();
+            let slowed = script.replacen("\nexec ", "\nsleep 1\nexec ", 1);
+            assert_ne!(slowed, script);
+            fs::write(&forced, slowed).unwrap();
             let mut home = Driven::start(
                 terminal_command(&fixture, &[])
                     .env("MAHI_LIVE", "local")
@@ -6951,6 +6953,70 @@ until [ -e done ] || [ $(($(date +%s) - start)) -ge 60 ]; do sleep 0.1; done
                 "{}",
                 screen(&home)
             );
+            home.wait_for(&format!("mahi invite --collaborator {thread} failed"));
+            home.terminal.write_all(b"q").unwrap();
+            assert_eq!(home.exit_code(), 0, "{}", home.text());
+            assert_eq!(git(&remote, &["for-each-ref", "refs/mahi/pair/"]), "");
+        }
+
+        fn drawn_again(home: &Driven, size: WindowSize, wanted: &str) -> String {
+            thread::sleep(Duration::from_millis(500));
+            let from = home.output.lock().unwrap().len();
+            home.child.resize(size).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let after = home.output.lock().unwrap()[from..].to_vec();
+                let mut parser = vt100::Parser::new(size.rows, size.cols, 0);
+                parser.process(&after);
+                let screen = parser.screen().contents();
+                if screen.contains(wanted) {
+                    return screen;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{wanted:?} not drawn again: {screen}"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn whole_box(screen: &str, title: &str) {
+            let top = screen
+                .lines()
+                .find(|line| line.contains(&format!("╭ {title}")))
+                .unwrap_or_else(|| panic!("no {title:?} box: {screen}"));
+            assert!(top.trim_end().ends_with('╮'), "{screen}");
+        }
+
+        #[test]
+        fn the_pairing_notice_and_code_are_drawn_again_whole_after_a_resize() {
+            let fixture = fixture();
+            let (thread, _claude) = worked_thread(&fixture);
+            let (server, remote) = serve_remote(&fixture);
+            let forced = server.dir.path().join("forced.sh");
+            let script = fs::read_to_string(&forced).unwrap();
+            let slowed = script.replacen("\nexec ", "\nsleep 3\nexec ", 1);
+            assert_ne!(slowed, script);
+            fs::write(&forced, slowed).unwrap();
+            let mut home = Driven::start(
+                terminal_command(&fixture, &[])
+                    .env("MAHI_LIVE", "local")
+                    .spawn()
+                    .unwrap(),
+            );
+            home.wait_for(&thread);
+            home.terminal.write_all(b"i").unwrap();
+            home.wait_for("What may they do with your agents?");
+            home.terminal.write_all(b"1").unwrap();
+            home.wait_for("Getting a pairing code ready on up…");
+            let size = WindowSize { rows: 21, cols: 90 };
+            let spinning = drawn_again(&home, size, "Getting a pairing code ready on up…");
+            whole_box(&spinning, "mahi");
+            home.wait_for("Tell this code to your teammate");
+            let size = WindowSize { rows: 20, cols: 80 };
+            let code = drawn_again(&home, size, "Tell this code to your teammate");
+            whole_box(&code, "Invite a teammate");
+            home.terminal.write_all(b"\x03").unwrap();
             home.wait_for(&format!("mahi invite --collaborator {thread} failed"));
             home.terminal.write_all(b"q").unwrap();
             assert_eq!(home.exit_code(), 0, "{}", home.text());

@@ -86,6 +86,7 @@ static SAVED: Mutex<Option<Termios>> = Mutex::new(None);
 static SAVED_STDERR: Mutex<Option<OwnedFd>> = Mutex::new(None);
 static NOTICE: Mutex<Notice> = Mutex::new(Notice {
     dialog: None,
+    drawn_at: None,
     spinning: false,
     asking: false,
     busy_since: None,
@@ -103,15 +104,37 @@ const CONTROL_DISABLED: u8 = 0;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("mahi's full-screen views know the disabled control value of Linux and macOS only");
 
-/// The notice a dialog shows while a command works, whether a spinner turns in its title,
-/// whether a question hides it, since when a command that has shown nothing yet works, and
-/// the thread that turns the spinner.
+/// The notice a dialog shows while a command works, the terminal's size when it was last drawn,
+/// whether a spinner turns in its title, whether a question hides it, since when a command that
+/// has shown nothing yet works, and the thread that turns the spinner.
 struct Notice {
     dialog: Option<Dialog>,
+    drawn_at: Option<WindowSize>,
     spinning: bool,
     asking: bool,
     busy_since: Option<Instant>,
     spinner: Option<Spinner>,
+}
+
+impl Notice {
+    fn was_drawn_at_another_size(&self, size: WindowSize) -> bool {
+        self.drawn_at.is_some_and(|drawn_at| drawn_at != size)
+    }
+
+    /// Whether the spinner draws the notice on a terminal of `size`: while no question hides it,
+    /// when it spins or was drawn at another size.
+    fn draws_at(&self, size: WindowSize) -> bool {
+        !self.asking && (self.spinning || self.was_drawn_at_another_size(size))
+    }
+
+    /// Takes in that a question starts or ends; one that starts hides the notice, so a still
+    /// notice is not drawn again over what follows the question.
+    fn ask(&mut self, asking: bool) {
+        self.asking = asking;
+        if asking {
+            self.drawn_at = None;
+        }
+    }
 }
 
 /// The thread that turns the spinner, and the sender whose drop stops it.
@@ -137,8 +160,9 @@ impl Spinner {
 }
 
 /// Turns the spinner every `SPIN_EVERY` until `stopped` ends: shows that mahi is working once
-/// a busy command has shown nothing for `SPIN_AFTER`, and redraws a spinning notice with the
-/// next frame in its title, through one terminal so only what changed is sent.
+/// a busy command has shown nothing for `SPIN_AFTER`, redraws a spinning notice with the next
+/// frame in its title, through one terminal so only what changed is sent, and draws a notice
+/// again whole once the terminal is no longer the size it was drawn at.
 fn spin(stopped: &mpsc::Receiver<()>) {
     let mut screen: Option<Terminal<AnsiBackend<io::Stdout>>> = None;
     let mut seen = DRAWN.load(Ordering::SeqCst);
@@ -147,10 +171,9 @@ fn spin(stopped: &mpsc::Receiver<()>) {
         let Ok(mut notice) = NOTICE.lock() else {
             return ControlFlow::Break(());
         };
-        if notice.asking {
-            return ControlFlow::Continue(());
-        }
+        let notice = &mut *notice;
         if notice.dialog.is_none()
+            && !notice.asking
             && notice
                 .busy_since
                 .is_some_and(|since| since.elapsed() >= SPIN_AFTER)
@@ -158,15 +181,19 @@ fn spin(stopped: &mpsc::Receiver<()>) {
             notice.dialog = Some(Dialog::notice("mahi", vec![WORKING.to_owned()]));
             notice.spinning = true;
         }
-        if !notice.spinning {
+        let size = terminal::size();
+        let resized = notice.was_drawn_at_another_size(size);
+        if !notice.draws_at(size) {
             return ControlFlow::Continue(());
         }
         let Some(dialog) = notice.dialog.as_mut() else {
             return ControlFlow::Continue(());
         };
-        title.clear();
-        spinner_title(tick, &mut title);
-        dialog.set_title(&title);
+        if notice.spinning {
+            title.clear();
+            spinner_title(tick, &mut title);
+            dialog.set_title(&title);
+        }
         let Ok(_drawing) = DRAWING.lock() else {
             return ControlFlow::Break(());
         };
@@ -174,14 +201,17 @@ fn spin(stopped: &mpsc::Receiver<()>) {
             return ControlFlow::Break(());
         }
         let drawn = DRAWN.load(Ordering::SeqCst);
-        if drawn != seen {
+        if drawn != seen || resized {
             screen = None;
             seen = drawn;
         }
         let _ = leave_mouse();
         if screen.is_none() {
-            let size = terminal::size();
             screen = Terminal::new(backend(size.rows, size.cols)).ok();
+            if resized && let Some(screen) = screen.as_mut() {
+                let _ = screen.clear();
+            }
+            notice.drawn_at = Some(size);
         }
         if let Some(screen) = screen.as_mut() {
             NOTICE_DRAWN.store(true, Ordering::SeqCst);
@@ -313,8 +343,9 @@ pub(crate) fn show_code(title: &str, code: &str, paragraphs: &[&str]) {
 
 fn keep_notice(dialog: Dialog, spinning: bool) {
     if let Ok(mut notice) = NOTICE.lock() {
+        notice.drawn_at = None;
         if !notice.asking {
-            let _ = show(&dialog);
+            notice.drawn_at = Some(show(&dialog).unwrap_or_else(|_| terminal::size()));
         }
         notice.dialog = Some(dialog);
         notice.spinning = spinning;
@@ -336,6 +367,7 @@ pub(crate) fn show_working() {
 pub(crate) fn clear_notice() -> bool {
     let spinner = NOTICE.lock().ok().and_then(|mut notice| {
         notice.dialog = None;
+        notice.drawn_at = None;
         notice.busy_since = None;
         notice.spinner.take()
     });
@@ -347,7 +379,7 @@ pub(crate) fn clear_notice() -> bool {
 
 fn set_asking(asking: bool) {
     if let Ok(mut notice) = NOTICE.lock() {
-        notice.asking = asking;
+        notice.ask(asking);
     }
 }
 
@@ -625,8 +657,7 @@ impl DialogPrompt {
         let takes_keys_at = Instant::now() + guard;
         let mut buffer = zeroize::Zeroizing::new([0_u8; MAX_READ]);
         loop {
-            let drawn = terminal::size();
-            show(dialog)?;
+            let drawn = show(dialog)?;
             let read = match read_keys(signals.as_ref(), &mut buffer, drawn)? {
                 Waited::Keys(read) => read,
                 Waited::Resized => continue,
@@ -778,23 +809,25 @@ pub(crate) fn clipboard_sequence(text: &str) -> Vec<u8> {
     sequence
 }
 
-/// Draws `dialog` over the full-screen view's last frame.
-fn show(dialog: &Dialog) -> io::Result<()> {
+/// Draws `dialog` over the full-screen view's last frame, and returns the terminal's size it
+/// drew at.
+fn show(dialog: &Dialog) -> io::Result<WindowSize> {
+    let size = terminal::size();
     let Ok(_drawing) = DRAWING.lock() else {
-        return Ok(());
+        return Ok(size);
     };
     if !is_showing() {
-        return Ok(());
+        return Ok(size);
     }
     DRAWN.fetch_add(1, Ordering::SeqCst);
     leave_mouse()?;
-    let size = terminal::size();
     let mut screen = Terminal::new(backend(size.rows, size.cols))?;
     if replaces_notice(dialog) {
         screen.backend_mut().drop_selection();
     }
     screen.clear()?;
-    draw_over_backdrop(&mut screen, dialog)
+    draw_over_backdrop(&mut screen, dialog)?;
+    Ok(size)
 }
 
 /// Returns whether `dialog` takes the place of a notice, which went without the key press that
@@ -1049,6 +1082,51 @@ mod tests {
         let done = spin_while((&mut out, Spin::Still), "mahi: stopping", None, || 7);
         assert_eq!(done, 7);
         assert_eq!(out, b"mahi: stopping\n");
+    }
+
+    #[test]
+    fn only_a_notice_drawn_at_another_size_is_drawn_again() {
+        let size = WindowSize { rows: 24, cols: 80 };
+        let mut notice = Notice {
+            dialog: None,
+            drawn_at: None,
+            spinning: false,
+            asking: false,
+            busy_since: None,
+            spinner: None,
+        };
+        assert!(!notice.was_drawn_at_another_size(size));
+        notice.drawn_at = Some(size);
+        assert!(!notice.was_drawn_at_another_size(size));
+        assert!(notice.was_drawn_at_another_size(WindowSize {
+            rows: 24,
+            cols: 100
+        }));
+        assert!(notice.was_drawn_at_another_size(WindowSize { rows: 30, cols: 80 }));
+    }
+
+    #[test]
+    fn a_still_notice_a_question_hid_is_not_drawn_again_after_a_resize() {
+        let drawn = WindowSize { rows: 24, cols: 80 };
+        let resized = WindowSize { rows: 20, cols: 70 };
+        let mut notice = Notice {
+            dialog: None,
+            drawn_at: Some(drawn),
+            spinning: false,
+            asking: false,
+            busy_since: None,
+            spinner: None,
+        };
+        assert!(!notice.draws_at(drawn));
+        assert!(notice.draws_at(resized));
+        notice.ask(true);
+        assert!(!notice.draws_at(resized));
+        notice.ask(false);
+        assert!(!notice.draws_at(resized));
+        notice.spinning = true;
+        assert!(notice.draws_at(drawn));
+        notice.ask(true);
+        assert!(!notice.draws_at(drawn));
     }
 
     #[test]
