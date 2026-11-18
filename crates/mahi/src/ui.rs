@@ -42,6 +42,7 @@ use mahi_term::{
     PaletteKeys,
     Preselected,
     Theme,
+    spinner,
 };
 use ratatui_core::{
     buffer::Buffer,
@@ -73,7 +74,6 @@ const SEQUENCE_WAIT: Duration = Duration::from_millis(30);
 const KEY_WAIT: Duration = Duration::from_millis(500);
 const ESC: u8 = 0x1b;
 const LEAVE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?2004l\x1b[?1049l";
-pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 pub(crate) const SPIN_EVERY: Duration = Duration::from_millis(100);
 const SPIN_AFTER: Duration = Duration::from_millis(150);
 const WORKING: &str = "working…";
@@ -228,12 +228,7 @@ impl Drop for Busy {
 
 fn spinner_title(tick: usize, title: &mut String) {
     title.push_str("mahi ");
-    title.push_str(
-        SPINNER
-            .get(tick % SPINNER.len())
-            .copied()
-            .unwrap_or_default(),
-    );
+    title.push_str(spinner(tick));
 }
 
 /// Shows `lines` in a notice whose spinner turns until the next question or the next frame
@@ -903,6 +898,8 @@ pub(crate) fn key_guard(preselected: Preselected) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use mahi_term::SPINNER;
+
     use super::*;
 
     #[test]

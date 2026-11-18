@@ -534,7 +534,7 @@ impl ThreadListKeys {
 fn key_wait(workspace: &Workspace) -> Duration {
     if workspace.is_running() {
         CHILD_WAIT
-    } else if workspace.waiting().is_some() {
+    } else if workspace.spins() {
         SPIN_EVERY
     } else {
         KEY_WAIT

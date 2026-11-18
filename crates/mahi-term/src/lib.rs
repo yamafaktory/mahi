@@ -103,6 +103,7 @@ pub use workspace::{
     OwnAgent,
     Panel,
     PanelChanges,
+    SPINNER,
     StatusAgent,
     StatusConflicts,
     StatusLanding,
@@ -114,4 +115,5 @@ pub use workspace::{
     TopBar,
     WorkspaceAgent,
     WorkspaceTab,
+    spinner,
 };

@@ -1074,3 +1074,14 @@ clear, since there is nothing to send. Enter on a moved line still leaves it mov
 send text an arrow brought back. The other choices were Shift-Tab alone, or Shift-Tab, Enter and
 Tab, though Tab can complete a path or a command. During the work, not by the user: Shift-Tab in
 the kitty keyboard protocol (`CSI 9;2u`) counts the same as `CSI Z`.
+
+## D131 · 2026-11-18 · The side panel's working marker turns like mahi's spinner
+
+From the issue the user wrote (#164). The side panel marked a working agent with a still `●`. Now
+its marker turns through the frames of the spinner that mahi's notices show, one every 100 ms, and
+a done agent's marker stays still. During the work, not by the user: the spinner's frames move to
+`mahi-term`, the workspace turns its one spinner while the shown tab's panel lists a working agent,
+as it already did while a tab waited for its host, and the pane's title and the palette keep
+`● working`, since the issue names the side panel only. On a terminal too narrow for the panel,
+the status line shows instead and the spinner still turns, at the cost of a redraw that changes
+nothing every 100 ms, which keeps one rule for when it turns.

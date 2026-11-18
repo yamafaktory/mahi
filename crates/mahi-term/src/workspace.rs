@@ -52,6 +52,19 @@ const PANEL_FROM: u16 = 100;
 const PANEL_TITLE: &str = " Thread ";
 const CHANGES_TITLE: &str = "Changes since base";
 
+/// The frames of mahi's spinner, which turns while mahi or an agent works.
+pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Returns the frame of [`SPINNER`] that shows at its `tick`, from the first frame again after
+/// the last.
+#[must_use]
+pub fn spinner(tick: usize) -> &'static str {
+    SPINNER
+        .get(tick % SPINNER.len())
+        .copied()
+        .unwrap_or_default()
+}
+
 /// What an agent in a thread's tab is doing, as the workspace shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
@@ -625,6 +638,8 @@ pub struct Panel<'a> {
     pub status: StatusLine<'a>,
     /// The worktree's changes, once they were read.
     pub changes: Option<PanelChanges<'a>>,
+    /// The frame of [`SPINNER`] that marks a working agent.
+    pub spinner: &'a str,
 }
 
 impl<'a> Panel<'a> {
@@ -648,11 +663,16 @@ impl<'a> Panel<'a> {
             lines.push(Line::default());
         }
         if let Some(own) = self.own {
-            lines.push(agent_row(own.slot, own.place, own.state));
+            lines.push(agent_row(own.slot, own.place, own.state, self.spinner));
             lines.push(Line::styled("  you", Theme::muted()));
         }
         for agent in self.status.agents {
-            lines.push(agent_row(agent.slot, agent.place, agent.state.into()));
+            lines.push(agent_row(
+                agent.slot,
+                agent.place,
+                agent.state.into(),
+                self.spinner,
+            ));
             if let Some(waits) = agent.waits {
                 let mut spans = vec![Span::raw("  ")];
                 spans.extend(turn_waits(waits));
@@ -706,15 +726,25 @@ impl<'a> Panel<'a> {
     }
 }
 
-/// Returns the row that names an agent in its participant's colour, with its state.
-fn agent_row(slot: &str, place: usize, state: AgentState) -> Line<'_> {
+/// Returns the row that names an agent in its participant's colour, with its state, which
+/// the frame `spinner` marks while the agent works.
+fn agent_row<'a>(slot: &'a str, place: usize, state: AgentState, spinner: &'a str) -> Line<'a> {
     let colour = Style::new().fg(Theme::participant(place));
-    Line::from(vec![
+    let mut spans = Vec::with_capacity(5);
+    spans.extend([
         Span::styled("● ", colour),
         Span::styled(shown(slot), colour.add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled(state.as_str(), Theme::muted()),
-    ])
+    ]);
+    match state.as_str().split_once(' ') {
+        Some((_, word)) if state == AgentState::Working => spans.extend([
+            Span::styled(spinner, Theme::muted()),
+            Span::styled(" ", Theme::muted()),
+            Span::styled(word, Theme::muted()),
+        ]),
+        _ => spans.push(Span::styled(state.as_str(), Theme::muted())),
+    }
+    Line::from(spans)
 }
 
 /// Returns the row of a changed file, its path cut from the left to leave room for its line
@@ -1010,6 +1040,14 @@ mod tests {
     ];
 
     #[test]
+    fn the_spinner_turns_through_its_frames_and_starts_again() {
+        assert_eq!(spinner(0), "⠋");
+        assert_eq!(spinner(3), "⠸");
+        assert_eq!(spinner(SPINNER.len()), spinner(0));
+        assert_ne!(spinner(3), spinner(4));
+    }
+
+    #[test]
     fn the_tab_bar_marks_the_selected_tab_and_a_thread_that_asks() {
         let tabs = [
             WorkspaceTab {
@@ -1244,12 +1282,13 @@ mod tests {
                 files: &files,
                 more: true,
             }),
+            spinner: spinner(3),
         };
         let lines = panel.lines(30);
         assert_eq!(
             texts(&lines),
             [
-                "● davy.claude  ● working",
+                "● davy.claude  ⠸ working",
                 "  you",
                 "● bob.claude  ✓ done",
                 "  a turn waits for you: changes agent settings",

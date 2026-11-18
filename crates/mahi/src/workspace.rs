@@ -73,6 +73,7 @@ use mahi_term::{
     WorkspaceTab,
     agent_mouse,
     cut_report,
+    spinner,
     split_mouse,
 };
 use ratatui_core::{
@@ -95,10 +96,7 @@ use crate::{
     palette::HELD_DETAIL,
     sync_view::SyncView,
     teammates::Teammates,
-    ui::{
-        SPIN_EVERY,
-        SPINNER,
-    },
+    ui::SPIN_EVERY,
     workspace_live::WorkspaceLive,
 };
 
@@ -397,8 +395,8 @@ pub(crate) struct Workspace {
     spin: Option<Spin>,
 }
 
-/// The spinner a tab that watches a joined thread turns until it lists an agent: its frame,
-/// and when it last turned.
+/// The spinner the shown tab turns while it waits for a joined thread's host, or while its panel
+/// shows a working agent: its frame, and when it last turned.
 #[derive(Debug, Clone, Copy)]
 struct Spin {
     frame: usize,
@@ -448,6 +446,13 @@ enum Picked {
 }
 
 impl Tab {
+    /// Returns the user's own agent the panel names: the shown one, or else the first.
+    fn own_agent(&self) -> Option<&Running> {
+        self.agents
+            .get(self.selected)
+            .or_else(|| self.agents.first())
+    }
+
     /// Returns whether the tab has nothing left to show: none of the user's agents, and it
     /// does not only watch the thread's teammates.
     fn is_done(&self) -> bool {
@@ -574,6 +579,16 @@ struct Told {
 }
 
 /// Returns the teammates `live` watches in `thread`, when the workspace hosts it.
+/// Returns whether the panel of `tab`, whose thread's teammates are `teammates`, names a working
+/// agent.
+fn shows_working(tab: &Tab, teammates: &Teammates) -> bool {
+    tab.own_agent()
+        .is_some_and(|running| running.shown_as().state == AgentState::Working)
+        || teammates
+            .agents()
+            .any(|(_, state)| state == TeammateState::Working)
+}
+
 fn teammates_of(live: Option<&WorkspaceLive>, thread: Option<ThreadId>) -> Option<&Teammates> {
     live?.teammates(thread?)
 }
@@ -1104,9 +1119,10 @@ impl Workspace {
     }
 
     /// Turns the spinner of the shown tab at `now` while it only watches a thread and lists
-    /// no agent yet; returns whether what it shows changed.
+    /// no agent yet, or while its panel shows a working agent; returns whether what it shows
+    /// changed.
     pub(crate) fn spin(&mut self, now: Instant) -> bool {
-        if !self.waits_for_host() {
+        if !self.spins() {
             return self.spin.take().is_some();
         }
         match &mut self.spin {
@@ -1118,7 +1134,7 @@ impl Workspace {
                 true
             }
             Some(spin) if now.saturating_duration_since(spin.turned) >= SPIN_EVERY => {
-                spin.frame = (spin.frame + 1) % SPINNER.len();
+                spin.frame = spin.frame.wrapping_add(1);
                 spin.turned = now;
                 true
             }
@@ -1130,21 +1146,29 @@ impl Workspace {
     /// thread's host.
     pub(crate) fn waiting(&self) -> Option<(&'static str, &'static str)> {
         let spin = self.spin.filter(|_| self.waits_for_host())?;
-        Some((SPINNER.get(spin.frame)?, WAITING_FOR_HOST))
+        Some((spinner(spin.frame), WAITING_FOR_HOST))
+    }
+
+    /// Returns whether the shown tab's spinner turns: while it waits for the thread's host, or
+    /// while its panel shows a working agent.
+    pub(crate) fn spins(&self) -> bool {
+        self.waits_for_host() || self.panel_shows_working()
+    }
+
+    fn panel_shows_working(&self) -> bool {
+        self.shown_with_teammates()
+            .is_some_and(|(tab, teammates)| shows_working(tab, teammates))
     }
 
     fn waits_for_host(&self) -> bool {
-        let Some(tab) = self
-            .selected
-            .checked_sub(1)
-            .and_then(|index| self.tabs.get(index))
-        else {
-            return false;
-        };
-        let Some(teammates) = teammates_of(self.live.as_ref(), tab.thread) else {
-            return false;
-        };
-        tab.watch_only && tab.agents.is_empty() && teammates.agents().len() == 0
+        self.shown_with_teammates().is_some_and(|(tab, teammates)| {
+            tab.watch_only && tab.agents.is_empty() && teammates.agents().len() == 0
+        })
+    }
+
+    fn shown_with_teammates(&self) -> Option<(&Tab, &Teammates)> {
+        let tab = self.tabs.get(self.selected.checked_sub(1)?)?;
+        Some((tab, teammates_of(self.live.as_ref(), tab.thread)?))
     }
 
     /// Closes the tabs that only watch threads their owners purged, as the live layer's
@@ -1876,17 +1900,13 @@ impl Workspace {
             .collect();
         let conflicts: Vec<StatusConflicts<'_>> = tab.sync.conflicts().into_iter().collect();
         let shown = tab.agents.get(tab.selected);
-        let own =
-            shown
-                .or_else(|| tab.agents.first())
-                .zip(teammates)
-                .map(|(running, teammates)| {
-                    (
-                        format!("{}.{}", teammates.own(), running.name),
-                        teammates.own_place(),
-                        running.shown_as().state,
-                    )
-                });
+        let own = tab.own_agent().zip(teammates).map(|(running, teammates)| {
+            (
+                format!("{}.{}", teammates.own(), running.name),
+                teammates.own_place(),
+                running.shown_as().state,
+            )
+        });
         let failed = shown.is_some_and(|running| running.ending == Ending::Failed);
         let screen = tab.screen(teammates);
         let failed_hints = [
@@ -1925,6 +1945,7 @@ impl Workspace {
                     files: changes.files(),
                     more: changes.more(),
                 }),
+                spinner: spinner(self.spin.map_or(0, |spin| spin.frame)),
             },
         }
         .render(screen, body, buffer);
@@ -2528,6 +2549,36 @@ mod tests {
     }
 
     #[test]
+    fn a_working_agents_marker_turns_with_the_time_and_a_done_ones_stays_still() {
+        let setup = crate::workspace_live::tests::setup();
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        workspace.host_with(Some(crate::workspace_live::tests::hosting(&setup)));
+        workspace.watch_thread(setup.thread);
+        let mut agent = running(&mut workspace, "sleep 5");
+        agent.state = AgentState::Done;
+        workspace.tabs[0].agents.push(agent);
+        let now = Instant::now();
+        assert!(!workspace.spins());
+        assert!(!workspace.spin(now));
+        workspace.tabs[0].agents[0].state = AgentState::Working;
+        assert!(workspace.spins());
+        assert!(workspace.spin(now));
+        assert_eq!(workspace.spin.map(|spin| spin.frame), Some(0));
+        assert!(!workspace.spin(now + SPIN_EVERY / 2));
+        assert!(workspace.spin(now + SPIN_EVERY));
+        assert!(workspace.spin(now + SPIN_EVERY * 2));
+        assert_eq!(workspace.spin.map(|spin| spin.frame), Some(2));
+        assert_eq!(workspace.waiting(), None);
+        workspace.tabs[0].agents[0].state = AgentState::Done;
+        assert!(workspace.spin(now + SPIN_EVERY * 3));
+        assert!(!workspace.spin(now + SPIN_EVERY * 4));
+        assert!(workspace.spin.is_none());
+    }
+
+    #[test]
     fn a_tab_that_watches_a_thread_the_workspace_cannot_host_does_not_spin() {
         let setup = crate::workspace_live::tests::setup();
         for live in [
@@ -3121,6 +3172,35 @@ mod tests {
             mahi_live::Body::Heartbeat { slot },
             Instant::now(),
         );
+    }
+
+    #[test]
+    fn the_panel_names_a_working_agent_while_a_teammates_or_the_users_own_works() {
+        let mut workspace = Workspace::new(
+            PaletteKey::default(),
+            Notice::for_terminal(TerminalHints::default()),
+        );
+        let mut teammates = Teammates::new("alice".parse().unwrap(), "alice".parse().unwrap());
+        heard(&mut teammates, "bob.claude");
+        let told = |teammates: &mut Teammates, state| {
+            teammates.apply(
+                &"bob".parse().unwrap(),
+                mahi_live::Body::State(mahi_live::StateEntry {
+                    slot: "bob.claude".parse().unwrap(),
+                    state,
+                }),
+                Instant::now(),
+            );
+        };
+        let watching = tab("a", Vec::new());
+        assert!(!shows_working(&watching, &teammates));
+        told(&mut teammates, mahi_live::TurnState::Working);
+        assert!(shows_working(&watching, &teammates));
+        told(&mut teammates, mahi_live::TurnState::Done);
+        assert!(!shows_working(&watching, &teammates));
+        let mut own = running(&mut workspace, "sleep 5");
+        own.state = AgentState::Working;
+        assert!(shows_working(&tab("b", vec![own]), &teammates));
     }
 
     #[test]
