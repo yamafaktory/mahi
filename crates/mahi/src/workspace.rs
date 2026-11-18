@@ -1340,6 +1340,11 @@ impl Workspace {
             .flat_map(|tab| tab.agents.iter_mut())
     }
 
+    /// Returns what the threads the workspace hosts report, when it hosts any.
+    pub(crate) fn live_reports(&self) -> Option<crate::live::Reports> {
+        self.live.as_ref().map(WorkspaceLive::reports)
+    }
+
     /// Asks every agent's command to end, as a stop signal does, and waits for them
     /// for at most `within`, reading what they write meanwhile so none waits on its terminal;
     /// returns how many still run, which dropping the workspace then kills.

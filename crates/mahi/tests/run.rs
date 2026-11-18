@@ -1862,6 +1862,19 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
         assert!(started.elapsed() < Duration::from_secs(25), "{output}");
         assert!(output.contains("stopping 1 agent(s)"), "{output}");
         assert!(!output.contains("were killed"), "{output}");
+        assert!(output.contains("\r⠋\u{1b}[K"), "{output}");
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        parser.process(output.as_bytes());
+        let screen = parser.screen().contents();
+        let stopping = screen
+            .lines()
+            .find(|line| line.contains("stopping 1 agent(s)"))
+            .unwrap_or_else(|| panic!("no stopping line: {screen}"));
+        assert_eq!(
+            stopping.trim_end(),
+            "mahi: stopping 1 agent(s), each with its last snapshot",
+            "{screen}"
+        );
         let store = Store::open(&fixture.repo).unwrap();
         let (_, last) = store
             .thread_refs()

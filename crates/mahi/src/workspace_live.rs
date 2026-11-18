@@ -139,6 +139,7 @@ pub(crate) struct WorkspaceLive {
     reach: Reach,
     purge_checks: PurgeChecks,
     time_zone: Option<TimeZone>,
+    reports: live::Reports,
 }
 
 /// A thread the workspace hosts: its host, the socket its agents reach it on, and the
@@ -178,7 +179,14 @@ impl WorkspaceLive {
             reach: Reach::gather(environment),
             time_zone: environment.time_zone.clone(),
             purge_checks: PurgeChecks::default(),
+            reports: live::Reports::default(),
         })
+    }
+
+    /// Returns what the threads it hosts report, which it can hold while something else owns
+    /// the terminal's rows and release after.
+    pub(crate) fn reports(&self) -> live::Reports {
+        self.reports.clone()
     }
 
     /// Hosts `thread`'s live layer with the mahi key the workspace keeps; a thread already
@@ -233,7 +241,7 @@ impl WorkspaceLive {
             owner: owner.clone(),
             relays: self.relays,
             bootstrap: live::bootstrap(&store, thread),
-            reports: live::Reports::default(),
+            reports: self.reports.clone(),
         };
         let host = LiveHost::start_on(
             (&shared, lock),

@@ -4,6 +4,7 @@ use std::{
         Read,
         Write,
     },
+    ops::ControlFlow,
     os::fd::{
         AsFd,
         OwnedFd,
@@ -142,18 +143,12 @@ fn spin(stopped: &mpsc::Receiver<()>) {
     let mut screen: Option<Terminal<AnsiBackend<io::Stdout>>> = None;
     let mut seen = DRAWN.load(Ordering::SeqCst);
     let mut title = String::new();
-    for tick in 1.. {
-        if !matches!(
-            stopped.recv_timeout(SPIN_EVERY),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ) {
-            return;
-        }
+    every_tick(stopped, |tick| {
         let Ok(mut notice) = NOTICE.lock() else {
-            return;
+            return ControlFlow::Break(());
         };
         if notice.asking {
-            continue;
+            return ControlFlow::Continue(());
         }
         if notice.dialog.is_none()
             && notice
@@ -164,19 +159,19 @@ fn spin(stopped: &mpsc::Receiver<()>) {
             notice.spinning = true;
         }
         if !notice.spinning {
-            continue;
+            return ControlFlow::Continue(());
         }
         let Some(dialog) = notice.dialog.as_mut() else {
-            continue;
+            return ControlFlow::Continue(());
         };
         title.clear();
         spinner_title(tick, &mut title);
         dialog.set_title(&title);
         let Ok(_drawing) = DRAWING.lock() else {
-            return;
+            return ControlFlow::Break(());
         };
         if !is_showing() || LEFT.load(Ordering::SeqCst) {
-            return;
+            return ControlFlow::Break(());
         }
         let drawn = DRAWN.load(Ordering::SeqCst);
         if drawn != seen {
@@ -192,7 +187,8 @@ fn spin(stopped: &mpsc::Receiver<()>) {
             NOTICE_DRAWN.store(true, Ordering::SeqCst);
             let _ = draw_over_backdrop(screen, dialog);
         }
-    }
+        ControlFlow::Continue(())
+    });
 }
 
 /// While it lives and a full-screen view owns the terminal, a command that shows nothing of
@@ -229,6 +225,71 @@ impl Drop for Busy {
 fn spinner_title(tick: usize, title: &mut String) {
     title.push_str("mahi ");
     title.push_str(spinner(tick));
+}
+
+/// Whether a terminal shows mahi's spinner: one that handles `\r` and erasing a row turns it,
+/// and a pipe, a file or a dumb terminal gets the line alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Spin {
+    /// The spinner turns on the row under the line.
+    Turning,
+    /// The line shows alone.
+    Still,
+}
+
+/// Writes `line` to `out` and runs `work`, while the spinner turns on the row under it when
+/// `spin` says so, the row cleared once `work` returns; returns what `work` returned. A stop
+/// signal among `signals` while it waits clears the row too, then ends mahi with that signal.
+pub(crate) fn spin_while<T>(
+    (out, spin): (&mut (impl Write + Send), Spin),
+    line: &str,
+    signals: Option<&TerminationSignals>,
+    work: impl FnOnce() -> T,
+) -> T {
+    let _ = writeln!(out, "{line}").and_then(|()| out.flush());
+    if spin == Spin::Still {
+        return work();
+    }
+    let (done, stopped) = mpsc::channel::<()>();
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut frame = String::new();
+            let mut draw = |text: &str| {
+                frame.clear();
+                frame.push('\r');
+                frame.push_str(text);
+                frame.push_str("\x1b[K");
+                let _ = out.write_all(frame.as_bytes()).and_then(|()| out.flush());
+            };
+            draw(spinner(0));
+            every_tick(&stopped, |tick| {
+                if let Some(signal) =
+                    signals.and_then(|signals| signals.wait_timeout(Duration::ZERO).ok().flatten())
+                {
+                    draw("");
+                    signal.reraise();
+                    std::process::exit(128 + signal.number());
+                }
+                draw(spinner(tick));
+                ControlFlow::Continue(())
+            });
+            draw("");
+        });
+        let returned = work();
+        drop(done);
+        returned
+    })
+}
+
+/// Calls `frame` with the next tick every `SPIN_EVERY`, from 1, until `stopped` ends or `frame`
+/// breaks.
+fn every_tick(stopped: &mpsc::Receiver<()>, mut frame: impl FnMut(usize) -> ControlFlow<()>) {
+    for tick in 1.. {
+        let waited = stopped.recv_timeout(SPIN_EVERY);
+        if !matches!(waited, Err(mpsc::RecvTimeoutError::Timeout)) || frame(tick).is_break() {
+            return;
+        }
+    }
 }
 
 /// Shows `lines` in a notice whose spinner turns until the next question or the next frame
@@ -935,6 +996,59 @@ mod tests {
         assert_eq!(title(1), "mahi ⠙");
         assert_eq!(title(SPINNER.len()), title(0));
         assert_ne!(title(3), title(4));
+    }
+
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Shared {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    #[test]
+    fn the_spinner_turns_under_the_line_while_the_work_runs_and_its_row_is_cleared_after() {
+        let out = Shared::default();
+        let seen = out.clone();
+        let line = "mahi: stopping 1 agent(s)";
+        let done = spin_while((&mut out.clone(), Spin::Turning), line, None, || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !seen.text().contains("\r⠙\x1b[K") {
+                assert!(Instant::now() < deadline, "{:?}", seen.text());
+                thread::sleep(Duration::from_millis(10));
+            }
+            7
+        });
+        assert_eq!(done, 7);
+        let text = out.text();
+        assert!(
+            text.starts_with("mahi: stopping 1 agent(s)\n\r⠋\x1b[K"),
+            "{text:?}"
+        );
+        assert!(text.ends_with("\r\x1b[K"), "{text:?}");
+        let mut screen = vt100::Parser::new(4, 10, 0);
+        screen.process(text.replace('\n', "\r\n").as_bytes());
+        assert_eq!(screen.screen().contents().trim_end(), line);
+    }
+
+    #[test]
+    fn a_still_spin_writes_the_line_alone() {
+        let mut out = Vec::new();
+        let done = spin_while((&mut out, Spin::Still), "mahi: stopping", None, || 7);
+        assert_eq!(done, 7);
+        assert_eq!(out, b"mahi: stopping\n");
     }
 
     #[test]

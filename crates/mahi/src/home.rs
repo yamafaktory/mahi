@@ -4,6 +4,7 @@ use std::{
     fs,
     io::{
         self,
+        IsTerminal,
         Write,
     },
     os::fd::AsFd,
@@ -242,7 +243,7 @@ pub(crate) fn home(environment: &Environment) -> i32 {
     drop(captured);
     drop(showing);
     drop(screen);
-    stop_agents(&mut workspace);
+    stop_agents(&mut workspace, environment);
     workspace.host_with(None);
     match outcome {
         Ok(()) => 0,
@@ -972,13 +973,26 @@ fn stop_thread_first(action: &HomeAction, workspace: &mut Workspace) -> Result<(
 
 /// Stops the agents the workspace still runs, once mahi has left its screen, saying so, and
 /// says how many had to be killed without their last snapshot.
-fn stop_agents(workspace: &mut Workspace) {
+fn stop_agents(workspace: &mut Workspace, environment: &Environment) {
     let count = workspace.running_count();
     if count == 0 {
         return;
     }
-    eprintln!("mahi: stopping {count} agent(s), each with its last snapshot");
-    let left = workspace.stop_all(STOP_WITHIN);
+    let line = format!("mahi: stopping {count} agent(s), each with its last snapshot");
+    let mut stderr = io::stderr();
+    let spin = if stderr.is_terminal() && terminal::answers_queries(environment.term.as_deref()) {
+        ui::Spin::Turning
+    } else {
+        ui::Spin::Still
+    };
+    let reports = workspace.live_reports();
+    reports.iter().for_each(crate::live::Reports::hold);
+    let signals = TerminationSignals::listen().ok();
+    let left = ui::spin_while((&mut stderr, spin), &line, signals.as_ref(), || {
+        workspace.stop_all(STOP_WITHIN)
+    });
+    drop(signals);
+    reports.iter().for_each(crate::live::Reports::release);
     if left > 0 {
         eprintln!(
             "mahi: {left} agent(s) did not stop within {} s and were killed without their last snapshot",

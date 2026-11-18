@@ -1085,3 +1085,17 @@ as it already did while a tab waited for its host, and the pane's title and the 
 `● working`, since the issue names the side panel only. On a terminal too narrow for the panel,
 the status line shows instead and the spinner still turns, at the cost of a redraw that changes
 nothing every 100 ms, which keeps one rule for when it turns.
+
+## D132 · 2026-11-18 · A spinner turns while the agents save their last snapshots on quit
+
+From the issue the user wrote (#165). On quit, mahi printed `mahi: stopping 1 agent(s), each
+with its last snapshot` and then nothing until it exited. Now mahi's spinner turns on the row
+under that line while the agents stop, and the row is cleared once they did, so nothing of it stays
+on the terminal. During the work, not by the user:
+- The spinner turns only when standard error is a terminal that is not `dumb`. A pipe, a file or a
+  dumb terminal gets the line alone, as before.
+- The spinner has a row of its own, so a line wider than the terminal cannot break it, and keys the
+  terminal echoes meanwhile go when the row is cleared.
+- What the threads the workspace hosts report while the agents stop waits until the row is
+  cleared.
+- A stop signal while the agents stop clears the row, then ends mahi with that signal, as before.
