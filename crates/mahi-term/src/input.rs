@@ -1,5 +1,7 @@
 use mahi_core::is_invisible;
 
+use crate::sequence::string_end;
+
 const ESC: u8 = 0x1b;
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -175,6 +177,7 @@ fn escape(rest: &[u8]) -> (usize, Option<PaletteInput>) {
     match rest.get(1) {
         None | Some(&ESC) => (1, Some(PaletteInput::Escape)),
         Some(b'[') => csi(rest),
+        Some(b']' | b'P' | b'_' | b'^' | b'X') => (string_end(rest, 2).unwrap_or(2), None),
         Some(b'O') => match rest.get(2) {
             Some(b'A') => (3, Some(PaletteInput::Up)),
             Some(b'B') => (3, Some(PaletteInput::Down)),
@@ -290,6 +293,14 @@ mod tests {
 
     fn pasted(text: &str) -> Vec<PaletteInput> {
         text.chars().map(PaletteInput::Pasted).collect()
+    }
+
+    #[test]
+    fn a_terminal_string_is_skipped_whole_and_the_keys_after_it_read() {
+        assert_eq!(inputs(&[b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\r"]), text("r"));
+        assert_eq!(inputs(&[b"\x1b]11;rgb:0/0/0\x07\x1b[?62;22cq"]), text("q"));
+        assert_eq!(inputs(&[b"\x1bP1$r0m\x1b\\x"]), text("x"));
+        assert_eq!(inputs(&[b"\x1b]ab"]), text("ab"));
     }
 
     #[test]

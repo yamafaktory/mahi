@@ -5,6 +5,7 @@ use std::{
         BorrowedFd,
     },
     process,
+    sync::Mutex,
     time::{
         Duration,
         Instant,
@@ -25,15 +26,22 @@ use mahi_term::{
     BACKGROUND_QUERY,
     Background,
     BackgroundReply,
+    ReplySplit,
 };
 use rustix::termios::{
     LocalModes,
     OptionalActions,
+    QueueSelector,
     Termios,
 };
 
 const FALLBACK_SIZE: WindowSize = WindowSize { rows: 24, cols: 80 };
-const LONGEST_REPLY: usize = 1024;
+const LATE_WAIT: Duration = Duration::from_secs(10);
+
+static AHEAD: Mutex<Ahead> = Mutex::new(Ahead {
+    keys: Vec::new(),
+    late: None,
+});
 
 /// How long mahi waits for the terminal to say what its background is.
 pub(crate) const BACKGROUND_WAIT: Duration = Duration::from_secs(1);
@@ -51,12 +59,19 @@ impl RawMode {
         if !rustix::termios::isatty(input.as_fd()) {
             return Ok(None);
         }
-        let saved = rustix::termios::tcgetattr(input.as_fd())?;
-        let mut raw = saved.clone();
-        raw.make_raw();
-        rustix::termios::tcsetattr(input.as_fd(), OptionalActions::Flush, &raw)?;
-        Ok(Some(Self { saved }))
+        Ok(Some(Self {
+            saved: make_raw(input.as_fd())?,
+        }))
     }
+}
+
+/// Puts `input` in raw mode, keeping the keys typed before, and returns the modes it had.
+fn make_raw(input: BorrowedFd<'_>) -> io::Result<Termios> {
+    let saved = rustix::termios::tcgetattr(input)?;
+    let mut raw = saved.clone();
+    raw.make_raw();
+    rustix::termios::tcsetattr(input, OptionalActions::Now, &raw)?;
+    Ok(saved)
 }
 
 impl Drop for RawMode {
@@ -111,8 +126,11 @@ pub(crate) fn background(
     if rustix::termios::tcsetattr(input, OptionalActions::Now, &raw).is_err() {
         return Background::Dark;
     }
-    let asked = read_background(input, output, wait, &signals);
+    let mut split = ReplySplit::default();
+    let mut keys = Vec::new();
+    let asked = read_background((input, output), wait, &signals, (&mut split, &mut keys));
     let _ = rustix::termios::tcsetattr(input, OptionalActions::Now, &saved);
+    keep_ahead(split, keys);
     match asked {
         Ok(background) => background,
         Err(signal) => {
@@ -124,10 +142,10 @@ pub(crate) fn background(
 }
 
 fn read_background(
-    input: BorrowedFd<'_>,
-    output: BorrowedFd<'_>,
+    (input, output): (BorrowedFd<'_>, BorrowedFd<'_>),
     wait: Duration,
     signals: &TerminationSignals,
+    (split, keys): (&mut ReplySplit, &mut Vec<u8>),
 ) -> Result<Background, Termination> {
     let mut written = 0;
     while let Some(rest) = BACKGROUND_QUERY
@@ -138,37 +156,188 @@ fn read_background(
             .ok()
             .filter(|&count| count > 0)
         else {
+            split.give_up(keys);
             return Ok(Background::Dark);
         };
         written += count;
     }
     let deadline = Instant::now() + wait;
-    let mut reply = Vec::with_capacity(LONGEST_REPLY);
     let mut chunk = [0; 256];
-    while reply.len() < LONGEST_REPLY {
+    loop {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
             return Ok(Background::Dark);
         };
         match signals.wait_for_input_within(input, left) {
             Ok(InputWait::Input) => {}
             Ok(InputWait::Signal(signal)) => return Err(signal),
-            Ok(InputWait::Timeout) | Err(_) => return Ok(Background::Dark),
+            Ok(InputWait::Timeout) => return Ok(Background::Dark),
+            Err(_) => {
+                split.give_up(keys);
+                return Ok(Background::Dark);
+            }
         }
         let Some(read) = rustix::io::read(input, &mut chunk)
             .ok()
             .and_then(|read| chunk.get(..read))
             .filter(|read| !read.is_empty())
         else {
+            split.give_up(keys);
             return Ok(Background::Dark);
         };
-        reply.extend_from_slice(read);
-        match Background::from_reply(&reply) {
+        match split.read(read, keys) {
             BackgroundReply::Told(background) => return Ok(background),
             BackgroundReply::NotTold => return Ok(Background::Dark),
             BackgroundReply::Incomplete => {}
         }
     }
-    Ok(Background::Dark)
+}
+
+/// The keys typed while mahi asked the terminal for its background, which the first read of
+/// the keys takes, and the reply that had not ended when the wait did, which later reads drop
+/// until it ends or [`LATE_WAIT`] passes.
+#[derive(Debug)]
+struct Ahead {
+    keys: Vec<u8>,
+    late: Option<(ReplySplit, Instant)>,
+}
+
+impl Ahead {
+    fn expire(&mut self, now: Instant) {
+        if let Some((mut split, _)) = self.late.take_if(|(_, until)| now >= *until) {
+            split.give_up(&mut self.keys);
+        }
+    }
+
+    fn give(&mut self, buffer: &mut [u8]) -> usize {
+        let count = self.keys.len().min(buffer.len());
+        if let (Some(into), Some(from)) = (buffer.get_mut(..count), self.keys.get(..count)) {
+            into.copy_from_slice(from);
+        }
+        self.keys.drain(..count);
+        count
+    }
+
+    fn drop_reply(&mut self, buffer: &mut [u8], read: usize) -> KeysRead {
+        let Some((split, _)) = &mut self.late else {
+            return KeysRead::Keys(read);
+        };
+        split.read(buffer.get(..read).unwrap_or_default(), &mut self.keys);
+        if split.is_ended() {
+            self.late = None;
+        }
+        match self.give(buffer) {
+            0 => KeysRead::OnlyReply,
+            given => KeysRead::Keys(given),
+        }
+    }
+}
+
+fn keep_ahead(mut split: ReplySplit, mut keys: Vec<u8>) {
+    let Ok(mut ahead) = AHEAD.lock() else {
+        return;
+    };
+    if !split.is_ended() {
+        split.wait_ended(&mut keys);
+        ahead.late = Some((split, Instant::now() + LATE_WAIT));
+    }
+    ahead.keys = keys;
+}
+
+/// What a read of the user's keys gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeysRead {
+    /// This many bytes of keys.
+    Keys(usize),
+    /// Only the terminal's late reply to the background query, which was dropped.
+    OnlyReply,
+    /// The input ended.
+    Ended,
+}
+
+/// Returns whether keys typed while mahi asked the terminal for its background wait for
+/// [`read_keys`], so a reader must not wait for `input` first.
+pub(crate) fn holds_keys() -> bool {
+    AHEAD.lock().is_ok_and(|mut ahead| {
+        ahead.expire(Instant::now());
+        !ahead.keys.is_empty()
+    })
+}
+
+/// Reads the user's keys from `input` into `buffer`: first the keys typed while mahi asked the
+/// terminal for its background, then what `input` gives, without the terminal's late reply to
+/// that query.
+pub(crate) fn read_keys(input: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<KeysRead> {
+    {
+        let mut ahead = AHEAD
+            .lock()
+            .map_err(|_| io::Error::other("the typed keys are lost"))?;
+        ahead.expire(Instant::now());
+        let given = ahead.give(buffer);
+        if given > 0 {
+            return Ok(KeysRead::Keys(given));
+        }
+    }
+    let read = loop {
+        match rustix::io::read(input, &mut *buffer) {
+            Err(rustix::io::Errno::INTR) => {}
+            read => break read?,
+        }
+    };
+    if read == 0 {
+        return Ok(KeysRead::Ended);
+    }
+    let mut ahead = AHEAD
+        .lock()
+        .map_err(|_| io::Error::other("the typed keys are lost"))?;
+    Ok(ahead.drop_reply(buffer, read))
+}
+
+/// Reads more of the user's keys from `input` into `buffer`, as [`read_keys`] does: returns how
+/// many it read, or `None` once the input ended.
+pub(crate) fn read_more(input: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+    Ok(match read_keys(input, buffer)? {
+        KeysRead::Keys(read) => Some(read),
+        KeysRead::OnlyReply => Some(0),
+        KeysRead::Ended => None,
+    })
+}
+
+/// What waiting for the user's keys gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeysWait {
+    /// Keys can be read.
+    Ready,
+    /// The reader must stop.
+    Quit,
+    /// Nothing yet.
+    Nothing,
+}
+
+/// Waits until the user's keys can be read from `input`, at once when [`read_keys`] holds some,
+/// or until `quitting` becomes readable.
+pub(crate) fn wait_for_keys(input: BorrowedFd<'_>, quitting: BorrowedFd<'_>) -> KeysWait {
+    if holds_keys() {
+        return KeysWait::Ready;
+    }
+    match mahi_sandbox::wait_readable(input, quitting) {
+        Ok((_, true)) => KeysWait::Quit,
+        Ok((false, false)) => KeysWait::Nothing,
+        Ok((true, false)) | Err(_) => KeysWait::Ready,
+    }
+}
+
+/// Throws away the keys typed so far on `input`, those [`read_keys`] holds too.
+pub(crate) fn drop_keys(input: BorrowedFd<'_>) {
+    let _ = rustix::termios::tcflush(input, QueueSelector::IFlush);
+    if let Ok(mut ahead) = AHEAD.lock() {
+        ahead.keys.clear();
+    }
+}
+
+/// Returns whether a terminal of type `term` may answer queries: a `dumb` one, such as an
+/// Emacs shell, answers none.
+pub(crate) fn answers_queries(term: Option<&str>) -> bool {
+    term != Some("dumb")
 }
 
 #[cfg(test)]
@@ -266,6 +435,105 @@ pub(crate) mod tests {
             rustix::io::read(&slave, &mut left),
             Err(rustix::io::Errno::AGAIN)
         );
+    }
+
+    fn keys_read(slave: &OwnedFd) -> Vec<u8> {
+        let mut buffer = [0; 64];
+        loop {
+            match read_keys(slave.as_fd(), &mut buffer).unwrap() {
+                KeysRead::Keys(read) => return buffer[..read].to_vec(),
+                KeysRead::OnlyReply => {}
+                KeysRead::Ended => return Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn keys_typed_while_the_terminal_answers_reach_the_first_read() {
+        let (background, _) = answered(
+            b"r\x1b]11;rgb:ffff/ffff/ffff\x07q\x1b[?62;22c",
+            Duration::from_secs(10),
+        );
+        assert_eq!(background, Background::Light);
+        assert!(holds_keys());
+        let (_master, slave) = pty_pair(24, 80);
+        assert_eq!(keys_read(&slave), b"rq");
+        assert!(!holds_keys());
+    }
+
+    #[test]
+    fn a_reply_that_comes_after_the_wait_is_dropped_and_the_keys_after_it_read() {
+        let (master, slave) = pty_pair(24, 80);
+        let background = background(slave.as_fd(), slave.as_fd(), Duration::from_millis(100));
+        assert_eq!(background, Background::Dark);
+        make_raw(slave.as_fd()).unwrap();
+        rustix::io::write(&master, b"y\x1b]11;rgb:ffff/ffff/ffff\x1b\\\x1b[?62;22cx").unwrap();
+        assert_eq!(keys_read(&slave), b"yx");
+        rustix::io::write(&master, b"\x1b[?62;22c").unwrap();
+        assert_eq!(keys_read(&slave), b"\x1b[?62;22c");
+    }
+
+    #[test]
+    fn dropping_the_keys_drops_those_typed_while_the_terminal_answered() {
+        let _ = answered(b"r\x1b[?62;22c", Duration::from_secs(10));
+        let (_master, slave) = pty_pair(24, 80);
+        drop_keys(slave.as_fd());
+        assert!(!holds_keys());
+    }
+
+    #[test]
+    fn raw_mode_keeps_the_keys_typed_before_it() {
+        let (master, slave) = pty_pair(24, 80);
+        rustix::io::write(&master, b"k").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        make_raw(slave.as_fd()).unwrap();
+        rustix::fs::fcntl_setfl(&slave, OFlags::NONBLOCK).unwrap();
+        let mut typed = [0; 8];
+        assert_eq!(rustix::io::read(&slave, &mut typed), Ok(1));
+        assert_eq!(&typed[..1], b"k");
+    }
+
+    #[test]
+    fn a_late_reply_that_does_not_end_gives_its_bytes_back_once_its_wait_passes() {
+        let mut split = ReplySplit::default();
+        let mut keys = Vec::new();
+        split.read(b"\x1b]11;rgb", &mut keys);
+        let until = Instant::now() + LATE_WAIT;
+        let mut ahead = Ahead {
+            keys,
+            late: Some((split, until)),
+        };
+        ahead.expire(until.checked_sub(Duration::from_millis(1)).unwrap());
+        assert!(ahead.keys.is_empty());
+        assert!(ahead.late.is_some());
+        ahead.expire(until);
+        assert_eq!(ahead.keys, b"\x1b]11;rgb");
+        assert!(ahead.late.is_none());
+    }
+
+    #[test]
+    fn a_terminal_that_closes_before_it_answers_leaves_no_late_reply_to_drop() {
+        let (master, slave) = pty_pair(24, 80);
+        let terminal = std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            let mut chunk = [0; 64];
+            while asked.len() < BACKGROUND_QUERY.len() {
+                let read = rustix::io::read(&master, &mut chunk).unwrap();
+                asked.extend_from_slice(&chunk[..read]);
+            }
+        });
+        let background = background(slave.as_fd(), slave.as_fd(), Duration::from_secs(10));
+        terminal.join().unwrap();
+        assert_eq!(background, Background::Dark);
+        assert!(AHEAD.lock().unwrap().late.is_none());
+    }
+
+    #[test]
+    fn only_a_dumb_terminal_is_not_asked() {
+        assert!(!answers_queries(Some("dumb")));
+        for term in [None, Some("xterm-256color"), Some("dumber")] {
+            assert!(answers_queries(term), "{term:?}");
+        }
     }
 
     #[test]

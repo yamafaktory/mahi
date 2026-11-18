@@ -27,6 +27,7 @@ pub use background::{
     BACKGROUND_QUERY,
     Background,
     BackgroundReply,
+    ReplySplit,
 };
 pub use dialog::{
     Answer,

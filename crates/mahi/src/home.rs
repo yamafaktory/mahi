@@ -99,6 +99,7 @@ use crate::{
     sync_state,
     terminal::{
         self,
+        KeysRead,
         RawMode,
     },
     thread_keys::{
@@ -311,7 +312,7 @@ impl Screen {
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        let _ = rustix::termios::tcflush(io::stdin(), rustix::termios::QueueSelector::IFlush);
+        terminal::drop_keys(io::stdin().as_fd());
         let _ = write_screen(LEAVE_SCREEN);
     }
 }
@@ -626,18 +627,21 @@ enum Chunk {
 /// Reads what was typed, waiting briefly for the rest of a sequence that starts with an
 /// escape, so a split arrow key is not read as Escape.
 fn read_chunk(signals: &TerminationSignals, buffer: &mut [u8; MAX_READ]) -> io::Result<Chunk> {
-    let mut read = read_input(buffer)?;
-    if read == 0 {
-        return Ok(Chunk::End);
-    }
+    let mut read = match terminal::read_keys(io::stdin().as_fd(), buffer)? {
+        KeysRead::Keys(read) => read,
+        KeysRead::OnlyReply => return Ok(Chunk::Read(0)),
+        KeysRead::Ended => return Ok(Chunk::End),
+    };
     while buffer.get(read - 1) == Some(&ESC) && read < MAX_READ {
         match wait(signals, SEQUENCE_WAIT)? {
             InputWait::Input => {
-                let more = read_input(buffer.get_mut(read..).unwrap_or_default())?;
-                if more == 0 {
-                    break;
+                match terminal::read_more(
+                    io::stdin().as_fd(),
+                    buffer.get_mut(read..).unwrap_or_default(),
+                )? {
+                    Some(more) => read += more,
+                    None => break,
                 }
-                read += more;
             }
             InputWait::Signal(signal) => return Ok(Chunk::Stopped(signal)),
             InputWait::Timeout => break,
@@ -657,18 +661,12 @@ fn activity(captured: Option<&Captured>) -> Vec<String> {
 }
 
 fn wait(signals: &TerminationSignals, timeout: Duration) -> io::Result<InputWait> {
+    if terminal::holds_keys() {
+        return Ok(InputWait::Input);
+    }
     signals
         .wait_for_input_within(io::stdin().as_fd(), timeout)
         .map_err(io::Error::other)
-}
-
-fn read_input(buffer: &mut [u8]) -> io::Result<usize> {
-    loop {
-        match rustix::io::read(io::stdin(), &mut *buffer) {
-            Err(rustix::io::Errno::INTR) => {}
-            read => return read.map_err(io::Error::from),
-        }
-    }
 }
 
 fn rows(place: &Place<'_>, cache: &mut ActivityCache) -> Vec<HomeRow> {

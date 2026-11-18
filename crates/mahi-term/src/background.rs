@@ -1,6 +1,8 @@
 use crate::sequence::{
     Csi,
+    starts_answer,
     string_end,
+    terminal_answer_at,
 };
 
 /// The query that asks a terminal for its background colour, followed by one every terminal
@@ -8,6 +10,8 @@ use crate::sequence::{
 pub const BACKGROUND_QUERY: &[u8] = b"\x1b]11;?\x1b\\\x1b[c";
 
 const REPLY_START: &[u8] = b"\x1b]11;";
+const ESC: u8 = 0x1b;
+const LONGEST_REPLY: usize = 1024;
 const MID_GREY_LUMINANCE: f64 = 0.184;
 
 /// Whether the terminal's background is dark or light, which picks mahi's palette.
@@ -70,6 +74,115 @@ impl Background {
             })
         })
     }
+}
+
+/// Splits what a terminal sends after [`BACKGROUND_QUERY`] into its reply and the keys typed
+/// meanwhile. The reply ends with the answer to the device query, and every byte after it is a
+/// key.
+#[derive(Debug, Default)]
+pub struct ReplySplit {
+    held: Vec<u8>,
+    reply: Vec<u8>,
+    waited: bool,
+    ended: bool,
+}
+
+impl ReplySplit {
+    /// Reads `chunk`, appends the keys it holds to `keys`, and returns what the reply tells so
+    /// far. The start of an answer that the next chunk can finish waits for it, and so does an
+    /// Escape alone or with `[` until [`ReplySplit::wait_ended`]. A string that does not start
+    /// as a terminal's answer does is keys, such as Alt-] and the text typed after it. A reply that grows past its bound ends,
+    /// and its held bytes become keys.
+    pub fn read(&mut self, chunk: &[u8], keys: &mut Vec<u8>) -> BackgroundReply {
+        if self.ended {
+            keys.extend_from_slice(chunk);
+            return self.told();
+        }
+        let joined;
+        let bytes = if self.held.is_empty() {
+            chunk
+        } else {
+            let mut held = std::mem::take(&mut self.held);
+            held.extend_from_slice(chunk);
+            joined = held;
+            &joined
+        };
+        let mut at = 0;
+        while let Some(rest) = bytes.get(at..).filter(|rest| !rest.is_empty()) {
+            if let Some(answer) = terminal_answer_at(bytes, at)
+                .and_then(|end| bytes.get(at..end))
+                .filter(|answer| is_reply(answer))
+            {
+                if self.reply.len() + answer.len() <= LONGEST_REPLY {
+                    self.reply.extend_from_slice(answer);
+                }
+                at += answer.len();
+                if answer.get(1) == Some(&b'[') && Csi::at(answer, 2).is_device_attributes() {
+                    self.ended = true;
+                    keys.extend_from_slice(bytes.get(at..).unwrap_or_default());
+                    return self.told();
+                }
+                continue;
+            }
+            if starts_answer(rest.strip_suffix(&[ESC]).unwrap_or(rest))
+                || matches!(rest, [ESC, b']' | b'P'])
+                || (!self.waited && is_csi_start(rest))
+            {
+                self.held.extend_from_slice(rest);
+                break;
+            }
+            keys.extend(rest.first());
+            at += 1;
+        }
+        if self.held.len() > LONGEST_REPLY {
+            self.give_up(keys);
+            return self.told();
+        }
+        BackgroundReply::Incomplete
+    }
+
+    /// Takes in that the wait for the reply ended: an Escape that waits alone or with `[`
+    /// becomes keys, and a later one does not wait.
+    pub fn wait_ended(&mut self, keys: &mut Vec<u8>) {
+        self.waited = true;
+        if is_csi_start(&self.held) {
+            keys.append(&mut self.held);
+        }
+    }
+
+    /// Ends the reply where it is, and appends the bytes that wait to `keys`.
+    pub fn give_up(&mut self, keys: &mut Vec<u8>) {
+        self.ended = true;
+        keys.append(&mut self.held);
+    }
+
+    /// Whether the reply ended, so every byte after it is a key.
+    #[must_use]
+    pub fn is_ended(&self) -> bool {
+        self.ended
+    }
+
+    fn told(&self) -> BackgroundReply {
+        match Background::from_reply(&self.reply) {
+            BackgroundReply::Incomplete => BackgroundReply::NotTold,
+            told => told,
+        }
+    }
+}
+
+fn is_csi_start(bytes: &[u8]) -> bool {
+    matches!(bytes, [ESC] | [ESC, b'['])
+}
+
+fn is_reply(answer: &[u8]) -> bool {
+    if answer.get(1) == Some(&b'[') {
+        return true;
+    }
+    let text = answer
+        .strip_suffix(b"\x07")
+        .or_else(|| answer.strip_suffix(b"\x1b\\"))
+        .unwrap_or(answer);
+    starts_answer(text)
 }
 
 fn find(bytes: &[u8], wanted: &[u8]) -> Option<usize> {
@@ -195,6 +308,110 @@ mod tests {
         for other in ["", "Light", "auto"] {
             assert_eq!(Background::from_name(other), None, "{other:?}");
         }
+    }
+
+    fn split(chunks: &[&[u8]]) -> (BackgroundReply, Vec<u8>, bool) {
+        let mut split = ReplySplit::default();
+        let mut keys = Vec::new();
+        let mut told = BackgroundReply::Incomplete;
+        for chunk in chunks {
+            told = split.read(chunk, &mut keys);
+        }
+        (told, keys, split.is_ended())
+    }
+
+    #[test]
+    fn keys_typed_around_the_reply_are_kept_and_the_reply_still_tells() {
+        let (told, keys, ended) = split(&[b"a\x1b]11;rgb:ffff/ffff/ffff\x07b\x1b[?62;22cc"]);
+        assert_eq!(told, BackgroundReply::Told(Background::Light));
+        assert_eq!(keys, b"abc");
+        assert!(ended);
+    }
+
+    #[test]
+    fn a_reply_split_anywhere_reads_the_same_and_gives_no_key() {
+        let whole: &[u8] = b"\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;22c";
+        for cut in 1..whole.len() {
+            let (told, keys, ended) = split(&[&whole[..cut], &whole[cut..]]);
+            assert_eq!(
+                told,
+                BackgroundReply::Told(Background::Dark),
+                "cut at {cut}"
+            );
+            assert_eq!(keys, b"", "cut at {cut}");
+            assert!(ended, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_key_sequence_typed_during_the_query_stays_whole() {
+        let (told, keys, ended) = split(&[b"\x1b[A\x1b[1;5R\x1b", b"[?62;22c"]);
+        assert_eq!(told, BackgroundReply::NotTold);
+        assert_eq!(keys, b"\x1b[A\x1b[1;5R");
+        assert!(ended);
+    }
+
+    #[test]
+    fn every_byte_after_the_device_answer_is_a_key() {
+        let (told, keys, _) = split(&[b"\x1b[?62;22c", b"\x1b]11;rgb:ffff/ffff/ffff\x07x"]);
+        assert_eq!(told, BackgroundReply::NotTold);
+        assert_eq!(keys, b"\x1b]11;rgb:ffff/ffff/ffff\x07x");
+    }
+
+    #[test]
+    fn an_escape_alone_waits_only_while_the_query_waits() {
+        let mut split = ReplySplit::default();
+        let mut keys = Vec::new();
+        split.read(b"a\x1b", &mut keys);
+        assert_eq!(keys, b"a");
+        split.wait_ended(&mut keys);
+        assert_eq!(keys, b"a\x1b");
+        split.read(b"\x1b", &mut keys);
+        assert_eq!(keys, b"a\x1b\x1b");
+        split.read(b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?62;22c", &mut keys);
+        assert_eq!(keys, b"a\x1b\x1b");
+        assert!(split.is_ended());
+    }
+
+    #[test]
+    fn giving_up_hands_back_what_waits_and_ends_the_reply() {
+        let mut split = ReplySplit::default();
+        let mut keys = Vec::new();
+        split.read(b"\x1b]11;rgb", &mut keys);
+        assert_eq!(keys, b"");
+        split.give_up(&mut keys);
+        assert_eq!(keys, b"\x1b]11;rgb");
+        assert_eq!(split.read(b"x", &mut keys), BackgroundReply::NotTold);
+        assert_eq!(keys, b"\x1b]11;rgbx");
+    }
+
+    #[test]
+    fn an_answer_cut_inside_its_terminator_is_held_until_it_ends() {
+        let whole: &[u8] = b"\x1b]2\x1b\\\x1b[?62;22c";
+        for cut in 1..whole.len() {
+            let (_, keys, ended) = split(&[&whole[..cut], &whole[cut..]]);
+            assert_eq!(keys, b"", "cut at {cut}");
+            assert!(ended, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_string_that_does_not_start_as_an_answer_is_keys_however_it_is_split() {
+        let typed: &[u8] = b"\x1b]ab\r\x1bPPP\r";
+        for cut in 0..=typed.len() {
+            let (_, keys, _) = split(&[&typed[..cut], &typed[cut..], b"\x1b[?62;22c"]);
+            assert_eq!(keys, typed, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_reply_that_never_ends_gives_its_bytes_back_as_keys_past_its_bound() {
+        let mut endless = b"\x1b]11;".to_vec();
+        endless.resize(LONGEST_REPLY + 1, b'f');
+        let (told, keys, ended) = split(&[&endless, b"x"]);
+        assert_eq!(told, BackgroundReply::NotTold);
+        assert_eq!(keys.len(), endless.len() + 1);
+        assert!(ended);
     }
 
     #[test]

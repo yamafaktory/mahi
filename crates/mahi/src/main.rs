@@ -172,7 +172,9 @@ fn main() {
         commands::connect(fd);
     }
     ui::set_true_color(ui::draws_true_color(environment.colorterm.as_deref()));
-    let may_ask = terminal::is_interactive() && terminal::is_foreground(io::stdin().as_fd());
+    let may_ask = terminal::is_interactive()
+        && terminal::is_foreground(io::stdin().as_fd())
+        && terminal::answers_queries(environment.term.as_deref());
     if let Some(background) =
         chosen_background(cli.command.as_ref(), environment.theme, may_ask, || {
             terminal::background(

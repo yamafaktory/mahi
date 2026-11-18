@@ -28,15 +28,20 @@ use rustix::{
     termios::{
         LocalModes,
         OptionalActions,
-        QueueSelector,
         Termios,
     },
 };
 use zeroize::Zeroizing;
 
-use crate::ui::{
-    self,
-    DialogPrompt,
+use crate::{
+    terminal::{
+        self,
+        KeysRead,
+    },
+    ui::{
+        self,
+        DialogPrompt,
+    },
 };
 
 const MAX_ANSWER_BYTES: usize = 1024;
@@ -144,7 +149,7 @@ impl TerminalPrompt {
             signals: &signals,
             stopped: None,
         };
-        rustix::termios::tcflush(terminal, QueueSelector::IFlush)?;
+        terminal::drop_keys(terminal.as_fd());
         let line = {
             let quiet = match typing {
                 Typing::Shown { after } if after.is_zero() => None,
@@ -154,7 +159,7 @@ impl TerminalPrompt {
             let _quiet = match typing {
                 Typing::Shown { after } if !after.is_zero() => {
                     thread::sleep(after);
-                    rustix::termios::tcflush(terminal, QueueSelector::IFlush)?;
+                    terminal::drop_keys(terminal.as_fd());
                     drop(quiet);
                     None
                 }
@@ -264,19 +269,23 @@ impl Prompt for TerminalPrompt {
 impl Read for Answer<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         loop {
-            if let Some(signal) = self
-                .signals
-                .wait_for_input(self.input.as_fd())
-                .map_err(io::Error::other)?
+            if !terminal::holds_keys()
+                && let Some(signal) = self
+                    .signals
+                    .wait_for_input(self.input.as_fd())
+                    .map_err(io::Error::other)?
             {
                 self.stopped = Some(signal);
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            match (&mut &*self.input).read(buffer) {
+            match terminal::read_keys(self.input.as_fd(), buffer) {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(NOT_READY_PAUSE);
                 }
-                result => return result,
+                Ok(KeysRead::Keys(read)) => return Ok(read),
+                Ok(KeysRead::OnlyReply) => {}
+                Ok(KeysRead::Ended) => return Ok(0),
+                Err(error) => return Err(error),
             }
         }
     }

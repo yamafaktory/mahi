@@ -54,12 +54,14 @@ use ratatui_core::{
 use rustix::termios::{
     LocalModes,
     OptionalActions,
-    QueueSelector,
     SpecialCodeIndex,
     Termios,
 };
 
-use crate::terminal;
+use crate::terminal::{
+    self,
+    KeysRead,
+};
 
 const MAX_ACTIVITY_LINES: usize = 200;
 pub(crate) const KEY_GUARD: Duration = Duration::from_millis(500);
@@ -552,7 +554,7 @@ impl DialogPrompt {
     fn ask_guarded(&mut self, mut dialog: Dialog, guard: Duration) -> io::Result<Answer> {
         let signalling = keys_make_signals_now();
         keys_make_signals(false);
-        let _ = rustix::termios::tcflush(io::stdin(), QueueSelector::IFlush);
+        terminal::drop_keys(io::stdin().as_fd());
         set_asking(true);
         let answer = self.read_answer(&mut dialog, guard);
         set_asking(false);
@@ -616,7 +618,7 @@ fn read_keys(
     buffer: &mut [u8; MAX_READ],
     drawn: WindowSize,
 ) -> io::Result<Waited> {
-    if let Some(signals) = signals {
+    if let Some(signals) = signals.filter(|_| !terminal::holds_keys()) {
         loop {
             match signals
                 .wait_for_input_within(io::stdin().as_fd(), KEY_WAIT)
@@ -633,10 +635,11 @@ fn read_keys(
             }
         }
     }
-    let mut read = read_input(buffer)?;
-    if read == 0 {
-        return Ok(Waited::Ended);
-    }
+    let mut read = match terminal::read_keys(io::stdin().as_fd(), buffer)? {
+        KeysRead::Keys(read) => read,
+        KeysRead::OnlyReply => return Ok(Waited::Keys(0)),
+        KeysRead::Ended => return Ok(Waited::Ended),
+    };
     while let Some(signals) = signals
         && buffer.get(read - 1) == Some(&ESC)
         && read < MAX_READ
@@ -646,11 +649,13 @@ fn read_keys(
             .map_err(io::Error::other)?
         {
             InputWait::Input => {
-                let more = read_input(buffer.get_mut(read..).unwrap_or_default())?;
-                if more == 0 {
-                    break;
+                match terminal::read_more(
+                    io::stdin().as_fd(),
+                    buffer.get_mut(read..).unwrap_or_default(),
+                )? {
+                    Some(more) => read += more,
+                    None => break,
                 }
-                read += more;
             }
             InputWait::Timeout | InputWait::Signal(_) => break,
         }
@@ -671,15 +676,6 @@ fn after_paste_tail(chunk: &[u8]) -> Option<&[u8]> {
         return None;
     }
     chunk.get(end + PASTE_END.len()..)
-}
-
-fn read_input(buffer: &mut [u8]) -> io::Result<usize> {
-    loop {
-        match rustix::io::read(io::stdin(), &mut *buffer) {
-            Err(rustix::io::Errno::INTR) => {}
-            read => return read.map_err(io::Error::from),
-        }
-    }
 }
 
 /// Shows `text`, which a command prints, in a dialog titled `title` under `intro`, until the

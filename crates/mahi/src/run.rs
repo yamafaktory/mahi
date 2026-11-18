@@ -258,6 +258,8 @@ use crate::{
     },
     terminal::{
         self,
+        KeysRead,
+        KeysWait,
         RawMode,
     },
     thread_lock::{
@@ -2733,14 +2735,15 @@ fn forward_input(
     let mut buffer = [0_u8; 4096];
     let mut last = b'\n';
     loop {
-        match mahi_sandbox::wait_readable(input.as_fd(), quitting.as_fd()) {
-            Ok((_, true)) => return,
-            Ok((false, false)) => continue,
-            Ok((true, false)) | Err(_) => {}
+        match terminal::wait_for_keys(input.as_fd(), quitting.as_fd()) {
+            KeysWait::Quit => return,
+            KeysWait::Nothing => continue,
+            KeysWait::Ready => {}
         }
-        let read = match rustix::io::read(&input, &mut buffer) {
-            Ok(read) => read,
-            Err(rustix::io::Errno::INTR) => continue,
+        let read = match terminal::read_keys(input.as_fd(), &mut buffer) {
+            Ok(KeysRead::Keys(read)) => read,
+            Ok(KeysRead::OnlyReply) => continue,
+            Ok(KeysRead::Ended) => 0,
             Err(_) => return,
         };
         let Ok(mut writer) = writer.lock() else {

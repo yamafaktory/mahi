@@ -1028,3 +1028,25 @@ the parser. The shared rules change two more things in a background reply, which
 terminal sends. A control byte other than BEL or `ESC` cuts the colour string, so the reply does
 not tell. The device answer that ends the wait takes any parameter byte after `ESC [ ?`, not only
 digits and `;`.
+
+## D128 · 2026-11-18 · Keys typed during the background query are kept, and a late reply is dropped
+
+Chosen by the user (#156). The query read every byte until the terminal answered, so it dropped
+the keys typed meanwhile, and a reply after the 1 s wait reached the next reader as keys. Raw mode
+also threw away every key typed before it turned on. Now the query keeps the keys apart from the
+reply, and the first read of the keys takes them. Raw mode no longer flushes the input. When the
+wait ends with no complete reply, later reads drop the reply as it arrives, up to its device
+answer, and the keys around it still act. The other choices were to keep the flush and fix only the
+home screen's key reader, or to keep the flush and still hand over the keys typed during the
+query. The user also chose to skip the query when `TERM` is `dumb`, as in an Emacs shell, which
+answers nothing. The other choice was to ask every terminal. During the work, not by the user:
+- mahi drops a late reply for 10 s at most, so a terminal that never answers cannot hold keys.
+- While the query waits, `ESC` alone or `ESC [` at the end of a read waits for the next read.
+- Every reader of the keys goes through `terminal::read_keys`, the line prompts too, and a prompt
+  that throws away the keys typed before it also throws away the kept ones.
+- A string that does not start as a terminal's answer does is keys, such as Alt-] and the text
+  after it, so the split reads the same however the bytes arrive.
+- A query that mahi could not write or read leaves no late reply to drop.
+- The home screen's key reader skips a whole OSC or DCS string that ends in the same read.
+- The terminal modes go back to the user's own after the query, as before. A late reply that comes
+  before raw mode turns on can still echo once.

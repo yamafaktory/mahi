@@ -131,6 +131,8 @@ use crate::{
     sync,
     terminal::{
         self,
+        KeysRead,
+        KeysWait,
         RawMode,
     },
     thread_lock::{
@@ -1089,15 +1091,15 @@ fn read_keys(
         let input = io::stdin();
         let mut buffer = [0_u8; 4096];
         loop {
-            match mahi_sandbox::wait_readable(input.as_fd(), quitting.as_fd()) {
-                Ok((_, true)) => return,
-                Ok((false, false)) => continue,
-                Ok((true, false)) | Err(_) => {}
+            match terminal::wait_for_keys(input.as_fd(), quitting.as_fd()) {
+                KeysWait::Quit => return,
+                KeysWait::Nothing => continue,
+                KeysWait::Ready => {}
             }
-            let read = match rustix::io::read(&input, &mut buffer) {
-                Ok(read) => read,
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(_) => 0,
+            let read = match terminal::read_keys(input.as_fd(), &mut buffer) {
+                Ok(KeysRead::Keys(read)) => read,
+                Ok(KeysRead::OnlyReply) => continue,
+                Ok(KeysRead::Ended) | Err(_) => 0,
             };
             let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
                 leave.store(true, Ordering::SeqCst);
