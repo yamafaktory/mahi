@@ -131,8 +131,8 @@ enum Line {
     /// Empty, with no key since it emptied that could open a picker or bring text back.
     Clear,
     /// Empty, but a key since may have opened a picker, brought back a past prompt or left a
-    /// draft: an arrow, Enter, which can send a command that opens a dialog, Escape, Ctrl-C or
-    /// Ctrl-U.
+    /// draft: an arrow, Enter on a line that was not clear, which can send a command that opens
+    /// a dialog, Escape, Ctrl-C or Ctrl-U.
     Moved,
     /// Holds this many characters the user typed, each of which a Backspace takes back.
     Typed(usize),
@@ -161,6 +161,13 @@ impl Line {
             Self::Typed(1) => Self::Clear,
             Self::Typed(count) => Self::Typed(count - 1),
             Self::Clear | Self::Moved | Self::Unsure => self,
+        }
+    }
+
+    fn entered(self) -> Self {
+        match self {
+            Self::Clear => Self::Clear,
+            Self::Moved | Self::Typed(_) | Self::Unsure => Self::Moved,
         }
     }
 
@@ -309,11 +316,11 @@ impl Activity {
 
     /// Notes `bytes` the user typed, or the terminal answered, that went to the agent: text, a
     /// paste that holds anything or Ctrl-J leaves the line unfinished; Backspace takes back a
-    /// character typed or a Ctrl-J; Enter, Ctrl-C,
-    /// Ctrl-U or Escape alone empties it, and Ctrl-C or Escape interrupts a turn; another key,
-    /// such as an arrow, may open a picker or bring text back, so it leaves an empty line
-    /// [`Line::Moved`] and makes typed text [`Line::Unsure`]; the terminal's answers change
-    /// nothing. Text or Enter answers the agent's question, if it asked one. An answer that
+    /// character typed or a Ctrl-J; Enter, Ctrl-C, Ctrl-U or Escape alone empties it, and Ctrl-C
+    /// or Escape interrupts a turn; Enter on a clear line keeps it clear, and Shift-Tab leaves
+    /// the line as it was; another key, such as an arrow, may open a picker or bring text back,
+    /// so it leaves an empty line [`Line::Moved`] and makes typed text [`Line::Unsure`]; the
+    /// terminal's answers change nothing. Text or Enter answers the agent's question, if it asked one. An answer that
     /// `bytes` leave unfinished waits for the next `bytes`, unless they are Escape alone. A
     /// second Escape that opens the agent's picker, as [`EscapeTwice`] tells, leaves the line
     /// unfinished.
@@ -521,6 +528,11 @@ impl LineEffect {
         }
     }
 
+    fn enter(&mut self) {
+        self.edits = true;
+        self.line = self.line.entered();
+    }
+
     fn empties(&mut self, interrupts: bool) {
         self.line = Line::Moved;
         self.edits = true;
@@ -596,7 +608,8 @@ fn line_effect(mut effect: LineEffect, bytes: &[u8]) -> LineEffect {
         }
         at += 1;
         match byte {
-            b'\r' | KILL_LINE => effect.empties(false),
+            b'\r' => effect.enter(),
+            KILL_LINE => effect.empties(false),
             b'\n' => effect.types(),
             INTERRUPT => effect.empties(true),
             ESC => at = escape(bytes, at, &mut effect),
@@ -622,7 +635,7 @@ fn escape(bytes: &[u8], at: usize, effect: &mut LineEffect) -> usize {
                 }
             } else if csi.last == Some(b'u') && csi.intermediates.is_empty() {
                 kitty_key(csi.params, effect);
-            } else if !csi.is_mouse() {
+            } else if !csi.is_mouse() && !is_shift_tab(&csi) {
                 effect.line = effect.line.moved();
             }
             csi.end + usize::from(csi.last.is_some())
@@ -638,6 +651,10 @@ fn escape(bytes: &[u8], at: usize, effect: &mut LineEffect) -> usize {
         }
         None => at,
     }
+}
+
+fn is_shift_tab(csi: &Csi<'_>) -> bool {
+    csi.last == Some(b'Z') && csi.params.is_empty() && csi.intermediates.is_empty()
 }
 
 /// A key the kitty keyboard protocol reported: its code, its modifiers but the lock keys, and
@@ -729,11 +746,13 @@ fn kitty_key(params: &[u8], effect: &mut LineEffect) {
     }
     match (code, modifiers) {
         (Some(27), 0) | (Some(99), 4) => effect.empties(true),
-        (Some(13), 0) | (Some(117), 4) => effect.empties(false),
+        (Some(13), 0) => effect.enter(),
+        (Some(117), 4) => effect.empties(false),
         (Some(127), 0) => effect.line = effect.line.backspace(),
         (Some(32..=126), 0 | 1) | (Some(106), 4) => effect.types(),
         (Some(code), 0 | 1) if code > 127 && !KITTY_PRIVATE_USE.contains(&code) => effect.unsure(),
         (Some(code), _) if code == 13 || KITTY_KEYPAD_TEXT.contains(&code) => effect.unsure(),
+        (Some(9), 1) => {}
         (Some(code), _)
             if KITTY_MODIFIER_KEYS.contains(&code) || KITTY_LOCK_KEYS.contains(&code) => {}
         _ => effect.line = effect.line.moved(),
@@ -1160,7 +1179,7 @@ mod tests {
         activity.keys(b"\x7f");
         thread::sleep(pace.quiet);
         assert!(activity.is_clear_after_turn_end(&pace));
-        activity.keys(b"\r");
+        activity.keys(b"/review\r");
         thread::sleep(pace.quiet);
         assert!(!activity.is_clear_after_turn_end(&pace));
     }
@@ -1497,7 +1516,8 @@ mod tests {
         assert_eq!(effect(b"\x1b[27u"), left(Line::Moved, true, true));
         assert_eq!(effect(b"\x1b[99;5u"), left(Line::Moved, true, true));
         assert_eq!(effect(b"x\x1b[117;5u"), left(Line::Moved, true, false));
-        assert_eq!(effect(b"\x1b[13u"), left(Line::Moved, true, false));
+        assert_eq!(effect(b"\x1b[13u"), left(Line::Clear, true, false));
+        assert_eq!(effect(b"x\x1b[13u"), left(Line::Moved, true, false));
         assert_eq!(effect(b"\x1b[97u"), left(Line::Typed(1), true, false));
         assert_eq!(effect(b"\x1bx"), left(Line::Unsure, true, false));
         assert_eq!(effect(b"abc\n"), left(Line::Typed(4), true, false));
@@ -1532,14 +1552,26 @@ mod tests {
                 "{answer:?}"
             );
         }
-        for moving in [&b"\x1b[A\x1bOB"[..], b"\x1b[5~", b"\t", b"\x1b[9u", b"\x01"] {
+        for moving in [
+            &b"\x1b[A\x1bOB"[..],
+            b"\x1b[5~",
+            b"\t",
+            b"\x1b[9u",
+            b"\x01",
+            b"\x1b[1;5Z",
+            b"\x1b[9;6u",
+        ] {
             assert_eq!(
                 effect(moving),
                 left(Line::Moved, false, false),
                 "{moving:?}"
             );
         }
-        assert_eq!(effect(b"\r\x1b[12;40R"), left(Line::Moved, true, false));
+        assert_eq!(effect(b"\r\x1b[12;40R"), left(Line::Clear, true, false));
+        assert_eq!(effect(b"\x1b[Z"), left(Line::Clear, false, false));
+        assert_eq!(effect(b"\x1b[9;2u"), left(Line::Clear, false, false));
+        assert_eq!(effect(b"\x1b[9;66u"), left(Line::Clear, false, false));
+        assert_eq!(effect(b"a\x1b[Z"), left(Line::Typed(1), true, false));
     }
 
     #[test]
@@ -1636,6 +1668,38 @@ mod tests {
         activity.saw(HookKind::TurnEnd, b"");
         thread::sleep(pace.quiet);
         assert!(activity.is_clear_after_turn_end(&pace));
+    }
+
+    #[test]
+    fn shift_tab_leaves_the_line_as_it_was_so_a_line_typed_after_it_counts_back_to_empty() {
+        let pace = fast();
+        for shift_tab in [&b"\x1b[Z"[..], b"\x1b[9;2u"] {
+            let activity = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
+            activity.wrote();
+            activity.keys(shift_tab);
+            activity.keys(b"hi");
+            activity.keys(shift_tab);
+            activity.keys(b"\x7f\x7f");
+            thread::sleep(pace.quiet);
+            assert!(activity.is_clear_after_turn_end(&pace), "{shift_tab:?}");
+        }
+    }
+
+    #[test]
+    fn enter_on_a_clear_line_keeps_it_clear_but_on_a_moved_one_keeps_it_moved() {
+        let pace = fast();
+        for enter in [&b"\r"[..], b"\x1b[13u"] {
+            let activity = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
+            activity.wrote();
+            activity.keys(enter);
+            activity.keys(b"hi\x7f\x7f");
+            thread::sleep(pace.quiet);
+            assert!(activity.is_clear_after_turn_end(&pace), "{enter:?}");
+            activity.keys(b"\x1b[A");
+            activity.keys(enter);
+            thread::sleep(pace.quiet);
+            assert!(!activity.is_clear_after_turn_end(&pace), "{enter:?}");
+        }
     }
 
     #[test]

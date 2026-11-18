@@ -1063,3 +1063,14 @@ Ctrl-J counts as one character typed, which Backspace takes back. A paste marker
 reads still counts, and a prompt hook closes a paste whose end mahi never saw, such as one the
 palette took. `mahi-term` now holds the paste markers and `PasteEnd`, the one rule that finds the
 end of a paste, which the palette's key readers use too.
+
+## D130 · 2026-11-18 · Shift-Tab and Enter on a clear line keep the input line's count
+
+Chosen by the user (#175). Since D118, an arrow, Tab or Enter left an empty line moved, so text
+typed after Shift-Tab (Claude Code's mode switch, `CSI Z`) or after Enter on an empty line could
+never count back to empty, and merges waited until Enter, Escape, Ctrl-C or Ctrl-U. Now Shift-Tab
+leaves the line as it was, since it does not change the text, and Enter on a clear line keeps it
+clear, since there is nothing to send. Enter on a moved line still leaves it moved, since it can
+send text an arrow brought back. The other choices were Shift-Tab alone, or Shift-Tab, Enter and
+Tab, though Tab can complete a path or a command. During the work, not by the user: Shift-Tab in
+the kitty keyboard protocol (`CSI 9;2u`) counts the same as `CSI Z`.
