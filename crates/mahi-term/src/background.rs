@@ -1,3 +1,8 @@
+use crate::sequence::{
+    Csi,
+    string_end,
+};
+
 /// The query that asks a terminal for its background colour, followed by one every terminal
 /// answers, so a terminal that does not tell its background is known once that answer comes.
 pub const BACKGROUND_QUERY: &[u8] = b"\x1b]11;?\x1b\\\x1b[c";
@@ -55,7 +60,7 @@ impl Background {
             return BackgroundReply::Incomplete;
         }
         let luminance = find(bytes, REPLY_START)
-            .and_then(|start| string_text(bytes.get(start + REPLY_START.len()..)?))
+            .and_then(|start| string_text(bytes, start + REPLY_START.len()))
             .and_then(luminance);
         luminance.map_or(BackgroundReply::NotTold, |luminance| {
             BackgroundReply::Told(if luminance > MID_GREY_LUMINANCE {
@@ -73,24 +78,18 @@ fn find(bytes: &[u8], wanted: &[u8]) -> Option<usize> {
         .position(|window| window == wanted)
 }
 
-fn string_text(rest: &[u8]) -> Option<&[u8]> {
-    let bell = rest.iter().position(|&byte| byte == 0x07 || byte == 0x9c);
-    let terminator = find(rest, b"\x1b\\");
-    let end = bell.into_iter().chain(terminator).min()?;
-    rest.get(..end)
+fn string_text(bytes: &[u8], start: usize) -> Option<&[u8]> {
+    let string = bytes.get(start..string_end(bytes, start)?)?;
+    string
+        .strip_suffix(b"\x07")
+        .or_else(|| string.strip_suffix(b"\x1b\\"))
 }
 
 fn holds_device_attributes(bytes: &[u8]) -> bool {
-    let mut starts = bytes.windows(3).enumerate();
-    starts.any(|(at, window)| {
-        window == b"\x1b[?"
-            && bytes
-                .get(at + 3..)
-                .unwrap_or_default()
-                .iter()
-                .find(|byte| !(byte.is_ascii_digit() || **byte == b';'))
-                == Some(&b'c')
-    })
+    let starts = bytes.windows(2).enumerate();
+    starts
+        .filter(|(_, window)| *window == b"\x1b[")
+        .any(|(at, _)| Csi::at(bytes, at + 2).is_device_attributes())
 }
 
 fn luminance(color: &[u8]) -> Option<f64> {
@@ -156,7 +155,6 @@ mod tests {
             (b"\x1b]11;rgb:1c1c/1a1a/2222\x07", Background::Dark),
             (b"\x1b]11;rgb:6/6/6\x07", Background::Dark),
             (b"\x1b]11;rgb:8/8/8\x07", Background::Light),
-            (b"\x1b]11;rgb:ffff/ffff/ffff\x9c", Background::Light),
         ] {
             assert_eq!(read(reply), BackgroundReply::Told(background), "{reply:?}");
         }
@@ -174,6 +172,8 @@ mod tests {
             b"\x1b]11;rgb:gg/ff/ff\x07",
             b"\x1b]11;rgb:+f/ff/ff\x07",
             b"\x1b]11;#ffffff\x07",
+            b"\x1b]11;rgb:ffff/ffff/ffff\x9c",
+            b"\x1b]11;rgb:ffff/ffff/ffff\rx\x07",
         ] {
             assert_eq!(read(unreadable), BackgroundReply::NotTold, "{unreadable:?}");
         }

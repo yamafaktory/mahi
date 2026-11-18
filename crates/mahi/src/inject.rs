@@ -25,7 +25,14 @@ use mahi_agent::{
     },
 };
 use mahi_live::TurnState;
-use mahi_term::Report;
+use mahi_term::{
+    Csi,
+    Report,
+    is_terminal_answer,
+    starts_answer,
+    string_end,
+    terminal_answer_at,
+};
 
 use crate::hub::OutputTap;
 
@@ -532,122 +539,6 @@ fn unfinished_answer_at(bytes: &[u8]) -> usize {
     bytes.len()
 }
 
-fn starts_answer(tail: &[u8]) -> bool {
-    match tail {
-        [ESC, b'[', _, ..] => {
-            let csi = Csi::at(tail, 2);
-            csi.last.is_none() && csi.end == tail.len()
-        }
-        [ESC, b']', rest @ ..] => {
-            let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
-            let after = rest.get(digits..).unwrap_or_default();
-            digits > 0
-                && (after.is_empty() || after.first() == Some(&b';'))
-                && string_end(tail, 2).is_none()
-        }
-        [ESC, b'P', b'0'..=b'9' | b'>' | b'!', ..] => string_end(tail, 2).is_none(),
-        _ => false,
-    }
-}
-
-fn is_terminal_answer(bytes: &[u8]) -> bool {
-    let mut at = 0;
-    while at < bytes.len() {
-        let Some(end) = terminal_answer_at(bytes, at) else {
-            return false;
-        };
-        at = end;
-    }
-    true
-}
-
-fn terminal_answer_at(bytes: &[u8], at: usize) -> Option<usize> {
-    if bytes.get(at) != Some(&ESC) {
-        return None;
-    }
-    match bytes.get(at + 1)? {
-        b'[' => {
-            let csi = Csi::at(bytes, at + 2);
-            let answers = match (csi.last?, csi.intermediates) {
-                (b'R', b"") => is_position_report(csi.params),
-                (b'c', b"") => matches!(csi.params.first(), Some(b'?' | b'>')),
-                (b'u', b"") => csi.params.first() == Some(&b'?'),
-                (b'I' | b'O', b"") => csi.params.is_empty(),
-                (b'y', b"$") => two_numbers(csi.params.strip_prefix(b"?").unwrap_or(csi.params)),
-                _ => false,
-            };
-            answers.then_some(csi.end + 1)
-        }
-        b']' | b'P' => string_end(bytes, at + 2),
-        _ => None,
-    }
-}
-
-fn is_position_report(params: &[u8]) -> bool {
-    let modified_f3 = params.starts_with(b"1;") && params != b"1;1";
-    !modified_f3 && two_numbers(params)
-}
-
-fn two_numbers(params: &[u8]) -> bool {
-    let mut fields = params.split(|&byte| byte == b';');
-    let number = |field: Option<&[u8]>| {
-        field.is_some_and(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
-    };
-    number(fields.next()) && number(fields.next()) && fields.next().is_none()
-}
-
-struct Csi<'bytes> {
-    params: &'bytes [u8],
-    intermediates: &'bytes [u8],
-    last: Option<u8>,
-    end: usize,
-}
-
-impl<'bytes> Csi<'bytes> {
-    fn is_mouse(&self) -> bool {
-        self.params.first() == Some(&b'<')
-            && self.intermediates.is_empty()
-            && matches!(self.last, Some(b'M' | b'm'))
-    }
-
-    fn at(bytes: &'bytes [u8], start: usize) -> Self {
-        let in_range = |end: usize, range: std::ops::RangeInclusive<u8>| {
-            bytes.get(end).is_some_and(|byte| range.contains(byte))
-        };
-        let mut end = start;
-        while in_range(end, 0x30..=0x3f) {
-            end += 1;
-        }
-        let middle = end;
-        while in_range(end, 0x20..=0x2f) {
-            end += 1;
-        }
-        Self {
-            params: bytes.get(start..middle).unwrap_or_default(),
-            intermediates: bytes.get(middle..end).unwrap_or_default(),
-            last: bytes
-                .get(end)
-                .copied()
-                .filter(|byte| (0x40..=0x7e).contains(byte)),
-            end,
-        }
-    }
-}
-
-fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut end = start;
-    while let Some(&byte) = bytes.get(end) {
-        if byte < 0x20 && byte != 0x07 && byte != ESC {
-            return Some(end);
-        }
-        end += 1;
-        if byte == 0x07 || (byte == b'\\' && bytes.get(end.wrapping_sub(2)) == Some(&ESC)) {
-            return Some(end);
-        }
-    }
-    None
-}
-
 fn line_effect(line: Line, bytes: &[u8]) -> LineEffect {
     let mut effect = LineEffect::on(line);
     if bytes == [ESC] {
@@ -1077,41 +968,12 @@ mod tests {
     fn the_terminals_answers_are_no_key() {
         let answers = [
             &b"\x1b[12;1R"[..],
-            b"\x1b[1;1R",
             b"\x1b]11;rgb:0000/0000/0000\x07",
-            b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\",
             b"\x1b[?62;22c",
-            b"\x1b[>1;10;0c",
-            b"\x1b[?0u",
-            b"\x1b[I",
-            b"\x1b[O",
             b"\x1b[?2026;2$y",
-            b"\x1b[4;2$y",
             b"\x1bP1+r544e=787465726d\x1b\\",
             b"\x1b[12;1R\x1b[?0u",
         ];
-        for answer in answers {
-            assert!(is_terminal_answer(answer), "{answer:?}");
-        }
-        for key in [
-            &b"\x1b[A"[..],
-            b"x",
-            b"\x1b[12;1Rx",
-            b"\x1b[1;5D",
-            b"\x1b[1;2R",
-            b"\x1b[1;5R",
-            b"\x1b[R",
-            b"\x1b[2R",
-            b"\x1b[1;2;3R",
-            b"\x1b]11;rgb:0000",
-            b"\x1b[2$y",
-            b"\x1b[?$y",
-            b"\x1b[?;;$y",
-            b"\x1b[?2026;2;1$y",
-            b"\x1b[99u",
-        ] {
-            assert!(!is_terminal_answer(key), "{key:?}");
-        }
         let pace = fast();
         let activity = Activity::telling(None, None, AtLaunch::Ready, EscapeTwice::Any);
         activity.wrote();

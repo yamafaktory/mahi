@@ -1014,3 +1014,17 @@ typed and why, a name with `:`, `/` or `@` is taken for a URL, changing a URL se
 when the remote has one and asks again whether a remote threads are pushed to is private, only a
 remote in the repository's own `config` can be changed or removed, and removing follows
 `git remote remove`, stopping pushing first.
+
+## D127 · 2026-11-18 · One parser reads the terminal's answers, and only 7-bit string ends
+
+Chosen by the user (#157). `background.rs` and `inject.rs` each had a parser for the terminal's
+answers, and they differed. The parser now lives in `mahi-term` (`sequence.rs`), and both use it.
+A string ends at BEL or `ESC \` only, as `inject.rs` read it. The 8-bit terminator `0x9c` no longer
+ends a background reply, because `0x9c` is also a UTF-8 continuation byte in what the user types.
+A terminal that sends `0x9c` also sends its device answer in 8 bits, which mahi does not read
+(#156). The other choices were to end a string at `0x9c` in both places, or to give the parser a
+flag for each caller. During the work, not by the user: a new fuzz target, `term-answer`, checks
+the parser. The shared rules change two more things in a background reply, which no known
+terminal sends. A control byte other than BEL or `ESC` cuts the colour string, so the reply does
+not tell. The device answer that ends the wait takes any parameter byte after `ESC [ ?`, not only
+digits and `;`.

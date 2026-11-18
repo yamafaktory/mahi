@@ -14,6 +14,7 @@ mod output;
 mod report;
 mod scan;
 mod screen;
+mod sequence;
 mod view;
 mod workspace;
 
@@ -78,6 +79,13 @@ pub use scan::{
     Segments,
 };
 pub use screen::AnsiBackend;
+pub use sequence::{
+    Csi,
+    is_terminal_answer,
+    starts_answer,
+    string_end,
+    terminal_answer_at,
+};
 pub use view::{
     Drawn,
     PaletteItem,
