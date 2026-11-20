@@ -22,6 +22,14 @@ const TRAILER: &str = "Mahi-Merged: ";
 const MOST_SOURCES: usize = 256;
 const MOST_ABSORBED: usize = MOST_SOURCES / 2;
 
+/// Says whether a snapshot's `message` records a merge: a line of it starts a `Mahi-Merged`
+/// trailer.
+pub(crate) fn merges(message: &[u8]) -> bool {
+    message
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.starts_with(TRAILER.as_bytes()))
+}
+
 /// The latest snapshot of each agent whose work was merged into an agent, as the `Mahi-Merged`
 /// trailers of the agent's snapshots record it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

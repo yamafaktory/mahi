@@ -27,7 +27,11 @@ use mahi_store::{
     Store,
     StoreError,
 };
-use mahi_thread::walk_turns_while;
+use mahi_thread::{
+    TranscriptError,
+    TurnRecord,
+    walk_turns_while,
+};
 
 use crate::{
     profile::Profile,
@@ -38,7 +42,8 @@ use crate::{
 const TRAILER: &str = "Mahi-Turn-End: ";
 const TURN_TRAILER: &str = "Mahi-Turn: ";
 const MAX_WALK: usize = 4096;
-const MAX_TURNS_BACK: usize = 1024;
+/// The most turns a search walks back through a transcript.
+pub(crate) const MAX_TURNS_BACK: usize = 1024;
 const UNREPORTED_FILE: &str = "turn-ends-unreported";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +127,7 @@ pub(crate) fn snapshot_message(ended_by: Option<&AgentSlot>, turn: Option<u64>) 
 
 /// Returns the transcript turn a snapshot's `message` names, when exactly one line of its
 /// trailers names one in decimal digits.
-fn turn_of(message: &[u8]) -> Option<u64> {
+pub(crate) fn turn_of(message: &[u8]) -> Option<u64> {
     let mut named = message
         .split(|byte| *byte == b'\n')
         .filter_map(|line| line.strip_prefix(TURN_TRAILER.as_bytes()));
@@ -153,18 +158,55 @@ pub(crate) fn turn_time(
 ) -> Option<Timestamp> {
     let named = turn_of(&store.commit_message(commit).ok()?)?;
     let mut time = None;
+    find_turn(store, key, (thread, slot), named, |turn| {
+        time = turn.newest_time();
+    })
+    .ok()?;
+    time
+}
+
+/// What a search for a turn among the newest [`MAX_TURNS_BACK`] turns of a transcript found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnLookup {
+    /// The transcript holds the turn.
+    Found,
+    /// Every turn the transcript holds is older: the turn is still open, or was never sealed.
+    NotYet,
+    /// The turn is older than the newest [`MAX_TURNS_BACK`] turns.
+    TooOld,
+}
+
+/// Looks for turn `number` among the newest [`MAX_TURNS_BACK`] turns of `slot`'s transcript in
+/// `thread`, which `key` opens, and hands it to `found` when it is there.
+///
+/// # Errors
+///
+/// Returns the error of a turn that cannot be read before the search ends.
+pub(crate) fn find_turn(
+    store: &Store,
+    key: &ThreadKey,
+    (thread, slot): (ThreadId, &AgentSlot),
+    number: u64,
+    mut found: impl FnMut(&TurnRecord),
+) -> Result<TurnLookup, TranscriptError> {
+    let mut newest = None;
+    let mut lookup = TurnLookup::TooOld;
     walk_turns_while(store, key, thread, slot, MAX_TURNS_BACK, |turn| {
-        if turn.turn() == named {
-            time = turn.newest_time();
+        newest.get_or_insert(turn.turn());
+        if turn.turn() == number {
+            found(&turn);
+            lookup = TurnLookup::Found;
         }
-        if turn.turn() <= named {
+        if turn.turn() <= number {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
         }
-    })
-    .ok()?;
-    time
+    })?;
+    if newest.is_none_or(|newest| newest < number) {
+        return Ok(TurnLookup::NotYet);
+    }
+    Ok(lookup)
 }
 
 /// The latest turn-end snapshot of each agent a host serves, read from its snapshots ref, with

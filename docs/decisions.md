@@ -1161,3 +1161,57 @@ keep done, or to show no state until the first turn. The user also chose:
   older peer, or to add a version handshake.
 - The marker is `◌`, a dotted circle from the family of `●`, `◉` and `○`. The other choices were
   `›` and `·`.
+
+## D137 · 2026-11-20 · `read_origin` reads a turn only in the current thread
+
+Chosen by the user (#148, step 3). `read_origin` usually traces a line to an earlier thread, and
+reading that thread's turn needs its thread key. A run unlocks the user's mahi key once at start
+and drops it after resume, so it holds only the current thread's key. The tool shows the turn
+only for a line from the current thread. For an earlier thread, it names the landing commit, the
+thread, the agents, the snapshot and the turn number, and says which thread's records hold the
+turn. The other choices were to open the key of every thread that lists the user at start, or
+to keep the mahi key unlocked for the whole run. During the work, not by the user:
+- The snapshot that first added a line is the oldest one, in each named agent's history, whose
+  file holds more copies of the line than the snapshot before it. Counting copies keeps a common
+  line, such as `}`, that the worktree started with from being credited to the first snapshot. A
+  merge snapshot is never credited. When the copies first grow in one, the agent took the line
+  from a teammate. Two agents can both be named when each added the same text.
+- An agent's first snapshot has no parent, so blame at a snapshot stops there. A line blamed on
+  the first snapshot is blamed again in the thread's base, when the base holds the same file.
+- A merge of the landing branch carries no trailer of its own, so a line it brought can name that
+  snapshot without a turn. The answer says the snapshot first adds the line, not that the agent
+  wrote it.
+- A file with NUL bytes is traced line by line, as gix blames it. The tool does not call it
+  binary, since its lines still have a commit.
+- MCP tool calls run on a thread of their own, not in async code, so the unbounded blame walk
+  needs no `spawn_blocking`.
+- The tool shows a turn only of a participant `meta` lists, as `read_transcript` does.
+- The turns come after the list of snapshots, so one long turn cannot hide the snapshots after
+  it. They share one budget with the rest of the answer.
+- A landing whose trailers name a thread and no agent has every agent with snapshots in that
+  thread searched.
+- A commit too large to read, past 64 KiB, gets an answer that says so, not an error. A merge
+  commit on the main branch is no snapshot, so it is not blamed again in the base.
+- A file renamed in the thread is followed back. When the copies first grow where the file
+  appears at its path, and that snapshot deleted a file that held the line, the search goes on
+  at the old path. Only the first 500 changed paths of that snapshot are looked at. A deleted file
+  with the same content as the new file wins over one that only holds the line.
+- One trace spends at most 4,096 units of work: each snapshot walked, compared, or looked into
+  for a move. Following moves runs the comparison again, so it spends from the same budget. At
+  most 16 moves are followed for each agent, since finding the deleted files reads trees that
+  the budget does not count.
+- A snapshot mahi refuses to read, such as one too large or with several parents, ends that
+  agent's walk instead of failing the tool.
+- The answer quotes at most the line's first 200 characters, so a long line cannot fill it.
+- A snapshot of the current thread is not said to hold a line not landed. After a landing, the
+  agent's snapshots go on, so the line may have landed already.
+- A turn newer than every turn the transcript holds is said to be not recorded yet. The
+  recorder names the open turn on its snapshots, and the turn is sealed only when it ends.
+- Chosen by the user: two gaps in how merges are recorded stay for a follow-up issue. A merge
+  snapshot can hold the agent's own edits made since its last snapshot, so its line goes
+  uncredited. An agent's first merge that leaves a path as it was writes no `Mahi-Merged`
+  trailer, so the receiving agent can be credited with a teammate's line. The other choice was
+  to change the recorder and the merge code in this change.
+- Two review findings were dropped by a judge. A first snapshot that started from another
+  agent's tree came only from the handoff that mahi removed. A path that is not UTF-8 would need
+  byte paths across the store's API.

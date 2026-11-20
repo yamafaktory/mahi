@@ -64,6 +64,7 @@ use mahi_core::{
 };
 use mahi_crypto::ThreadKey;
 use mahi_store::{
+    Blamed,
     Change,
     FileDiff,
     ObjectId,
@@ -71,6 +72,7 @@ use mahi_store::{
 };
 use mahi_thread::{
     ParticipantKey,
+    TurnRecord,
     load_meta,
     walk_turns,
 };
@@ -94,8 +96,21 @@ use crate::{
         self,
         NoteBy,
     },
+    origin::{
+        self,
+        FirstHeld,
+        Found,
+        Origin,
+        Searched,
+        Walked,
+    },
     palette::HELD_DETAIL,
     sync_view::SyncView,
+    turn_end::{
+        self,
+        MAX_TURNS_BACK,
+        TurnLookup,
+    },
     turns::split_event,
     when::{
         self,
@@ -111,6 +126,7 @@ const MAX_PATH_CHARS: usize = 4096;
 const MAX_LISTED_CHANGES: usize = 500;
 pub(crate) const DEFAULT_TURNS: usize = 10;
 const MAX_TURNS: usize = 30;
+const MAX_QUOTED_CHARS: usize = 200;
 const TURNS_BUDGET: usize = MAX_TOOL_TEXT - 512;
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 const WRITE_WAIT: Duration = Duration::from_secs(10);
@@ -139,7 +155,8 @@ fn instructions(me: &AgentSlot, note_by: NoteBy) -> String {
          mahi records your worktree after your tool calls, so others can read and merge your \
          work. Do not commit or push: `git commit` and `git push` fail in your sandbox, and the \
          thread's work becomes commits on its branch when the thread lands. `list_agents` shows \
-         who works in the thread. `read_transcript` and `read_diff` show what an agent did. \
+         who works in the thread. `read_transcript` and `read_diff` show what an agent did, and \
+         `read_origin` where a line of code came from. \
          `read_status` shows what waits for your user and the files your worktree changed \
          since the last landing, with the lines each adds and removes. \
          Before you edit, look at `list_claims`, claim what you start with `claim`, and \
@@ -554,6 +571,67 @@ impl ThreadTools {
         })
     }
 
+    fn read_origin(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
+        let path =
+            mcp::text_argument(arguments, "path", MAX_PATH_CHARS)?.ok_or(ToolError::Arguments)?;
+        let line = arguments
+            .get("line")
+            .and_then(Value::as_u64)
+            .and_then(|line| u32::try_from(line).ok())
+            .filter(|line| *line >= 1)
+            .ok_or(ToolError::Arguments)?;
+        let store = self.store()?;
+        let view = self.meta(&store)?;
+        let snapshots = ThreadRef::new(self.thread, RefKind::Snapshots(self.me.clone()));
+        let latest = store.head(&snapshots).map_err(|error| failed(&error))?;
+        let at = latest.unwrap_or(view.base);
+        let blamed = match origin::blame(&store, (self.thread, view.base), at, (path, line))
+            .map_err(|error| failed(&error))?
+        {
+            Blamed::Commit(blamed) => blamed,
+            Blamed::NoLine => return Ok(format!("{path:?} has no line {line}")),
+            Blamed::Missing => return Ok(format!("no file is at {path:?}")),
+            Blamed::NotAFile => {
+                return Ok(format!(
+                    "{path:?} is not a file, or not a plain path from the thread's root"
+                ));
+            }
+            Blamed::TooLarge => return Ok(format!("{path:?} is too large to trace")),
+        };
+        let traced = origin::trace(&store, self.thread, &blamed).map_err(|error| failed(&error))?;
+        let held_in = if latest.is_some() {
+            "your latest snapshot"
+        } else {
+            "the thread's base"
+        };
+        let (shown, cut) = quoted(&blamed.text);
+        let mut answer = OriginAnswer {
+            store: &store,
+            key: self.key.as_deref(),
+            thread: self.thread,
+            listed: view.listed.into_iter().map(|(name, ..)| name).collect(),
+            read: TurnsRead {
+                clock: Clock::new(when::now(), self.time_zone.clone()),
+                ..TurnsRead::default()
+            },
+            turns: Vec::new(),
+        };
+        let _ = writeln!(
+            answer.read.text,
+            "Line {line} of {path:?}, as {held_in} holds it, reads {:?}{}. Commit {} last \
+             changed it.",
+            shown,
+            match cut {
+                Cut::Whole => "",
+                Cut::Short => " (cut short)",
+            },
+            blamed.commit
+        );
+        answer.push_origin(&traced);
+        answer.push_turns();
+        Ok(cleaned(&answer.read.text))
+    }
+
     fn read_transcript(&self, arguments: &Map<String, Value>) -> Result<String, ToolError> {
         let key = self.key.as_ref().ok_or_else(|| {
             ToolError::Failed("this run cannot open the thread's records".to_owned())
@@ -577,6 +655,168 @@ impl ThreadTools {
             Clock::new(when::now(), self.time_zone.clone()),
         )
         .map_err(ToolError::Failed)
+    }
+}
+
+/// What `read_origin` answers, written into the buffer of `read`, so the turns it shows share
+/// one budget with the rest of the answer. It reads turns only in `thread`, the one the agent
+/// works in, whose records `key` opens, and only of the participants `meta` lists. The turns
+/// to read wait in `turns` until every snapshot is named, so a long turn never cuts the list.
+struct OriginAnswer<'store> {
+    store: &'store Store,
+    key: Option<&'store ThreadKey>,
+    thread: ThreadId,
+    listed: Vec<ParticipantName>,
+    read: TurnsRead,
+    turns: Vec<(AgentSlot, u64)>,
+}
+
+impl OriginAnswer<'_> {
+    /// Appends where `traced` leads, with the turns it names that can be read.
+    fn push_origin(&mut self, traced: &Origin) {
+        match traced {
+            Origin::Outside => self.read.text.push_str(
+                "That commit names no mahi thread: it was written outside mahi, or the messages \
+                 that named its thread were dropped, as a squash merge can drop them.\n",
+            ),
+            Origin::TooLarge => self
+                .read
+                .text
+                .push_str("That commit is too large to read the threads it names.\n"),
+            Origin::Landed(searched) => {
+                for searched in searched {
+                    let text = &mut self.read.text;
+                    let _ = write!(text, "That commit landed thread {}", searched.thread);
+                    if !searched.agents.is_empty() {
+                        text.push_str(" of");
+                    }
+                    for slot in &searched.agents {
+                        let _ = write!(text, " {slot}");
+                    }
+                    text.push_str(".\n");
+                    self.push_searched(searched);
+                }
+            }
+            Origin::Unlanded(searched) => {
+                self.read
+                    .text
+                    .push_str("That commit is a snapshot of this thread.\n");
+                self.push_searched(searched);
+            }
+        }
+    }
+
+    fn push_searched(&mut self, searched: &Searched) {
+        let Found::Snapshots(first_held, walked) = &searched.found else {
+            let _ = writeln!(
+                self.read.text,
+                "This repository holds no snapshots of those agents in thread {}: the thread \
+                 was purged, or never fetched here.",
+                searched.thread
+            );
+            return;
+        };
+        if first_held.is_empty() && *walked == Walked::All {
+            let _ = writeln!(
+                self.read.text,
+                "No snapshot of those agents in thread {} adds the line.",
+                searched.thread
+            );
+        }
+        for FirstHeld {
+            slot,
+            snapshot,
+            turn,
+        } in first_held
+        {
+            let _ = write!(
+                self.read.text,
+                "{slot}'s snapshot {snapshot} is the first to add the line"
+            );
+            match turn {
+                Some(number) => {
+                    let _ = writeln!(self.read.text, ", in turn {number}.");
+                    self.push_turn((searched.thread, slot), *number);
+                }
+                None => self.read.text.push_str(", and it names no turn.\n"),
+            }
+        }
+        if *walked == Walked::Cut {
+            let _ = writeln!(
+                self.read.text,
+                "(the search ran out of its work budget before it searched every snapshot)"
+            );
+        }
+    }
+
+    /// Says why turn `number` of `slot` in `thread` cannot be shown, or keeps it to show at the
+    /// end.
+    fn push_turn(&mut self, (thread, slot): (ThreadId, &AgentSlot), number: u64) {
+        let text = &mut self.read.text;
+        if thread != self.thread {
+            let _ = writeln!(
+                text,
+                "  The turn is in thread {thread}'s records, which this tool reads only for the \
+                 thread you work in."
+            );
+        } else if !self.listed.contains(slot.participant()) {
+            let _ = writeln!(
+                text,
+                "  The thread no longer lists {}, so the turn is not shown.",
+                slot.participant()
+            );
+        } else if self.key.is_none() {
+            text.push_str("  This run cannot open the thread's records.\n");
+        } else {
+            self.turns.push((slot.clone(), number));
+        }
+    }
+
+    /// Appends each turn kept to show, as `read_transcript` shows a turn, after the agent it
+    /// belongs to, or why it is not shown.
+    fn push_turns(&mut self) {
+        let Some(key) = self.key else {
+            return;
+        };
+        for (slot, number) in std::mem::take(&mut self.turns) {
+            let read = &mut self.read;
+            let _ = write!(read.text, "{slot}: ");
+            if read.text.len() >= TURNS_BUDGET {
+                let _ = writeln!(read.text, "turn {number} is left out for size.");
+                continue;
+            }
+            let kept = read.kept.len();
+            let looked =
+                turn_end::find_turn(self.store, key, (self.thread, &slot), number, |turn| {
+                    read.take_turn(turn);
+                });
+            match looked {
+                Ok(TurnLookup::Found) if read.kept.len() > kept => {}
+                Ok(TurnLookup::Found) => {
+                    let _ = writeln!(read.text, "turn {number} is left out for size.");
+                }
+                Ok(TurnLookup::NotYet) => {
+                    let _ = writeln!(
+                        read.text,
+                        "turn {number} is not recorded yet: it may still be running."
+                    );
+                }
+                Ok(TurnLookup::TooOld) => {
+                    let _ = writeln!(
+                        read.text,
+                        "turn {number} is not among the transcript's latest {MAX_TURNS_BACK} \
+                         turns."
+                    );
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        read.text,
+                        "turn {number} cannot be read: {}.",
+                        crate::describe(&error)
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -637,15 +877,7 @@ pub(crate) fn transcript_text(
         clock,
         ..TurnsRead::default()
     };
-    let walked = walk_turns(store, key, thread, slot, last, |turn| {
-        read.take(
-            (
-                turn.turn(),
-                turn.events().iter().find_map(mahi_thread::Event::time),
-            ),
-            turn.events().iter().map(mahi_thread::Event::payload),
-        );
-    });
+    let walked = walk_turns(store, key, thread, slot, last, |turn| read.take_turn(&turn));
     if read.kept.is_empty() {
         walked.map_err(|error| crate::describe(&error))?;
         return Ok(format!("{slot} has no recorded turns here"));
@@ -675,6 +907,16 @@ struct TurnsRead {
 }
 
 impl TurnsRead {
+    fn take_turn(&mut self, turn: &TurnRecord) {
+        self.take(
+            (
+                turn.turn(),
+                turn.events().iter().find_map(mahi_thread::Event::time),
+            ),
+            turn.events().iter().map(mahi_thread::Event::payload),
+        );
+    }
+
     fn take<'a>(
         &mut self,
         (number, started): (u64, Option<Timestamp>),
@@ -871,6 +1113,54 @@ fn land_tool() -> Tool {
     }
 }
 
+fn read_origin_tool() -> Tool {
+    Tool {
+        name: "read_origin",
+        description: "Shows where a line of a file came from: the commit that last \
+                      changed it, the thread and agents that landed it, the snapshot \
+                      that first added it and, in the thread you work in, what that \
+                      agent was asked and which tools it used in that turn.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "A file, /-separated, from the thread's root."
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "The line, counted from 1."
+                }
+            },
+            "required": ["path", "line"]
+        }),
+    }
+}
+
+/// Whether a quoted text is whole or was cut short.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    Whole,
+    Short,
+}
+
+/// Returns `text` as UTF-8, cut to its first [`MAX_QUOTED_CHARS`] characters, so one long line
+/// cannot fill an answer, and whether it was cut. Only the bytes those characters can take are
+/// read.
+fn quoted(text: &[u8]) -> (String, Cut) {
+    let head = text.get(..MAX_QUOTED_CHARS * 4).unwrap_or(text);
+    let read = String::from_utf8_lossy(head);
+    let mut chars = read.chars();
+    let shown: String = chars.by_ref().take(MAX_QUOTED_CHARS).collect();
+    let cut = if chars.next().is_some() || head.len() < text.len() {
+        Cut::Short
+    } else {
+        Cut::Whole
+    };
+    (shown, cut)
+}
+
 fn cleaned(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_TOOL_TEXT));
     push_clean(&mut out, text);
@@ -971,6 +1261,7 @@ impl Toolbox for ThreadTools {
                     "required": ["agent"]
                 }),
             },
+            read_origin_tool(),
         ]
     }
 
@@ -984,6 +1275,7 @@ impl Toolbox for ThreadTools {
             "release" => self.release(arguments),
             "list_claims" => Ok(self.list_claims()),
             "land" => self.land(arguments),
+            "read_origin" => self.read_origin(arguments),
             _ => Err(ToolError::Unknown),
         }
     }
@@ -1523,6 +1815,298 @@ mod tests {
             .unwrap();
         let after = tools.call("read_status", &Map::new()).unwrap();
         assert!(after.contains("\"README.md\" +1 -0\n"), "{after}");
+    }
+
+    #[test]
+    fn read_origin_leads_a_line_of_this_thread_to_the_turn_that_added_it() {
+        use mahi_thread::{
+            Event,
+            TurnRecord,
+        };
+
+        use crate::workspace_live::tests::{
+            append_alices_turn,
+            setup,
+        };
+
+        let setup = setup();
+        let alice: AgentSlot = "alice.claude".parse().unwrap();
+        let key = load_meta(&setup.store, setup.thread, &setup.owner(), 0)
+            .unwrap()
+            .thread_key(alice.participant(), setup.identity.as_age())
+            .unwrap();
+        let tools = ThreadTools::new(
+            setup.store.common_dir().to_path_buf(),
+            (setup.thread, setup.owner(), Some(Arc::new(key))),
+            (alice.clone(), Arc::new(Claims::default())),
+            None,
+        );
+        let readme = setup.store.write_blob(b"hello\nmoto\n").unwrap();
+        let tree = setup
+            .store
+            .write_tree(&[("README", EntryKind::Blob, readme)])
+            .unwrap();
+        let snapshots = ThreadRef::new(setup.thread, RefKind::Snapshots(alice));
+        let head = setup.store.head(&snapshots).unwrap();
+        let message = mahi_thread::snapshot_message("snapshot\n\nMahi-Turn: 1\n", setup.thread);
+        let added = setup
+            .store
+            .append(&snapshots, head, tree, &message)
+            .unwrap();
+        let prompt = |seq: u64, text: &str| {
+            let payload = format!("prompt\n{{\"prompt\":\"{text}\"}}").into_bytes();
+            vec![Event::new(seq, None, payload).unwrap()]
+        };
+        let tip = append_alices_turn(
+            &setup,
+            None,
+            &TurnRecord::new(0, prompt(0, "say hello")).unwrap(),
+        );
+        append_alices_turn(
+            &setup,
+            Some(&tip),
+            &TurnRecord::new(1, prompt(1, "add moto")).unwrap(),
+        );
+        let arguments = |line: u64| {
+            let Value::Object(arguments) = json!({ "path": "README", "line": line }) else {
+                panic!("the arguments are an object");
+            };
+            arguments
+        };
+        assert_eq!(
+            tools.call("read_origin", &arguments(2)).unwrap(),
+            format!(
+                "Line 2 of \"README\", as your latest snapshot holds it, reads \"moto\". Commit \
+                 {added} last changed it.\nThat commit is a snapshot of this thread.\nalice.claude's snapshot {added} is the first to add the line, in \
+                 turn 1.\nalice.claude: Turn 1:\n  asked: add moto\n"
+            )
+        );
+        let outside = tools.call("read_origin", &arguments(1)).unwrap();
+        assert!(
+            outside.contains("That commit names no mahi thread"),
+            "{outside}"
+        );
+        assert_eq!(
+            tools.call("read_origin", &arguments(3)).unwrap(),
+            "\"README\" has no line 3"
+        );
+        assert_eq!(
+            tools.call("read_origin", &arguments(0)),
+            Err(ToolError::Arguments)
+        );
+    }
+
+    #[test]
+    fn read_origin_names_a_turn_of_another_thread_without_reading_it() {
+        use crate::workspace_live::tests::setup;
+
+        let setup = setup();
+        let earlier = ThreadId::random().unwrap();
+        let snapshot = ObjectId::from_bytes_or_panic(&[7; 20]);
+        let mut answer = OriginAnswer {
+            store: &setup.store,
+            key: None,
+            thread: setup.thread,
+            listed: vec!["alice".parse().unwrap()],
+            read: TurnsRead::default(),
+            turns: Vec::new(),
+        };
+        answer.push_origin(&Origin::Landed(vec![
+            Searched {
+                thread: earlier,
+                agents: vec![
+                    "alice.claude".parse().unwrap(),
+                    "bob.codex".parse().unwrap(),
+                ],
+                found: Found::Snapshots(
+                    vec![FirstHeld {
+                        slot: "bob.codex".parse().unwrap(),
+                        snapshot,
+                        turn: Some(5),
+                    }],
+                    Walked::Cut,
+                ),
+            },
+            Searched {
+                thread: setup.thread,
+                agents: vec!["alice.claude".parse().unwrap()],
+                found: Found::NoSnapshots,
+            },
+        ]));
+        let text = answer.read.text;
+        assert_eq!(
+            text,
+            format!(
+                "That commit landed thread {earlier} of alice.claude bob.codex.\nbob.codex's \
+                 snapshot {snapshot} is the first to add the line, in turn 5.\n  The turn is in \
+                 thread {earlier}'s records, which this tool reads only for the thread you work \
+                 in.\n(the search ran out of its work budget before it searched every snapshot)\nThat commit landed thread {} of \
+                 alice.claude.\nThis repository holds no snapshots of those agents in thread {}: \
+                 the thread was purged, or never fetched here.\n",
+                setup.thread, setup.thread
+            )
+        );
+    }
+
+    #[test]
+    fn read_origin_reads_the_threads_base_before_the_agents_first_snapshot() {
+        use crate::workspace_live::tests::setup;
+
+        let setup = setup();
+        let tools = ThreadTools::new(
+            setup.store.common_dir().to_path_buf(),
+            (setup.thread, setup.owner(), None),
+            ("alice.codex".parse().unwrap(), Arc::new(Claims::default())),
+            None,
+        );
+        let Value::Object(arguments) = json!({ "path": "README", "line": 1 }) else {
+            panic!("the arguments are an object");
+        };
+        let text = tools.call("read_origin", &arguments).unwrap();
+        assert!(
+            text.starts_with(
+                "Line 1 of \"README\", as the thread's base holds it, reads \"hello\"."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("That commit names no mahi thread"), "{text}");
+    }
+
+    #[test]
+    fn read_origin_reads_every_turn_it_names_within_one_budget() {
+        use mahi_thread::{
+            Event,
+            TurnRecord,
+        };
+
+        use crate::workspace_live::tests::{
+            append_alices_turn,
+            setup,
+        };
+
+        let setup = setup();
+        let alice: AgentSlot = "alice.claude".parse().unwrap();
+        let key = load_meta(&setup.store, setup.thread, &setup.owner(), 0)
+            .unwrap()
+            .thread_key(alice.participant(), setup.identity.as_age())
+            .unwrap();
+        let prompt = |seq: u64, text: &str| {
+            let payload = format!("prompt\n{{\"prompt\":\"{text}\"}}").into_bytes();
+            vec![Event::new(seq, None, payload).unwrap()]
+        };
+        let long = "x".repeat(3000);
+        let events = (0..30).flat_map(|seq| prompt(seq, &long)).collect();
+        let tip = append_alices_turn(&setup, None, &TurnRecord::new(0, events).unwrap());
+        append_alices_turn(
+            &setup,
+            Some(&tip),
+            &TurnRecord::new(1, prompt(30, "short")).unwrap(),
+        );
+        let held = |slot: &AgentSlot, turn| FirstHeld {
+            slot: slot.clone(),
+            snapshot: ObjectId::from_bytes_or_panic(&[7; 20]),
+            turn: Some(turn),
+        };
+        let mut answer = OriginAnswer {
+            store: &setup.store,
+            key: Some(&key),
+            thread: setup.thread,
+            listed: vec!["alice".parse().unwrap()],
+            read: TurnsRead::default(),
+            turns: Vec::new(),
+        };
+        answer.push_origin(&Origin::Unlanded(Searched {
+            thread: setup.thread,
+            agents: vec![alice.clone()],
+            found: Found::Snapshots(
+                vec![
+                    held(&alice, 0),
+                    held(&alice, 1),
+                    held(&alice, 2),
+                    held(&"carol.claude".parse().unwrap(), 0),
+                ],
+                Walked::All,
+            ),
+        }));
+        answer.push_turns();
+        let text = answer.read.text;
+        assert!(text.len() < MAX_TOOL_TEXT, "{}", text.len());
+        assert!(
+            text.contains(
+                "in turn 0.\n  The thread no longer lists carol, so the turn is not shown.\n\
+                 alice.claude: Turn 0:\n"
+            ),
+            "{}",
+            text.get(..2000).unwrap_or_default()
+        );
+        assert!(
+            text.ends_with(
+                "(the rest of this turn is left out for size)\nalice.claude: turn 1 is left out \
+                 for size.\nalice.claude: turn 2 is left out for size.\n"
+            ),
+            "{}",
+            text.get(text.len().saturating_sub(400)..)
+                .unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn a_turn_newer_than_any_the_transcript_holds_is_not_recorded_yet() {
+        use mahi_thread::{
+            Event,
+            TurnRecord,
+        };
+
+        use crate::workspace_live::tests::{
+            append_alices_turn,
+            setup,
+        };
+
+        let setup = setup();
+        let alice: AgentSlot = "alice.claude".parse().unwrap();
+        let key = load_meta(&setup.store, setup.thread, &setup.owner(), 0)
+            .unwrap()
+            .thread_key(alice.participant(), setup.identity.as_age())
+            .unwrap();
+        let mut answer = OriginAnswer {
+            store: &setup.store,
+            key: Some(&key),
+            thread: setup.thread,
+            listed: vec!["alice".parse().unwrap()],
+            read: TurnsRead::default(),
+            turns: Vec::new(),
+        };
+        answer.push_turns();
+        answer.turns.push((alice.clone(), 0));
+        answer.push_turns();
+        let payload = b"prompt\n{\"prompt\":\"hi\"}".to_vec();
+        let events = vec![Event::new(0, None, payload).unwrap()];
+        append_alices_turn(&setup, None, &TurnRecord::new(0, events).unwrap());
+        answer.turns.extend([(alice.clone(), 0), (alice, 1)]);
+        answer.push_turns();
+        assert_eq!(
+            answer.read.text,
+            "alice.claude: turn 0 is not recorded yet: it may still be running.\nalice.claude: \
+             Turn 0:\n  asked: hi\nalice.claude: turn 1 is not recorded yet: it may still be \
+             running.\n"
+        );
+    }
+
+    #[test]
+    fn a_quoted_line_is_cut_to_its_first_characters() {
+        assert_eq!(
+            quoted("é".repeat(200).as_bytes()),
+            ("é".repeat(200), Cut::Whole)
+        );
+        assert_eq!(
+            quoted("é".repeat(201).as_bytes()),
+            ("é".repeat(200), Cut::Short)
+        );
+        assert_eq!(
+            quoted("x".repeat(1 << 20).as_bytes()),
+            ("x".repeat(200), Cut::Short)
+        );
+        assert_eq!(quoted(b"a\xffb"), ("a\u{fffd}b".to_owned(), Cut::Whole));
     }
 
     #[test]
