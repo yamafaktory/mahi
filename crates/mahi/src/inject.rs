@@ -277,6 +277,7 @@ impl Activity {
 
     fn tell(&self, state: TurnState) {
         crate::report::send(&match state {
+            TurnState::Ready => Report::Ready,
             TurnState::Working => Report::Working,
             TurnState::Done => Report::Done,
             TurnState::Asks => Report::Asks,
@@ -1259,7 +1260,7 @@ mod tests {
         assert!(activity.is_idle_after_turn_end(&pace));
         let waiting = Activity::telling(
             None,
-            Some(TurnState::Done),
+            Some(TurnState::Ready),
             AtLaunch::MayAsk,
             EscapeTwice::Any,
         );
@@ -1284,6 +1285,25 @@ mod tests {
         let mut reports = Vec::new();
         mahi_term::ReportReader::default().feed(&read[..length], |report| reports.push(report));
         assert_eq!(reports, [Report::Working, Report::Done]);
+    }
+
+    #[test]
+    fn a_run_that_starts_ready_tells_working_then_done_on_its_first_turn() {
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        crate::report::connect(std::os::fd::IntoRawFd::into_raw_fd(writer));
+        let activity = Activity::telling(
+            None,
+            Some(TurnState::Ready),
+            AtLaunch::MayAsk,
+            EscapeTwice::Any,
+        );
+        activity.saw(HookKind::Prompt, b"");
+        activity.saw(HookKind::TurnEnd, b"");
+        let mut read = [0_u8; 64];
+        let length = rustix::io::read(&reader, &mut read).unwrap();
+        let mut reports = Vec::new();
+        mahi_term::ReportReader::default().feed(&read[..length], |report| reports.push(report));
+        assert_eq!(reports, [Report::Ready, Report::Working, Report::Done]);
     }
 
     #[test]

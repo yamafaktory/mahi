@@ -68,6 +68,8 @@ pub fn spinner(tick: usize) -> &'static str {
 /// What an agent in a thread's tab is doing, as the workspace shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
+    /// It waits for its first prompt since it started.
+    Ready,
     /// A turn is open.
     Working,
     /// Its turn ended: it waits for its next prompt.
@@ -90,6 +92,7 @@ impl AgentState {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Ready => "◌ ready",
             Self::Working => "● working",
             Self::Done => "✓ done",
             Self::AsksYou => "! asks you",
@@ -124,6 +127,8 @@ pub struct WorkspaceTab<'a> {
 /// What a teammate's agent is doing, as the status line names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeammateState {
+    /// It waits for its first prompt since it started.
+    Ready,
     /// A turn is open.
     Working,
     /// Its turn ended.
@@ -141,6 +146,7 @@ impl TeammateState {
     #[must_use]
     pub fn word(self) -> &'static str {
         match self {
+            Self::Ready => "ready",
             Self::Working => "working",
             Self::Done => "done",
             Self::Asks => "asks",
@@ -153,6 +159,7 @@ impl TeammateState {
 impl From<TeammateState> for AgentState {
     fn from(state: TeammateState) -> Self {
         match state {
+            TeammateState::Ready => Self::Ready,
             TeammateState::Working => Self::Working,
             TeammateState::Done => Self::Done,
             TeammateState::Asks => Self::Asks,
@@ -1546,6 +1553,11 @@ mod tests {
             state: AgentState::Done,
         };
         assert_eq!(own.palette_label(), "Show agent claude (✓ done)");
+        let fresh = WorkspaceAgent {
+            state: AgentState::Ready,
+            ..own
+        };
+        assert_eq!(fresh.palette_label(), "Show agent claude (◌ ready)");
         let teammates = WorkspaceAgent {
             owner: Some("bob\x1b[2J"),
             name: "claude\n",
@@ -1555,6 +1567,12 @@ mod tests {
             teammates.palette_label(),
             "Show bob?[2J's agent claude? (read-only, ◉ live)"
         );
+    }
+
+    #[test]
+    fn a_teammates_agent_before_its_first_prompt_is_ready() {
+        assert_eq!(TeammateState::Ready.word(), "ready");
+        assert_eq!(AgentState::from(TeammateState::Ready), AgentState::Ready);
     }
 
     fn owned(paths: &[&str]) -> Vec<String> {

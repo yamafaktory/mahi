@@ -900,7 +900,7 @@ impl Workspace {
             child,
             closed: false,
             ending: Ending::Running,
-            state: AgentState::Done,
+            state: AgentState::Ready,
             told_asks: None,
             commands: Some(commands),
         };
@@ -2000,6 +2000,7 @@ impl Workspace {
             return false;
         };
         match report {
+            Report::Ready => running.state = AgentState::Ready,
             Report::Working => running.state = AgentState::Working,
             Report::Done => running.state = AgentState::Done,
             Report::Asks => {
@@ -2054,8 +2055,8 @@ impl Workspace {
         }
     }
 
-    /// Shows the next agent after the one shown, in any tab, that asks the user, is done or
-    /// failed, if there is one.
+    /// Shows the next agent after the one shown, in any tab, that asks the user, is ready, is
+    /// done or failed, if there is one.
     fn show_next_waiting(&mut self) {
         let flat: Vec<(usize, usize, bool)> = self
             .tabs
@@ -2068,7 +2069,10 @@ impl Workspace {
                     .enumerate()
                     .map(move |(agent, running)| {
                         let waiting = running.ending == Ending::Failed
-                            || matches!(running.state, AgentState::Done | AgentState::AsksYou);
+                            || matches!(
+                                running.state,
+                                AgentState::Ready | AgentState::Done | AgentState::AsksYou
+                            );
                         (tab, agent, waiting)
                     })
             })
@@ -2214,7 +2218,7 @@ mod tests {
             child: Child::start(shell(script), SIZE, id, &workspace.sender).unwrap(),
             closed: false,
             ending: Ending::Running,
-            state: AgentState::Done,
+            state: AgentState::Ready,
             told_asks: None,
             commands: None,
         }
@@ -2447,7 +2451,7 @@ mod tests {
         for item in [
             "Go to the thread list",
             "Go to thread a (shown)",
-            "Show agent agent (✓ done)",
+            "Show agent agent (◌ ready)",
             "Go to the next agent waiting for you",
             "Show this agent's held turns",
             "Pass Ctrl-Space through to the agent",
@@ -3048,7 +3052,7 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol().to_owned())
                 .collect()
         };
-        assert!(row(0).starts_with("╭ agent (✓ done) "), "{:?}", row(0));
+        assert!(row(0).starts_with("╭ agent (◌ ready) "), "{:?}", row(0));
         assert!(
             row(10).starts_with("bob.claude live  carol.codex live"),
             "{:?}",
@@ -3226,7 +3230,7 @@ mod tests {
         assert_eq!(
             listed,
             [
-                (None, "agent", AgentState::Done),
+                (None, "agent", AgentState::Ready),
                 (Some("bob"), "claude", AgentState::Live),
             ]
         );
@@ -3649,6 +3653,11 @@ mod tests {
         assert_eq!(workspace.shown_id(), Some(ids[2]));
         workspace.type_keys(b"\x00 ", &mut threads);
         assert_eq!(workspace.shown_id(), Some(ids[1]));
+        workspace.take_report(ids[0], &Report::Ready, &mut Vec::new());
+        workspace.type_keys(b"\x00 ", &mut threads);
+        assert_eq!(workspace.shown_id(), Some(ids[2]));
+        workspace.type_keys(b"\x00 ", &mut threads);
+        assert_eq!(workspace.shown_id(), Some(ids[0]));
         assert!(threads.is_empty());
     }
 

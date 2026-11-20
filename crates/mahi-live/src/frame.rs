@@ -152,6 +152,8 @@ pub enum Body {
 /// What an agent does, as its host tells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnState {
+    /// It waits for its first prompt since it started.
+    Ready,
     /// A turn is open.
     Working,
     /// Its turn ended: it waits for its next prompt.
@@ -166,6 +168,7 @@ impl TurnState {
             Self::Working => 0,
             Self::Done => 1,
             Self::Asks => 2,
+            Self::Ready => 3,
         }
     }
 
@@ -174,6 +177,7 @@ impl TurnState {
             0 => Some(Self::Working),
             1 => Some(Self::Done),
             2 => Some(Self::Asks),
+            3 => Some(Self::Ready),
             _ => None,
         }
     }
@@ -1635,11 +1639,16 @@ mod tests {
         let unknown = alice
             .seal_wire(WireBody::State(WireState {
                 slot: "alice.claude",
-                state: 3,
+                state: 4,
             }))
             .unwrap();
         assert_eq!(receiver.open(&unknown), Err(FrameError::Malformed));
-        for state in [TurnState::Working, TurnState::Done, TurnState::Asks] {
+        for state in [
+            TurnState::Working,
+            TurnState::Done,
+            TurnState::Asks,
+            TurnState::Ready,
+        ] {
             assert_eq!(TurnState::from_code(state.code()), Some(state));
         }
     }

@@ -856,11 +856,11 @@ mod tests {
         tap.attach(guest.tap.clone());
         let _activity = Activity::telling(
             Some(tap),
-            Some(TurnState::Done),
+            Some(TurnState::Ready),
             AtLaunch::MayAsk,
             EscapeTwice::Any,
         );
-        assert_eq!(handle.state_of(&codex), Some(TurnState::Done));
+        assert_eq!(handle.state_of(&codex), Some(TurnState::Ready));
     }
 
     #[test]

@@ -1930,6 +1930,36 @@ printf '%s\n' '{"type":"assistant","timestamp":"2026-09-30T00:00:00Z","message":
     }
 
     #[test]
+    fn a_workspace_agent_shows_ready_before_its_first_prompt_and_done_once_its_turn_ends() {
+        let fixture = fixture();
+        let agent = "#!/bin/sh\nsleep 0.5\necho agent-waits\nread line\nprintf '{\"prompt\":\"build\"}' | \"$MAHI_BIN\" hook prompt\n\"$MAHI_BIN\" hook turn-end < /dev/null\nwhile :; do sleep 1; done\n";
+        let claude = script(&fixture, "reporting-agents", "claude", agent);
+        script(&fixture, "reporting-agents", "codex", agent);
+        let path = format!("{}:/usr/bin:/bin:/usr", claude.parent().unwrap().display());
+        let (code, output) = in_terminal_typing(
+            terminal_command(&fixture, &[]).env("PATH", &path),
+            &[
+                ("Threads", b"n"),
+                ("Which agent should start the thread?", b"1"),
+                ("claude (◌ ready)", b""),
+                ("agent-waits", b"build\r"),
+                ("claude (✓ done)", b"\x000"),
+                ("Threads · ", b"q"),
+                ("stop it and quit?", b"y"),
+            ],
+        );
+        assert_eq!(code, 0, "{output}");
+        let waits = output.find("agent-waits").unwrap();
+        let mut parser = vt100::Parser::new(24, 200, 0);
+        parser.process(&output.as_bytes()[..waits]);
+        let rows: Vec<String> = parser.screen().rows(0, 200).collect();
+        assert!(
+            rows.iter().any(|row| row.contains("claude (◌ ready)")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
     fn the_agent_dialog_starts_on_the_agent_chosen_last() {
         let fixture = fixture();
         let agent = "#!/bin/sh\necho started-$(basename $0)\nwhile :; do sleep 1; done\n";

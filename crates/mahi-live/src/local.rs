@@ -428,6 +428,7 @@ mod tests {
             LocalMessage::State(TurnState::Working),
             LocalMessage::State(TurnState::Done),
             LocalMessage::State(TurnState::Asks),
+            LocalMessage::State(TurnState::Ready),
         ] {
             assert_eq!(round_trip(&message), message);
         }
@@ -436,11 +437,15 @@ mod tests {
     #[test]
     fn a_state_is_one_known_byte() {
         assert!(LocalMessage::decode(&[STATE]).is_err());
-        assert!(LocalMessage::decode(&[STATE, 3]).is_err());
+        assert!(LocalMessage::decode(&[STATE, 4]).is_err());
         assert!(LocalMessage::decode(&[STATE, 0, 0]).is_err());
         assert_eq!(
             LocalMessage::decode(&[STATE, 2]).unwrap(),
             LocalMessage::State(TurnState::Asks)
+        );
+        assert_eq!(
+            LocalMessage::decode(&[STATE, 3]).unwrap(),
+            LocalMessage::State(TurnState::Ready)
         );
     }
 

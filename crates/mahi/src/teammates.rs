@@ -67,6 +67,7 @@ impl Teammate {
         }
         match self.state {
             None => TeammateState::Live,
+            Some(TurnState::Ready) => TeammateState::Ready,
             Some(TurnState::Working) => TeammateState::Working,
             Some(TurnState::Done) => TeammateState::Done,
             Some(TurnState::Asks) => TeammateState::Asks,
@@ -711,6 +712,8 @@ mod tests {
         };
         assert!(teammates.apply(&bob(), beat(), now));
         assert_eq!(shown(&teammates), Some(TeammateState::Live));
+        assert!(teammates.apply(&bob(), told("bob.claude", TurnState::Ready), now));
+        assert_eq!(shown(&teammates), Some(TeammateState::Ready));
         assert!(teammates.apply(&bob(), told("bob.claude", TurnState::Working), now));
         assert_eq!(shown(&teammates), Some(TeammateState::Working));
         assert!(!teammates.apply(&bob(), told("bob.claude", TurnState::Working), now));

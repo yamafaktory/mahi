@@ -10,6 +10,8 @@ const MAX_LINE_BYTES: usize = 511;
 pub enum Report {
     /// The agent's thread.
     Thread(ThreadId),
+    /// It waits for its first prompt since it started.
+    Ready,
     /// A turn is open.
     Working,
     /// Its turn ended: it waits for its next prompt.
@@ -23,6 +25,7 @@ impl Report {
     pub fn write(&self, out: &mut Vec<u8>) {
         let _ = match self {
             Self::Thread(id) => writeln!(out, "thread {id}"),
+            Self::Ready => writeln!(out, "ready"),
             Self::Working => writeln!(out, "working"),
             Self::Done => writeln!(out, "done"),
             Self::Asks => writeln!(out, "asks"),
@@ -31,6 +34,7 @@ impl Report {
 
     fn parse(line: &[u8]) -> Option<Self> {
         match line {
+            b"ready" => Some(Self::Ready),
             b"working" => Some(Self::Working),
             b"done" => Some(Self::Done),
             b"asks" => Some(Self::Asks),
@@ -110,6 +114,7 @@ mod tests {
             Report::Working,
             Report::Done,
             Report::Asks,
+            Report::Ready,
         ];
         let mut out = Vec::new();
         for report in &written {

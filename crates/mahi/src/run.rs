@@ -1270,14 +1270,6 @@ impl Prepared {
         }
     }
 
-    /// Returns the state the agent starts in, done and waiting for its first prompt, when its
-    /// profile's hooks report its turns.
-    fn first_state(&self) -> Option<TurnState> {
-        self.profile
-            .and_then(Profile::turn_end_agent)
-            .map(|_| TurnState::Done)
-    }
-
     fn launch(
         mut self,
         (environment, config): (&Environment, &ConfigDir),
@@ -1287,7 +1279,7 @@ impl Prepared {
         self.announce(&started);
         let session = self.session_source(&started);
         let restore = restore_of(&self.store, session.as_ref(), &started);
-        let first = self.first_state();
+        let first = first_state(self.profile);
         let reporting = first.map_or(Reporting::Unreported, |_| Reporting::Reported);
         let (thread, slot) = (started.thread, started.slot.clone());
         let state = self.state_dir(&started);
@@ -2288,6 +2280,14 @@ impl Launch<'_> {
     }
 }
 
+/// Returns the state an agent of `profile` starts in, ready for its first prompt, when the
+/// profile's hooks report its turns.
+fn first_state(profile: Option<&Profile>) -> Option<TurnState> {
+    profile
+        .and_then(Profile::turn_end_agent)
+        .map(|_| TurnState::Ready)
+}
+
 /// The agent a launch started, with the terminal mode and proxy it runs with, its state
 /// directory with the approvals of mahi's hooks it recorded at launch, and whether its launch
 /// can open a dialog.
@@ -3052,6 +3052,15 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_whose_hooks_report_turns_starts_ready_and_another_tells_no_state() {
+        for program in ["claude", "codex"] {
+            let profile = Profile::for_agent(OsStr::new(program));
+            assert_eq!(first_state(profile), Some(TurnState::Ready), "{program}");
+        }
+        assert_eq!(first_state(None), None);
+    }
 
     #[test]
     fn a_missing_credential_is_asked_once_unless_declined_passed_or_unknown() {

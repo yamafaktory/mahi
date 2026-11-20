@@ -1108,3 +1108,19 @@ the notice's title: `Removing an earlier pairing from origin…`, only when this
 `Reaching the relay…`, or `Finding your address on the local network…` when relays are off; then
 `Publishing where to find you on origin…`. The other choices were numbered steps, or a checklist
 that keeps each finished step.
+
+## D136 · 2026-11-20 · A new agent shows ready until its first turn
+
+Chosen by the user (#202). A new agent showed `✓ done` before the user sent any prompt, which read
+as if a turn already ran. Now it shows `◌ ready` until its first turn opens, and `✓ done` once a
+turn ends, as before. Space picks a ready agent as it picks a done one. The other choices were to
+keep done, or to show no state until the first turn. The user also chose:
+- Teammates see ready too. The live frame carries it as a new state, code 3. The other choice
+  kept ready local, so a teammate saw done.
+- A mahi older than this change refuses a frame with code 3 as malformed. The user accepts that
+  for a preview, as DESIGN.md does for a clone's `off` remote. Until the agent's first turn, an
+  older teammate drops the host's claims frames, with their claims and turn ends, and an older
+  hub on the same machine drops the run's local link. The other choices were to send done to an
+  older peer, or to add a version handshake.
+- The marker is `◌`, a dotted circle from the family of `●`, `◉` and `○`. The other choices were
+  `›` and `·`.
