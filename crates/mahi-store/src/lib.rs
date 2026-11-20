@@ -21,7 +21,10 @@ mod store;
 mod trailers;
 mod worktree;
 
-pub use blame::Blamed;
+pub use blame::{
+    Blamed,
+    BlamedLine,
+};
 pub use changes::{
     Change,
     Changes,
