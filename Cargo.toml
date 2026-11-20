@@ -34,7 +34,7 @@ clap = { version = "4.6.7", default-features = false, features = ["derive", "err
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize"] }
 getrandom = "0.4.3"
 ghash = { version = "0.5.1", default-features = false, features = ["zeroize"] }
-gix = { version = "0.88.0", default-features = false, features = ["attributes", "blocking-network-client", "excludes", "index", "merge", "pack-cache-lru-dynamic", "parallel", "sha1", "worktree-mutation"] }
+gix = { version = "0.88.0", default-features = false, features = ["attributes", "blame", "blocking-network-client", "excludes", "index", "merge", "pack-cache-lru-dynamic", "parallel", "sha1", "worktree-mutation"] }
 gix-hash = "0.27.0"
 gix-imara-diff = { version = "0.3.0", default-features = false, features = ["unified_diff"] }
 gix-error = "0.4.0"

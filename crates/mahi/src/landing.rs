@@ -23,6 +23,7 @@ use mahi_store::{
     ObjectId,
     Store,
     StoreError,
+    landing_trailers,
 };
 use serde_json::{
     Map,
@@ -304,14 +305,6 @@ fn is_control(character: char) -> bool {
     character.is_control() && !matches!(character, '\n' | '\t')
 }
 
-pub(crate) fn trailers(thread: ThreadId, agents: &[AgentSlot]) -> String {
-    let mut trailers = format!("Thread: {thread}\n");
-    for slot in agents {
-        let _ = writeln!(trailers, "Agent: {slot}");
-    }
-    trailers
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Onto {
     Merged(ObjectId),
@@ -356,7 +349,7 @@ pub(crate) fn build(
     (thread, agents): (ThreadId, &[AgentSlot]),
     (identity, signer): (&Identity, &dyn CommitSigner),
 ) -> Result<Vec<ObjectId>, StoreError> {
-    let trailers = trailers(thread, agents);
+    let trailers = landing_trailers(thread, agents);
     let mut tree = store.commit_tree(landed)?;
     let mut parent = landed;
     let mut built = Vec::with_capacity(call.commits.len());

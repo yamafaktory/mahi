@@ -47,7 +47,7 @@ fn as_text(found: &Found) -> Result<Option<&str>, FileDiff> {
     }
 }
 
-enum Found {
+pub(crate) enum Found {
     File(Vec<u8>, EntryMode),
     Missing,
     TooLarge,
@@ -139,7 +139,12 @@ impl Store {
         })
     }
 
-    fn file_at(&self, tree: ObjectId, path: &str, limit: u64) -> Result<Found, StoreError> {
+    pub(crate) fn file_at(
+        &self,
+        tree: ObjectId,
+        path: &str,
+        limit: u64,
+    ) -> Result<Found, StoreError> {
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() > MAX_PATH_DEPTH || parts.iter().any(|part| matches!(*part, "" | "." | ".."))
         {

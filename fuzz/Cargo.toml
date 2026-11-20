@@ -300,6 +300,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "store-landed-from"
+path = "fuzz_targets/store_landed_from.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "store-names"
 path = "fuzz_targets/store_names.rs"
 test = false

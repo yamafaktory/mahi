@@ -252,6 +252,8 @@ Agent: bob.codex
 
 The trailers join the commit's last paragraph when git would read it as a trailer block (every line a `Key: value` trailer, a folded continuation or a `(cherry picked from commit …)` line, or at least a quarter of them with one git wrote, `Signed-off-by` or cherry-picked), and start a paragraph of their own otherwise, with the message's own line endings.
 
+To trace a line back, mahi finds the commit that last changed it, following renames and with the histogram diff, in a file of at most 1 MiB, where an earlier version larger than that counts as empty, and reads that commit's `Thread:` and `Agent:` lines wherever they sit in its message, indented or not, since a squash merge can copy several landings' messages into one. Each `Agent:` line belongs to the `Thread:` line before it; a value that does not parse is left out, with the `Agent:` lines after a `Thread:` line that does not parse, and at most 64 threads, and 64 agents of each, are read from one message (D135).
+
 ## Compaction and cleanup
 
 Thread histories are never rewritten. A fetch moves an agent's ref only forward and only over commits its participant signed, so a rewritten history would be refused by every teammate, and no one can re-sign another participant's commits. What a thread adds to the repository is bounded instead, and cleanup deletes whole refs.

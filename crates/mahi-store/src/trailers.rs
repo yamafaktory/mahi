@@ -1,11 +1,88 @@
+use std::fmt::Write;
+
 use gix::bstr::{
     BStr,
     BString,
     ByteSlice,
 };
+use mahi_core::{
+    AgentSlot,
+    ThreadId,
+};
 
 const CHERRY_PICKED: &[u8] = b"(cherry picked from commit ";
 const SIGNED_OFF_BY: &[u8] = b"Signed-off-by";
+const LANDED_THREAD: &str = "Thread: ";
+const LANDED_AGENT: &str = "Agent: ";
+const MAX_LANDED_NAMES: usize = 64;
+
+/// A thread a landed commit names in its trailers, with the agents named after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landed {
+    /// The thread.
+    pub thread: ThreadId,
+    /// The agents named after it, each once.
+    pub agents: Vec<AgentSlot>,
+}
+
+/// Returns the trailers a landing of `thread` by `agents` writes on its commit.
+#[must_use]
+pub fn landing_trailers(thread: ThreadId, agents: &[AgentSlot]) -> String {
+    let mut trailers = format!("{LANDED_THREAD}{thread}\n");
+    for slot in agents {
+        let _ = writeln!(trailers, "{LANDED_AGENT}{slot}");
+    }
+    trailers
+}
+
+/// Reads the threads a landed commit's `message` names, each with the agents named after it.
+/// The lines may be anywhere and indented, since a squash merge can copy the messages of several
+/// landings into one. A value that does not parse is left out, and so is an agent named before
+/// any thread or after a thread line that does not parse, and any name past the 64th of its
+/// kind, threads or one thread's agents.
+#[must_use]
+pub fn landed_from(message: &[u8]) -> Vec<Landed> {
+    let mut landed: Vec<Landed> = Vec::new();
+    let mut current = None;
+    let lines = message
+        .lines()
+        .filter_map(|line| line.to_str().ok())
+        .map(str::trim_start);
+    for line in lines {
+        if let Some(id) = line.strip_prefix(LANDED_THREAD) {
+            current = id
+                .parse()
+                .ok()
+                .and_then(|thread| named_at(&mut landed, thread));
+        } else if let Some(slot) = line
+            .strip_prefix(LANDED_AGENT)
+            .and_then(|slot| slot.parse().ok())
+            && let Some(named) = current.and_then(|at| landed.get_mut(at))
+        {
+            push_once(&mut named.agents, slot);
+        }
+    }
+    landed
+}
+
+fn named_at(landed: &mut Vec<Landed>, thread: ThreadId) -> Option<usize> {
+    if let Some(at) = landed.iter().position(|named| named.thread == thread) {
+        return Some(at);
+    }
+    (landed.len() < MAX_LANDED_NAMES).then(|| {
+        landed.push(Landed {
+            thread,
+            agents: Vec::new(),
+        });
+        landed.len() - 1
+    })
+}
+
+fn push_once<T: PartialEq>(names: &mut Vec<T>, name: T) {
+    if !names.contains(&name) && names.len() < MAX_LANDED_NAMES {
+        names.push(name);
+    }
+}
 
 /// Returns `message` with `trailers`, lines of `Key: value` each ending in a newline, joined to
 /// its trailer block, or starting one when its last paragraph is not one, as git reads trailers.
@@ -86,6 +163,60 @@ fn trailer_key(line: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_landing_reads_back_each_thread_with_its_agents_from_anywhere_in_a_message() {
+        let thread = ThreadId::random().unwrap();
+        let other = ThreadId::random().unwrap();
+        let alice: AgentSlot = "alice.claude".parse().unwrap();
+        let bob: AgentSlot = "bob.codex".parse().unwrap();
+        let landed = landing_trailers(thread, &[alice.clone(), bob.clone()]);
+        let squashed = format!(
+            "Squashed\n\nAgent: carol.claude\n* Change a\n\n{landed}\n    * Change b\n\n    Thread: {other}\n    Agent: alice.claude\nThread: not-an-id\nAgent: no slot\n"
+        );
+        assert_eq!(
+            landed_from(squashed.as_bytes()),
+            [
+                Landed {
+                    thread,
+                    agents: vec![alice.clone(), bob],
+                },
+                Landed {
+                    thread: other,
+                    agents: vec![alice],
+                },
+            ]
+        );
+        assert_eq!(landed_from(b"Plain commit\n"), []);
+    }
+
+    #[test]
+    fn an_agent_after_a_thread_line_that_does_not_parse_belongs_to_no_thread() {
+        let thread = ThreadId::random().unwrap();
+        let message =
+            format!("Thread: {thread}\nAgent: alice.claude\nThread: not-an-id\nAgent: bob.codex\n");
+        assert_eq!(
+            landed_from(message.as_bytes()),
+            [Landed {
+                thread,
+                agents: vec!["alice.claude".parse().unwrap()],
+            }]
+        );
+    }
+
+    #[test]
+    fn at_most_64_threads_and_64_agents_of_a_thread_are_read_from_one_message() {
+        let mut message = String::new();
+        for _ in 0..70 {
+            let _ = writeln!(message, "Thread: {}", ThreadId::random().unwrap());
+        }
+        assert_eq!(landed_from(message.as_bytes()).len(), 64);
+        let mut message = format!("Thread: {}\n", ThreadId::random().unwrap());
+        for agent in 0..70 {
+            let _ = writeln!(message, "Agent: alice.agent{agent}");
+        }
+        assert_eq!(landed_from(message.as_bytes())[0].agents.len(), 64);
+    }
 
     #[test]
     fn trailers_join_an_existing_block_or_start_one() {

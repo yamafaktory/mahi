@@ -4,6 +4,7 @@
 compile_error!("mahi supports Linux and macOS only");
 
 mod agent_config;
+mod blame;
 mod changes;
 mod commit;
 mod diff;
@@ -20,6 +21,7 @@ mod store;
 mod trailers;
 mod worktree;
 
+pub use blame::Blamed;
 pub use changes::{
     Change,
     Changes,
@@ -75,4 +77,9 @@ pub use store::{
     Store,
     StoreError,
 };
-pub use trailers::appended_trailers;
+pub use trailers::{
+    Landed,
+    appended_trailers,
+    landed_from,
+    landing_trailers,
+};

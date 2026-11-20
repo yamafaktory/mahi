@@ -1127,6 +1127,25 @@ names that turn in the same signed trailer, `Mahi-Turn: <number>`. During the wo
   transcript refuses a gap. Its snapshots then name that later turn, so a reader that traces a line
   to a turn must check that the turn holds the line's change.
 
+## D135 · 2026-11-18 · A line leads to the commit that last changed it, and its trailers name the thread
+
+Step 2 of the plan the user approved for #148 (D111). The workspace's `gix` now has its `blame`
+feature, which adds `gix-blame` and gix's blob diff, both pure Rust. `Store::line_commit` finds the
+commit that last changed a line of a file in a given commit. `landed_from` reads the `Thread:` and
+`Agent:` lines a landing writes, and `landing_trailers`, which writes them, moves next to it in
+`mahi-store`. During the work, not by the user:
+- The lines may sit anywhere in the message and be indented, since a squash merge can copy the
+  messages of several landings into one, so a commit can name several threads. Each `Agent:` line
+  belongs to the `Thread:` line before it.
+- A value that does not parse is left out, each name counts once, and at most 64 threads, and 64
+  agents of each, are read from one message. An `Agent:` line after a `Thread:` line that does
+  not parse is left out too, so it is not credited to an earlier thread.
+- Blame follows renames and always uses the histogram diff, as mahi's other diffs do. It reads a
+  path as a diff does: a file of at most 1 MiB, no empty, `.` or `..` part, and not a link or a
+  submodule. An earlier version larger than 1 MiB counts as empty, so its lines are blamed on the
+  commit that made the file smaller. Blame sets its own `core.bigFileThreshold` for this, on a
+  copy of the repository, since merges read the same setting.
+
 ## D136 · 2026-11-20 · A new agent shows ready until its first turn
 
 Chosen by the user (#202). A new agent showed `✓ done` before the user sent any prompt, which read
